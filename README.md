@@ -1,10 +1,7 @@
 <div align="center">
 <img src="assets/figures/realcli-logo.jpeg" alt="REALCLI logo" width="220"/>
-<h1>REALCLI-Benchmark-v1.0</h1>
-<p>Evaluating Human–Agent Collaboration in CLI Agents</p>
+<h1>Evaluating Human–Agent Collaboration in CLI Agents</h1>
 </div>
-
-**Dataset Coming Soon.** We are currently preparing the release of the RealCLI dataset and will make it publicly available soon.
 
 <p align="center">
 <a href="https://huggingface.co/datasets/RealCLI-Team/RealCLI-Benchmark-v1.0">
@@ -14,6 +11,8 @@
   <img src="https://img.shields.io/badge/GitHub-RealCLI--Benchmark--v1.0-black" alt="GitHub repository">
 </a>
 </p>
+
+**Dataset Coming Soon.** We are currently preparing the release of the RealCLI dataset and will make it publicly available soon.
 
 ## 🎯 Abstract
 
