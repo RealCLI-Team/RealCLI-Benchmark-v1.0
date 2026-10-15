@@ -1,0 +1,3197 @@
+diff --git a/doc/reference/algorithms/isomorphism.rst b/doc/reference/algorithms/isomorphism.rst
+index 5a29f1e..1d64bd0 100644
+--- a/doc/reference/algorithms/isomorphism.rst
++++ b/doc/reference/algorithms/isomorphism.rst
+@@ -4,9 +4,6 @@
+ Isomorphism
+ ***********
+ 
+-.. toctree::
+-   :maxdepth: 2
+-
+ .. automodule:: networkx.algorithms.isomorphism
+ .. autosummary::
+    :toctree: generated/
+@@ -16,6 +13,15 @@ Isomorphism
+    fast_could_be_isomorphic
+    faster_could_be_isomorphic
+ 
++VF2++
++-----
++.. automodule:: networkx.algorithms.isomorphism.vf2pp
++.. autosummary::
++   :toctree: generated/
++
++   vf2pp_is_isomorphic
++   vf2pp_all_isomorphisms
++   vf2pp_isomorphism
+ 
+ Tree Isomorphism
+ -----------------
+diff --git a/networkx/algorithms/__init__.py b/networkx/algorithms/__init__.py
+index 9fa60b9..d21a4f3 100644
+--- a/networkx/algorithms/__init__.py
++++ b/networkx/algorithms/__init__.py
+@@ -117,6 +117,7 @@ from networkx.algorithms.isomorphism import could_be_isomorphic
+ from networkx.algorithms.isomorphism import fast_could_be_isomorphic
+ from networkx.algorithms.isomorphism import faster_could_be_isomorphic
+ from networkx.algorithms.isomorphism import is_isomorphic
++from networkx.algorithms.isomorphism.vf2pp import *
+ from networkx.algorithms.tree.branchings import maximum_branching
+ from networkx.algorithms.tree.branchings import maximum_spanning_arborescence
+ from networkx.algorithms.tree.branchings import minimum_branching
+diff --git a/networkx/algorithms/isomorphism/__init__.py b/networkx/algorithms/isomorphism/__init__.py
+index ddcedea..58c2268 100644
+--- a/networkx/algorithms/isomorphism/__init__.py
++++ b/networkx/algorithms/isomorphism/__init__.py
+@@ -4,3 +4,4 @@ from networkx.algorithms.isomorphism.matchhelpers import *
+ from networkx.algorithms.isomorphism.temporalisomorphvf2 import *
+ from networkx.algorithms.isomorphism.ismags import *
+ from networkx.algorithms.isomorphism.tree_isomorphism import *
++from networkx.algorithms.isomorphism.vf2pp import *
+diff --git a/networkx/algorithms/isomorphism/isomorph.py b/networkx/algorithms/isomorphism/isomorph.py
+index 1b9a727..277b197 100644
+--- a/networkx/algorithms/isomorphism/isomorph.py
++++ b/networkx/algorithms/isomorphism/isomorph.py
+@@ -1,5 +1,29 @@
+ """
+ Graph isomorphism functions.
++
++Top-level entry points sitting on top of the classic VF2 matchers
++(:class:`GraphMatcher`, :class:`DiGraphMatcher`) and the VF2++
++implementation in :mod:`networkx.algorithms.isomorphism.vf2pp`.
++
++The pre-check helpers (:func:`could_be_isomorphic`,
++:func:`fast_could_be_isomorphic`, :func:`faster_could_be_isomorphic`) are
++designed as cheap *necessary* conditions for isomorphism, usable on every
++graph type NetworkX ships (undirected simple, undirected multi, directed
++simple, directed multi).  Historically the two heavier variants only
++handled undirected simple graphs because they relied on ``nx.triangles``
++and ``nx.number_of_cliques``, both of which raise
++:class:`~networkx.exception.NetworkXNotImplemented` on directed or
++multi-graphs.  They now fall back to a degree-sequence-only check (the
++same as :func:`faster_could_be_isomorphic`) whenever the extra structural
++statistics are not defined for the input graph type, keeping their
++contract intact: ``True`` never guarantees isomorphism, but ``False``
++still guarantees the two graphs are provably non-isomorphic.
++
++All three pre-check helpers optionally accept a ``node_label`` keyword.
++When set, they additionally require that the multiset of label values in
++both graphs coincides, using ``default_label`` for nodes that lack the
++attribute.  This lets :func:`is_isomorphic` reject label-incompatible
++inputs cheaply before dispatching to a full VF2/VF2++ search.
+ """
+ import networkx as nx
+ from networkx.exception import NetworkXError
+@@ -12,25 +36,117 @@ __all__ = [
+ ]
+ 
+ 
+-def could_be_isomorphic(G1, G2):
++def _degree_sequence(G):
++    """Return the (sorted) degree sequence appropriate for ``G``'s type.
++
++    For undirected graphs this is a plain sorted list of integer degrees.
++    For directed graphs it is a sorted list of ``(in_degree, out_degree)``
++    tuples so that mismatches in either direction are caught.
++    """
++    if G.is_directed():
++        return sorted(
++            (d_in, d_out)
++            for (_, d_in), (_, d_out) in zip(G.in_degree, G.out_degree)
++        )
++    return sorted(d for _, d in G.degree)
++
++
++def _same_type(G1, G2):
++    """Return True when ``G1`` and ``G2`` share directedness *and* multi-edge
++    behaviour.  Graphs that differ in either of these two flags cannot be
++    isomorphic under any bijection of the vertices, so the pre-check
++    helpers can short-circuit to ``False`` before doing any further work.
++    """
++    return G1.is_directed() == G2.is_directed() and G1.is_multigraph() == G2.is_multigraph()
++
++
++def _basic_size_agrees(G1, G2):
++    """Check node count and edge count.  Both must match for any bijection
++    between ``G1`` and ``G2`` to be edge-preserving.
++    """
++    if G1.number_of_nodes() != G2.number_of_nodes():
++        return False
++    if G1.number_of_edges() != G2.number_of_edges():
++        return False
++    return True
++
++
++def _needs_undirected_simple_stats(G):
++    """The heavier pre-checks (triangles, number_of_cliques) are only defined
++    on undirected simple graphs.  Return True when we can safely compute
++    them for ``G`` without hitting
++    :class:`~networkx.exception.NetworkXNotImplemented`.
++    """
++    return not (G.is_directed() or G.is_multigraph())
++
++
++def _label_multiset(G, node_label, default_label):
++    """Return the sorted multiset of label values on ``G``'s nodes.
++
++    Nodes that do not carry the ``node_label`` attribute fall back to
++    ``default_label``.  Values are coerced to their ``repr`` before sorting
++    so that heterogeneous label types (mixing ints, strs, tuples, ...)
++    remain comparable and produce a deterministic ordering.
++    """
++    if node_label is None:
++        return None
++    return sorted(
++        repr(G.nodes[n].get(node_label, default_label)) for n in G.nodes
++    )
++
++
++def _label_multisets_agree(G1, G2, node_label, default_label):
++    if node_label is None:
++        return True
++    return (
++        _label_multiset(G1, node_label, default_label)
++        == _label_multiset(G2, node_label, default_label)
++    )
++
++
++def could_be_isomorphic(G1, G2, *, node_label=None, default_label=None):
+     """Returns False if graphs are definitely not isomorphic.
+     True does NOT guarantee isomorphism.
+ 
+     Parameters
+     ----------
+     G1, G2 : graphs
+-       The two graphs G1 and G2 must be the same type.
++       The two graphs G1 and G2.
++
++    node_label : str, optional (keyword-only)
++       Node attribute whose multiset of values must coincide between
++       ``G1`` and ``G2`` for the check to return ``True``.  When omitted,
++       node attributes are ignored (the classical behaviour).
++
++    default_label : scalar, optional (keyword-only)
++       Value used for nodes lacking the ``node_label`` attribute.  Only
++       meaningful when ``node_label`` is set.
+ 
+     Notes
+     -----
+-    Checks for matching degree, triangle, and number of cliques sequences.
++    On undirected simple graphs this checks matching degree, triangle and
++    number-of-cliques sequences (as in earlier versions of NetworkX).  On
++    directed or multi-graph inputs, where the triangle/clique statistics
++    are not defined, the check gracefully degrades to a degree-sequence
++    comparison rather than raising
++    :class:`~networkx.exception.NetworkXNotImplemented`.  Graphs of
++    incompatible type (mixing directed with undirected, or multi with
++    simple) can never be isomorphic and return ``False`` immediately.
+     """
++    if not _same_type(G1, G2):
++        return False
++    if not _basic_size_agrees(G1, G2):
++        return False
++
++    if _degree_sequence(G1) != _degree_sequence(G2):
++        return False
+ 
+-    # Check global properties
+-    if G1.order() != G2.order():
++    if not _label_multisets_agree(G1, G2, node_label, default_label):
+         return False
+ 
+-    # Check local properties
++    if not _needs_undirected_simple_stats(G1):
++        return True
++
+     d1 = G1.degree()
+     t1 = nx.triangles(G1)
+     c1 = nx.number_of_cliques(G1)
+@@ -53,7 +169,7 @@ def could_be_isomorphic(G1, G2):
+ graph_could_be_isomorphic = could_be_isomorphic
+ 
+ 
+-def fast_could_be_isomorphic(G1, G2):
++def fast_could_be_isomorphic(G1, G2, *, node_label=None, default_label=None):
+     """Returns False if graphs are definitely not isomorphic.
+ 
+     True does NOT guarantee isomorphism.
+@@ -61,17 +177,38 @@ def fast_could_be_isomorphic(G1, G2):
+     Parameters
+     ----------
+     G1, G2 : graphs
+-       The two graphs G1 and G2 must be the same type.
++       The two graphs G1 and G2.
++
++    node_label : str, optional (keyword-only)
++       Node attribute whose multiset of values must match between the two
++       graphs.  See :func:`could_be_isomorphic`.
++
++    default_label : scalar, optional (keyword-only)
++       Fallback value used for nodes without the ``node_label`` attribute.
+ 
+     Notes
+     -----
+-    Checks for matching degree and triangle sequences.
++    Checks matching degree and triangle sequences on undirected simple
++    graphs.  On directed or multi-graphs the triangle statistic is
++    undefined and the check falls back to a degree-sequence comparison,
++    keeping the "``False`` implies non-isomorphic" contract intact across
++    every graph type NetworkX ships.  Incompatible graph types (directed
++    vs undirected, multi vs simple) immediately return ``False``.
+     """
+-    # Check global properties
+-    if G1.order() != G2.order():
++    if not _same_type(G1, G2):
++        return False
++    if not _basic_size_agrees(G1, G2):
++        return False
++
++    if _degree_sequence(G1) != _degree_sequence(G2):
++        return False
++
++    if not _label_multisets_agree(G1, G2, node_label, default_label):
+         return False
+ 
+-    # Check local properties
++    if not _needs_undirected_simple_stats(G1):
++        return True
++
+     d1 = G1.degree()
+     t1 = nx.triangles(G1)
+     props1 = [[d, t1[v]] for v, d in d1]
+@@ -92,7 +229,7 @@ def fast_could_be_isomorphic(G1, G2):
+ fast_graph_could_be_isomorphic = fast_could_be_isomorphic
+ 
+ 
+-def faster_could_be_isomorphic(G1, G2):
++def faster_could_be_isomorphic(G1, G2, *, node_label=None, default_label=None):
+     """Returns False if graphs are definitely not isomorphic.
+ 
+     True does NOT guarantee isomorphism.
+@@ -100,66 +237,94 @@ def faster_could_be_isomorphic(G1, G2):
+     Parameters
+     ----------
+     G1, G2 : graphs
+-       The two graphs G1 and G2 must be the same type.
++       The two graphs G1 and G2.
++
++    node_label : str, optional (keyword-only)
++       Node attribute whose multiset of values must match between the two
++       graphs.
++
++    default_label : scalar, optional (keyword-only)
++       Fallback value used for nodes without the ``node_label`` attribute.
+ 
+     Notes
+     -----
+-    Checks for matching degree sequences.
++    Checks matching degree sequences.  For directed graphs the check uses
++    the joint ``(in_degree, out_degree)`` sequence so that isomorphism
++    candidates must agree in both directions.  Incompatible graph types
++    (directed vs undirected, multi vs simple) return ``False`` immediately.
+     """
+-    # Check global properties
+-    if G1.order() != G2.order():
++    if not _same_type(G1, G2):
++        return False
++    if not _basic_size_agrees(G1, G2):
+         return False
+ 
+-    # Check local properties
+-    d1 = sorted(d for n, d in G1.degree())
+-    d2 = sorted(d for n, d in G2.degree())
++    if _degree_sequence(G1) != _degree_sequence(G2):
++        return False
+ 
+-    if d1 != d2:
++    if not _label_multisets_agree(G1, G2, node_label, default_label):
+         return False
+ 
+-    # OK...
+     return True
+ 
+ 
+ faster_graph_could_be_isomorphic = faster_could_be_isomorphic
+ 
+ 
+-def is_isomorphic(G1, G2, node_match=None, edge_match=None):
++def is_isomorphic(G1, G2, node_match=None, edge_match=None,
++                  *, node_label=None, default_label=None):
+     """Returns True if the graphs G1 and G2 are isomorphic and False otherwise.
+ 
+     Parameters
+     ----------
+     G1, G2: graphs
+-        The two graphs G1 and G2 must be the same type.
++        The two graphs ``G1`` and ``G2`` must share directedness (both
++        directed or both undirected); a mismatch raises
++        :class:`~networkx.exception.NetworkXError`.
+ 
+-    node_match : callable
+-        A function that returns True if node n1 in G1 and n2 in G2 should
+-        be considered equal during the isomorphism test.
+-        If node_match is not specified then node attributes are not considered.
+-
+-        The function will be called like
++    node_match : callable, optional
++        A function that returns True if node ``n1`` in ``G1`` and ``n2``
++        in ``G2`` should be considered equal during the isomorphism test.
++        If ``node_match`` is not specified then node attributes are not
++        considered by the VF2 matcher.  The function will be called like
+ 
+            node_match(G1.nodes[n1], G2.nodes[n2]).
+ 
+-        That is, the function will receive the node attribute dictionaries
+-        for n1 and n2 as inputs.
+-
+-    edge_match : callable
+-        A function that returns True if the edge attribute dictionary
+-        for the pair of nodes (u1, v1) in G1 and (u2, v2) in G2 should
+-        be considered equal during the isomorphism test.  If edge_match is
+-        not specified then edge attributes are not considered.
+-
+-        The function will be called like
++    edge_match : callable, optional
++        A function that returns True if the edge attribute dictionary for
++        the pair of nodes ``(u1, v1)`` in ``G1`` and ``(u2, v2)`` in
++        ``G2`` should be considered equal during the isomorphism test.
++        If ``edge_match`` is not specified then edge attributes are not
++        considered.  The function will be called like
+ 
+            edge_match(G1[u1][v1], G2[u2][v2]).
+ 
+-        That is, the function will receive the edge attribute dictionaries
+-        of the edges under consideration.
++    node_label : str, optional (keyword-only)
++        Name of a node attribute to enforce equality on when matching
++        nodes.  When only ``node_label`` is given (no ``node_match`` and
++        no ``edge_match``) the search is dispatched to the VF2++
++        implementation
++        (:func:`~networkx.algorithms.isomorphism.vf2pp.vf2pp_is_isomorphic`)
++        which is dramatically faster than VF2 with a ``node_match``
++        callback for large labelled graphs.  When ``node_label`` is
++        combined with a user-supplied ``node_match`` or ``edge_match`` the
++        search remains on the classic VF2 matcher, with the label
++        constraint composed on top of ``node_match`` so that user-supplied
++        semantics still apply.  Regardless of the underlying matcher, a
++        cheap label-multiset pre-check runs first so that
++        label-incompatible inputs return ``False`` in near-constant time.
++
++    default_label : scalar, optional (keyword-only)
++        Value substituted for nodes that lack the ``node_label``
++        attribute.  Only meaningful when ``node_label`` is provided;
++        ignored otherwise.
+ 
+     Notes
+     -----
+-    Uses the vf2 algorithm [1]_.
++    Uses the vf2 algorithm [1]_ for the classic ``node_match`` /
++    ``edge_match`` entry point.  When routed through ``node_label``, the
++    underlying search is VF2++ [2]_ which uses a rarity/degree-driven
++    matching order, non-recursive backtracking and incremental frontier
++    maintenance.
+ 
+     Examples
+     --------
+@@ -208,10 +373,20 @@ def is_isomorphic(G1, G2, node_match=None, edge_match=None):
+     >>> nx.is_isomorphic(G1, G2, edge_match=em, node_match=nm)
+     True
+ 
++    Fast label-aware check via VF2++:
++
++    >>> G = nx.path_graph(4)
++    >>> H = nx.path_graph(4)
++    >>> nx.set_node_attributes(G, {0: "a", 1: "b", 2: "b", 3: "a"}, "kind")
++    >>> nx.set_node_attributes(H, {0: "a", 1: "b", 2: "b", 3: "a"}, "kind")
++    >>> nx.is_isomorphic(G, H, node_label="kind")
++    True
++
+     See Also
+     --------
+     numerical_node_match, numerical_edge_match, numerical_multiedge_match
+     categorical_node_match, categorical_edge_match, categorical_multiedge_match
++    vf2pp_is_isomorphic, vf2pp_isomorphism, vf2pp_all_isomorphisms
+ 
+     References
+     ----------
+@@ -220,13 +395,53 @@ def is_isomorphic(G1, G2, node_match=None, edge_match=None):
+        3rd IAPR-TC15 Workshop  on Graph-based Representations in
+        Pattern Recognition, Cuen, pp. 149-159, 2001.
+        https://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.101.5342
++    .. [2]  Alpár Jüttner and Péter Madarasi,
++       "VF2++—An improved subgraph isomorphism algorithm",
++       Discrete Applied Mathematics, 2018.
+     """
+-    if G1.is_directed() and G2.is_directed():
++    if G1.is_directed() != G2.is_directed():
++        raise NetworkXError("Graphs G1 and G2 are not of the same type.")
++
++    # Cheap label-multiset short-circuit.  Even when we later fall through
++    # to the classic VF2 matcher (because the caller combined ``node_label``
++    # with a ``node_match`` or ``edge_match``), a labels-cannot-possibly-
++    # match precondition here saves us from launching a full VF2 search on
++    # obviously-incompatible inputs.
++    if node_label is not None and not _label_multisets_agree(
++        G1, G2, node_label, default_label
++    ):
++        return False
++
++    if node_label is not None and node_match is None and edge_match is None:
++        # Pure label-driven matching: route to VF2++.  The dedicated
++        # implementation is non-recursive and honours all four graph types
++        # (Graph, DiGraph, MultiGraph, MultiDiGraph) natively, including
++        # parallel-edge multiplicities and directed in/out degrees.
++        return nx.vf2pp_is_isomorphic(
++            G1, G2, node_label=node_label, default_label=default_label
++        )
++
++    if node_label is not None:
++        # A label constraint was requested alongside user-supplied
++        # semantics.  Compose it on top of ``node_match`` so the VF2
++        # matcher still respects the user's edge_match / additional
++        # attribute logic while enforcing per-node label equality.
++        _user_node_match = node_match
++
++        def _label_node_match(a, b, _lbl=node_label, _dflt=default_label,
++                              _user=_user_node_match):
++            if a.get(_lbl, _dflt) != b.get(_lbl, _dflt):
++                return False
++            if _user is None:
++                return True
++            return _user(a, b)
++
++        node_match = _label_node_match
++
++    if G1.is_directed():
+         GM = nx.algorithms.isomorphism.DiGraphMatcher
+-    elif (not G1.is_directed()) and (not G2.is_directed()):
+-        GM = nx.algorithms.isomorphism.GraphMatcher
+     else:
+-        raise NetworkXError("Graphs G1 and G2 are not of the same type.")
++        GM = nx.algorithms.isomorphism.GraphMatcher
+ 
+     gm = GM(G1, G2, node_match=node_match, edge_match=edge_match)
+ 
+diff --git a/networkx/algorithms/isomorphism/tests/vf2pp/test_vf2pp.py b/networkx/algorithms/isomorphism/tests/vf2pp/test_vf2pp.py
+new file mode 100644
+index 0000000..f8f97be
+--- /dev/null
++++ b/networkx/algorithms/isomorphism/tests/vf2pp/test_vf2pp.py
+@@ -0,0 +1,1570 @@
++import itertools
++
++import pytest
++import utils
++
++import networkx as nx
++from networkx.algorithms.isomorphism.vf2pp import vf2pp_isomorphism
++
++
++class TestAllGraphTypesEdgeCases:
++    @pytest.mark.parametrize("graph_type", (nx.Graph, nx.MultiGraph, nx.DiGraph))
++    def test_both_graphs_empty(self, graph_type):
++        G = graph_type()
++        H = graph_type()
++        assert vf2pp_isomorphism(G, H) is None
++
++        G.add_node(0)
++
++        assert vf2pp_isomorphism(G, H) is None
++        assert vf2pp_isomorphism(H, G) is None
++
++        H.add_node(0)
++        assert vf2pp_isomorphism(G, H) == {0: 0}
++
++    @pytest.mark.parametrize("graph_type", (nx.Graph, nx.MultiGraph, nx.DiGraph))
++    def test_first_graph_empty(self, graph_type):
++        G = graph_type()
++        H = graph_type([(0, 1)])
++        assert vf2pp_isomorphism(G, H) is None
++
++    @pytest.mark.parametrize("graph_type", (nx.Graph, nx.MultiGraph, nx.DiGraph))
++    def test_second_graph_empty(self, graph_type):
++        G = graph_type([(0, 1)])
++        H = graph_type()
++        assert vf2pp_isomorphism(G, H) is None
++
++
++class TestGraphISOVF2pp:
++    def test_custom_graph1_same_labels(self):
++        G1 = nx.Graph()
++
++        mapped = {1: "A", 2: "B", 3: "C", 4: "D", 5: "Z", 6: "E"}
++        edges1 = [(1, 2), (1, 3), (1, 4), (2, 3), (2, 6), (3, 4), (5, 1), (5, 2)]
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Add edge making G1 symmetrical
++        G1.add_edge(3, 7)
++        G1.nodes[7]["label"] = "blue"
++        assert vf2pp_isomorphism(G1, G2, node_label="label") is None
++
++        # Make G2 isomorphic to G1
++        G2.add_edges_from([(mapped[3], "X"), (mapped[6], mapped[5])])
++        G1.add_edge(4, 7)
++        G2.nodes["X"]["label"] = "blue"
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Re-structure maintaining isomorphism
++        G1.remove_edges_from([(1, 4), (1, 3)])
++        G2.remove_edges_from([(mapped[1], mapped[5]), (mapped[1], mapped[2])])
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++    def test_custom_graph1_different_labels(self):
++        G1 = nx.Graph()
++
++        mapped = {1: "A", 2: "B", 3: "C", 4: "D", 5: "Z", 6: "E"}
++        edges1 = [(1, 2), (1, 3), (1, 4), (2, 3), (2, 6), (3, 4), (5, 1), (5, 2)]
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_different))), "label"
++        )
++        nx.set_node_attributes(
++            G2,
++            dict(zip([mapped[n] for n in G1], itertools.cycle(utils.labels_different))),
++            "label",
++        )
++        assert vf2pp_isomorphism(G1, G2, node_label="label") == mapped
++
++    def test_custom_graph2_same_labels(self):
++        G1 = nx.Graph()
++
++        mapped = {1: "A", 2: "C", 3: "D", 4: "E", 5: "G", 7: "B", 6: "F"}
++        edges1 = [(1, 2), (1, 5), (5, 6), (2, 3), (2, 4), (3, 4), (4, 5), (2, 7)]
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Obtain two isomorphic subgraphs from the graph
++        G2.remove_edge(mapped[1], mapped[2])
++        G2.add_edge(mapped[1], mapped[4])
++        H1 = nx.Graph(G1.subgraph([2, 3, 4, 7]))
++        H2 = nx.Graph(G2.subgraph([mapped[1], mapped[4], mapped[5], mapped[6]]))
++        assert vf2pp_isomorphism(H1, H2, node_label="label")
++
++        # Add edges maintaining isomorphism
++        H1.add_edges_from([(3, 7), (4, 7)])
++        H2.add_edges_from([(mapped[1], mapped[6]), (mapped[4], mapped[6])])
++        assert vf2pp_isomorphism(H1, H2, node_label="label")
++
++    def test_custom_graph2_different_labels(self):
++        G1 = nx.Graph()
++
++        mapped = {1: "A", 2: "C", 3: "D", 4: "E", 5: "G", 7: "B", 6: "F"}
++        edges1 = [(1, 2), (1, 5), (5, 6), (2, 3), (2, 4), (3, 4), (4, 5), (2, 7)]
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_different))), "label"
++        )
++        nx.set_node_attributes(
++            G2,
++            dict(zip([mapped[n] for n in G1], itertools.cycle(utils.labels_different))),
++            "label",
++        )
++
++        # Adding new nodes
++        G1.add_node(0)
++        G2.add_node("Z")
++        G1.nodes[0]["label"] = G1.nodes[1]["label"]
++        G2.nodes["Z"]["label"] = G1.nodes[1]["label"]
++        mapped.update({0: "Z"})
++
++        assert vf2pp_isomorphism(G1, G2, node_label="label") == mapped
++
++        # Change the color of one of the nodes
++        G2.nodes["Z"]["label"] = G1.nodes[2]["label"]
++        assert vf2pp_isomorphism(G1, G2, node_label="label") is None
++
++        # Add an extra edge
++        G1.nodes[0]["label"] = "blue"
++        G2.nodes["Z"]["label"] = "blue"
++        G1.add_edge(0, 1)
++
++        assert vf2pp_isomorphism(G1, G2, node_label="label") is None
++
++        # Add extra edge to both
++        G2.add_edge("Z", "A")
++        assert vf2pp_isomorphism(G1, G2, node_label="label") == mapped
++
++    def test_custom_graph3_same_labels(self):
++        G1 = nx.Graph()
++
++        mapped = {1: 9, 2: 8, 3: 7, 4: 6, 5: 3, 8: 5, 9: 4, 7: 1, 6: 2}
++        edges1 = [
++            (1, 2),
++            (1, 3),
++            (2, 3),
++            (3, 4),
++            (4, 5),
++            (4, 7),
++            (4, 9),
++            (5, 8),
++            (8, 9),
++            (5, 6),
++            (6, 7),
++            (5, 2),
++        ]
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Connect nodes maintaining symmetry
++        G1.add_edges_from([(6, 9), (7, 8)])
++        G2.add_edges_from([(mapped[6], mapped[8]), (mapped[7], mapped[9])])
++        assert vf2pp_isomorphism(G1, G2, node_label="label") is None
++
++        # Make isomorphic
++        G1.add_edges_from([(6, 8), (7, 9)])
++        G2.add_edges_from([(mapped[6], mapped[9]), (mapped[7], mapped[8])])
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Connect more nodes
++        G1.add_edges_from([(2, 7), (3, 6)])
++        G2.add_edges_from([(mapped[2], mapped[7]), (mapped[3], mapped[6])])
++        G1.add_node(10)
++        G2.add_node("Z")
++        G1.nodes[10]["label"] = "blue"
++        G2.nodes["Z"]["label"] = "blue"
++
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Connect the newly added node, to opposite sides of the graph
++        G1.add_edges_from([(10, 1), (10, 5), (10, 8)])
++        G2.add_edges_from([("Z", mapped[1]), ("Z", mapped[4]), ("Z", mapped[9])])
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Get two subgraphs that are not isomorphic but are easy to make
++        H1 = nx.Graph(G1.subgraph([2, 3, 4, 5, 6, 7, 10]))
++        H2 = nx.Graph(
++            G2.subgraph(
++                [mapped[4], mapped[5], mapped[6], mapped[7], mapped[8], mapped[9], "Z"]
++            )
++        )
++        assert vf2pp_isomorphism(H1, H2, node_label="label") is None
++
++        # Restructure both to make them isomorphic
++        H1.add_edges_from([(10, 2), (10, 6), (3, 6), (2, 7), (2, 6), (3, 7)])
++        H2.add_edges_from(
++            [("Z", mapped[7]), (mapped[6], mapped[9]), (mapped[7], mapped[8])]
++        )
++        assert vf2pp_isomorphism(H1, H2, node_label="label")
++
++        # Add edges with opposite direction in each Graph
++        H1.add_edge(3, 5)
++        H2.add_edge(mapped[5], mapped[7])
++        assert vf2pp_isomorphism(H1, H2, node_label="label") is None
++
++    def test_custom_graph3_different_labels(self):
++        G1 = nx.Graph()
++
++        mapped = {1: 9, 2: 8, 3: 7, 4: 6, 5: 3, 8: 5, 9: 4, 7: 1, 6: 2}
++        edges1 = [
++            (1, 2),
++            (1, 3),
++            (2, 3),
++            (3, 4),
++            (4, 5),
++            (4, 7),
++            (4, 9),
++            (5, 8),
++            (8, 9),
++            (5, 6),
++            (6, 7),
++            (5, 2),
++        ]
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_different))), "label"
++        )
++        nx.set_node_attributes(
++            G2,
++            dict(zip([mapped[n] for n in G1], itertools.cycle(utils.labels_different))),
++            "label",
++        )
++        assert vf2pp_isomorphism(G1, G2, node_label="label") == mapped
++
++        # Add extra edge to G1
++        G1.add_edge(1, 7)
++        assert vf2pp_isomorphism(G1, G2, node_label="label") is None
++
++        # Compensate in G2
++        G2.add_edge(9, 1)
++        assert vf2pp_isomorphism(G1, G2, node_label="label") == mapped
++
++        # Add extra node
++        G1.add_node("A")
++        G2.add_node("K")
++        G1.nodes["A"]["label"] = "green"
++        G2.nodes["K"]["label"] = "green"
++        mapped.update({"A": "K"})
++
++        assert vf2pp_isomorphism(G1, G2, node_label="label") == mapped
++
++        # Connect A to one side of G1 and K to the opposite
++        G1.add_edge("A", 6)
++        G2.add_edge("K", 5)
++        assert vf2pp_isomorphism(G1, G2, node_label="label") is None
++
++        # Make the graphs symmetrical
++        G1.add_edge(1, 5)
++        G1.add_edge(2, 9)
++        G2.add_edge(9, 3)
++        G2.add_edge(8, 4)
++        assert vf2pp_isomorphism(G1, G2, node_label="label") is None
++
++        # Assign same colors so the two opposite sides are identical
++        for node in G1.nodes():
++            color = "red"
++            G1.nodes[node]["label"] = color
++            G2.nodes[mapped[node]]["label"] = color
++
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++    def test_custom_graph4_different_labels(self):
++        G1 = nx.Graph()
++        edges1 = [
++            (1, 2),
++            (2, 3),
++            (3, 8),
++            (3, 4),
++            (4, 5),
++            (4, 6),
++            (3, 6),
++            (8, 7),
++            (8, 9),
++            (5, 9),
++            (10, 11),
++            (11, 12),
++            (12, 13),
++            (11, 13),
++        ]
++
++        mapped = {
++            1: "n",
++            2: "m",
++            3: "l",
++            4: "j",
++            5: "k",
++            6: "i",
++            7: "g",
++            8: "h",
++            9: "f",
++            10: "b",
++            11: "a",
++            12: "d",
++            13: "e",
++        }
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_different))), "label"
++        )
++        nx.set_node_attributes(
++            G2,
++            dict(zip([mapped[n] for n in G1], itertools.cycle(utils.labels_different))),
++            "label",
++        )
++        assert vf2pp_isomorphism(G1, G2, node_label="label") == mapped
++
++    def test_custom_graph4_same_labels(self):
++        G1 = nx.Graph()
++        edges1 = [
++            (1, 2),
++            (2, 3),
++            (3, 8),
++            (3, 4),
++            (4, 5),
++            (4, 6),
++            (3, 6),
++            (8, 7),
++            (8, 9),
++            (5, 9),
++            (10, 11),
++            (11, 12),
++            (12, 13),
++            (11, 13),
++        ]
++
++        mapped = {
++            1: "n",
++            2: "m",
++            3: "l",
++            4: "j",
++            5: "k",
++            6: "i",
++            7: "g",
++            8: "h",
++            9: "f",
++            10: "b",
++            11: "a",
++            12: "d",
++            13: "e",
++        }
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Add nodes of different label
++        G1.add_node(0)
++        G2.add_node("z")
++        G1.nodes[0]["label"] = "green"
++        G2.nodes["z"]["label"] = "blue"
++
++        assert vf2pp_isomorphism(G1, G2, node_label="label") is None
++
++        # Make the labels identical
++        G2.nodes["z"]["label"] = "green"
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Change the structure of the graphs, keeping them isomorphic
++        G1.add_edge(2, 5)
++        G2.remove_edge("i", "l")
++        G2.add_edge("g", "l")
++        G2.add_edge("m", "f")
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Change the structure of the disconnected sub-graph, keeping it isomorphic
++        G1.remove_node(13)
++        G2.remove_node("d")
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Connect the newly added node to the disconnected graph, which now is just a path of size 3
++        G1.add_edge(0, 10)
++        G2.add_edge("e", "z")
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Connect the two disconnected sub-graphs, forming a single graph
++        G1.add_edge(11, 3)
++        G1.add_edge(0, 8)
++        G2.add_edge("a", "l")
++        G2.add_edge("z", "j")
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++    def test_custom_graph5_same_labels(self):
++        G1 = nx.Graph()
++        edges1 = [
++            (1, 5),
++            (1, 2),
++            (1, 4),
++            (2, 3),
++            (2, 6),
++            (3, 4),
++            (3, 7),
++            (4, 8),
++            (5, 8),
++            (5, 6),
++            (6, 7),
++            (7, 8),
++        ]
++        mapped = {1: "a", 2: "h", 3: "d", 4: "i", 5: "g", 6: "b", 7: "j", 8: "c"}
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Add different edges in each graph, maintaining symmetry
++        G1.add_edges_from([(3, 6), (2, 7), (2, 5), (1, 3), (4, 7), (6, 8)])
++        G2.add_edges_from(
++            [
++                (mapped[6], mapped[3]),
++                (mapped[2], mapped[7]),
++                (mapped[1], mapped[6]),
++                (mapped[5], mapped[7]),
++                (mapped[3], mapped[8]),
++                (mapped[2], mapped[4]),
++            ]
++        )
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++        # Obtain two different but isomorphic subgraphs from G1 and G2
++        H1 = nx.Graph(G1.subgraph([1, 5, 8, 6, 7, 3]))
++        H2 = nx.Graph(
++            G2.subgraph(
++                [mapped[1], mapped[4], mapped[8], mapped[7], mapped[3], mapped[5]]
++            )
++        )
++        assert vf2pp_isomorphism(H1, H2, node_label="label")
++
++        # Delete corresponding node from the two graphs
++        H1.remove_node(8)
++        H2.remove_node(mapped[7])
++        assert vf2pp_isomorphism(H1, H2, node_label="label")
++
++        # Re-orient, maintaining isomorphism
++        H1.add_edge(1, 6)
++        H1.remove_edge(3, 6)
++        assert vf2pp_isomorphism(H1, H2, node_label="label")
++
++    def test_custom_graph5_different_labels(self):
++        G1 = nx.Graph()
++        edges1 = [
++            (1, 5),
++            (1, 2),
++            (1, 4),
++            (2, 3),
++            (2, 6),
++            (3, 4),
++            (3, 7),
++            (4, 8),
++            (5, 8),
++            (5, 6),
++            (6, 7),
++            (7, 8),
++        ]
++        mapped = {1: "a", 2: "h", 3: "d", 4: "i", 5: "g", 6: "b", 7: "j", 8: "c"}
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        colors = ["red", "blue", "grey", "none", "brown", "solarized", "yellow", "pink"]
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_different))), "label"
++        )
++        nx.set_node_attributes(
++            G2,
++            dict(zip([mapped[n] for n in G1], itertools.cycle(utils.labels_different))),
++            "label",
++        )
++        assert vf2pp_isomorphism(G1, G2, node_label="label") == mapped
++
++        # Assign different colors to matching nodes
++        c = 0
++        for node in G1.nodes():
++            color1 = colors[c]
++            color2 = colors[(c + 3) % len(colors)]
++            G1.nodes[node]["label"] = color1
++            G2.nodes[mapped[node]]["label"] = color2
++            c += 1
++
++        assert vf2pp_isomorphism(G1, G2, node_label="label") is None
++
++        # Get symmetrical sub-graphs of G1,G2 and compare them
++        H1 = G1.subgraph([1, 5])
++        H2 = G2.subgraph(["i", "c"])
++        c = 0
++        for node1, node2 in zip(H1.nodes(), H2.nodes()):
++            H1.nodes[node1]["label"] = "red"
++            H2.nodes[node2]["label"] = "red"
++            c += 1
++
++        assert vf2pp_isomorphism(H1, H2, node_label="label")
++
++    def test_disconnected_graph_all_same_labels(self):
++        G1 = nx.Graph()
++        G1.add_nodes_from([i for i in range(10)])
++
++        mapped = {0: 9, 1: 8, 2: 7, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1, 9: 0}
++        G2 = nx.relabel_nodes(G1, mapped)
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++    def test_disconnected_graph_all_different_labels(self):
++        G1 = nx.Graph()
++        G1.add_nodes_from([i for i in range(10)])
++
++        mapped = {0: 9, 1: 8, 2: 7, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1, 9: 0}
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_different))), "label"
++        )
++        nx.set_node_attributes(
++            G2,
++            dict(zip([mapped[n] for n in G1], itertools.cycle(utils.labels_different))),
++            "label",
++        )
++        assert vf2pp_isomorphism(G1, G2, node_label="label") == mapped
++
++    def test_disconnected_graph_some_same_labels(self):
++        G1 = nx.Graph()
++        G1.add_nodes_from([i for i in range(10)])
++
++        mapped = {0: 9, 1: 8, 2: 7, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1, 9: 0}
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        colors = [
++            "white",
++            "white",
++            "white",
++            "purple",
++            "purple",
++            "red",
++            "red",
++            "pink",
++            "pink",
++            "pink",
++        ]
++
++        nx.set_node_attributes(G1, dict(zip(G1, itertools.cycle(colors))), "label")
++        nx.set_node_attributes(
++            G2, dict(zip([mapped[n] for n in G1], itertools.cycle(colors))), "label"
++        )
++
++        assert vf2pp_isomorphism(G1, G2, node_label="label")
++
++
++class TestMultiGraphISOVF2pp:
++    def test_custom_multigraph1_same_labels(self):
++        G1 = nx.MultiGraph()
++
++        mapped = {1: "A", 2: "B", 3: "C", 4: "D", 5: "Z", 6: "E"}
++        edges1 = [
++            (1, 2),
++            (1, 3),
++            (1, 4),
++            (1, 4),
++            (1, 4),
++            (2, 3),
++            (2, 6),
++            (2, 6),
++            (3, 4),
++            (3, 4),
++            (5, 1),
++            (5, 1),
++            (5, 2),
++            (5, 2),
++        ]
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Transfer the 2-clique to the right side of G1
++        G1.remove_edges_from([(2, 6), (2, 6)])
++        G1.add_edges_from([(3, 6), (3, 6)])
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Delete an edges, making them symmetrical, so the position of the 2-clique doesn't matter
++        G2.remove_edge(mapped[1], mapped[4])
++        G1.remove_edge(1, 4)
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Add self-loops
++        G1.add_edges_from([(5, 5), (5, 5), (1, 1)])
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Compensate in G2
++        G2.add_edges_from(
++            [(mapped[1], mapped[1]), (mapped[4], mapped[4]), (mapped[4], mapped[4])]
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++    def test_custom_multigraph1_different_labels(self):
++        G1 = nx.MultiGraph()
++
++        mapped = {1: "A", 2: "B", 3: "C", 4: "D", 5: "Z", 6: "E"}
++        edges1 = [
++            (1, 2),
++            (1, 3),
++            (1, 4),
++            (1, 4),
++            (1, 4),
++            (2, 3),
++            (2, 6),
++            (2, 6),
++            (3, 4),
++            (3, 4),
++            (5, 1),
++            (5, 1),
++            (5, 2),
++            (5, 2),
++        ]
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_different))), "label"
++        )
++        nx.set_node_attributes(
++            G2,
++            dict(zip([mapped[n] for n in G1], itertools.cycle(utils.labels_different))),
++            "label",
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++        assert m == mapped
++
++        # Re-structure G1, maintaining the degree sequence
++        G1.remove_edge(1, 4)
++        G1.add_edge(1, 5)
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Restructure G2, making it isomorphic to G1
++        G2.remove_edge("A", "D")
++        G2.add_edge("A", "Z")
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++        assert m == mapped
++
++        # Add edge from node to itself
++        G1.add_edges_from([(6, 6), (6, 6), (6, 6)])
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Same for G2
++        G2.add_edges_from([("E", "E"), ("E", "E"), ("E", "E")])
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++        assert m == mapped
++
++    def test_custom_multigraph2_same_labels(self):
++        G1 = nx.MultiGraph()
++
++        mapped = {1: "A", 2: "C", 3: "D", 4: "E", 5: "G", 7: "B", 6: "F"}
++        edges1 = [
++            (1, 2),
++            (1, 2),
++            (1, 5),
++            (1, 5),
++            (1, 5),
++            (5, 6),
++            (2, 3),
++            (2, 3),
++            (2, 4),
++            (3, 4),
++            (3, 4),
++            (4, 5),
++            (4, 5),
++            (4, 5),
++            (2, 7),
++            (2, 7),
++            (2, 7),
++        ]
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Obtain two non-somorphic subgraphs from the graph
++        G2.remove_edges_from([(mapped[1], mapped[2]), (mapped[1], mapped[2])])
++        G2.add_edge(mapped[1], mapped[4])
++        H1 = nx.MultiGraph(G1.subgraph([2, 3, 4, 7]))
++        H2 = nx.MultiGraph(G2.subgraph([mapped[1], mapped[4], mapped[5], mapped[6]]))
++
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert not m
++
++        # Make them isomorphic
++        H1.remove_edge(3, 4)
++        H1.add_edges_from([(2, 3), (2, 4), (2, 4)])
++        H2.add_edges_from([(mapped[5], mapped[6]), (mapped[5], mapped[6])])
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++        # Remove triangle edge
++        H1.remove_edges_from([(2, 3), (2, 3), (2, 3)])
++        H2.remove_edges_from([(mapped[5], mapped[4])] * 3)
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++        # Change the edge orientation such that H1 is rotated H2
++        H1.remove_edges_from([(2, 7), (2, 7)])
++        H1.add_edges_from([(3, 4), (3, 4)])
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++        # Add extra edges maintaining degree sequence, but in a non-symmetrical manner
++        H2.add_edge(mapped[5], mapped[1])
++        H1.add_edge(3, 4)
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert not m
++
++    def test_custom_multigraph2_different_labels(self):
++        G1 = nx.MultiGraph()
++
++        mapped = {1: "A", 2: "C", 3: "D", 4: "E", 5: "G", 7: "B", 6: "F"}
++        edges1 = [
++            (1, 2),
++            (1, 2),
++            (1, 5),
++            (1, 5),
++            (1, 5),
++            (5, 6),
++            (2, 3),
++            (2, 3),
++            (2, 4),
++            (3, 4),
++            (3, 4),
++            (4, 5),
++            (4, 5),
++            (4, 5),
++            (2, 7),
++            (2, 7),
++            (2, 7),
++        ]
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_different))), "label"
++        )
++        nx.set_node_attributes(
++            G2,
++            dict(zip([mapped[n] for n in G1], itertools.cycle(utils.labels_different))),
++            "label",
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++        assert m == mapped
++
++        # Re-structure G1
++        G1.remove_edge(2, 7)
++        G1.add_edge(5, 6)
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Same for G2
++        G2.remove_edge("B", "C")
++        G2.add_edge("G", "F")
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++        assert m == mapped
++
++        # Delete node from G1 and G2, keeping them isomorphic
++        G1.remove_node(3)
++        G2.remove_node("D")
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Change G1 edges
++        G1.remove_edge(1, 2)
++        G1.remove_edge(2, 7)
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Make G2 identical to G1, but with different edge orientation and different labels
++        G2.add_edges_from([("A", "C"), ("C", "E"), ("C", "E")])
++        G2.remove_edges_from(
++            [("A", "G"), ("A", "G"), ("F", "G"), ("E", "G"), ("E", "G")]
++        )
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Make all labels the same, so G1 and G2 are also isomorphic
++        for n1, n2 in zip(G1.nodes(), G2.nodes()):
++            G1.nodes[n1]["label"] = "blue"
++            G2.nodes[n2]["label"] = "blue"
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++    def test_custom_multigraph3_same_labels(self):
++        G1 = nx.MultiGraph()
++
++        mapped = {1: 9, 2: 8, 3: 7, 4: 6, 5: 3, 8: 5, 9: 4, 7: 1, 6: 2}
++        edges1 = [
++            (1, 2),
++            (1, 3),
++            (1, 3),
++            (2, 3),
++            (2, 3),
++            (3, 4),
++            (4, 5),
++            (4, 7),
++            (4, 9),
++            (4, 9),
++            (4, 9),
++            (5, 8),
++            (5, 8),
++            (8, 9),
++            (8, 9),
++            (5, 6),
++            (6, 7),
++            (6, 7),
++            (6, 7),
++            (5, 2),
++        ]
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Connect nodes maintaining symmetry
++        G1.add_edges_from([(6, 9), (7, 8), (5, 8), (4, 9), (4, 9)])
++        G2.add_edges_from(
++            [
++                (mapped[6], mapped[8]),
++                (mapped[7], mapped[9]),
++                (mapped[5], mapped[8]),
++                (mapped[4], mapped[9]),
++                (mapped[4], mapped[9]),
++            ]
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Make isomorphic
++        G1.add_edges_from([(6, 8), (6, 8), (7, 9), (7, 9), (7, 9)])
++        G2.add_edges_from(
++            [
++                (mapped[6], mapped[8]),
++                (mapped[6], mapped[9]),
++                (mapped[7], mapped[8]),
++                (mapped[7], mapped[9]),
++                (mapped[7], mapped[9]),
++            ]
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Connect more nodes
++        G1.add_edges_from([(2, 7), (2, 7), (3, 6), (3, 6)])
++        G2.add_edges_from(
++            [
++                (mapped[2], mapped[7]),
++                (mapped[2], mapped[7]),
++                (mapped[3], mapped[6]),
++                (mapped[3], mapped[6]),
++            ]
++        )
++        G1.add_node(10)
++        G2.add_node("Z")
++        G1.nodes[10]["label"] = "blue"
++        G2.nodes["Z"]["label"] = "blue"
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Connect the newly added node, to opposite sides of the graph
++        G1.add_edges_from([(10, 1), (10, 5), (10, 8), (10, 10), (10, 10)])
++        G2.add_edges_from(
++            [
++                ("Z", mapped[1]),
++                ("Z", mapped[4]),
++                ("Z", mapped[9]),
++                ("Z", "Z"),
++                ("Z", "Z"),
++            ]
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # We connected the new node to opposite sides, so G1 must be symmetrical to G2. Re-structure them to be so
++        G1.remove_edges_from([(1, 3), (4, 9), (4, 9), (7, 9)])
++        G2.remove_edges_from(
++            [
++                (mapped[1], mapped[3]),
++                (mapped[4], mapped[9]),
++                (mapped[4], mapped[9]),
++                (mapped[7], mapped[9]),
++            ]
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Get two subgraphs that are not isomorphic but are easy to make
++        H1 = nx.Graph(G1.subgraph([2, 3, 4, 5, 6, 7, 10]))
++        H2 = nx.Graph(
++            G2.subgraph(
++                [mapped[4], mapped[5], mapped[6], mapped[7], mapped[8], mapped[9], "Z"]
++            )
++        )
++
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert not m
++
++        # Restructure both to make them isomorphic
++        H1.add_edges_from([(10, 2), (10, 6), (3, 6), (2, 7), (2, 6), (3, 7)])
++        H2.add_edges_from(
++            [("Z", mapped[7]), (mapped[6], mapped[9]), (mapped[7], mapped[8])]
++        )
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++        # Remove one self-loop in H2
++        H2.remove_edge("Z", "Z")
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert not m
++
++        # Compensate in H1
++        H1.remove_edge(10, 10)
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++    def test_custom_multigraph3_different_labels(self):
++        G1 = nx.MultiGraph()
++
++        mapped = {1: 9, 2: 8, 3: 7, 4: 6, 5: 3, 8: 5, 9: 4, 7: 1, 6: 2}
++        edges1 = [
++            (1, 2),
++            (1, 3),
++            (1, 3),
++            (2, 3),
++            (2, 3),
++            (3, 4),
++            (4, 5),
++            (4, 7),
++            (4, 9),
++            (4, 9),
++            (4, 9),
++            (5, 8),
++            (5, 8),
++            (8, 9),
++            (8, 9),
++            (5, 6),
++            (6, 7),
++            (6, 7),
++            (6, 7),
++            (5, 2),
++        ]
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_different))), "label"
++        )
++        nx.set_node_attributes(
++            G2,
++            dict(zip([mapped[n] for n in G1], itertools.cycle(utils.labels_different))),
++            "label",
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++        assert m == mapped
++
++        # Delete edge maintaining isomorphism
++        G1.remove_edge(4, 9)
++        G2.remove_edge(4, 6)
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++        assert m == mapped
++
++        # Change edge orientation such that G1 mirrors G2
++        G1.add_edges_from([(4, 9), (1, 2), (1, 2)])
++        G1.remove_edges_from([(1, 3), (1, 3)])
++        G2.add_edges_from([(3, 5), (7, 9)])
++        G2.remove_edge(8, 9)
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Make all labels the same, so G1 and G2 are also isomorphic
++        for n1, n2 in zip(G1.nodes(), G2.nodes()):
++            G1.nodes[n1]["label"] = "blue"
++            G2.nodes[n2]["label"] = "blue"
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        G1.add_node(10)
++        G2.add_node("Z")
++        G1.nodes[10]["label"] = "green"
++        G2.nodes["Z"]["label"] = "green"
++
++        # Add different number of edges between the new nodes and themselves
++        G1.add_edges_from([(10, 10), (10, 10)])
++        G2.add_edges_from([("Z", "Z")])
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Make the number of self-edges equal
++        G1.remove_edge(10, 10)
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Connect the new node to the graph
++        G1.add_edges_from([(10, 3), (10, 4)])
++        G2.add_edges_from([("Z", 8), ("Z", 3)])
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Remove central node
++        G1.remove_node(4)
++        G2.remove_node(3)
++        G1.add_edges_from([(5, 6), (5, 6), (5, 7)])
++        G2.add_edges_from([(1, 6), (1, 6), (6, 2)])
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++    def test_custom_multigraph4_same_labels(self):
++        G1 = nx.MultiGraph()
++        edges1 = [
++            (1, 2),
++            (1, 2),
++            (2, 2),
++            (2, 3),
++            (3, 8),
++            (3, 8),
++            (3, 4),
++            (4, 5),
++            (4, 5),
++            (4, 5),
++            (4, 6),
++            (3, 6),
++            (3, 6),
++            (6, 6),
++            (8, 7),
++            (7, 7),
++            (8, 9),
++            (9, 9),
++            (8, 9),
++            (8, 9),
++            (5, 9),
++            (10, 11),
++            (11, 12),
++            (12, 13),
++            (11, 13),
++            (10, 10),
++            (10, 11),
++            (11, 13),
++        ]
++
++        mapped = {
++            1: "n",
++            2: "m",
++            3: "l",
++            4: "j",
++            5: "k",
++            6: "i",
++            7: "g",
++            8: "h",
++            9: "f",
++            10: "b",
++            11: "a",
++            12: "d",
++            13: "e",
++        }
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Add extra but corresponding edges to both graphs
++        G1.add_edges_from([(2, 2), (2, 3), (2, 8), (3, 4)])
++        G2.add_edges_from([("m", "m"), ("m", "l"), ("m", "h"), ("l", "j")])
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Obtain subgraphs
++        H1 = nx.MultiGraph(G1.subgraph([2, 3, 4, 6, 10, 11, 12, 13]))
++        H2 = nx.MultiGraph(
++            G2.subgraph(
++                [
++                    mapped[2],
++                    mapped[3],
++                    mapped[8],
++                    mapped[9],
++                    mapped[10],
++                    mapped[11],
++                    mapped[12],
++                    mapped[13],
++                ]
++            )
++        )
++
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert not m
++
++        # Make them isomorphic
++        H2.remove_edges_from(
++            [(mapped[3], mapped[2]), (mapped[9], mapped[8]), (mapped[2], mapped[2])]
++        )
++        H2.add_edges_from([(mapped[9], mapped[9]), (mapped[2], mapped[8])])
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++        # Re-structure the disconnected sub-graph
++        H1.remove_node(12)
++        H2.remove_node(mapped[12])
++        H1.add_edge(13, 13)
++        H2.add_edge(mapped[13], mapped[13])
++
++        # Connect the two disconnected components, forming a single graph
++        H1.add_edges_from([(3, 13), (6, 11)])
++        H2.add_edges_from([(mapped[8], mapped[10]), (mapped[2], mapped[11])])
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++        # Change orientation of self-loops in one graph, maintaining the degree sequence
++        H1.remove_edges_from([(2, 2), (3, 6)])
++        H1.add_edges_from([(6, 6), (2, 3)])
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert not m
++
++    def test_custom_multigraph4_different_labels(self):
++        G1 = nx.MultiGraph()
++        edges1 = [
++            (1, 2),
++            (1, 2),
++            (2, 2),
++            (2, 3),
++            (3, 8),
++            (3, 8),
++            (3, 4),
++            (4, 5),
++            (4, 5),
++            (4, 5),
++            (4, 6),
++            (3, 6),
++            (3, 6),
++            (6, 6),
++            (8, 7),
++            (7, 7),
++            (8, 9),
++            (9, 9),
++            (8, 9),
++            (8, 9),
++            (5, 9),
++            (10, 11),
++            (11, 12),
++            (12, 13),
++            (11, 13),
++        ]
++
++        mapped = {
++            1: "n",
++            2: "m",
++            3: "l",
++            4: "j",
++            5: "k",
++            6: "i",
++            7: "g",
++            8: "h",
++            9: "f",
++            10: "b",
++            11: "a",
++            12: "d",
++            13: "e",
++        }
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_different))), "label"
++        )
++        nx.set_node_attributes(
++            G2,
++            dict(zip([mapped[n] for n in G1], itertools.cycle(utils.labels_different))),
++            "label",
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m == mapped
++
++        # Add extra but corresponding edges to both graphs
++        G1.add_edges_from([(2, 2), (2, 3), (2, 8), (3, 4)])
++        G2.add_edges_from([("m", "m"), ("m", "l"), ("m", "h"), ("l", "j")])
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m == mapped
++
++        # Obtain isomorphic subgraphs
++        H1 = nx.MultiGraph(G1.subgraph([2, 3, 4, 6]))
++        H2 = nx.MultiGraph(G2.subgraph(["m", "l", "j", "i"]))
++
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++        # Delete the 3-clique, keeping only the path-graph. Also, H1 mirrors H2
++        H1.remove_node(4)
++        H2.remove_node("j")
++        H1.remove_edges_from([(2, 2), (2, 3), (6, 6)])
++        H2.remove_edges_from([("l", "i"), ("m", "m"), ("m", "m")])
++
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert not m
++
++        # Assign the same labels so that mirroring means isomorphic
++        for n1, n2 in zip(H1.nodes(), H2.nodes()):
++            H1.nodes[n1]["label"] = "red"
++            H2.nodes[n2]["label"] = "red"
++
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++        # Leave only one node with self-loop
++        H1.remove_nodes_from([3, 6])
++        H2.remove_nodes_from(["m", "l"])
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++        # Remove one self-loop from H1
++        H1.remove_edge(2, 2)
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert not m
++
++        # Same for H2
++        H2.remove_edge("i", "i")
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++        # Compose H1 with the disconnected sub-graph of G1. Same for H2
++        S1 = nx.compose(H1, nx.MultiGraph(G1.subgraph([10, 11, 12, 13])))
++        S2 = nx.compose(H2, nx.MultiGraph(G2.subgraph(["a", "b", "d", "e"])))
++
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++        # Connect the two components
++        S1.add_edges_from([(13, 13), (13, 13), (2, 13)])
++        S2.add_edges_from([("a", "a"), ("a", "a"), ("i", "e")])
++        m = vf2pp_isomorphism(H1, H2, node_label="label")
++        assert m
++
++    def test_custom_multigraph5_same_labels(self):
++        G1 = nx.MultiGraph()
++
++        edges1 = [
++            (1, 5),
++            (1, 2),
++            (1, 4),
++            (2, 3),
++            (2, 6),
++            (3, 4),
++            (3, 7),
++            (4, 8),
++            (5, 8),
++            (5, 6),
++            (6, 7),
++            (7, 8),
++        ]
++        mapped = {1: "a", 2: "h", 3: "d", 4: "i", 5: "g", 6: "b", 7: "j", 8: "c"}
++
++        G1.add_edges_from(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Add multiple edges and self-loops, maintaining isomorphism
++        G1.add_edges_from(
++            [(1, 2), (1, 2), (3, 7), (8, 8), (8, 8), (7, 8), (2, 3), (5, 6)]
++        )
++        G2.add_edges_from(
++            [
++                ("a", "h"),
++                ("a", "h"),
++                ("d", "j"),
++                ("c", "c"),
++                ("c", "c"),
++                ("j", "c"),
++                ("d", "h"),
++                ("g", "b"),
++            ]
++        )
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Make G2 to be the rotated G1
++        G2.remove_edges_from(
++            [
++                ("a", "h"),
++                ("a", "h"),
++                ("d", "j"),
++                ("c", "c"),
++                ("c", "c"),
++                ("j", "c"),
++                ("d", "h"),
++                ("g", "b"),
++            ]
++        )
++        G2.add_edges_from(
++            [
++                ("d", "i"),
++                ("a", "h"),
++                ("g", "b"),
++                ("g", "b"),
++                ("i", "i"),
++                ("i", "i"),
++                ("b", "j"),
++                ("d", "j"),
++            ]
++        )
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++    def test_disconnected_multigraph_all_same_labels(self):
++        G1 = nx.MultiGraph()
++        G1.add_nodes_from([i for i in range(10)])
++        G1.add_edges_from([(i, i) for i in range(10)])
++
++        mapped = {0: 9, 1: 8, 2: 7, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1, 9: 0}
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_same))), "label"
++        )
++        nx.set_node_attributes(
++            G2, dict(zip(G2, itertools.cycle(utils.labels_same))), "label"
++        )
++
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Add self-loops to non-mapped nodes. Should be the same, as the graph is disconnected.
++        G1.add_edges_from([(i, i) for i in range(5, 8)] * 3)
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Compensate in G2
++        G2.add_edges_from([(i, i) for i in range(0, 3)] * 3)
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++        # Add one more self-loop in G2
++        G2.add_edges_from([(0, 0), (1, 1), (1, 1)])
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Compensate in G1
++        G1.add_edges_from([(5, 5), (7, 7), (7, 7)])
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++    def test_disconnected_multigraph_all_different_labels(self):
++        G1 = nx.MultiGraph()
++        G1.add_nodes_from([i for i in range(10)])
++        G1.add_edges_from([(i, i) for i in range(10)])
++
++        mapped = {0: 9, 1: 8, 2: 7, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1, 9: 0}
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        nx.set_node_attributes(
++            G1, dict(zip(G1, itertools.cycle(utils.labels_different))), "label"
++        )
++        nx.set_node_attributes(
++            G2,
++            dict(zip([mapped[n] for n in G1], itertools.cycle(utils.labels_different))),
++            "label",
++        )
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++        assert m == mapped
++
++        # Add self-loops to non-mapped nodes. Now it is not the same, as there are different labels
++        G1.add_edges_from([(i, i) for i in range(5, 8)] * 3)
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Add self-loops to non mapped nodes in G2 as well
++        G2.add_edges_from([(mapped[i], mapped[i]) for i in range(0, 3)] * 7)
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Add self-loops to mapped nodes in G2
++        G2.add_edges_from([(mapped[i], mapped[i]) for i in range(5, 8)] * 3)
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert not m
++
++        # Add self-loops to G1 so that they are even in both graphs
++        G1.add_edges_from([(i, i) for i in range(0, 3)] * 7)
++        m = vf2pp_isomorphism(G1, G2, node_label="label")
++        assert m
++
++
++class TestDiGraphISOVF2pp:
++    def test_wikipedia_graph(self):
++        edges1 = [
++            (1, 5),
++            (1, 2),
++            (1, 4),
++            (3, 2),
++            (6, 2),
++            (3, 4),
++            (7, 3),
++            (4, 8),
++            (5, 8),
++            (6, 5),
++            (6, 7),
++            (7, 8),
++        ]
++        mapped = {1: "a", 2: "h", 3: "d", 4: "i", 5: "g", 6: "b", 7: "j", 8: "c"}
++
++        G1 = nx.DiGraph(edges1)
++        G2 = nx.relabel_nodes(G1, mapped)
++
++        assert vf2pp_isomorphism(G1, G2) == mapped
++
++        # Change the direction of an edge
++        G1.remove_edge(1, 5)
++        G1.add_edge(5, 1)
++        assert vf2pp_isomorphism(G1, G2) is None
++
++    def test_non_isomorphic_same_degree_sequence(self):
++        r"""
++                G1                           G2
++        x--------------x              x--------------x
++        | \            |              | \            |
++        |  x-------x   |              |  x-------x   |
++        |  |       |   |              |  |       |   |
++        |  x-------x   |              |  x-------x   |
++        | /            |              |            \ |
++        x--------------x              x--------------x
++        """
++        edges1 = [
++            (1, 5),
++            (1, 2),
++            (4, 1),
++            (3, 2),
++            (3, 4),
++            (4, 8),
++            (5, 8),
++            (6, 5),
++            (6, 7),
++            (7, 8),
++        ]
++        edges2 = [
++            (1, 5),
++            (1, 2),
++            (4, 1),
++            (3, 2),
++            (4, 3),
++            (5, 8),
++            (6, 5),
++            (6, 7),
++            (3, 7),
++            (8, 7),
++        ]
++
++        G1 = nx.DiGraph(edges1)
++        G2 = nx.DiGraph(edges2)
++        assert vf2pp_isomorphism(G1, G2) is None
+diff --git a/networkx/algorithms/isomorphism/tests/vf2pp/utils.py b/networkx/algorithms/isomorphism/tests/vf2pp/utils.py
+new file mode 100644
+index 0000000..00883f2
+--- /dev/null
++++ b/networkx/algorithms/isomorphism/tests/vf2pp/utils.py
+@@ -0,0 +1,19 @@
++import networkx as nx
++
++labels_same = ["blue"]
++
++labels_different = [
++    "white",
++    "red",
++    "blue",
++    "green",
++    "orange",
++    "black",
++    "purple",
++    "yellow",
++    "brown",
++    "cyan",
++    "solarized",
++    "pink",
++    "none",
++]
+diff --git a/networkx/algorithms/isomorphism/vf2pp.py b/networkx/algorithms/isomorphism/vf2pp.py
+new file mode 100644
+index 0000000..b2dc602
+--- /dev/null
++++ b/networkx/algorithms/isomorphism/vf2pp.py
+@@ -0,0 +1,358 @@
++"""
++***************
++VF2++ Algorithm
++***************
++
++An implementation of the VF2++ algorithm for Graph Isomorphism testing.
++
++The simplest interface to use this module is to call:
++
++`vf2pp_is_isomorphic`: to check whether two graphs are isomorphic.
++`vf2pp_isomorphism`: to obtain the node mapping between two graphs,
++in case they are isomorphic.
++`vf2pp_all_isomorphisms`: to generate all possible mappings between two graphs,
++if isomorphic.
++
++Introduction
++------------
++The VF2++ algorithm, follows a similar logic to that of VF2, while also
++introducing new easy-to-check cutting rules and determining the optimal access
++order of nodes. It is also implemented in a non-recursive manner, which saves
++both time and space, when compared to its previous counterpart.
++
++The optimal node ordering is obtained after taking into consideration both the
++degree but also the label rarity of each node.
++This way we place the nodes that are more likely to match, first in the order,
++thus examining the most promising branches in the beginning.
++The rules also consider node labels, making it easier to prune unfruitful
++branches early in the process.
++
++Examples
++--------
++
++Suppose G1 and G2 are Isomorphic Graphs. Verification is as follows:
++
++Without node labels:
++
++>>> import networkx as nx
++>>> G1 = nx.path_graph(4)
++>>> G2 = nx.path_graph(4)
++>>> nx.vf2pp_is_isomorphic(G1, G2, node_label=None)
++True
++>>> nx.vf2pp_isomorphism(G1, G2, node_label=None)
++{1: 1, 2: 2, 0: 0, 3: 3}
++
++With node labels:
++
++>>> G1 = nx.path_graph(4)
++>>> G2 = nx.path_graph(4)
++>>> mapped = {1: 1, 2: 2, 3: 3, 0: 0}
++>>> nx.set_node_attributes(G1, dict(zip(G1, ["blue", "red", "green", "yellow"])), "label")
++>>> nx.set_node_attributes(G2, dict(zip([mapped[u] for u in G1], ["blue", "red", "green", "yellow"])), "label")
++>>> nx.vf2pp_is_isomorphic(G1, G2, node_label="label")
++True
++>>> nx.vf2pp_isomorphism(G1, G2, node_label="label")
++{1: 1, 2: 2, 0: 0, 3: 3}
++
++"""
++import collections
++
++import networkx as nx
++
++from .vf2pp_helpers.candidates import _find_candidates, _find_candidates_Di
++from .vf2pp_helpers.feasibility import _feasibility
++from .vf2pp_helpers.node_ordering import _matching_order
++from .vf2pp_helpers.state import _restore_Tinout, _restore_Tinout_Di, _update_Tinout
++
++__all__ = ["vf2pp_isomorphism", "vf2pp_is_isomorphic", "vf2pp_all_isomorphisms"]
++
++_GraphParameters = collections.namedtuple(
++    "_GraphParameters",
++    [
++        "G1",
++        "G2",
++        "G1_labels",
++        "G2_labels",
++        "nodes_of_G1Labels",
++        "nodes_of_G2Labels",
++        "G2_nodes_of_degree",
++    ],
++)
++
++_StateParameters = collections.namedtuple(
++    "_StateParameters",
++    [
++        "mapping",
++        "reverse_mapping",
++        "T1",
++        "T1_in",
++        "T1_tilde",
++        "T1_tilde_in",
++        "T2",
++        "T2_in",
++        "T2_tilde",
++        "T2_tilde_in",
++    ],
++)
++
++
++def vf2pp_isomorphism(G1, G2, node_label=None, default_label=None):
++    """Return an isomorphic mapping between `G1` and `G2` if it exists.
++
++    Parameters
++    ----------
++    G1, G2 : NetworkX Graph or MultiGraph instances.
++        The two graphs to check for isomorphism.
++
++    node_label : str, optional
++        The name of the node attribute to be used when comparing nodes.
++        The default is `None`, meaning node attributes are not considered
++        in the comparison. Any node that doesn't have the `node_label`
++        attribute uses `default_label` instead.
++
++    default_label : scalar
++        Default value to use when a node doesn't have an attribute
++        named `node_label`. Default is `None`.
++
++    Returns
++    -------
++    dict or None
++        Node mapping if the two graphs are isomorphic. None otherwise.
++    """
++    try:
++        mapping = next(vf2pp_all_isomorphisms(G1, G2, node_label, default_label))
++        return mapping
++    except StopIteration:
++        return None
++
++
++def vf2pp_is_isomorphic(G1, G2, node_label=None, default_label=None):
++    """Examines whether G1 and G2 are isomorphic.
++
++    Parameters
++    ----------
++    G1, G2 : NetworkX Graph or MultiGraph instances.
++        The two graphs to check for isomorphism.
++
++    node_label : str, optional
++        The name of the node attribute to be used when comparing nodes.
++        The default is `None`, meaning node attributes are not considered
++        in the comparison. Any node that doesn't have the `node_label`
++        attribute uses `default_label` instead.
++
++    default_label : scalar
++        Default value to use when a node doesn't have an attribute
++        named `node_label`. Default is `None`.
++
++    Returns
++    -------
++    bool
++        True if the two graphs are isomorphic, False otherwise.
++    """
++    if vf2pp_isomorphism(G1, G2, node_label, default_label) is not None:
++        return True
++    return False
++
++
++def vf2pp_all_isomorphisms(G1, G2, node_label=None, default_label=None):
++    """Yields all the possible mappings between G1 and G2.
++
++    Parameters
++    ----------
++    G1, G2 : NetworkX Graph or MultiGraph instances.
++        The two graphs to check for isomorphism.
++
++    node_label : str, optional
++        The name of the node attribute to be used when comparing nodes.
++        The default is `None`, meaning node attributes are not considered
++        in the comparison. Any node that doesn't have the `node_label`
++        attribute uses `default_label` instead.
++
++    default_label : scalar
++        Default value to use when a node doesn't have an attribute
++        named `node_label`. Default is `None`.
++
++    Yields
++    ------
++    dict
++        Isomorphic mapping between the nodes in `G1` and `G2`.
++    """
++    if G1.number_of_nodes() == 0 or G2.number_of_nodes() == 0:
++        return False
++
++    # Create the degree dicts based on graph type
++    if G1.is_directed():
++        G1_degree = {
++            n: (in_degree, out_degree)
++            for (n, in_degree), (_, out_degree) in zip(G1.in_degree, G1.out_degree)
++        }
++        G2_degree = {
++            n: (in_degree, out_degree)
++            for (n, in_degree), (_, out_degree) in zip(G2.in_degree, G2.out_degree)
++        }
++    else:
++        G1_degree = dict(G1.degree)
++        G2_degree = dict(G2.degree)
++
++    if not G1.is_directed():
++        find_candidates = _find_candidates
++        restore_Tinout = _restore_Tinout
++    else:
++        find_candidates = _find_candidates_Di
++        restore_Tinout = _restore_Tinout_Di
++
++    # Check that both graphs have the same number of nodes and degree sequence
++    if G1.order() != G2.order():
++        return False
++    if sorted(G1_degree.values()) != sorted(G2_degree.values()):
++        return False
++
++    # Initialize parameters and cache necessary information about degree and labels
++    graph_params, state_params = _initialize_parameters(
++        G1, G2, G2_degree, node_label, default_label
++    )
++
++    # Check if G1 and G2 have the same labels, and that number of nodes per label is equal between the two graphs
++    if not _precheck_label_properties(graph_params):
++        return False
++
++    # Calculate the optimal node ordering
++    node_order = _matching_order(graph_params)
++
++    # Initialize the stack
++    stack = []
++    candidates = iter(
++        find_candidates(node_order[0], graph_params, state_params, G1_degree)
++    )
++    stack.append((node_order[0], candidates))
++
++    mapping = state_params.mapping
++    reverse_mapping = state_params.reverse_mapping
++
++    # Index of the node from the order, currently being examined
++    matching_node = 1
++
++    while stack:
++        current_node, candidate_nodes = stack[-1]
++
++        try:
++            candidate = next(candidate_nodes)
++        except StopIteration:
++            # If no remaining candidates, return to a previous state, and follow another branch
++            stack.pop()
++            matching_node -= 1
++            if stack:
++                # Pop the previously added u-v pair, and look for a different candidate _v for u
++                popped_node1, _ = stack[-1]
++                popped_node2 = mapping[popped_node1]
++                mapping.pop(popped_node1)
++                reverse_mapping.pop(popped_node2)
++                restore_Tinout(popped_node1, popped_node2, graph_params, state_params)
++            continue
++
++        if _feasibility(current_node, candidate, graph_params, state_params):
++            # Terminate if mapping is extended to its full
++            if len(mapping) == G2.number_of_nodes() - 1:
++                cp_mapping = mapping.copy()
++                cp_mapping[current_node] = candidate
++                yield cp_mapping
++                continue
++
++            # Feasibility rules pass, so extend the mapping and update the parameters
++            mapping[current_node] = candidate
++            reverse_mapping[candidate] = current_node
++            _update_Tinout(current_node, candidate, graph_params, state_params)
++            # Append the next node and its candidates to the stack
++            candidates = iter(
++                find_candidates(
++                    node_order[matching_node], graph_params, state_params, G1_degree
++                )
++            )
++            stack.append((node_order[matching_node], candidates))
++            matching_node += 1
++
++
++def _precheck_label_properties(graph_params):
++    G1, G2, G1_labels, G2_labels, nodes_of_G1Labels, nodes_of_G2Labels, _ = graph_params
++    if any(
++        label not in nodes_of_G1Labels or len(nodes_of_G1Labels[label]) != len(nodes)
++        for label, nodes in nodes_of_G2Labels.items()
++    ):
++        return False
++    return True
++
++
++def _initialize_parameters(G1, G2, G2_degree, node_label=None, default_label=-1):
++    """Initializes all the necessary parameters for VF2++
++
++    Parameters
++    ----------
++    G1,G2: NetworkX Graph or MultiGraph instances.
++        The two graphs to check for isomorphism or monomorphism
++
++    G1_labels,G2_labels: dict
++        The label of every node in G1 and G2 respectively
++
++    Returns
++    -------
++    graph_params: namedtuple
++        Contains all the Graph-related parameters:
++
++        G1,G2
++        G1_labels,G2_labels: dict
++
++    state_params: namedtuple
++        Contains all the State-related parameters:
++
++        mapping: dict
++            The mapping as extended so far. Maps nodes of G1 to nodes of G2
++
++        reverse_mapping: dict
++            The reverse mapping as extended so far. Maps nodes from G2 to nodes of G1. It's basically "mapping" reversed
++
++        T1, T2: set
++            Ti contains uncovered neighbors of covered nodes from Gi, i.e. nodes that are not in the mapping, but are
++            neighbors of nodes that are.
++
++        T1_out, T2_out: set
++            Ti_out contains all the nodes from Gi, that are neither in the mapping nor in Ti
++    """
++    G1_labels = dict(G1.nodes(data=node_label, default=default_label))
++    G2_labels = dict(G2.nodes(data=node_label, default=default_label))
++
++    graph_params = _GraphParameters(
++        G1,
++        G2,
++        G1_labels,
++        G2_labels,
++        nx.utils.groups(G1_labels),
++        nx.utils.groups(G2_labels),
++        nx.utils.groups(G2_degree),
++    )
++
++    T1, T1_in = set(), set()
++    T2, T2_in = set(), set()
++    if G1.is_directed():
++        T1_tilde, T1_tilde_in = (
++            set(G1.nodes()),
++            set(),
++        )  # todo: do we need Ti_tilde_in? What nodes does it have?
++        T2_tilde, T2_tilde_in = set(G2.nodes()), set()
++    else:
++        T1_tilde, T1_tilde_in = set(G1.nodes()), set()
++        T2_tilde, T2_tilde_in = set(G2.nodes()), set()
++
++    state_params = _StateParameters(
++        dict(),
++        dict(),
++        T1,
++        T1_in,
++        T1_tilde,
++        T1_tilde_in,
++        T2,
++        T2_in,
++        T2_tilde,
++        T2_tilde_in,
++    )
++
++    return graph_params, state_params
+diff --git a/networkx/algorithms/isomorphism/vf2pp_helpers/__init__.py b/networkx/algorithms/isomorphism/vf2pp_helpers/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/networkx/algorithms/isomorphism/vf2pp_helpers/candidates.py b/networkx/algorithms/isomorphism/vf2pp_helpers/candidates.py
+new file mode 100644
+index 0000000..8f6aeb0
+--- /dev/null
++++ b/networkx/algorithms/isomorphism/vf2pp_helpers/candidates.py
+@@ -0,0 +1,126 @@
++def _find_candidates(
++    u, graph_params, state_params, G1_degree
++):  # todo: make the 4th argument the degree of u
++    """Given node u of G1, finds the candidates of u from G2.
++
++    Parameters
++    ----------
++    u: Graph node
++        The node from G1 for which to find the candidates from G2.
++
++    graph_params: namedtuple
++        Contains all the Graph-related parameters:
++
++        G1,G2: NetworkX Graph or MultiGraph instances.
++            The two graphs to check for isomorphism or monomorphism
++
++        G1_labels,G2_labels: dict
++            The label of every node in G1 and G2 respectively
++
++    state_params: namedtuple
++        Contains all the State-related parameters:
++
++        mapping: dict
++            The mapping as extended so far. Maps nodes of G1 to nodes of G2
++
++        reverse_mapping: dict
++            The reverse mapping as extended so far. Maps nodes from G2 to nodes of G1. It's basically "mapping" reversed
++
++        T1, T2: set
++            Ti contains uncovered neighbors of covered nodes from Gi, i.e. nodes that are not in the mapping, but are
++            neighbors of nodes that are.
++
++        T1_tilde, T2_tilde: set
++            Ti_tilde contains all the nodes from Gi, that are neither in the mapping nor in Ti
++
++    Returns
++    -------
++    candidates: set
++        The nodes from G2 which are candidates for u.
++    """
++    G1, G2, G1_labels, _, _, nodes_of_G2Labels, G2_nodes_of_degree = graph_params
++    mapping, reverse_mapping, _, _, _, _, _, _, T2_tilde, _ = state_params
++
++    covered_neighbors = [nbr for nbr in G1[u] if nbr in mapping]
++    if not covered_neighbors:
++        candidates = set(nodes_of_G2Labels[G1_labels[u]])
++        candidates.intersection_update(G2_nodes_of_degree[G1_degree[u]])
++        candidates.intersection_update(T2_tilde)
++        candidates.difference_update(reverse_mapping)
++        if G1.is_multigraph():
++            candidates.difference_update(
++                {
++                    node
++                    for node in candidates
++                    if G1.number_of_edges(u, u) != G2.number_of_edges(node, node)
++                }
++            )
++        return candidates
++
++    nbr1 = covered_neighbors[0]
++    common_nodes = set(G2[mapping[nbr1]])
++
++    for nbr1 in covered_neighbors[1:]:
++        common_nodes.intersection_update(G2[mapping[nbr1]])
++
++    common_nodes.difference_update(reverse_mapping)
++    common_nodes.intersection_update(G2_nodes_of_degree[G1_degree[u]])
++    common_nodes.intersection_update(nodes_of_G2Labels[G1_labels[u]])
++    if G1.is_multigraph():
++        common_nodes.difference_update(
++            {
++                node
++                for node in common_nodes
++                if G1.number_of_edges(u, u) != G2.number_of_edges(node, node)
++            }
++        )
++    return common_nodes
++
++
++def _find_candidates_Di(u, graph_params, state_params, G1_degree):
++    G1, G2, G1_labels, _, _, nodes_of_G2Labels, G2_nodes_of_degree = graph_params
++    mapping, reverse_mapping, _, _, _, _, _, _, T2_tilde, _ = state_params
++
++    covered_successors = [succ for succ in G1[u] if succ in mapping]
++    covered_predecessors = [pred for pred in G1.pred[u] if pred in mapping]
++
++    if not (covered_successors or covered_predecessors):
++        candidates = set(nodes_of_G2Labels[G1_labels[u]])
++        candidates.intersection_update(G2_nodes_of_degree[G1_degree[u]])
++        candidates.intersection_update(T2_tilde)
++        candidates.difference_update(reverse_mapping)
++        if G1.is_multigraph():
++            candidates.difference_update(
++                {
++                    node
++                    for node in candidates
++                    if G1.number_of_edges(u, u) != G2.number_of_edges(node, node)
++                }
++            )
++        return candidates
++
++    if covered_successors:
++        succ1 = covered_successors[0]
++        common_nodes = set(G2.pred[mapping[succ1]])
++
++        for succ1 in covered_successors[1:]:
++            common_nodes.intersection_update(G2.pred[mapping[succ1]])
++    else:
++        pred1 = covered_predecessors.pop()
++        common_nodes = set(G2[mapping[pred1]])
++
++    for pred1 in covered_predecessors:
++        common_nodes.intersection_update(G2[mapping[pred1]])
++
++    common_nodes.difference_update(reverse_mapping)
++    common_nodes.intersection_update(G2_nodes_of_degree[G1_degree[u]])
++    common_nodes.intersection_update(nodes_of_G2Labels[G1_labels[u]])
++    if G1.is_multigraph():
++        common_nodes.difference_update(
++            {
++                node
++                for node in common_nodes
++                if G1.number_of_edges(u, u) != G2.number_of_edges(node, node)
++            }
++        )
++    return common_nodes
+diff --git a/networkx/algorithms/isomorphism/vf2pp_helpers/feasibility.py b/networkx/algorithms/isomorphism/vf2pp_helpers/feasibility.py
+new file mode 100644
+index 0000000..90e8fe8
+--- /dev/null
++++ b/networkx/algorithms/isomorphism/vf2pp_helpers/feasibility.py
+@@ -0,0 +1,247 @@
++import networkx as nx
++
++
++def _feasibility(node1, node2, graph_params, state_params):
++    """Given a candidate pair of nodes u and v from G1 and G2 respectively, checks if it's feasible to extend the
++    mapping, i.e. if u and v can be matched.
++
++    Notes
++    -----
++    This function performs all the necessary checking by applying both consistency and cutting rules.
++
++    Parameters
++    ----------
++    node1, node2: Graph node
++        The candidate pair of nodes being checked for matching
++
++    graph_params: namedtuple
++        Contains all the Graph-related parameters:
++
++        G1,G2: NetworkX Graph or MultiGraph instances.
++            The two graphs to check for isomorphism or monomorphism
++
++        G1_labels,G2_labels: dict
++            The label of every node in G1 and G2 respectively
++
++    state_params: namedtuple
++        Contains all the State-related parameters:
++
++        mapping: dict
++            The mapping as extended so far. Maps nodes of G1 to nodes of G2
++
++        reverse_mapping: dict
++            The reverse mapping as extended so far. Maps nodes from G2 to nodes of G1. It's basically "mapping" reversed
++
++        T1, T2: set
++            Ti contains uncovered neighbors of covered nodes from Gi, i.e. nodes that are not in the mapping, but are
++            neighbors of nodes that are.
++
++        T1_out, T2_out: set
++            Ti_out contains all the nodes from Gi, that are neither in the mapping nor in Ti
++
++    Returns
++    -------
++    True if all checks are successful, False otherwise.
++    """
++    G1 = graph_params.G1
++
++    if _cut_PT(node1, node2, graph_params, state_params):
++        return False
++
++    if G1.is_multigraph():
++        if not _consistent_PT(node1, node2, graph_params, state_params):
++            return False
++
++    return True
++
++
++def _cut_PT(u, v, graph_params, state_params):
++    """Implements the cutting rules for the ISO problem.
++
++    Parameters
++    ----------
++    u, v: Graph node
++        The two candidate nodes being examined.
++
++    graph_params: namedtuple
++        Contains all the Graph-related parameters:
++
++        G1,G2: NetworkX Graph or MultiGraph instances.
++            The two graphs to check for isomorphism or monomorphism
++
++        G1_labels,G2_labels: dict
++            The label of every node in G1 and G2 respectively
++
++    state_params: namedtuple
++        Contains all the State-related parameters:
++
++        mapping: dict
++            The mapping as extended so far. Maps nodes of G1 to nodes of G2
++
++        reverse_mapping: dict
++            The reverse mapping as extended so far. Maps nodes from G2 to nodes of G1. It's basically "mapping" reversed
++
++        T1, T2: set
++            Ti contains uncovered neighbors of covered nodes from Gi, i.e. nodes that are not in the mapping, but are
++            neighbors of nodes that are.
++
++        T1_tilde, T2_tilde: set
++            Ti_out contains all the nodes from Gi, that are neither in the mapping nor in Ti
++
++    Returns
++    -------
++    True if we should prune this branch, i.e. the node pair failed the cutting checks. False otherwise.
++    """
++    G1, G2, G1_labels, G2_labels, _, _, _ = graph_params
++    (
++        _,
++        _,
++        T1,
++        T1_in,
++        T1_tilde,
++        _,
++        T2,
++        T2_in,
++        T2_tilde,
++        _,
++    ) = state_params
++
++    u_labels_predecessors, v_labels_predecessors = {}, {}
++    if G1.is_directed():
++        u_labels_predecessors = nx.utils.groups(
++            {n1: G1_labels[n1] for n1 in G1.pred[u]}
++        )
++        v_labels_predecessors = nx.utils.groups(
++            {n2: G2_labels[n2] for n2 in G2.pred[v]}
++        )
++
++        if set(u_labels_predecessors.keys()) != set(v_labels_predecessors.keys()):
++            return True
++
++    u_labels_successors = nx.utils.groups({n1: G1_labels[n1] for n1 in G1[u]})
++    v_labels_successors = nx.utils.groups({n2: G2_labels[n2] for n2 in G2[v]})
++
++    # if the neighbors of u, do not have the same labels as those of v, NOT feasible.
++    if set(u_labels_successors.keys()) != set(v_labels_successors.keys()):
++        return True
++
++    for label, G1_nbh in u_labels_successors.items():
++        G2_nbh = v_labels_successors[label]
++
++        if G1.is_multigraph():
++            # Check for every neighbor in the neighborhood, if u-nbr1 has same edges as v-nbr2
++            u_nbrs_edges = sorted(G1.number_of_edges(u, x) for x in G1_nbh)
++            v_nbrs_edges = sorted(G2.number_of_edges(v, x) for x in G2_nbh)
++            if any(
++                u_nbr_edges != v_nbr_edges
++                for u_nbr_edges, v_nbr_edges in zip(u_nbrs_edges, v_nbrs_edges)
++            ):
++                return True
++
++        if len(T1.intersection(G1_nbh)) != len(T2.intersection(G2_nbh)):
++            return True
++        if len(T1_tilde.intersection(G1_nbh)) != len(T2_tilde.intersection(G2_nbh)):
++            return True
++        if G1.is_directed() and len(T1_in.intersection(G1_nbh)) != len(
++            T2_in.intersection(G2_nbh)
++        ):
++            return True
++
++    if not G1.is_directed():
++        return False
++
++    for label, G1_pred in u_labels_predecessors.items():
++        G2_pred = v_labels_predecessors[label]
++
++        if G1.is_multigraph():
++            # Check for every neighbor in the neighborhood, if u-nbr1 has same edges as v-nbr2
++            u_pred_edges = sorted(G1.number_of_edges(u, x) for x in G1_pred)
++            v_pred_edges = sorted(G2.number_of_edges(v, x) for x in G2_pred)
++            if any(
++                u_nbr_edges != v_nbr_edges
++                for u_nbr_edges, v_nbr_edges in zip(u_pred_edges, v_pred_edges)
++            ):
++                return True
++
++        if len(T1.intersection(G1_pred)) != len(T2.intersection(G2_pred)):
++            return True
++        if len(T1_tilde.intersection(G1_pred)) != len(T2_tilde.intersection(G2_pred)):
++            return True
++        if len(T1_in.intersection(G1_pred)) != len(T2_in.intersection(G2_pred)):
++            return True
++
++    return False
++
++
++def _consistent_PT(u, v, graph_params, state_params):
++    """Checks the consistency of extending the mapping using the current node pair.
++
++    Parameters
++    ----------
++    u, v: Graph node
++        The two candidate nodes being examined.
++
++    graph_params: namedtuple
++        Contains all the Graph-related parameters:
++
++        G1,G2: NetworkX Graph or MultiGraph instances.
++            The two graphs to check for isomorphism or monomorphism
++
++        G1_labels,G2_labels: dict
++            The label of every node in G1 and G2 respectively
++
++    state_params: namedtuple
++        Contains all the State-related parameters:
++
++        mapping: dict
++            The mapping as extended so far. Maps nodes of G1 to nodes of G2
++
++        reverse_mapping: dict
++            The reverse mapping as extended so far. Maps nodes from G2 to nodes of G1. It's basically "mapping" reversed
++
++        T1, T2: set
++            Ti contains uncovered neighbors of covered nodes from Gi, i.e. nodes that are not in the mapping, but are
++            neighbors of nodes that are.
++
++        T1_out, T2_out: set
++            Ti_out contains all the nodes from Gi, that are neither in the mapping nor in Ti
++
++    Returns
++    -------
++    True if the pair passes all the consistency checks successfully. False otherwise.
++    """
++    G1, G2 = graph_params.G1, graph_params.G2
++    mapping, reverse_mapping = state_params.mapping, state_params.reverse_mapping
++
++    for neighbor in G1[u]:
++        if neighbor in mapping:
++            if G1.number_of_edges(u, neighbor) != G2.number_of_edges(
++                v, mapping[neighbor]
++            ):
++                return False
++
++    for neighbor in G2[v]:
++        if neighbor in reverse_mapping:
++            if G1.number_of_edges(u, reverse_mapping[neighbor]) != G2.number_of_edges(
++                v, neighbor
++            ):
++                return False
++
++    if not G1.is_directed():
++        return True
++
++    for predecessor in G1.pred[u]:
++        if predecessor in mapping:
++            if G1.number_of_edges(u, predecessor) != G2.number_of_edges(
++                v, mapping[predecessor]
++            ):
++                return False
++
++    for predecessor in G2.pred[v]:
++        if predecessor in reverse_mapping:
++            if G1.number_of_edges(
++                u, reverse_mapping[predecessor]
++            ) != G2.number_of_edges(v, predecessor):
++                return False
++
++    return True
+diff --git a/networkx/algorithms/isomorphism/vf2pp_helpers/node_ordering.py b/networkx/algorithms/isomorphism/vf2pp_helpers/node_ordering.py
+new file mode 100644
+index 0000000..97c5c60
+--- /dev/null
++++ b/networkx/algorithms/isomorphism/vf2pp_helpers/node_ordering.py
+@@ -0,0 +1,72 @@
++import networkx as nx
++
++
++def _matching_order(graph_params):
++    """The node ordering as introduced in VF2++.
++
++    Notes
++    -----
++    Taking into account the structure of the Graph and the node labeling, the nodes are placed in an order such that,
++    most of the unfruitful/infeasible branches of the search space can be pruned on high levels, significantly
++    decreasing the number of visited states. The premise is that, the algorithm will be able to recognize
++    inconsistencies early, proceeding to go deep into the search tree only if it's needed.
++
++    Parameters
++    ----------
++    graph_params: namedtuple
++        Contains:
++
++            G1,G2: NetworkX Graph or MultiGraph instances.
++                The two graphs to check for isomorphism or monomorphism.
++
++            G1_labels,G2_labels: dict
++                The label of every node in G1 and G2 respectively.
++
++    Returns
++    -------
++    node_order: list
++        The ordering of the nodes.
++    """
++    G1, G2, G1_labels, _, _, nodes_of_G2Labels, _ = graph_params
++    if not G1 and not G2:
++        return {}
++
++    if G1.is_directed():
++        G1 = G1.to_undirected(as_view=True)
++
++    V1_unordered = set(G1.nodes())
++    label_rarity = {label: len(nodes) for label, nodes in nodes_of_G2Labels.items()}
++    used_degrees = {node: 0 for node in G1}
++    node_order = []
++
++    while V1_unordered:
++        max_rarity = min(label_rarity[G1_labels[x]] for x in V1_unordered)
++        rarest_nodes = [
++            n for n in V1_unordered if label_rarity[G1_labels[n]] == max_rarity
++        ]
++        max_node = max(rarest_nodes, key=G1.degree)
++
++        for dlevel_nodes in nx.bfs_layers(G1, max_node):
++            nodes_to_add = dlevel_nodes.copy()
++            while nodes_to_add:
++                max_used_degree = max(used_degrees[n] for n in nodes_to_add)
++                max_used_degree_nodes = [
++                    n for n in nodes_to_add if used_degrees[n] == max_used_degree
++                ]
++                max_degree = max(G1.degree[n] for n in max_used_degree_nodes)
++                max_degree_nodes = [
++                    n for n in max_used_degree_nodes if G1.degree[n] == max_degree
++                ]
++                next_node = min(
++                    max_degree_nodes, key=lambda x: label_rarity[G1_labels[x]]
++                )
++
++                node_order.append(next_node)
++                for node in G1.neighbors(next_node):
++                    used_degrees[node] += 1
++
++                nodes_to_add.remove(next_node)
++                label_rarity[G1_labels[next_node]] -= 1
++                V1_unordered.discard(next_node)
++
++    return node_order
+diff --git a/networkx/algorithms/isomorphism/vf2pp_helpers/state.py b/networkx/algorithms/isomorphism/vf2pp_helpers/state.py
+new file mode 100644
+index 0000000..27ddac9
+--- /dev/null
++++ b/networkx/algorithms/isomorphism/vf2pp_helpers/state.py
+@@ -0,0 +1,259 @@
++def _update_Tinout(new_node1, new_node2, graph_params, state_params):
++    """Updates the Ti/Ti_out (i=1,2) when a new node pair u-v is added to the mapping.
++
++    Notes
++    -----
++    This function should be called right after the feasibility checks are passed, and node1 is mapped to node2. The
++    purpose of this function is to avoid brute force computing of Ti/Ti_out by iterating over all nodes of the graph
++    and checking which nodes satisfy the necessary conditions. Instead, in every step of the algorithm we focus
++    exclusively on the two nodes that are being added to the mapping, incrementally updating Ti/Ti_out.
++
++    Parameters
++    ----------
++    new_node1, new_node2: Graph node
++        The two new nodes, added to the mapping.
++
++    graph_params: namedtuple
++        Contains all the Graph-related parameters:
++
++        G1,G2: NetworkX Graph or MultiGraph instances.
++            The two graphs to check for isomorphism or monomorphism
++
++        G1_labels,G2_labels: dict
++            The label of every node in G1 and G2 respectively
++
++    state_params: namedtuple
++        Contains all the State-related parameters:
++
++        mapping: dict
++            The mapping as extended so far. Maps nodes of G1 to nodes of G2
++
++        reverse_mapping: dict
++            The reverse mapping as extended so far. Maps nodes from G2 to nodes of G1. It's basically "mapping" reversed
++
++        T1, T2: set
++            Ti contains uncovered neighbors of covered nodes from Gi, i.e. nodes that are not in the mapping, but are
++            neighbors of nodes that are.
++
++        T1_tilde, T2_tilde: set
++            Ti_out contains all the nodes from Gi, that are neither in the mapping nor in Ti
++    """
++    G1, G2, _, _, _, _, _ = graph_params
++    (
++        mapping,
++        reverse_mapping,
++        T1,
++        T1_in,
++        T1_tilde,
++        T1_tilde_in,
++        T2,
++        T2_in,
++        T2_tilde,
++        T2_tilde_in,
++    ) = state_params
++
++    uncovered_successors_G1 = {succ for succ in G1[new_node1] if succ not in mapping}
++    uncovered_successors_G2 = {
++        succ for succ in G2[new_node2] if succ not in reverse_mapping
++    }
++
++    # Add the uncovered neighbors of node1 and node2 in T1 and T2 respectively
++    T1.update(uncovered_successors_G1)
++    T2.update(uncovered_successors_G2)
++    T1.discard(new_node1)
++    T2.discard(new_node2)
++
++    T1_tilde.difference_update(uncovered_successors_G1)
++    T2_tilde.difference_update(uncovered_successors_G2)
++    T1_tilde.discard(new_node1)
++    T2_tilde.discard(new_node2)
++
++    if not G1.is_directed():
++        return
++
++    uncovered_predecessors_G1 = {
++        pred for pred in G1.pred[new_node1] if pred not in mapping
++    }
++    uncovered_predecessors_G2 = {
++        pred for pred in G2.pred[new_node2] if pred not in reverse_mapping
++    }
++
++    T1_in.update(uncovered_predecessors_G1)
++    T2_in.update(uncovered_predecessors_G2)
++    T1_in.discard(new_node1)
++    T2_in.discard(new_node2)
++
++    T1_tilde.difference_update(uncovered_predecessors_G1)
++    T2_tilde.difference_update(uncovered_predecessors_G2)
++    T1_tilde.discard(new_node1)
++    T2_tilde.discard(new_node2)
++
++
++def _restore_Tinout(popped_node1, popped_node2, graph_params, state_params):
++    """Restores the previous version of Ti/Ti_out when a node pair is deleted from the mapping.
++
++    Parameters
++    ----------
++    popped_node1, popped_node2: Graph node
++        The two nodes deleted from the mapping.
++
++    graph_params: namedtuple
++        Contains all the Graph-related parameters:
++
++        G1,G2: NetworkX Graph or MultiGraph instances.
++            The two graphs to check for isomorphism or monomorphism
++
++        G1_labels,G2_labels: dict
++            The label of every node in G1 and G2 respectively
++
++    state_params: namedtuple
++        Contains all the State-related parameters:
++
++        mapping: dict
++            The mapping as extended so far. Maps nodes of G1 to nodes of G2
++
++        reverse_mapping: dict
++            The reverse mapping as extended so far. Maps nodes from G2 to nodes of G1. It's basically "mapping" reversed
++
++        T1, T2: set
++            Ti contains uncovered neighbors of covered nodes from Gi, i.e. nodes that are not in the mapping, but are
++            neighbors of nodes that are.
++
++        T1_tilde, T2_tilde: set
++            Ti_out contains all the nodes from Gi, that are neither in the mapping nor in Ti
++    """
++    # If the node we want to remove from the mapping, has at least one covered neighbor, add it to T1.
++    G1, G2, _, _, _, _, _ = graph_params
++    (
++        mapping,
++        reverse_mapping,
++        T1,
++        T1_in,
++        T1_tilde,
++        T1_tilde_in,
++        T2,
++        T2_in,
++        T2_tilde,
++        T2_tilde_in,
++    ) = state_params
++
++    is_added = False
++    for neighbor in G1[popped_node1]:
++        if neighbor in mapping:
++            # if a neighbor of the excluded node1 is in the mapping, keep node1 in T1
++            is_added = True
++            T1.add(popped_node1)
++        else:
++            # check if its neighbor has another connection with a covered node. If not, only then exclude it from T1
++            if any(nbr in mapping for nbr in G1[neighbor]):
++                continue
++            T1.discard(neighbor)
++            T1_tilde.add(neighbor)
++
++    # Case where the node is not present in neither the mapping nor T1. By definition, it should belong to T1_tilde
++    if not is_added:
++        T1_tilde.add(popped_node1)
++
++    is_added = False
++    for neighbor in G2[popped_node2]:
++        if neighbor in reverse_mapping:
++            is_added = True
++            T2.add(popped_node2)
++        else:
++            if any(nbr in reverse_mapping for nbr in G2[neighbor]):
++                continue
++            T2.discard(neighbor)
++            T2_tilde.add(neighbor)
++
++    if not is_added:
++        T2_tilde.add(popped_node2)
++
++
++def _restore_Tinout_Di(popped_node1, popped_node2, graph_params, state_params):
++    # If the node we want to remove from the mapping, has at least one covered neighbor, add it to T1.
++    G1, G2, _, _, _, _, _ = graph_params
++    (
++        mapping,
++        reverse_mapping,
++        T1,
++        T1_in,
++        T1_tilde,
++        T1_tilde_in,
++        T2,
++        T2_in,
++        T2_tilde,
++        T2_tilde_in,
++    ) = state_params
++
++    is_added = False
++    for successor in G1[popped_node1]:
++        if successor in mapping:
++            # if a neighbor of the excluded node1 is in the mapping, keep node1 in T1
++            is_added = True
++            T1_in.add(popped_node1)
++        else:
++            # check if its neighbor has another connection with a covered node. If not, only then exclude it from T1
++            if not any(pred in mapping for pred in G1.pred[successor]):
++                T1.discard(successor)
++
++            if not any(succ in mapping for succ in G1[successor]):
++                T1_in.discard(successor)
++
++            if successor not in T1:
++                if successor not in T1_in:
++                    T1_tilde.add(successor)
++
++    for predecessor in G1.pred[popped_node1]:
++        if predecessor in mapping:
++            # if a neighbor of the excluded node1 is in the mapping, keep node1 in T1
++            is_added = True
++            T1.add(popped_node1)
++        else:
++            # check if its neighbor has another connection with a covered node. If not, only then exclude it from T1
++            if not any(pred in mapping for pred in G1.pred[predecessor]):
++                T1.discard(predecessor)
++
++            if not any(succ in mapping for succ in G1[predecessor]):
++                T1_in.discard(predecessor)
++
++            if not (predecessor in T1 or predecessor in T1_in):
++                T1_tilde.add(predecessor)
++
++    # Case where the node is not present in neither the mapping nor T1. By deffinition it should belong to T1_tilde
++    if not is_added:
++        T1_tilde.add(popped_node1)
++
++    is_added = False
++    for successor in G2[popped_node2]:
++        if successor in reverse_mapping:
++            is_added = True
++            T2_in.add(popped_node2)
++        else:
++            if not any(pred in reverse_mapping for pred in G2.pred[successor]):
++                T2.discard(successor)
++
++            if not any(succ in reverse_mapping for succ in G2[successor]):
++                T2_in.discard(successor)
++
++            if successor not in T2:
++                if successor not in T2_in:
++                    T2_tilde.add(successor)
++
++    for predecessor in G2.pred[popped_node2]:
++        if predecessor in reverse_mapping:
++            # if a neighbor of the excluded node1 is in the mapping, keep node1 in T1
++            is_added = True
++            T2.add(popped_node2)
++        else:
++            # check if its neighbor has another connection with a covered node. If not, only then exclude it from T1
++            if not any(pred in reverse_mapping for pred in G2.pred[predecessor]):
++                T2.discard(predecessor)
++
++            if not any(succ in reverse_mapping for succ in G2[predecessor]):
++                T2_in.discard(predecessor)
++
++            if not (predecessor in T2 or predecessor in T2_in):
++                T2_tilde.add(predecessor)
++
++    if not is_added:
++        T2_tilde.add(popped_node2)
+diff --git a/setup.py b/setup.py
+index cd7f4a4..02813bd 100644
+--- a/setup.py
++++ b/setup.py
+@@ -121,7 +121,7 @@ dd = os.path.join(docdirbase, "examples", "javascript/force")
+ pp = os.path.join("examples", "javascript/force")
+ data.append((dd, glob(os.path.join(pp, "*"))))
+ 
+-# add the tests
++# add the tests and helper subpackage(s)
+ package_data = {
+     "networkx": ["tests/*.py"],
+     "networkx.algorithms": ["tests/*.py"],
+@@ -134,7 +134,11 @@ package_data = {
+     "networkx.algorithms.coloring": ["tests/*.py"],
+     "networkx.algorithms.minors": ["tests/*.py"],
+     "networkx.algorithms.flow": ["tests/*.py", "tests/*.bz2"],
+-    "networkx.algorithms.isomorphism": ["tests/*.py", "tests/*.*99"],
++    "networkx.algorithms.isomorphism": [
++        "tests/*.py",
++        "tests/*.*99",
++        "vf2pp_helpers/*.py",
++    ],
+     "networkx.algorithms.link_analysis": ["tests/*.py"],
+     "networkx.algorithms.approximation": ["tests/*.py"],
+     "networkx.algorithms.operators": ["tests/*.py"],

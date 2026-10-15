@@ -1,0 +1,2541 @@
+diff -Nurp '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' repo-clean/example_scenes/timeline_example.py repo-patched/example_scenes/timeline_example.py
+--- a/example_scenes/timeline_example.py	1970-01-01 08:00:00.000000000 +0800
++++ b/example_scenes/timeline_example.py	2026-08-26 18:37:07.834176617 +0800
+@@ -0,0 +1,104 @@
++"""Small demo scenes that exercise the :class:`~.Timeline` API.
++
++These are meant to be readable rather than exhaustive; the regression
++suite under ``tests/module/scene/test_timeline.py`` covers the API
++surface in detail.
++"""
++
++from __future__ import annotations
++
++from manim import (
++    Circle,
++    Dot,
++    FadeIn,
++    FadeOut,
++    Indicate,
++    Scene,
++    Square,
++    Timeline,
++    Write,
++)
++
++
++class DeclarativeTimeline(Scene):
++    """Build a small timeline declaratively and play it in one shot.
++
++    The intent of the timeline API is that you first *describe* what
++    you want to happen, then hand the whole description off to the
++    renderer.  Nothing is rendered while the timeline is being built.
++    """
++
++    def construct(self) -> None:
++        title = Square()
++        formula = Circle()
++        graph = Dot()
++
++        timeline = Timeline()
++        intro = timeline.schedule(FadeIn(title), at=0.0)
++        derivation = timeline.schedule(
++            Write(formula, run_time=2.0), after=intro, delay=0.5
++        )
++        timeline.schedule(Indicate(formula), after=derivation)
++        timeline.schedule(FadeIn(graph), at=derivation.start)
++        timeline.schedule(FadeOut(title), after=intro, delay=6.5)
++
++        # Inspect the layout before committing to it -- this is the
++        # main advantage of the declarative model.
++        print("timeline duration:", timeline.duration)
++        for row in timeline.report():
++            print(row)
++
++        # `Scene.play` accepts Timelines directly.
++        self.play(timeline)
++
++
++class TimelineRescaled(Scene):
++    """Show that a timeline can be rescaled in one step to change tempo."""
++
++    def construct(self) -> None:
++        timeline = Timeline()
++        square = Square()
++        circle = Circle()
++        first = timeline.schedule(FadeIn(square), at=0.0)
++        timeline.schedule(FadeIn(circle), after=first, delay=0.5)
++
++        # Play the timeline at half speed.
++        self.play(timeline.rescale(0.5))
++
++
++class TimelineTracks(Scene):
++    """Illustrate the "track" view of a timeline.
++
++    Two parallel voices are scheduled at the same time and end up on
++    separate tracks; a follow-up entry appended after both fits back on
++    the first track.
++    """
++
++    def construct(self) -> None:
++        left = Square()
++        right = Circle()
++        follow = Dot()
++
++        timeline = Timeline()
++        a = timeline.schedule(FadeIn(left), at=0.0)
++        b = timeline.schedule(FadeIn(right), at=0.0)
++        timeline.schedule(FadeIn(follow), after=[a, b], delay=0.25)
++
++        for i, track in enumerate(timeline.tracks()):
++            print(f"track {i}: {[entry.index for entry in track]}")
++
++        self.play(timeline)
++
++
++class TimelineMerged(Scene):
++    """Compose two smaller timelines into a larger one via merge/+."""
++
++    def construct(self) -> None:
++        intro = Timeline()
++        intro.schedule(FadeIn(Square()), at=0.0)
++
++        outro = Timeline()
++        outro.schedule(FadeIn(Circle()), at=0.0)
++
++        combined = intro + outro
++        self.play(combined)
+diff -Nurp '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' repo-clean/manim/__init__.py repo-patched/manim/__init__.py
+--- a/manim/__init__.py	2026-08-26 18:26:19.499350250 +0800
++++ b/manim/__init__.py	2026-08-26 18:31:07.042635000 +0800
+@@ -87,6 +87,7 @@ from .scene.moving_camera_scene import *
+ from .scene.scene import *
+ from .scene.scene_file_writer import *
+ from .scene.section import *
++from .scene.timeline import *
+ from .scene.three_d_scene import *
+ from .scene.vector_space_scene import *
+ from .scene.zoomed_scene import *
+diff -Nurp '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' repo-clean/manim/animation/animation.py repo-patched/manim/animation/animation.py
+--- a/manim/animation/animation.py	2026-08-26 18:26:19.547978000 +0800
++++ b/manim/animation/animation.py	2026-08-26 18:29:33.969246000 +0800
+@@ -14,7 +14,7 @@ from ..utils.rate_functions import linea
+ __all__ = ["Animation", "Wait", "Add", "override_animation"]
+ 
+ 
+-from collections.abc import Callable, Iterable, Sequence
++from collections.abc import Callable, Iterable, Iterator, Sequence
+ from copy import deepcopy
+ from functools import partialmethod
+ from typing import TYPE_CHECKING, Any, Self
+@@ -320,6 +320,83 @@ class Animation:
+         """
+         return deepcopy(self)
+ 
++    def iter_leaves(self) -> Iterator[Animation]:
++        """Yield the "leaf" animations reachable from this animation.
++
++        A leaf animation is one that plays a single visual effect on its
++        :attr:`mobject`; for a plain :class:`Animation` this method
++        yields ``self`` and nothing else.  Composite animations such as
++        :class:`~.AnimationGroup`, :class:`~.Succession` and
++        :class:`~.LaggedStart` override :meth:`iter_leaves` to recurse
++        into their subanimations, returning the flattened stream of
++        leaves in traversal order.
++
++        This is a public introspection hook used by tools that need to
++        reason about "what will actually play" (for example, the
++        :class:`~.Timeline` scheduling machinery), and is not used by
++        the animation engine itself.
++
++        Yields
++        ------
++        Animation
++            The leaf animations, in traversal order.
++        """
++        yield self
++
++    def is_placeholder(self) -> bool:
++        """Whether this animation contributes no observable mobjects.
++
++        The default implementation returns :data:`False`; animations
++        that use a bookkeeping placeholder :class:`~.Mobject` rather
++        than a mobject actually drawn on screen (such as :class:`Wait`)
++        override this to return :data:`True`.
++
++        The :meth:`affected_family` helper uses this flag to decide
++        whether the animation should contribute anything to the set of
++        "affected" mobjects reported for scheduling and introspection
++        purposes.
++
++        Returns
++        -------
++        bool
++            :data:`True` if this animation has no observable mobject.
++        """
++        return False
++
++    def affected_family(self) -> tuple[Mobject, ...]:
++        """Return the mobjects that this animation is going to act upon.
++
++        The result is the full family of :attr:`mobject` (the mobject
++        itself, then all of its submobjects, recursively) with
++        duplicates removed by identity while preserving family
++        traversal order.  Animations that have no observable mobject
++        (see :meth:`is_placeholder`) or whose :attr:`mobject` attribute
++        is :data:`None` return an empty tuple.
++
++        Composite animations override :meth:`affected_family` to return
++        the deduplicated union of the affected families of their
++        leaves.
++
++        This helper is the canonical answer to the question "which
++        mobjects does this animation touch?", and is what higher-level
++        tooling like :class:`~.Timeline` uses to reason about overlap.
++
++        Returns
++        -------
++        tuple of :class:`~.Mobject`
++            The affected mobjects, in family-traversal order and
++            deduplicated by identity.
++        """
++        if self.mobject is None or self.is_placeholder():
++            return ()
++        seen: set[int] = set()
++        family: list[Mobject] = []
++        for member in self.mobject.get_family():
++            if id(member) not in seen:
++                seen.add(id(member))
++                family.append(member)
++        return tuple(family)
++
+     # Methods for interpolation, the mean of an Animation
+ 
+     # TODO: stop using alpha as parameter name in different meanings.
+@@ -637,6 +714,17 @@ class Wait(Animation):
+     def interpolate(self, alpha: float) -> None:
+         pass
+ 
++    def is_placeholder(self) -> bool:
++        """A :class:`Wait` never draws anything of its own.
++
++        Its :attr:`mobject` is a private placeholder used only so that
++        the base :class:`Animation` machinery has something to hang
++        family-traversal calls off; higher-level tooling like
++        :class:`~.Timeline` should treat :class:`Wait` as having no
++        affected mobjects at all.
++        """
++        return True
++
+ 
+ class Add(Animation):
+     """Add Mobjects to a scene, without animating them in any other way. This
+diff -Nurp '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' repo-clean/manim/animation/composition.py repo-patched/manim/animation/composition.py
+--- a/manim/animation/composition.py	2026-08-26 18:26:19.550096000 +0800
++++ b/manim/animation/composition.py	2026-08-26 18:29:51.936716000 +0800
+@@ -2,7 +2,7 @@
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Callable, Iterable, Sequence
++from collections.abc import Callable, Iterable, Iterator, Sequence
+ from typing import TYPE_CHECKING, Any
+ 
+ import numpy as np
+@@ -83,6 +83,46 @@ class AnimationGroup(Animation):
+     def get_all_mobjects(self) -> Sequence[Mobject | OpenGLMobject]:
+         return list(self.group)
+ 
++    def iter_leaves(self) -> Iterator[Animation]:
++        """Yield the leaf animations of this composite, in traversal order.
++
++        The traversal recurses through nested :class:`AnimationGroup`
++        instances (which includes :class:`Succession` and
++        :class:`LaggedStart`) so that only genuine "leaf" animations
++        are yielded.  The order matches the order of
++        :attr:`animations`; each leaf is yielded exactly once even if
++        the underlying tree happens to reference it twice.
++
++        Yields
++        ------
++        Animation
++            The leaves of this composite, in traversal order.
++        """
++        seen: set[int] = set()
++        for anim in self.animations:
++            for leaf in anim.iter_leaves():
++                if id(leaf) not in seen:
++                    seen.add(id(leaf))
++                    yield leaf
++
++    def affected_family(self) -> tuple[Mobject, ...]:
++        """Return the union of :meth:`~.Animation.affected_family` of all leaves.
++
++        The result concatenates the affected family of every leaf
++        animation (see :meth:`iter_leaves`), preserving traversal order
++        and deduplicating by identity.  Leaves whose
++        :meth:`~.Animation.affected_family` is empty (for example,
++        :class:`~.Wait`) contribute nothing.
++        """
++        seen: set[int] = set()
++        family: list[Mobject] = []
++        for leaf in self.iter_leaves():
++            for member in leaf.affected_family():
++                if id(member) not in seen:
++                    seen.add(id(member))
++                    family.append(member)
++        return tuple(family)
++
+     def begin(self) -> None:
+         if not self.animations:
+             raise ValueError(
+diff -Nurp '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' repo-clean/manim/scene/scene.py repo-patched/manim/scene/scene.py
+--- a/manim/scene/scene.py	2026-08-26 18:26:19.908139972 +0800
++++ b/manim/scene/scene.py	2026-08-26 18:30:36.696612000 +0800
+@@ -64,6 +64,7 @@ if TYPE_CHECKING:
+     from types import FrameType
+     from typing import Self, TypeAlias
+ 
++    from manim.scene.timeline import Timeline
+     from manim.typing import Point3D
+ 
+     SceneInteractAction: TypeAlias = (
+@@ -1161,7 +1162,7 @@ class Scene:
+ 
+     def play(
+         self,
+-        *args: Animation | Mobject | _AnimationBuilder,
++        *args: Animation | Mobject | _AnimationBuilder | Timeline,
+         subcaption: str | None = None,
+         subcaption_duration: float | None = None,
+         subcaption_offset: float = 0,
+@@ -1169,11 +1170,24 @@ class Scene:
+     ) -> None:
+         r"""Plays an animation in this scene.
+ 
++        In addition to the usual :class:`~.Animation` (and
++        animation-builder) arguments, :meth:`play` also accepts
++        :class:`~.Timeline` instances directly: each timeline is
++        replaced by its :meth:`~.Timeline.build` result before the
++        animations are handed to the renderer, so that
++        ``scene.play(timeline)``, ``scene.play_timeline(timeline)`` and
++        ``scene.play(timeline.build())`` are strictly equivalent.
++
++        Timeline arguments may be freely mixed with regular animations
++        in a single call; each timeline is expanded independently and
++        all resulting animations are played together.
++
+         Parameters
+         ----------
+ 
+         args
+-            Animations to be played.
++            Animations, animation builders or :class:`~.Timeline`
++            instances to be played.
+         subcaption
+             The content of the external subcaption that should
+             be added during the animation.
+@@ -1188,6 +1202,7 @@ class Scene:
+             All other keywords are passed to the renderer.
+ 
+         """
++        args = self._expand_timeline_arguments(args)
+         # If we are in interactive embedded mode, make sure this is running on the main thread (required for OpenGL)
+         if (
+             self.interactive_mode
+@@ -1221,6 +1236,74 @@ class Scene:
+                 offset=-run_time + subcaption_offset,
+             )
+ 
++    @staticmethod
++    def _expand_timeline_arguments(
++        args: tuple[Any, ...],
++    ) -> tuple[Any, ...]:
++        """Return ``args`` with every :class:`~.Timeline` replaced by its build result.
++
++        This helper is what lets :meth:`play` accept
++        :class:`~.Timeline` instances directly.  The import is local so
++        that :mod:`manim.scene.scene` does not import
++        :mod:`manim.scene.timeline` at module import time (which would
++        create a circular import).
++
++        Non-:class:`~.Timeline` arguments are passed through unchanged;
++        anything else that used to be accepted by :meth:`play`
++        continues to be accepted.
++        """
++        from manim.scene.timeline import Timeline
++
++        if not any(isinstance(arg, Timeline) for arg in args):
++            return args
++        return tuple(
++            arg.build() if isinstance(arg, Timeline) else arg for arg in args
++        )
++
++    def play_timeline(self, timeline: Timeline, **kwargs: Any) -> None:
++        """Play a :class:`~.Timeline` as a single composite animation.
++
++        This is a thin, back-compat convenience wrapper around
++        :meth:`play`: it validates the argument type and then delegates
++        to ``self.play(timeline, **kwargs)``, so the actual timeline
++        expansion happens in exactly one place.
++
++        Parameters
++        ----------
++        timeline
++            The :class:`~.Timeline` to play.  Passing anything else
++            raises :class:`TypeError`.
++        kwargs
++            All other keyword arguments are forwarded to :meth:`play`.
++
++        Raises
++        ------
++        TypeError
++            If ``timeline`` is not a :class:`~.Timeline` instance.
++
++        Examples
++        --------
++
++        .. manim:: PlayTimelineExample
++
++            class PlayTimelineExample(Scene):
++                def construct(self):
++                    square = Square()
++                    circle = Circle()
++                    timeline = Timeline()
++                    timeline.schedule(FadeIn(square), at=0.0)
++                    timeline.schedule(FadeIn(circle), at=0.5)
++                    self.play_timeline(timeline)
++        """
++        from manim.scene.timeline import Timeline
++
++        if not isinstance(timeline, Timeline):
++            raise TypeError(
++                "play_timeline expects a Timeline instance, got "
++                f"{type(timeline).__name__}."
++            )
++        self.play(timeline, **kwargs)
++
+     def wait(
+         self,
+         duration: float = DEFAULT_WAIT_TIME,
+diff -Nurp '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' repo-clean/manim/scene/timeline.py repo-patched/manim/scene/timeline.py
+--- a/manim/scene/timeline.py	1970-01-01 08:00:00.000000000 +0800
++++ b/manim/scene/timeline.py	2026-08-26 18:32:32.494176000 +0800
+@@ -0,0 +1,837 @@
++"""Declarative, non-linear scheduling of animations on a timeline.
++
++This module provides a small "video editor" style model on top of the
++regular :class:`~.Scene` playback machinery.  Instead of chaining
++:meth:`~.Scene.play` calls (which always append to the current end of
++the scene), a :class:`Timeline` lets you place animations at explicit
++absolute start times, relative to other already scheduled animations,
++or appended after everything scheduled so far.
++
++A timeline is a purely logical construct: building one does not render
++anything.  Once the layout of the animations has been decided, the
++timeline can be turned into a single composite animation via
++:meth:`Timeline.build`, which can then be played like any other
++animation -- most conveniently through :meth:`.Scene.play` (which
++accepts :class:`Timeline` instances directly) or the equivalent
++back-compat wrapper :meth:`.Scene.play_timeline`.
++
++Examples
++--------
++
++A typical use looks like this::
++
++    timeline = Timeline()
++    intro = timeline.schedule(FadeIn(title), at=0.0)
++    timeline.schedule(Write(formula), after=intro, delay=0.5)
++    timeline.schedule(Circumscribe(formula), at=4.0)
++
++    print(timeline.duration)   # total length of the composition
++    print(timeline.report())   # machine readable schedule overview
++
++    # inside a Scene.construct method:
++    self.play(timeline)
++
++Two scheduled animations may overlap in time only if the sets of
++mobjects they act upon are disjoint; otherwise a
++:class:`TimelineConflictError` is raised at schedule time.  The set of
++"affected" mobjects for a scheduled animation is computed via the
++:meth:`~.Animation.affected_family` and :meth:`~.Animation.iter_leaves`
++hooks that :class:`~.Animation` and :class:`~.AnimationGroup` expose,
++so composite animations and family-of-a-group entries participate in
++conflict detection correctly.
++
++Start times are resolved from three independent pieces of information:
++an explicit absolute time (``at``), one or more dependencies on
++previously scheduled entries (``after``), and an additional
++non-negative ``delay``.  When neither ``at`` nor ``after`` is given,
++the animation is appended directly after everything scheduled so far,
++which makes the following two snippets equivalent::
++
++    # explicit chaining
++    first = timeline.schedule(FadeIn(a), at=0.0)
++    timeline.schedule(FadeIn(b), after=first)
++
++    # implicit appending
++    timeline.schedule(FadeIn(a), at=0.0)
++    timeline.schedule(FadeIn(b))
++
++Because a timeline never renders anything by itself, it is cheap to
++inspect and rearrange a composition before committing to it.  The
++:meth:`Timeline.active_at`, :meth:`Timeline.entries_between`,
++:meth:`Timeline.gaps`, :meth:`Timeline.tracks` and
++:meth:`Timeline.report` methods provide different views on the same
++schedule, and :meth:`Timeline.rescale`, :meth:`Timeline.shift`,
++:meth:`Timeline.slice` and :meth:`Timeline.merge` produce transformed
++copies of the whole composition in one step.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Iterable, Iterator
++from typing import Any
++
++from manim.animation.animation import Animation, Wait
++from manim.animation.composition import AnimationGroup, Succession
++from manim.mobject.mobject import Mobject
++
++__all__ = [
++    "Timeline",
++    "ScheduledAnimation",
++    "TimelineConflictError",
++]
++
++
++class TimelineConflictError(Exception):
++    """Raised when two animations scheduled on a :class:`Timeline` overlap in
++    time while acting on the same mobject (or on members of the same mobject
++    family).
++
++    This is a scheduling error, not a rendering error: it is raised by
++    :meth:`Timeline.schedule` at the moment the conflicting entry would be
++    added, and the timeline is left completely unchanged (its length, its
++    entry count and its running index counter are all preserved).
++    """
++
++
++def _iter_leaf_animations(animation: Animation) -> Iterator[Animation]:
++    """Yield the leaves of ``animation`` via :meth:`~.Animation.iter_leaves`.
++
++    Kept as a module-level helper so downstream code can iterate leaves
++    without having to know whether the argument is a plain
++    :class:`~.Animation` or a composite :class:`~.AnimationGroup`.
++    """
++    yield from animation.iter_leaves()
++
++
++def affected_mobjects(animation: Animation) -> list[Mobject]:
++    """Return the list of mobjects that ``animation`` acts upon.
++
++    This is a thin, tolerant list-shaped wrapper around
++    :meth:`~.Animation.affected_family` (which already handles the
++    recursion into composite animations and the deduplication).
++
++    Parameters
++    ----------
++    animation
++        The animation whose affected mobjects should be computed.
++
++    Returns
++    -------
++    list of :class:`~.Mobject`
++        The mobjects influenced by the animation, in family-traversal
++        order and deduplicated by identity.
++    """
++    return list(animation.affected_family())
++
++
++def affected_type_names(animation: Animation) -> list[str]:
++    """Return the sorted, de-duplicated class names of the mobjects
++    that ``animation`` acts upon.
++
++    This is the same set of mobjects as computed by
++    :func:`affected_mobjects`, reduced to their type names.
++    """
++    return sorted({type(mobject).__name__ for mobject in affected_mobjects(animation)})
++
++
++def _intervals_overlap(start0: float, end0: float, start1: float, end1: float) -> bool:
++    """Return whether the half-open intervals ``[start0, end0)`` and
++    ``[start1, end1)`` have a non-empty intersection.
++
++    Intervals that merely touch (the end of one equals the start of the
++    other) do *not* count as overlapping, and an empty interval
++    (``start == end``) never overlaps anything.
++    """
++    if end0 <= start0 or end1 <= start1:
++        return False
++    return start0 < end1 and start1 < end0
++
++
++class ScheduledAnimation:
++    """A single entry of a :class:`Timeline`.
++
++    Instances are created by :meth:`Timeline.schedule` and should not be
++    constructed directly.
++
++    Attributes
++    ----------
++    animation
++        The scheduled :class:`~.Animation`.
++    start
++        The resolved absolute start time of the animation, in seconds.
++    delay
++        The delay that was applied on top of the resolved base time when
++        the entry was scheduled.
++    dependencies
++        The tuple of other :class:`ScheduledAnimation` entries this entry
++        was scheduled after (possibly empty).
++    index
++        The insertion index of this entry in its timeline, starting at 0.
++    """
++
++    def __init__(
++        self,
++        animation: Animation,
++        start: float,
++        delay: float,
++        dependencies: tuple[ScheduledAnimation, ...],
++        index: int,
++    ) -> None:
++        self.animation: Animation = animation
++        self.start: float = start
++        self.delay: float = delay
++        self.dependencies: tuple[ScheduledAnimation, ...] = dependencies
++        self.index: int = index
++
++    @property
++    def run_time(self) -> float:
++        """The current run time of the scheduled animation, in seconds."""
++        return self.animation.run_time
++
++    @property
++    def end(self) -> float:
++        """The absolute end time of this entry, ``start + run_time``."""
++        return self.start + self.run_time
++
++    def overlaps(self, other: ScheduledAnimation) -> bool:
++        """Return whether this entry's time window overlaps ``other``'s.
++
++        Uses the same half-open semantics as
++        :meth:`Timeline.active_at` and :meth:`Timeline.entries_between`:
++        two entries whose windows merely touch (one entry's end equals
++        the other entry's start) do not count as overlapping, and a
++        zero-length window never overlaps anything.
++        """
++        return _intervals_overlap(self.start, self.end, other.start, other.end)
++
++    def __repr__(self) -> str:
++        return (
++            f"{type(self).__name__}({type(self.animation).__name__}, "
++            f"start={self.start}, end={self.end})"
++        )
++
++
++class Timeline:
++    """A declarative, non-linear schedule of animations.
++
++    A timeline keeps an ordered collection of :class:`ScheduledAnimation`
++    entries.  New animations are added with :meth:`schedule`; their start
++    time is resolved from the ``at``, ``after`` and ``delay`` arguments
++    (see :meth:`schedule` for the exact resolution rules).
++
++    Timelines do not render anything by themselves.  Use :meth:`build` to
++    convert a timeline into a single composite :class:`~.AnimationGroup`,
++    or :meth:`.Scene.play` / :meth:`.Scene.play_timeline` to build and
++    play it in one step.
++    """
++
++    def __init__(self) -> None:
++        self._entries: list[ScheduledAnimation] = []
++
++    @property
++    def entries(self) -> tuple[ScheduledAnimation, ...]:
++        """The scheduled entries, in insertion order."""
++        return tuple(self._entries)
++
++    def __len__(self) -> int:
++        return len(self._entries)
++
++    def __iter__(self) -> Iterator[ScheduledAnimation]:
++        return iter(self._entries)
++
++    def __contains__(self, item: object) -> bool:
++        return any(item is entry for entry in self._entries)
++
++    def __repr__(self) -> str:
++        return (
++            f"{type(self).__name__}(entries={len(self)}, "
++            f"duration={self.duration})"
++        )
++
++    @property
++    def duration(self) -> float:
++        """The total duration of the timeline in seconds.
++
++        This is the maximum end time over all scheduled entries, or
++        ``0.0`` if the timeline is empty.
++        """
++        return max((entry.end for entry in self._entries), default=0.0)
++
++    def clear(self) -> None:
++        """Remove all scheduled entries from the timeline."""
++        self._entries.clear()
++
++    def _resolve_dependencies(
++        self, after: ScheduledAnimation | Animation | Iterable[Any] | None
++    ) -> list[ScheduledAnimation]:
++        """Normalize the ``after`` argument of :meth:`schedule` into a list
++        of :class:`ScheduledAnimation` entries.
++
++        Accepts a single :class:`ScheduledAnimation`, a single
++        :class:`~.Animation` (resolved to the first entry, in insertion
++        order, that schedules exactly that animation object), or an
++        iterable mixing both.  Anything that cannot be resolved to an
++        entry of *this* timeline raises a :class:`ValueError`.
++        """
++        if after is None:
++            return []
++        if isinstance(after, (ScheduledAnimation, Animation)):
++            candidates: list[Any] = [after]
++        else:
++            candidates = list(after)
++
++        resolved: list[ScheduledAnimation] = []
++        for candidate in candidates:
++            if isinstance(candidate, ScheduledAnimation):
++                if not any(candidate is entry for entry in self._entries):
++                    raise ValueError(
++                        "The given ScheduledAnimation does not belong to this "
++                        "Timeline; dependencies must refer to entries that "
++                        "have already been scheduled on this timeline."
++                    )
++                entry = candidate
++            elif isinstance(candidate, Animation):
++                entry = next(
++                    (e for e in self._entries if e.animation is candidate),
++                    None,
++                )
++                if entry is None:
++                    raise ValueError(
++                        "The given animation has not been scheduled on this "
++                        "Timeline yet; schedule it first or pass the "
++                        "ScheduledAnimation returned by Timeline.schedule."
++                    )
++            else:
++                raise TypeError(
++                    "Dependencies must be ScheduledAnimation or Animation "
++                    f"instances, got {type(candidate).__name__}."
++                )
++            if all(entry is not existing for existing in resolved):
++                resolved.append(entry)
++        return resolved
++
++    def _check_conflicts(self, new_entry: ScheduledAnimation) -> None:
++        """Raise :class:`TimelineConflictError` if ``new_entry`` overlaps
++        in time with an already scheduled entry while both act on at
++        least one common mobject.
++        """
++        new_mobjects = {id(m) for m in affected_mobjects(new_entry.animation)}
++        if not new_mobjects:
++            return
++        for other in self._entries:
++            if not _intervals_overlap(
++                new_entry.start, new_entry.end, other.start, other.end
++            ):
++                continue
++            other_mobjects = {id(m) for m in affected_mobjects(other.animation)}
++            if new_mobjects & other_mobjects:
++                raise TimelineConflictError(
++                    f"Cannot schedule {type(new_entry.animation).__name__} "
++                    f"at [{new_entry.start}, {new_entry.end}): it overlaps "
++                    f"with {type(other.animation).__name__} at "
++                    f"[{other.start}, {other.end}) and both animations act "
++                    f"on the same mobject."
++                )
++
++    def schedule(
++        self,
++        animation: Animation,
++        *,
++        at: float | None = None,
++        after: ScheduledAnimation | Animation | Iterable[Any] | None = None,
++        delay: float = 0.0,
++    ) -> ScheduledAnimation:
++        """Schedule an animation on the timeline.
++
++        The start time of the new entry is resolved as follows:
++
++        - If neither ``at`` nor ``after`` is given, the animation is
++          appended after all currently scheduled content: its base time is
++          the current :attr:`duration` of the timeline.
++        - If only ``at`` is given, the base time is ``at``.
++        - If only ``after`` is given, the base time is the maximum end
++          time of the referenced entries.
++        - If both are given, the base time is the later of ``at`` and the
++          maximum end time of the referenced entries.
++
++        The (non-negative) ``delay`` is always added on top of the
++        resolved base time.
++
++        After resolution, the new entry is checked against all existing
++        entries: if its time window ``[start, end)`` overlaps the window
++        of another entry and both animations act on a common mobject (in
++        the sense of :meth:`~.Animation.affected_family`), a
++        :class:`TimelineConflictError` is raised and the timeline is left
++        unchanged.
++
++        Parameters
++        ----------
++        animation
++            The :class:`~.Animation` to schedule.
++        at
++            An explicit absolute start time in seconds.  Must not be
++            negative.
++        after
++            One or more dependencies: :class:`ScheduledAnimation` entries
++            of this timeline, or :class:`~.Animation` objects that have
++            already been scheduled on this timeline.  Dependencies must
++            already exist; scheduling an entry before its dependencies is
++            not possible.
++        delay
++            An additional non-negative delay in seconds, added after the
++            base time has been resolved.
++
++        Returns
++        -------
++        ScheduledAnimation
++            The created timeline entry.
++
++        Raises
++        ------
++        TypeError
++            If ``animation`` is not an :class:`~.Animation`.
++        ValueError
++            If ``at`` or ``delay`` is negative, or if a dependency cannot
++            be resolved to an entry of this timeline.
++        TimelineConflictError
++            If the new entry would overlap in time with an existing entry
++            acting on the same mobject.
++        """
++        if not isinstance(animation, Animation):
++            raise TypeError(
++                "Only Animation instances can be scheduled on a Timeline, "
++                f"got {type(animation).__name__}."
++            )
++        if at is not None and at < 0:
++            raise ValueError(f"The start time `at` must not be negative, got {at}.")
++        if delay < 0:
++            raise ValueError(f"The delay must not be negative, got {delay}.")
++
++        dependencies = self._resolve_dependencies(after)
++        if at is None and not dependencies:
++            base = self.duration
++        elif at is None:
++            base = max(entry.end for entry in dependencies)
++        elif not dependencies:
++            base = at
++        else:
++            base = max(at, max(entry.end for entry in dependencies))
++        start = float(base + delay)
++
++        entry = ScheduledAnimation(
++            animation=animation,
++            start=start,
++            delay=float(delay),
++            dependencies=tuple(dependencies),
++            index=len(self._entries),
++        )
++        self._check_conflicts(entry)
++        self._entries.append(entry)
++        return entry
++
++    def active_at(self, time: float) -> tuple[ScheduledAnimation, ...]:
++        """Return the entries whose animations are playing at ``time``.
++
++        An entry is active during the half-open interval
++        ``[start, end)``: it is active at its exact start time and no
++        longer active at its exact end time.  Entries are returned in
++        insertion order.
++
++        Parameters
++        ----------
++        time
++            The absolute time in seconds.  Must not be negative.
++        """
++        if time < 0:
++            raise ValueError(f"The time must not be negative, got {time}.")
++        return tuple(
++            entry for entry in self._entries if entry.start <= time < entry.end
++        )
++
++    def entries_between(
++        self, start: float, end: float
++    ) -> tuple[ScheduledAnimation, ...]:
++        """Return the entries whose time window overlaps ``[start, end)``.
++
++        Windows that merely touch the given interval do not count as
++        overlapping; an empty interval (``start == end``) never overlaps
++        anything.  Entries are returned in insertion order.
++
++        Parameters
++        ----------
++        start
++            The start of the query interval in seconds.  Must not be
++            negative.
++        end
++            The end of the query interval in seconds.  Must not be smaller
++            than ``start``.
++        """
++        if start < 0:
++            raise ValueError(f"The start must not be negative, got {start}.")
++        if end < start:
++            raise ValueError(
++                f"The end ({end}) must not be smaller than the start ({start})."
++            )
++        if end == start:
++            return ()
++        return tuple(
++            entry
++            for entry in self._entries
++            if _intervals_overlap(entry.start, entry.end, start, end)
++        )
++
++    def report(self) -> list[dict[str, Any]]:
++        """Return a machine-readable overview of the schedule.
++
++        The result is a list with one dictionary per scheduled entry,
++        sorted by ``(start, index)``.  Each dictionary has exactly the
++        following keys:
++
++        - ``"index"``: the insertion index of the entry.
++        - ``"animation"``: the class name of the scheduled animation.
++        - ``"start"``: the resolved absolute start time.
++        - ``"end"``: the absolute end time (``start + run_time``).
++        - ``"run_time"``: the current run time of the animation.
++        - ``"targets"``: the sorted, de-duplicated class names of all
++          mobjects the animation acts upon (see
++          :func:`affected_type_names`).  For a :class:`~.Wait`, whose
++          :meth:`~.Animation.affected_family` is empty, this is the
++          empty list.
++        """
++        return [
++            {
++                "index": entry.index,
++                "animation": type(entry.animation).__name__,
++                "start": entry.start,
++                "end": entry.end,
++                "run_time": entry.run_time,
++                "targets": affected_type_names(entry.animation),
++            }
++            for entry in sorted(self._entries, key=lambda e: (e.start, e.index))
++        ]
++
++    def build(self) -> AnimationGroup:
++        """Build a single composite animation from the timeline.
++
++        Every scheduled entry is wrapped in a
++        ``Succession(Wait(entry.start), entry.animation)`` so that it
++        begins at its resolved start time, and all wrapped entries are
++        combined into one :class:`~.AnimationGroup` (in insertion order)
++        whose run time is the :attr:`duration` of the timeline.
++
++        Returns
++        -------
++        :class:`~.AnimationGroup`
++            The composite animation representing the whole timeline.
++
++        Raises
++        ------
++        ValueError
++            If the timeline is empty.
++        """
++        if not self._entries:
++            raise ValueError(
++                "Cannot build an animation from an empty Timeline; "
++                "schedule at least one animation first."
++            )
++        return AnimationGroup(
++            *(
++                Succession(Wait(entry.start), entry.animation)
++                for entry in self._entries
++            ),
++            run_time=self.duration,
++        )
++
++    def gaps(self) -> tuple[tuple[float, float], ...]:
++        """Return the idle intervals of the timeline.
++
++        A gap is a maximal time interval within ``[0, duration)`` during
++        which no scheduled entry is playing.  Overlapping or touching
++        entry windows are merged before the complement is computed, so
++        the returned intervals never have zero length and are sorted by
++        start time.  There is never a trailing gap after the last entry,
++        since the timeline ends at its :attr:`duration`.
++
++        Returns
++        -------
++        tuple of (float, float)
++            The ``(start, end)`` pairs of the idle intervals.  An empty
++            tuple is returned for an empty timeline and for a timeline
++            without idle time.
++        """
++        if not self._entries:
++            return ()
++        merged: list[list[float]] = []
++        for start, end in sorted((e.start, e.end) for e in self._entries):
++            if merged and start <= merged[-1][1]:
++                merged[-1][1] = max(merged[-1][1], end)
++            else:
++                merged.append([start, end])
++        idle: list[tuple[float, float]] = []
++        cursor = 0.0
++        for start, end in merged:
++            if start > cursor:
++                idle.append((cursor, start))
++            cursor = max(cursor, end)
++        return tuple(idle)
++
++    def rescale(self, factor: float) -> Timeline:
++        """Return a new timeline with all times scaled by ``factor``.
++
++        The new timeline contains, for every entry of this timeline (in
++        insertion order), a *copy* of the scheduled animation whose run
++        time is scaled by ``factor``; start times, delays and dependency
++        relations are scaled and preserved accordingly.  This timeline
++        and its animations are left untouched.
++
++        Parameters
++        ----------
++        factor
++            The scaling factor.  Must be strictly positive.
++
++        Returns
++        -------
++        Timeline
++            The rescaled timeline.
++        """
++        if factor <= 0:
++            raise ValueError(f"The rescale factor must be positive, got {factor}.")
++        scaled = Timeline()
++        mapping: dict[int, ScheduledAnimation] = {}
++        for entry in self._entries:
++            animation_copy = entry.animation.copy()
++            animation_copy.set_run_time(entry.run_time * factor)
++            base = entry.start - entry.delay
++            new_entry = scaled.schedule(
++                animation_copy,
++                at=base * factor,
++                after=[mapping[dep.index] for dep in entry.dependencies] or None,
++                delay=entry.delay * factor,
++            )
++            mapping[entry.index] = new_entry
++        return scaled
++
++    def shift(self, offset: float) -> Timeline:
++        """Return a new timeline where every start time is offset by ``offset``.
++
++        The animations themselves are deep-copied (as for
++        :meth:`rescale`) so the original timeline stays untouched.
++        Dependencies are rewired to point at the copies inside the new
++        timeline.  Shifting by a strictly negative offset is allowed as
++        long as no entry would end up with a negative start time.
++
++        Parameters
++        ----------
++        offset
++            The offset in seconds to add to every entry's start time.
++
++        Returns
++        -------
++        Timeline
++            The shifted timeline.
++
++        Raises
++        ------
++        ValueError
++            If the shift would produce a negative start time for any
++            entry.
++        """
++        if self._entries and min(entry.start for entry in self._entries) + offset < 0:
++            raise ValueError(
++                "Shifting by this offset would move at least one entry "
++                "before time zero, which is not allowed."
++            )
++        shifted = Timeline()
++        mapping: dict[int, ScheduledAnimation] = {}
++        for entry in self._entries:
++            animation_copy = entry.animation.copy()
++            animation_copy.set_run_time(entry.run_time)
++            base = entry.start + offset - entry.delay
++            new_entry = shifted.schedule(
++                animation_copy,
++                at=base,
++                after=[mapping[dep.index] for dep in entry.dependencies] or None,
++                delay=entry.delay,
++            )
++            mapping[entry.index] = new_entry
++        return shifted
++
++    def slice(self, start: float, end: float) -> Timeline:
++        """Return a new timeline containing only entries strictly inside
++        ``[start, end)``.
++
++        An entry is included when its full time window is contained in
++        ``[start, end)`` -- entries that would be cut in half are
++        dropped rather than clipped.  Start times of the surviving
++        entries are re-anchored so that the surviving window begins at
++        time zero in the new timeline, and dependencies among surviving
++        entries are preserved.
++
++        Parameters
++        ----------
++        start
++            The (non-negative) start of the slice window.
++        end
++            The end of the slice window; must not be smaller than
++            ``start``.
++
++        Returns
++        -------
++        Timeline
++            The sliced timeline (possibly empty).
++
++        Raises
++        ------
++        ValueError
++            If ``start`` is negative or ``end < start``.
++        """
++        if start < 0:
++            raise ValueError(f"The slice start must not be negative, got {start}.")
++        if end < start:
++            raise ValueError(
++                f"The slice end ({end}) must not be smaller than the start ({start})."
++            )
++        sliced = Timeline()
++        if end == start:
++            return sliced
++        mapping: dict[int, ScheduledAnimation] = {}
++        for entry in self._entries:
++            if entry.start < start or entry.end > end:
++                continue
++            animation_copy = entry.animation.copy()
++            animation_copy.set_run_time(entry.run_time)
++            base = entry.start - start - entry.delay
++            surviving_deps = [
++                mapping[dep.index] for dep in entry.dependencies if dep.index in mapping
++            ]
++            new_entry = sliced.schedule(
++                animation_copy,
++                at=base,
++                after=surviving_deps or None,
++                delay=entry.delay,
++            )
++            mapping[entry.index] = new_entry
++        return sliced
++
++    def merge(self, other: Timeline, *, offset: float | None = None) -> Timeline:
++        """Return a new timeline that plays ``self`` and ``other`` together.
++
++        Every entry of ``self`` is copied first (indices ``0 .. len(self)``),
++        followed by every entry of ``other`` shifted forward by
++        ``offset``.  When ``offset`` is :data:`None` (the default), the
++        two timelines are concatenated end-to-end using
++        ``self.duration`` as the offset, which is what you want when you
++        want ``other`` to play strictly after ``self`` finishes.
++
++        Both timelines are left untouched; all animations are deep
++        copies.  Dependencies stay local: an entry originally coming
++        from ``self`` never depends on an entry from ``other`` and vice
++        versa, so the two halves stay independent in the merged result.
++
++        Parameters
++        ----------
++        other
++            The timeline to merge into a copy of ``self``.
++        offset
++            Absolute offset added to every start time of ``other``.  If
++            :data:`None`, defaults to ``self.duration``.  Must be
++            non-negative when provided explicitly.
++
++        Returns
++        -------
++        Timeline
++            The merged timeline.
++
++        Raises
++        ------
++        TypeError
++            If ``other`` is not a :class:`Timeline`.
++        ValueError
++            If ``offset`` is explicitly given and is negative.
++        """
++        if not isinstance(other, Timeline):
++            raise TypeError(
++                "Timeline.merge requires another Timeline, got "
++                f"{type(other).__name__}."
++            )
++        if offset is None:
++            offset = self.duration
++        elif offset < 0:
++            raise ValueError(
++                f"The merge offset must not be negative, got {offset}."
++            )
++        merged = Timeline()
++        mapping_self: dict[int, ScheduledAnimation] = {}
++        for entry in self._entries:
++            animation_copy = entry.animation.copy()
++            animation_copy.set_run_time(entry.run_time)
++            base = entry.start - entry.delay
++            new_entry = merged.schedule(
++                animation_copy,
++                at=base,
++                after=[mapping_self[dep.index] for dep in entry.dependencies]
++                or None,
++                delay=entry.delay,
++            )
++            mapping_self[entry.index] = new_entry
++        mapping_other: dict[int, ScheduledAnimation] = {}
++        for entry in other._entries:
++            animation_copy = entry.animation.copy()
++            animation_copy.set_run_time(entry.run_time)
++            base = entry.start + offset - entry.delay
++            new_entry = merged.schedule(
++                animation_copy,
++                at=base,
++                after=[mapping_other[dep.index] for dep in entry.dependencies]
++                or None,
++                delay=entry.delay,
++            )
++            mapping_other[entry.index] = new_entry
++        return merged
++
++    def __add__(self, other: Timeline) -> Timeline:
++        """Concatenate two timelines end-to-end.
++
++        ``self + other`` is exactly ``self.merge(other)`` with the
++        default offset of ``self.duration``, so the second timeline
++        plays immediately after the first one finishes.
++        """
++        if not isinstance(other, Timeline):
++            return NotImplemented
++        return self.merge(other)
++
++    def tracks(self) -> tuple[tuple[ScheduledAnimation, ...], ...]:
++        """Assign every entry to a "track" using greedy interval scheduling.
++
++        Entries are considered in ``(start, index)`` order and placed on
++        the lowest-numbered track that has no time overlap with the
++        entry being placed.  This produces a valid layered layout where
++        each individual track holds entries whose time windows are
++        pairwise non-overlapping (touching windows are allowed on the
++        same track, since only strict overlap is prohibited).
++
++        The greedy assignment does not consider mobject conflicts: it
++        purely partitions entries by their time window, which is what a
++        typical timeline UI wants for a visual "row per parallel voice"
++        layout.  The number of tracks equals the maximum number of
++        simultaneously active entries.
++
++        Returns
++        -------
++        tuple of tuple of :class:`ScheduledAnimation`
++            One tuple per track, in the order tracks were created; each
++            inner tuple is sorted by start time.
++        """
++        tracks: list[list[ScheduledAnimation]] = []
++        entries_by_start = sorted(self._entries, key=lambda e: (e.start, e.index))
++        for entry in entries_by_start:
++            placed = False
++            for track in tracks:
++                last = track[-1]
++                if last.end <= entry.start:
++                    track.append(entry)
++                    placed = True
++                    break
++            if not placed:
++                tracks.append([entry])
++        return tuple(tuple(track) for track in tracks)
+diff -Nurp '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' repo-clean/tests/module/scene/test_timeline.py repo-patched/tests/module/scene/test_timeline.py
+--- a/tests/module/scene/test_timeline.py	1970-01-01 08:00:00.000000000 +0800
++++ b/tests/module/scene/test_timeline.py	2026-08-26 18:38:10.418629000 +0800
+@@ -0,0 +1,1275 @@
++"""Tests for the :class:`~.Timeline` animation scheduling model.
++
++These tests double as regression tests for the introspection hooks
++(:meth:`~.Animation.iter_leaves`, :meth:`~.Animation.affected_family`
++and their :class:`~.AnimationGroup` overrides) and for the
++:class:`~.Scene.play` -> :class:`~.Timeline` integration path added on
++top of the regular playback pipeline.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from manim import (
++    AnimationGroup,
++    Circle,
++    Dot,
++    FadeIn,
++    FadeOut,
++    Group,
++    Indicate,
++    LaggedStart,
++    Line,
++    Mobject,
++    Scene,
++    Square,
++    Succession,
++    VGroup,
++    Wait,
++    Write,
++    tempconfig,
++)
++from manim.animation.animation import Animation
++from manim.scene.timeline import (
++    ScheduledAnimation,
++    Timeline,
++    TimelineConflictError,
++    affected_mobjects,
++    affected_type_names,
++)
++
++
++def make_square_animation(**kwargs):
++    return FadeIn(Square(), **kwargs)
++
++
++class TestScheduledAnimationInterface:
++    def test_attributes_are_exposed(self):
++        timeline = Timeline()
++        animation = FadeIn(Square(), run_time=2.0)
++        entry = timeline.schedule(animation, at=1.0, delay=0.25)
++        assert entry.animation is animation
++        assert entry.start == 1.25
++        assert entry.delay == 0.25
++        assert entry.dependencies == ()
++        assert entry.index == 0
++
++    def test_run_time_and_end_properties(self):
++        timeline = Timeline()
++        animation = FadeIn(Square(), run_time=2.0)
++        entry = timeline.schedule(animation, at=1.0)
++        assert entry.run_time == 2.0
++        assert entry.end == 3.0
++
++    def test_end_tracks_run_time_changes(self):
++        timeline = Timeline()
++        animation = FadeIn(Square(), run_time=2.0)
++        entry = timeline.schedule(animation, at=1.0)
++        animation.set_run_time(5.0)
++        assert entry.run_time == 5.0
++        assert entry.end == 6.0
++
++    def test_repr_mentions_animation_type(self):
++        timeline = Timeline()
++        entry = timeline.schedule(FadeIn(Square()), at=0.0)
++        assert "FadeIn" in repr(entry)
++
++    def test_entries_are_returned_in_insertion_order(self):
++        timeline = Timeline()
++        square, circle, dot = Square(), Circle(), Dot()
++        entry0 = timeline.schedule(FadeIn(square), at=3.0)
++        entry1 = timeline.schedule(FadeIn(circle), at=0.0)
++        entry2 = timeline.schedule(FadeIn(dot), at=1.5)
++        assert timeline.entries == (entry0, entry1, entry2)
++        assert [entry.index for entry in timeline.entries] == [0, 1, 2]
++
++    def test_entries_returns_an_immutable_tuple(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        entries = timeline.entries
++        assert isinstance(entries, tuple)
++        with pytest.raises(AttributeError):
++            entries.append("nope")
++
++    def test_overlaps_helper_matches_active_semantics(self):
++        timeline = Timeline()
++        first = timeline.schedule(FadeIn(Square()), at=0.0)
++        second = timeline.schedule(FadeIn(Circle()), at=0.5)
++        third = timeline.schedule(FadeIn(Dot()), at=1.0)
++        assert first.overlaps(second)
++        assert second.overlaps(first)
++        assert not first.overlaps(third)
++        assert not third.overlaps(first)
++
++
++class TestScheduleResolution:
++    def test_explicit_at(self):
++        timeline = Timeline()
++        entry = timeline.schedule(FadeIn(Square()), at=2.0)
++        assert entry.start == 2.0
++        assert entry.end == 3.0
++
++    def test_explicit_at_with_delay(self):
++        timeline = Timeline()
++        entry = timeline.schedule(FadeIn(Square()), at=2.0, delay=0.5)
++        assert entry.start == 2.5
++
++    def test_append_after_current_content(self):
++        timeline = Timeline()
++        first = timeline.schedule(FadeIn(Square(), run_time=2.0), at=1.0)
++        second = timeline.schedule(FadeIn(Circle()))
++        assert second.start == first.end == 3.0
++
++    def test_append_to_empty_timeline_starts_at_zero(self):
++        timeline = Timeline()
++        entry = timeline.schedule(FadeIn(Square()))
++        assert entry.start == 0.0
++
++    def test_append_uses_latest_end_not_latest_insertion(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square(), run_time=10.0), at=0.0)
++        timeline.schedule(FadeIn(Circle()), at=0.0)
++        entry = timeline.schedule(FadeIn(Dot()))
++        assert entry.start == 10.0
++
++    def test_after_single_entry(self):
++        timeline = Timeline()
++        first = timeline.schedule(FadeIn(Square(), run_time=2.0), at=1.0)
++        second = timeline.schedule(FadeIn(Circle()), after=first)
++        assert second.start == 3.0
++
++    def test_after_single_entry_with_delay(self):
++        timeline = Timeline()
++        first = timeline.schedule(FadeIn(Square(), run_time=2.0), at=1.0)
++        second = timeline.schedule(FadeIn(Circle()), after=first, delay=0.5)
++        assert second.start == 3.5
++
++    def test_after_animation_object(self):
++        timeline = Timeline()
++        animation = FadeIn(Square(), run_time=2.0)
++        timeline.schedule(animation, at=1.0)
++        second = timeline.schedule(FadeIn(Circle()), after=animation)
++        assert second.start == 3.0
++
++    def test_after_unscheduled_animation_raises(self):
++        timeline = Timeline()
++        with pytest.raises(ValueError):
++            timeline.schedule(FadeIn(Circle()), after=FadeIn(Square()))
++
++    def test_after_entry_from_other_timeline_raises(self):
++        timeline = Timeline()
++        other = Timeline()
++        foreign = other.schedule(FadeIn(Square()), at=0.0)
++        with pytest.raises(ValueError):
++            timeline.schedule(FadeIn(Circle()), after=foreign)
++
++    def test_after_multiple_dependencies_takes_max_end(self):
++        timeline = Timeline()
++        square, circle, dot = Square(), Circle(), Dot()
++        entry0 = timeline.schedule(FadeIn(square, run_time=1.0), at=0.0)
++        entry1 = timeline.schedule(FadeIn(circle, run_time=4.0), at=0.5)
++        entry2 = timeline.schedule(FadeIn(dot, run_time=2.0), at=2.0)
++        dependent = timeline.schedule(
++            FadeOut(dot), after=[entry0, entry1, entry2]
++        )
++        assert dependent.start == max(
++            entry.end for entry in (entry0, entry1, entry2)
++        )
++        assert dependent.start == 4.5
++
++    def test_after_accepts_a_plain_list_of_animation_objects(self):
++        timeline = Timeline()
++        square_animation = FadeIn(Square(), run_time=3.0)
++        circle_animation = FadeIn(Circle(), run_time=1.0)
++        timeline.schedule(square_animation, at=0.0)
++        timeline.schedule(circle_animation, at=0.0)
++        entry = timeline.schedule(
++            FadeIn(Dot()), after=[square_animation, circle_animation]
++        )
++        assert entry.start == 3.0
++
++    def test_after_deduplicates_repeated_dependencies(self):
++        timeline = Timeline()
++        first = timeline.schedule(FadeIn(Square()), at=0.0)
++        second = timeline.schedule(FadeIn(Circle()), after=[first, first, first])
++        assert second.dependencies == (first,)
++
++    def test_dependencies_are_recorded_on_entry(self):
++        timeline = Timeline()
++        first = timeline.schedule(FadeIn(Square()), at=0.0)
++        second = timeline.schedule(FadeIn(Circle()), after=first)
++        third = timeline.schedule(FadeIn(Dot()), after=second)
++        assert second.dependencies == (first,)
++        assert third.dependencies == (second,)
++        assert first.dependencies == ()
++
++    def test_at_and_after_uses_later_base(self):
++        timeline = Timeline()
++        first = timeline.schedule(FadeIn(Square(), run_time=2.0), at=0.0)
++        entry = timeline.schedule(FadeIn(Circle()), at=10.0, after=first)
++        assert entry.start == 10.0
++        entry = timeline.schedule(FadeIn(Dot()), at=1.0, after=first)
++        assert entry.start == 2.0
++
++    def test_at_and_after_with_delay(self):
++        timeline = Timeline()
++        first = timeline.schedule(FadeIn(Square(), run_time=2.0), at=0.0)
++        entry = timeline.schedule(FadeIn(Circle()), at=1.0, after=first, delay=0.5)
++        assert entry.start == 2.5
++
++    def test_chained_dependencies_accumulate(self):
++        timeline = Timeline()
++        entry = timeline.schedule(FadeIn(Square()), at=0.0)
++        for _ in range(4):
++            entry = timeline.schedule(FadeIn(Circle()), after=entry)
++        assert entry.start == 4.0
++        assert entry.end == 5.0
++
++    def test_invalid_dependency_type_raises_type_error(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        with pytest.raises(TypeError):
++            timeline.schedule(FadeIn(Circle()), after="not an animation")
++
++    def test_dependency_inside_iterable_is_validated(self):
++        timeline = Timeline()
++        first = timeline.schedule(FadeIn(Square()), at=0.0)
++        with pytest.raises(ValueError):
++            timeline.schedule(FadeIn(Circle()), after=[first, FadeIn(Dot())])
++
++
++class TestScheduleValidation:
++    def test_non_animation_raises_type_error(self):
++        timeline = Timeline()
++        with pytest.raises(TypeError):
++            timeline.schedule(Square())
++
++    def test_none_animation_raises_type_error(self):
++        timeline = Timeline()
++        with pytest.raises(TypeError):
++            timeline.schedule(None)
++
++    def test_negative_at_raises_value_error(self):
++        timeline = Timeline()
++        with pytest.raises(ValueError):
++            timeline.schedule(FadeIn(Square()), at=-0.5)
++
++    def test_zero_at_is_allowed(self):
++        timeline = Timeline()
++        entry = timeline.schedule(FadeIn(Square()), at=0.0)
++        assert entry.start == 0.0
++
++    def test_negative_delay_raises_value_error(self):
++        timeline = Timeline()
++        with pytest.raises(ValueError):
++            timeline.schedule(FadeIn(Square()), at=1.0, delay=-0.1)
++
++    def test_zero_delay_is_allowed(self):
++        timeline = Timeline()
++        entry = timeline.schedule(FadeIn(Square()), at=1.0, delay=0.0)
++        assert entry.start == 1.0
++
++
++class TestConflictDetection:
++    def test_overlap_same_mobject_raises(self):
++        timeline = Timeline()
++        square = Square()
++        timeline.schedule(FadeIn(square), at=0.0)
++        with pytest.raises(TimelineConflictError):
++            timeline.schedule(FadeOut(square), at=0.5)
++
++    def test_failed_schedule_leaves_timeline_unchanged(self):
++        timeline = Timeline()
++        square = Square()
++        timeline.schedule(FadeIn(square), at=0.0)
++        with pytest.raises(TimelineConflictError):
++            timeline.schedule(FadeOut(square), at=0.5)
++        assert len(timeline) == 1
++        assert timeline.duration == 1.0
++
++    def test_touching_boundaries_do_not_conflict(self):
++        timeline = Timeline()
++        square = Square()
++        timeline.schedule(FadeIn(square), at=0.0)
++        second = timeline.schedule(FadeOut(square), at=1.0)
++        assert second.start == 1.0
++        assert len(timeline) == 2
++
++    def test_disjoint_mobjects_may_overlap(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        entry = timeline.schedule(FadeIn(Circle()), at=0.5)
++        assert entry.start == 0.5
++
++    def test_family_intersection_counts_as_conflict(self):
++        timeline = Timeline()
++        square = Square()
++        group = VGroup(square, Circle())
++        timeline.schedule(FadeIn(group), at=0.0)
++        with pytest.raises(TimelineConflictError):
++            timeline.schedule(Indicate(square), at=0.5)
++
++    def test_family_intersection_child_then_parent(self):
++        timeline = Timeline()
++        square = Square()
++        group = VGroup(square, Circle())
++        timeline.schedule(Indicate(square), at=0.0)
++        with pytest.raises(TimelineConflictError):
++            timeline.schedule(FadeIn(group), at=0.5)
++
++    def test_composite_animation_conflict_via_subanimation(self):
++        timeline = Timeline()
++        square, circle = Square(), Circle()
++        timeline.schedule(
++            AnimationGroup(FadeIn(square), FadeIn(circle)), at=0.0
++        )
++        with pytest.raises(TimelineConflictError):
++            timeline.schedule(Indicate(circle), at=0.5)
++
++    def test_composite_animation_nested_conflict(self):
++        timeline = Timeline()
++        square = Square()
++        composite = Succession(
++            AnimationGroup(FadeIn(square), FadeIn(Circle())),
++            FadeIn(Dot()),
++        )
++        timeline.schedule(composite, at=0.0)
++        with pytest.raises(TimelineConflictError):
++            timeline.schedule(FadeOut(square), at=1.0)
++
++    def test_wait_animations_do_not_conflict(self):
++        timeline = Timeline()
++        timeline.schedule(Wait(2.0), at=0.0)
++        entry = timeline.schedule(Wait(1.0), at=0.5)
++        assert entry.start == 0.5
++        assert timeline.duration == 2.0
++
++    def test_wait_does_not_conflict_with_real_animation(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        entry = timeline.schedule(Wait(1.0), at=0.0)
++        assert entry.start == 0.0
++
++    def test_composite_versus_composite_conflict(self):
++        timeline = Timeline()
++        square, circle = Square(), Circle()
++        timeline.schedule(
++            AnimationGroup(FadeIn(square), FadeIn(Dot())), at=0.0
++        )
++        with pytest.raises(TimelineConflictError):
++            timeline.schedule(
++                AnimationGroup(FadeIn(circle), FadeOut(square)), at=0.5
++            )
++
++    def test_composite_versus_composite_disjoint(self):
++        timeline = Timeline()
++        timeline.schedule(
++            AnimationGroup(FadeIn(Square()), FadeIn(Dot())), at=0.0
++        )
++        entry = timeline.schedule(
++            AnimationGroup(FadeIn(Circle()), FadeIn(Line())), at=0.5
++        )
++        assert entry.start == 0.5
++
++
++class TestDurationAndContainer:
++    def test_empty_timeline_duration_is_zero(self):
++        assert Timeline().duration == 0.0
++
++    def test_duration_is_max_end_time(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square(), run_time=3.0), at=1.0)
++        timeline.schedule(FadeIn(Circle(), run_time=1.0), at=10.0)
++        assert timeline.duration == 11.0
++
++    def test_len_counts_entries(self):
++        timeline = Timeline()
++        assert len(timeline) == 0
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.schedule(FadeIn(Circle()), at=2.0)
++        assert len(timeline) == 2
++
++    def test_iteration_yields_insertion_order(self):
++        timeline = Timeline()
++        entry0 = timeline.schedule(FadeIn(Square()), at=5.0)
++        entry1 = timeline.schedule(FadeIn(Circle()), at=0.0)
++        assert list(timeline) == [entry0, entry1]
++
++    def test_clear_resets_timeline(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.schedule(FadeIn(Circle()), at=2.0)
++        timeline.clear()
++        assert len(timeline) == 0
++        assert timeline.entries == ()
++        assert timeline.duration == 0.0
++
++    def test_indices_restart_after_clear(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.clear()
++        entry = timeline.schedule(FadeIn(Circle()), at=0.0)
++        assert entry.index == 0
++
++    def test_contains_checks_membership_by_identity(self):
++        timeline = Timeline()
++        entry = timeline.schedule(FadeIn(Square()), at=0.0)
++        assert entry in timeline
++        assert "unrelated" not in timeline
++
++
++class TestActiveAt:
++    def make_timeline(self):
++        timeline = Timeline()
++        entry0 = timeline.schedule(FadeIn(Square()), at=0.0)
++        entry1 = timeline.schedule(FadeIn(Circle()), at=0.5)
++        entry2 = timeline.schedule(FadeIn(Dot()), at=2.0)
++        return timeline, entry0, entry1, entry2
++
++    def test_active_at_start_boundary_is_inclusive(self):
++        timeline, entry0, _, _ = self.make_timeline()
++        assert timeline.active_at(0.0) == (entry0,)
++
++    def test_active_at_end_boundary_is_exclusive(self):
++        timeline, _, entry1, _ = self.make_timeline()
++        assert timeline.active_at(1.0) == (entry1,)
++
++    def test_active_at_overlap_region(self):
++        timeline, entry0, entry1, _ = self.make_timeline()
++        assert timeline.active_at(0.75) == (entry0, entry1)
++
++    def test_active_at_gap(self):
++        timeline, _, _, _ = self.make_timeline()
++        assert timeline.active_at(1.75) == ()
++
++    def test_active_at_negative_time_raises(self):
++        timeline, _, _, _ = self.make_timeline()
++        with pytest.raises(ValueError):
++            timeline.active_at(-0.1)
++
++
++class TestEntriesBetween:
++    def make_timeline(self):
++        timeline = Timeline()
++        entry0 = timeline.schedule(FadeIn(Square()), at=0.0)
++        entry1 = timeline.schedule(FadeIn(Circle()), at=2.0)
++        entry2 = timeline.schedule(FadeIn(Dot()), at=4.0)
++        return timeline, entry0, entry1, entry2
++
++    def test_full_coverage(self):
++        timeline, entry0, entry1, entry2 = self.make_timeline()
++        assert timeline.entries_between(0.0, 10.0) == (entry0, entry1, entry2)
++
++    def test_partial_overlap_counts(self):
++        timeline, entry0, entry1, _ = self.make_timeline()
++        assert timeline.entries_between(0.5, 2.5) == (entry0, entry1)
++
++    def test_touching_interval_does_not_count(self):
++        timeline, _, _, _ = self.make_timeline()
++        assert timeline.entries_between(1.0, 2.0) == ()
++
++    def test_empty_result_for_gap(self):
++        timeline, _, _, _ = self.make_timeline()
++        assert timeline.entries_between(1.25, 1.75) == ()
++
++    def test_negative_start_raises(self):
++        timeline, _, _, _ = self.make_timeline()
++        with pytest.raises(ValueError):
++            timeline.entries_between(-1.0, 2.0)
++
++    def test_end_before_start_raises(self):
++        timeline, _, _, _ = self.make_timeline()
++        with pytest.raises(ValueError):
++            timeline.entries_between(2.0, 1.0)
++
++    def test_empty_interval_returns_nothing(self):
++        timeline, _, _, _ = self.make_timeline()
++        assert timeline.entries_between(0.5, 0.5) == ()
++
++
++class TestReport:
++    def test_empty_report(self):
++        assert Timeline().report() == []
++
++    def test_report_structure_and_values(self):
++        timeline = Timeline()
++        square, circle = Square(), Circle()
++        timeline.schedule(FadeIn(square), at=0.0)
++        timeline.schedule(Write(circle, run_time=2.0), at=1.0, delay=0.5)
++        report = timeline.report()
++        assert report == [
++            {
++                "index": 0,
++                "animation": "FadeIn",
++                "start": 0.0,
++                "end": 1.0,
++                "run_time": 1.0,
++                "targets": ["Square"],
++            },
++            {
++                "index": 1,
++                "animation": "Write",
++                "start": 1.5,
++                "end": 3.5,
++                "run_time": 2.0,
++                "targets": ["Circle"],
++            },
++        ]
++
++    def test_report_is_sorted_by_start_then_index(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=3.0)
++        timeline.schedule(FadeIn(Circle()), at=0.0)
++        timeline.schedule(FadeIn(Dot()), at=0.0)
++        report = timeline.report()
++        assert [row["index"] for row in report] == [1, 2, 0]
++        assert [row["start"] for row in report] == [0.0, 0.0, 3.0]
++
++    def test_report_keys_are_exactly_the_documented_ones(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        (row,) = timeline.report()
++        assert set(row) == {
++            "index",
++            "animation",
++            "start",
++            "end",
++            "run_time",
++            "targets",
++        }
++
++    def test_report_targets_for_grouped_mobject(self):
++        timeline = Timeline()
++        group = VGroup(Square(), Circle())
++        timeline.schedule(FadeIn(group), at=0.0)
++        (row,) = timeline.report()
++        assert row["targets"] == ["Circle", "Square", "VGroup"]
++
++    def test_report_targets_for_composite_animation(self):
++        timeline = Timeline()
++        timeline.schedule(
++            AnimationGroup(FadeIn(Square()), FadeIn(Circle())), at=0.0
++        )
++        (row,) = timeline.report()
++        assert row["targets"] == ["Circle", "Square"]
++
++    def test_report_targets_of_wait_is_empty(self):
++        timeline = Timeline()
++        timeline.schedule(Wait(1.0), at=0.0)
++        (row,) = timeline.report()
++        assert row["animation"] == "Wait"
++        assert row["targets"] == []
++
++    def test_report_targets_are_sorted_and_deduplicated(self):
++        timeline = Timeline()
++        group = VGroup(Square(), Square())
++        timeline.schedule(FadeIn(group), at=0.0)
++        (row,) = timeline.report()
++        assert row["targets"] == sorted(row["targets"])
++        assert len(row["targets"]) == len(set(row["targets"]))
++
++
++class TestBuild:
++    def test_build_empty_timeline_raises(self):
++        with pytest.raises(ValueError):
++            Timeline().build()
++
++    def test_build_returns_animation_group(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        built = timeline.build()
++        assert isinstance(built, AnimationGroup)
++
++    def test_build_run_time_equals_duration(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square(), run_time=2.0), at=1.0)
++        timeline.schedule(FadeIn(Circle()), at=0.0)
++        built = timeline.build()
++        assert built.run_time == timeline.duration == 3.0
++
++    def test_build_wraps_entries_in_wait_succession(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=2.0)
++        built = timeline.build()
++        (child,) = built.animations
++        assert isinstance(child, Succession)
++        wait, animation = child.animations
++        assert isinstance(wait, Wait)
++        assert wait.run_time == 2.0
++        assert isinstance(animation, FadeIn)
++
++    def test_build_preserves_animation_identity(self):
++        timeline = Timeline()
++        animation = FadeIn(Square())
++        timeline.schedule(animation, at=1.0)
++        built = timeline.build()
++        assert built.animations[0].animations[1] is animation
++
++    def test_build_children_follow_insertion_order(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=4.0)
++        timeline.schedule(FadeIn(Circle()), at=0.0)
++        built = timeline.build()
++        waits = [child.animations[0].run_time for child in built.animations]
++        assert waits == [4.0, 0.0]
++
++    def test_build_zero_start_still_wraps_in_wait(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        built = timeline.build()
++        wait = built.animations[0].animations[0]
++        assert isinstance(wait, Wait)
++        assert wait.run_time == 0.0
++
++    def test_build_does_not_consume_timeline(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.build()
++        assert len(timeline) == 1
++        second_build = timeline.build()
++        assert isinstance(second_build, AnimationGroup)
++
++
++class TestRescale:
++    def make_timeline(self):
++        timeline = Timeline()
++        square, circle = Square(), Circle()
++        first = timeline.schedule(FadeIn(square, run_time=1.0), at=0.0)
++        timeline.schedule(Write(circle, run_time=2.0), after=first, delay=0.5)
++        return timeline
++
++    def test_rescale_scales_starts_and_run_times(self):
++        timeline = self.make_timeline()
++        scaled = timeline.rescale(2.0)
++        starts_and_ends = [(e.start, e.end) for e in scaled.entries]
++        assert starts_and_ends == [(0.0, 2.0), (3.0, 7.0)]
++        assert scaled.duration == 7.0
++
++    def test_rescale_down(self):
++        timeline = self.make_timeline()
++        scaled = timeline.rescale(0.5)
++        starts_and_ends = [(e.start, e.end) for e in scaled.entries]
++        assert starts_and_ends == [(0.0, 0.5), (0.75, 1.75)]
++        assert scaled.duration == 1.75
++
++    def test_rescale_by_one_preserves_schedule(self):
++        timeline = self.make_timeline()
++        scaled = timeline.rescale(1.0)
++        assert [(e.start, e.end) for e in scaled.entries] == [
++            (e.start, e.end) for e in timeline.entries
++        ]
++
++    def test_rescale_copies_animations(self):
++        timeline = self.make_timeline()
++        scaled = timeline.rescale(2.0)
++        for original, copy in zip(timeline.entries, scaled.entries):
++            assert copy.animation is not original.animation
++            assert type(copy.animation) is type(original.animation)
++
++    def test_rescale_leaves_original_untouched(self):
++        timeline = self.make_timeline()
++        before = [(e.start, e.run_time, e.delay) for e in timeline.entries]
++        timeline.rescale(3.0)
++        after = [(e.start, e.run_time, e.delay) for e in timeline.entries]
++        assert before == after
++
++    def test_rescale_scales_delays(self):
++        timeline = self.make_timeline()
++        scaled = timeline.rescale(2.0)
++        assert scaled.entries[0].delay == 0.0
++        assert scaled.entries[1].delay == 1.0
++
++    def test_rescale_preserves_dependencies(self):
++        timeline = self.make_timeline()
++        scaled = timeline.rescale(2.0)
++        assert scaled.entries[0].dependencies == ()
++        assert scaled.entries[1].dependencies == (scaled.entries[0],)
++
++    def test_rescale_dependencies_point_into_new_timeline(self):
++        timeline = self.make_timeline()
++        scaled = timeline.rescale(2.0)
++        dependency = scaled.entries[1].dependencies[0]
++        assert any(dependency is entry for entry in scaled.entries)
++        assert not any(dependency is entry for entry in timeline.entries)
++
++    def test_rescale_empty_timeline(self):
++        scaled = Timeline().rescale(2.0)
++        assert len(scaled) == 0
++        assert scaled.duration == 0.0
++
++    def test_rescale_zero_factor_raises(self):
++        timeline = self.make_timeline()
++        with pytest.raises(ValueError):
++            timeline.rescale(0.0)
++
++    def test_rescale_negative_factor_raises(self):
++        timeline = self.make_timeline()
++        with pytest.raises(ValueError):
++            timeline.rescale(-1.0)
++
++    def test_rescaled_timeline_can_be_built(self):
++        timeline = self.make_timeline()
++        built = timeline.rescale(4.0).build()
++        assert built.run_time == pytest.approx(14.0)
++
++
++class TestShift:
++    def test_shift_moves_starts(self):
++        timeline = Timeline()
++        first = timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.schedule(FadeIn(Circle()), after=first, delay=0.5)
++        shifted = timeline.shift(2.0)
++        assert [e.start for e in shifted.entries] == [2.0, 3.5]
++
++    def test_shift_leaves_original_untouched(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.shift(1.0)
++        assert timeline.entries[0].start == 0.0
++
++    def test_shift_negative_offset_that_stays_non_negative(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=1.0)
++        shifted = timeline.shift(-1.0)
++        assert shifted.entries[0].start == 0.0
++
++    def test_shift_rejects_would_be_negative(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=1.0)
++        with pytest.raises(ValueError):
++            timeline.shift(-2.0)
++
++
++class TestSlice:
++    def test_slice_keeps_only_contained_entries(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.schedule(FadeIn(Circle()), at=2.0)
++        timeline.schedule(FadeIn(Dot()), at=4.0)
++        sliced = timeline.slice(1.5, 3.5)
++        assert len(sliced) == 1
++        assert sliced.entries[0].start == 0.5
++
++    def test_slice_negative_start_raises(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        with pytest.raises(ValueError):
++            timeline.slice(-0.1, 1.0)
++
++    def test_slice_end_before_start_raises(self):
++        timeline = Timeline()
++        with pytest.raises(ValueError):
++            timeline.slice(2.0, 1.0)
++
++    def test_slice_empty_window(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        sliced = timeline.slice(1.0, 1.0)
++        assert len(sliced) == 0
++
++
++class TestMerge:
++    def test_merge_appends_with_default_offset(self):
++        first = Timeline()
++        first.schedule(FadeIn(Square(), run_time=2.0), at=0.0)
++        second = Timeline()
++        second.schedule(FadeIn(Circle()), at=0.0)
++        merged = first.merge(second)
++        assert [e.start for e in merged.entries] == [0.0, 2.0]
++        assert merged.duration == 3.0
++
++    def test_merge_with_explicit_offset(self):
++        first = Timeline()
++        first.schedule(FadeIn(Square()), at=0.0)
++        second = Timeline()
++        second.schedule(FadeIn(Circle()), at=0.0)
++        merged = first.merge(second, offset=5.0)
++        assert [e.start for e in merged.entries] == [0.0, 5.0]
++
++    def test_merge_type_check(self):
++        with pytest.raises(TypeError):
++            Timeline().merge("not a timeline")
++
++    def test_merge_negative_offset_rejected(self):
++        with pytest.raises(ValueError):
++            Timeline().merge(Timeline(), offset=-1.0)
++
++    def test_merge_leaves_operands_untouched(self):
++        first = Timeline()
++        first.schedule(FadeIn(Square()), at=0.0)
++        second = Timeline()
++        second.schedule(FadeIn(Circle()), at=0.0)
++        first.merge(second)
++        assert len(first) == 1
++        assert len(second) == 1
++
++    def test_add_is_merge(self):
++        first = Timeline()
++        first.schedule(FadeIn(Square(), run_time=2.0), at=0.0)
++        second = Timeline()
++        second.schedule(FadeIn(Circle()), at=0.0)
++        added = first + second
++        assert [e.start for e in added.entries] == [0.0, 2.0]
++
++    def test_add_with_non_timeline_raises(self):
++        with pytest.raises(TypeError):
++            Timeline() + 3
++
++    def test_merge_dependencies_stay_local(self):
++        left = Timeline()
++        a = left.schedule(FadeIn(Square()), at=0.0)
++        left.schedule(FadeIn(Circle()), after=a, delay=0.5)
++        right = Timeline()
++        r_a = right.schedule(FadeIn(Dot()), at=0.0)
++        right.schedule(FadeIn(Line()), after=r_a)
++        merged = left.merge(right, offset=10.0)
++        assert len(merged) == 4
++        # First two entries come from left, next two from right (shifted).
++        assert [e.start for e in merged.entries] == [0.0, 1.5, 10.0, 11.0]
++
++
++class TestTracks:
++    def test_tracks_partitions_non_overlapping(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.schedule(FadeIn(Circle()), at=2.0)
++        tracks = timeline.tracks()
++        assert len(tracks) == 1
++        assert len(tracks[0]) == 2
++
++    def test_tracks_splits_when_overlap(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.schedule(FadeIn(Circle()), at=0.5)
++        tracks = timeline.tracks()
++        assert len(tracks) == 2
++        assert all(len(track) == 1 for track in tracks)
++
++    def test_tracks_empty_timeline(self):
++        assert Timeline().tracks() == ()
++
++    def test_tracks_touching_allowed_on_same_track(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.schedule(FadeIn(Circle()), at=1.0)
++        tracks = timeline.tracks()
++        assert len(tracks) == 1
++
++
++class TestAffectedMobjectsHelpers:
++    def test_single_animation_family(self):
++        square = Square()
++        mobjects = affected_mobjects(FadeIn(square))
++        assert mobjects == [square]
++
++    def test_composite_animation_collects_all_leaves(self):
++        square, circle = Square(), Circle()
++        animation = AnimationGroup(FadeIn(square), FadeIn(circle))
++        assert set(map(id, affected_mobjects(animation))) == {
++            id(square),
++            id(circle),
++        }
++
++    def test_wait_has_no_affected_mobjects(self):
++        assert affected_mobjects(Wait(1.0)) == []
++        assert affected_type_names(Wait(1.0)) == []
++
++    def test_type_names_are_sorted(self):
++        animation = AnimationGroup(FadeIn(Square()), FadeIn(Circle()))
++        assert affected_type_names(animation) == ["Circle", "Square"]
++
++    def test_group_family_includes_group_itself(self):
++        group = VGroup(Square(), Circle())
++        names = affected_type_names(FadeIn(group))
++        assert names == ["Circle", "Square", "VGroup"]
++
++
++class TestAnimationIntrospectionHooks:
++    def test_animation_iter_leaves_default(self):
++        anim = FadeIn(Square())
++        assert list(anim.iter_leaves()) == [anim]
++
++    def test_animation_group_iter_leaves_recurses(self):
++        a = FadeIn(Square())
++        b = FadeIn(Circle())
++        group = AnimationGroup(a, b)
++        assert list(group.iter_leaves()) == [a, b]
++
++    def test_nested_animation_group_iter_leaves(self):
++        a = FadeIn(Square())
++        b = FadeIn(Circle())
++        c = FadeIn(Dot())
++        group = Succession(AnimationGroup(a, b), c)
++        assert list(group.iter_leaves()) == [a, b, c]
++
++    def test_wait_is_placeholder(self):
++        assert Wait(1.0).is_placeholder() is True
++        assert FadeIn(Square()).is_placeholder() is False
++
++    def test_animation_affected_family_family_order(self):
++        group = VGroup(Square(), Circle())
++        family = FadeIn(group).affected_family()
++        assert family[0] is group
++
++
++class TestPlayTimeline:
++    def test_play_timeline_rejects_non_timeline(self):
++        with tempconfig({"dry_run": True, "quality": "low_quality"}):
++            scene = Scene()
++            with pytest.raises(TypeError):
++                scene.play_timeline("not a timeline")
++
++    def test_play_timeline_advances_scene_time_by_duration(self):
++        class TimelineScene(Scene):
++            def construct(self):
++                self.square = Square()
++                self.circle = Circle()
++                timeline = Timeline()
++                timeline.schedule(FadeIn(self.square), at=0.0)
++                timeline.schedule(FadeIn(self.circle), at=0.5)
++                timeline.schedule(FadeOut(self.square), at=2.0)
++                self.play_timeline(timeline)
++
++        with tempconfig({"dry_run": True, "quality": "low_quality"}):
++            scene = TimelineScene()
++            scene.render()
++            assert scene.time == pytest.approx(3.0)
++            assert scene.square not in scene.mobjects
++            assert scene.circle in scene.mobjects
++
++    def test_play_timeline_passes_build_result_to_play(self):
++        recorded = []
++
++        class RecordingScene(Scene):
++            def play(self, *args, **kwargs):
++                recorded.append((args, kwargs))
++
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=1.0)
++        with tempconfig({"dry_run": True, "quality": "low_quality"}):
++            scene = RecordingScene()
++            scene.play_timeline(timeline)
++        ((args, _),) = recorded
++        (played,) = args
++        assert isinstance(played, Timeline)
++
++
++class TestScenePlayAcceptsTimeline:
++    """`Scene.play(timeline)` should work exactly like `play_timeline`."""
++
++    def test_play_expands_single_timeline(self):
++        recorded = []
++
++        class Recording(Scene):
++            def renderer_play(self, scene, *args, **kwargs):
++                pass
++
++        class WrapperScene(Scene):
++            def play(self, *args, **kwargs):
++                # Simulate the expansion happening in Scene.play. We can
++                # detect it by hooking renderer.play indirectly: instead
++                # of calling super we just record what would arrive.
++                from manim.scene.timeline import Timeline as _TL
++
++                expanded = tuple(
++                    a.build() if isinstance(a, _TL) else a for a in args
++                )
++                recorded.append(expanded)
++
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=1.0)
++        scene = WrapperScene()
++        scene.play(timeline)
++        (args,) = recorded
++        (played,) = args
++        assert isinstance(played, AnimationGroup)
++        assert played.run_time == timeline.duration
++
++    def test_scene_play_end_to_end_with_timeline(self):
++        class TimelineScene(Scene):
++            def construct(self):
++                self.square = Square()
++                timeline = Timeline()
++                timeline.schedule(FadeIn(self.square), at=0.0)
++                timeline.schedule(FadeOut(self.square), at=1.0)
++                self.play(timeline)
++
++        with tempconfig({"dry_run": True, "quality": "low_quality"}):
++            scene = TimelineScene()
++            scene.render()
++            assert scene.time == pytest.approx(2.0)
++            assert scene.square not in scene.mobjects
++
++    def test_regression_play_still_accepts_plain_animation(self):
++        recorded = []
++
++        class RecordingScene(Scene):
++            def play(self, *args, **kwargs):
++                recorded.append(args)
++
++        with tempconfig({"dry_run": True, "quality": "low_quality"}):
++            scene = RecordingScene()
++            scene.play(FadeIn(Square()))
++        assert isinstance(recorded[0][0], Animation)
++
++
++class TestScheduleResolutionTable:
++    @pytest.mark.parametrize(
++        ("at", "use_after", "delay", "expected_start"),
++        [
++            (None, False, 0.0, 3.0),
++            (None, False, 0.5, 3.5),
++            (5.0, False, 0.0, 5.0),
++            (5.0, False, 1.0, 6.0),
++            (0.0, False, 0.0, 0.0),
++            (None, True, 0.0, 3.0),
++            (None, True, 2.0, 5.0),
++            (10.0, True, 0.0, 10.0),
++            (10.0, True, 1.0, 11.0),
++            (1.5, True, 0.0, 3.0),
++            (1.5, True, 0.25, 3.25),
++            (3.0, True, 0.0, 3.0),
++        ],
++    )
++    def test_resolution_rules(self, at, use_after, delay, expected_start):
++        timeline = Timeline()
++        reference = timeline.schedule(FadeIn(Square(), run_time=2.0), at=1.0)
++        kwargs = {"at": at, "delay": delay}
++        if use_after:
++            kwargs["after"] = reference
++        entry = timeline.schedule(FadeIn(Circle()), **kwargs)
++        assert entry.start == expected_start
++        assert entry.delay == delay
++
++    def test_animation_builder_is_rejected(self):
++        from manim import UP
++
++        timeline = Timeline()
++        builder = Square().animate.shift(UP)
++        with pytest.raises(TypeError):
++            timeline.schedule(builder)
++
++    def test_mobject_is_rejected(self):
++        timeline = Timeline()
++        with pytest.raises(TypeError):
++            timeline.schedule(VGroup(Square(), Circle()))
++
++    def test_wait_uses_default_run_time(self):
++        timeline = Timeline()
++        entry = timeline.schedule(Wait(), at=0.0)
++        assert entry.run_time == 1.0
++        assert entry.end == 1.0
++
++
++class TestGaps:
++    def test_empty_timeline_has_no_gaps(self):
++        assert Timeline().gaps() == ()
++
++    def test_single_entry_from_zero_has_no_gaps(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        assert timeline.gaps() == ()
++
++    def test_leading_gap_is_reported(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=2.0)
++        assert timeline.gaps() == ((0.0, 2.0),)
++
++    def test_idle_interval_between_entries(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.schedule(FadeIn(Circle()), at=3.0)
++        assert timeline.gaps() == ((1.0, 3.0),)
++
++    def test_multiple_gaps(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=1.0)
++        timeline.schedule(FadeIn(Circle()), at=4.0)
++        timeline.schedule(FadeIn(Dot()), at=7.0)
++        assert timeline.gaps() == ((0.0, 1.0), (2.0, 4.0), (5.0, 7.0))
++
++    def test_overlapping_entries_merge_before_gap_computation(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square(), run_time=3.0), at=0.0)
++        timeline.schedule(FadeIn(Circle()), at=1.0)
++        timeline.schedule(FadeIn(Dot()), at=4.0)
++        assert timeline.gaps() == ((3.0, 4.0),)
++
++    def test_touching_entries_produce_no_gap(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=0.0)
++        timeline.schedule(FadeIn(Circle()), at=1.0)
++        assert timeline.gaps() == ()
++
++    def test_no_trailing_gap(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square()), at=5.0)
++        gaps = timeline.gaps()
++        assert gaps == ((0.0, 5.0),)
++        assert timeline.duration == 6.0
++
++
++class TestTimelineRepr:
++    def test_repr_mentions_entry_count_and_duration(self):
++        timeline = Timeline()
++        timeline.schedule(FadeIn(Square(), run_time=2.0), at=1.0)
++        timeline.schedule(FadeIn(Circle()), at=5.0)
++        text = repr(timeline)
++        assert "Timeline" in text
++        assert "2" in text
++        assert "6.0" in text
++
++
++class TestScheduleEquivalenceWithManualComposition:
++    """A timeline built from sequential appends must be equivalent to the
++    manually chained version of the same composition."""
++
++    def test_appending_matches_manual_chaining(self):
++        chained = Timeline()
++        first = chained.schedule(FadeIn(Square()), at=0.0)
++        second = chained.schedule(FadeIn(Circle()), after=first)
++        chained.schedule(FadeIn(Dot()), after=second)
++
++        appended = Timeline()
++        appended.schedule(FadeIn(Square()), at=0.0)
++        appended.schedule(FadeIn(Circle()))
++        appended.schedule(FadeIn(Dot()))
++
++        assert [e.start for e in appended.entries] == [
++            e.start for e in chained.entries
++        ]
++        assert [e.end for e in appended.entries] == [
++            e.end for e in chained.entries
++        ]
++        assert appended.duration == chained.duration == 3.0
++
++    def test_built_compositions_match(self):
++        chained = Timeline()
++        first = chained.schedule(FadeIn(Square()), at=0.0)
++        chained.schedule(FadeIn(Circle()), after=first)
++
++        appended = Timeline()
++        appended.schedule(FadeIn(Square()), at=0.0)
++        appended.schedule(FadeIn(Circle()))
++
++        assert chained.build().run_time == appended.build().run_time
++
++
++class TestConflictAdditional:
++    @pytest.mark.parametrize("offset", [0.1, 0.5, 0.9, 0.999999])
++    def test_any_strict_overlap_conflicts(self, offset):
++        timeline = Timeline()
++        square = Square()
++        timeline.schedule(FadeIn(square), at=0.0)
++        with pytest.raises(TimelineConflictError):
++            timeline.schedule(FadeOut(square), at=offset)
++
++    @pytest.mark.parametrize("at", [1.0, 1.5, 2.0, 10.0])
++    def test_non_overlapping_times_are_accepted(self, at):
++        timeline = Timeline()
++        square = Square()
++        timeline.schedule(FadeIn(square), at=0.0)
++        entry = timeline.schedule(FadeOut(square), at=at)
++        assert entry.start == at
++
++    def test_indicate_on_group_conflicts_with_member_animation(self):
++        timeline = Timeline()
++        square, circle = Square(), Circle()
++        group = VGroup(square, circle)
++        timeline.schedule(Indicate(square), at=0.0)
++        with pytest.raises(TimelineConflictError):
++            timeline.schedule(Indicate(group), at=0.25)
++
++    def test_two_groups_sharing_a_member_conflict(self):
++        timeline = Timeline()
++        shared = Square()
++        group_a = VGroup(shared, Circle())
++        group_b = VGroup(shared, Dot())
++        timeline.schedule(FadeIn(group_a), at=0.0)
++        with pytest.raises(TimelineConflictError):
++            timeline.schedule(FadeIn(group_b), at=0.5)
++
++
++class TestMergeMore:
++    def test_merge_with_dependencies_preserved(self):
++        left = Timeline()
++        a = left.schedule(FadeIn(Square()), at=0.0)
++        b = left.schedule(FadeIn(Circle()), after=a)
++        merged = left.merge(Timeline())
++        # Even with an empty right-hand side, dependencies on the left
++        # copy must point back into the merged timeline.
++        assert merged.entries[1].dependencies[0] is merged.entries[0]
++        assert merged.entries[1].start == 1.0
++
++    def test_merge_with_offset_zero(self):
++        left = Timeline()
++        left.schedule(FadeIn(Square()), at=0.0)
++        right = Timeline()
++        right.schedule(FadeIn(Circle()), at=1.0)
++        merged = left.merge(right, offset=0.0)
++        assert [e.start for e in merged.entries] == [0.0, 1.0]
++
++
++class TestRegressionOnExistingBehavior:
++    """The introspection hooks introduced for Timeline must not change
++    any pre-existing behavior of Animation / AnimationGroup / Wait /
++    Scene.play."""
++
++    def test_wait_still_supports_construction_with_run_time(self):
++        wait = Wait(2.5)
++        assert wait.run_time == 2.5
++
++    def test_animation_group_still_has_animations_attribute(self):
++        first = FadeIn(Square())
++        group = AnimationGroup(first, FadeIn(Circle()))
++        assert group.animations[0] is first
++
++    def test_animation_group_run_time_defaults_to_children(self):
++        group = AnimationGroup(FadeIn(Square(), run_time=2.0), FadeIn(Circle()))
++        assert group.run_time == 2.0
++
++    def test_scene_play_still_accepts_multiple_animations(self):
++        recorded = []
++
++        class RecordingScene(Scene):
++            def play(self, *args, **kwargs):
++                recorded.append(args)
++
++        scene = RecordingScene()
++        scene.play(FadeIn(Square()), FadeIn(Circle()))
++        assert len(recorded[0]) == 2
++
++
++class TestPublicApiSurface:
++    def test_timeline_importable_from_top_level(self):
++        import manim
++
++        assert manim.Timeline is Timeline
++
++    def test_scheduled_animation_importable_from_top_level(self):
++        import manim
++
++        assert manim.ScheduledAnimation is ScheduledAnimation
++
++    def test_conflict_error_importable_from_top_level(self):
++        import manim
++
++        assert manim.TimelineConflictError is TimelineConflictError
++
++    def test_play_timeline_is_scene_method(self):
++        assert callable(Scene.play_timeline)
++
++    def test_schedule_returns_scheduled_animation(self):
++        timeline = Timeline()
++        entry = timeline.schedule(FadeIn(Square()), at=0.0)
++        assert isinstance(entry, ScheduledAnimation)
++
++    def test_timeline_module_all(self):
++        from manim.scene import timeline as timeline_module
++
++        assert set(timeline_module.__all__) == {
++            "Timeline",
++            "ScheduledAnimation",
++            "TimelineConflictError",
++        }

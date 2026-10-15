@@ -1,0 +1,2456 @@
+diff --git a/altair/__init__.py b/altair/__init__.py
+--- a/altair/__init__.py
++++ b/altair/__init__.py
+@@ -261,6 +261,8 @@
+     "LineConfig",
+     "LineString",
+     "LinearGradient",
++    "LintError",
++    "LintIssue",
+     "LocalMultiTimeUnit",
+     "LocalSingleTimeUnit",
+     "Locale",
+@@ -622,6 +624,7 @@
+     "jupyter",
+     "layer",
+     "limit_rows",
++    "lint",
+     "load_ipython_extension",
+     "load_schema",
+     "mixins",
+@@ -662,6 +665,7 @@
+ from altair.jupyter import JupyterChart
+ from altair.expr import expr
+ from altair.utils import AltairDeprecationWarning, parse_shorthand, Undefined
++from altair.vegalite.v6.api import LintError, LintIssue, lint
+ from altair import datasets, theme, typing
+ 
+ 
+diff --git a/altair/utils/core.py b/altair/utils/core.py
+--- a/altair/utils/core.py
++++ b/altair/utils/core.py
+@@ -523,6 +523,11 @@
+     return data_nw
+ 
+ 
++#: Sentinel key used by :func:`parse_shorthand` in ``errors="collect"`` mode
++#: to attach a parse-error message to an otherwise-usable attribute dict.
++SHORTHAND_ERROR_KEY = "__shorthand_error__"
++
++
+ def parse_shorthand(  # noqa: C901
+     shorthand: dict[str, Any] | str,
+     data: IntoDataFrame | None = None,
+@@ -530,6 +535,8 @@
+     parse_window_ops: bool = False,
+     parse_timeunits: bool = True,
+     parse_types: bool = True,
++    *,
++    errors: str = "raise",
+ ) -> dict[str, Any]:
+     """
+     General tool to parse shorthand values.
+@@ -559,6 +566,16 @@
+         If True (default), then parse timeUnits from within the shorthand
+     parse_types : boolean
+         If True (default), then parse typecodes within the shorthand
++    errors : {"raise", "collect"}, keyword-only, optional
++        How to react when the shorthand cannot be parsed.  The default
++        ``"raise"`` preserves the historical behavior: an invalid type code
++        or an unmatched shorthand raises ``ValueError`` / ``StopIteration``
++        respectively.  ``"collect"`` instead never raises for the two
++        parse-time failure modes -- it returns whatever attributes could be
++        extracted plus a ``"__shorthand_error__"`` key holding a
++        human-readable description of the problem.  This mode is designed
++        for tools such as :func:`altair.lint` that want to accumulate
++        diagnostics without unwinding the stack.
+ 
+     Returns
+     -------
+@@ -627,6 +644,13 @@
+     """
+     from altair.utils.data import is_data_type
+ 
++    if errors not in {"raise", "collect"}:
++        msg = (
++            "parse_shorthand: 'errors' must be 'raise' or 'collect', "
++            f"got {errors!r}"
++        )
++        raise ValueError(msg)
++
+     if not shorthand:
+         return {}
+ 
+@@ -646,20 +670,39 @@
+     if parse_types:
+         patterns = list(itertools.chain(*((p + ":{type}", p) for p in patterns)))
+ 
+-    regexps = (
++    regexps = [
+         re.compile(r"\A" + p.format(**SHORTHAND_UNITS) + r"\Z", re.DOTALL)
+         for p in patterns
+-    )
++    ]
+ 
+     # find matches depending on valid fields passed
+     if isinstance(shorthand, dict):
+         attrs = shorthand
+     else:
+-        attrs = next(
+-            exp.match(shorthand).groupdict()  # type: ignore[union-attr]
+-            for exp in regexps
+-            if exp.match(shorthand) is not None
+-        )
++        matched: dict[str, Any] | None = None
++        for exp in regexps:
++            m = exp.match(shorthand)
++            if m is not None:
++                matched = m.groupdict()
++                break
++        if matched is None:
++            if errors == "collect":
++                return {
++                    SHORTHAND_ERROR_KEY: (
++                        f"shorthand {shorthand!r} does not match any known "
++                        "pattern"
++                    )
++                }
++            # Reproduce the historical behavior of ``next(...)`` on an
++            # empty iterator, wrapped in a slightly more descriptive
++            # ValueError so callers can attribute the failure.
++            msg = (
++                f"shorthand {shorthand!r} does not match any known pattern; "
++                "expected forms include 'field', 'field:Q', 'sum(field)', "
++                "'sum(field):Q', 'month(field)', ..."
++            )
++            raise ValueError(msg)
++        attrs = matched
+ 
+     # Handle short form of the type expression
+     if "type" in attrs:
+@@ -698,8 +741,9 @@
+         and ":" in attrs["field"]
+         and attrs["field"][attrs["field"].rfind(":") - 1] != "\\"
+     ):
+-        raise ValueError(
+-            '"{}" '.format(attrs["field"].split(":")[-1])
++        bad_type = attrs["field"].split(":")[-1]
++        message = (
++            '"{}" '.format(bad_type)
+             + "is not one of the valid encoding data types: {}.".format(
+                 ", ".join(TYPECODE_MAP.values())
+             )
+@@ -707,6 +751,14 @@
+             + "If you are trying to use a column name that contains a colon, "
+             + 'prefix it with a backslash; for example "column\\:name" instead of "column:name".'
+         )
++        if errors == "collect":
++            attrs = dict(attrs)
++            attrs[SHORTHAND_ERROR_KEY] = (
++                f"{bad_type!r} is not a valid encoding data type "
++                f"(in shorthand {shorthand!r})"
++            )
++            return attrs
++        raise ValueError(message)
+     return attrs
+ 
+ 
+diff --git a/altair/vegalite/v6/api.py b/altair/vegalite/v6/api.py
+--- a/altair/vegalite/v6/api.py
++++ b/altair/vegalite/v6/api.py
+@@ -2034,12 +2034,1283 @@
+         raise TypeError(msg)
+ 
+ 
++# ---------------------------------------------------------------------------
++# Static ("no-render") chart-specification linter
++#
++# The rules below inspect a chart tree without ever calling ``to_dict()``,
++# hitting the Vega-Lite compiler, or looking at the data.  Their valid-value
++# sets come from the Vega-Lite JSON schema that ships with this package
++# (``altair/vegalite/v6/schema/vega-lite-schema.json``): the frozen sets
++# here are kept in-file so linting is cheap and deterministic and does not
++# depend on the (large) schema document being parsed at runtime.
++#
++# Historically these checks either fired far too late (schema validation,
++# the Vega-Lite compiler in the browser) or not at all (silent no-ops when
++# a channel name is unknown, when a scale is incompatible with the field
++# type, ...).  The linter exposes them at ``altair.lint`` / ``chart.lint``
++# and, when the caller asks for it, wires them into ``to_dict`` /
++# ``to_json`` via the ``strict_lint`` keyword argument.
++# ---------------------------------------------------------------------------
++
++#: Severity labels used on :class:`LintIssue`.
++_LINT_SEVERITY_ERROR = "error"
++_LINT_SEVERITY_WARNING = "warning"
++
++#: Primitive marks (schema definition ``Mark``) plus the three composite
++#: marks (schema union ``CompositeMark``: ``BoxPlot``, ``ErrorBar``,
++#: ``ErrorBand``).
++_LINT_MARK_TYPES: frozenset[str] = frozenset(
++    {
++        # primitive marks
++        "arc",
++        "area",
++        "bar",
++        "image",
++        "line",
++        "point",
++        "rect",
++        "rule",
++        "text",
++        "tick",
++        "trail",
++        "circle",
++        "square",
++        "geoshape",
++        # composite marks
++        "boxplot",
++        "errorbar",
++        "errorband",
++    }
++)
++
++#: Schema definition ``AggregateOp`` (basic aggregate + composite BoxPlot
++#: helpers like ``q1``/``q3``/``ci0``/``ci1``/``stderr`` and the newer
++#: ``exponential``/``exponentialb`` operators).
++_LINT_AGGREGATE_OPS: frozenset[str] = frozenset(
++    {
++        "argmax",
++        "argmin",
++        "average",
++        "count",
++        "distinct",
++        "max",
++        "mean",
++        "median",
++        "min",
++        "missing",
++        "product",
++        "q1",
++        "q3",
++        "ci0",
++        "ci1",
++        "stderr",
++        "stdev",
++        "stdevp",
++        "sum",
++        "valid",
++        "values",
++        "variance",
++        "variancep",
++        "exponential",
++        "exponentialb",
++    }
++)
++
++#: Schema definition ``Type`` -- the measurement type of a channel.
++_LINT_FIELD_TYPES: frozenset[str] = frozenset(
++    {"quantitative", "ordinal", "temporal", "nominal", "geojson"}
++)
++
++#: Schema definition ``ScaleType``.
++_LINT_SCALE_TYPES: frozenset[str] = frozenset(
++    {
++        "linear",
++        "log",
++        "pow",
++        "sqrt",
++        "symlog",
++        "identity",
++        "sequential",
++        "time",
++        "utc",
++        "quantile",
++        "quantize",
++        "threshold",
++        "bin-ordinal",
++        "ordinal",
++        "point",
++        "band",
++    }
++)
++
++#: Continuous scale types that only make sense for a numeric measurement.
++_LINT_CONTINUOUS_ONLY_SCALES: frozenset[str] = frozenset(
++    {"log", "pow", "sqrt", "symlog"}
++)
++
++#: Scale types that require a temporal field.
++_LINT_TEMPORAL_ONLY_SCALES: frozenset[str] = frozenset({"time", "utc"})
++
++#: Field types that are never valid for continuous-only scales.
++_LINT_NON_CONTINUOUS_TYPES: frozenset[str] = frozenset(
++    {"nominal", "ordinal", "geojson"}
++)
++
++#: Field types that are never valid for a sequential color scale.
++_LINT_NON_SEQUENTIAL_TYPES: frozenset[str] = frozenset({"nominal", "geojson"})
++
++#: Union of the schema definitions ``LocalSingleTimeUnit``,
++#: ``UtcSingleTimeUnit``, ``LocalMultiTimeUnit``, ``UtcMultiTimeUnit`` and
++#: ``BinnedTimeUnit`` (together they form ``TimeUnit``).
++_LINT_TIME_UNITS: frozenset[str] = frozenset(
++    {
++        # local single time units
++        "year",
++        "quarter",
++        "month",
++        "week",
++        "day",
++        "dayofyear",
++        "date",
++        "hours",
++        "minutes",
++        "seconds",
++        "milliseconds",
++        # utc single time units
++        "utcyear",
++        "utcquarter",
++        "utcmonth",
++        "utcweek",
++        "utcday",
++        "utcdayofyear",
++        "utcdate",
++        "utchours",
++        "utcminutes",
++        "utcseconds",
++        "utcmilliseconds",
++        # local multi time units
++        "yearquarter",
++        "yearquartermonth",
++        "yearmonth",
++        "yearmonthdate",
++        "yearmonthdatehours",
++        "yearmonthdatehoursminutes",
++        "yearmonthdatehoursminutesseconds",
++        "yearweek",
++        "yearweekday",
++        "yearweekdayhours",
++        "yearweekdayhoursminutes",
++        "yearweekdayhoursminutesseconds",
++        "yeardayofyear",
++        "quartermonth",
++        "monthdate",
++        "monthdatehours",
++        "monthdatehoursminutes",
++        "monthdatehoursminutesseconds",
++        "weekday",
++        "weekdayhours",
++        "weekdayhoursminutes",
++        "weekdayhoursminutesseconds",
++        "dayhours",
++        "dayhoursminutes",
++        "dayhoursminutesseconds",
++        "hoursminutes",
++        "hoursminutesseconds",
++        "minutesseconds",
++        "secondsmilliseconds",
++        # utc multi time units
++        "utcyearquarter",
++        "utcyearquartermonth",
++        "utcyearmonth",
++        "utcyearmonthdate",
++        "utcyearmonthdatehours",
++        "utcyearmonthdatehoursminutes",
++        "utcyearmonthdatehoursminutesseconds",
++        "utcyearweek",
++        "utcyearweekday",
++        "utcyearweekdayhours",
++        "utcyearweekdayhoursminutes",
++        "utcyearweekdayhoursminutesseconds",
++        "utcyeardayofyear",
++        "utcquartermonth",
++        "utcmonthdate",
++        "utcmonthdatehours",
++        "utcmonthdatehoursminutes",
++        "utcmonthdatehoursminutesseconds",
++        "utcweekday",
++        "utcweekdayhours",
++        "utcweekdayhoursminutes",
++        "utcweekdayhoursminutesseconds",
++        "utcdayhours",
++        "utcdayhoursminutes",
++        "utcdayhoursminutesseconds",
++        "utchoursminutes",
++        "utchoursminutesseconds",
++        "utcminutesseconds",
++        "utcsecondsmilliseconds",
++        # binned time units
++        "binnedyear",
++        "binnedyearquarter",
++        "binnedyearquartermonth",
++        "binnedyearmonth",
++        "binnedyearmonthdate",
++        "binnedyearmonthdatehours",
++        "binnedyearmonthdatehoursminutes",
++        "binnedyearmonthdatehoursminutesseconds",
++        "binnedyearweek",
++        "binnedyearweekday",
++        "binnedyearweekdayhours",
++        "binnedyearweekdayhoursminutes",
++        "binnedyearweekdayhoursminutesseconds",
++        "binnedyeardayofyear",
++        "binnedutcyear",
++        "binnedutcyearquarter",
++        "binnedutcyearquartermonth",
++        "binnedutcyearmonth",
++        "binnedutcyearmonthdate",
++        "binnedutcyearmonthdatehours",
++        "binnedutcyearmonthdatehoursminutes",
++        "binnedutcyearmonthdatehoursminutesseconds",
++        "binnedutcyearweek",
++        "binnedutcyearweekday",
++        "binnedutcyearweekdayhours",
++        "binnedutcyearweekdayhoursminutes",
++        "binnedutcyearweekdayhoursminutesseconds",
++        "binnedutcyeardayofyear",
++    }
++)
++
++#: Schema definition ``StackOffset`` plus the boolean shorthands Vega-Lite
++#: accepts (``True`` is equivalent to ``"zero"``, ``False``/``None`` disable
++#: stacking).
++_LINT_STACK_VALUES: frozenset[Any] = frozenset(
++    {"zero", "center", "normalize", True, False}
++)
++
++#: Schema definition ``SortOrder``.
++_LINT_SORT_ORDERS: frozenset[str] = frozenset({"ascending", "descending"})
++
++#: Schema definitions ``SortByChannel`` / ``SortByChannelDesc``.  Sorting an
++#: encoding by another channel of the same view, optionally with a leading
++#: ``-`` for descending order.
++_LINT_SORT_BY_CHANNEL: frozenset[str] = frozenset(
++    {
++        "x",
++        "y",
++        "color",
++        "fill",
++        "stroke",
++        "strokeWidth",
++        "size",
++        "shape",
++        "fillOpacity",
++        "strokeOpacity",
++        "opacity",
++        "text",
++    }
++)
++
++#: All valid string values for an encoding ``sort`` property.
++_LINT_SORT_STRINGS: frozenset[str] = frozenset(
++    set(_LINT_SORT_ORDERS)
++    | _LINT_SORT_BY_CHANNEL
++    | {"-" + ch for ch in _LINT_SORT_BY_CHANNEL}
++)
++
++#: Union of the property names of the schema definitions ``Encoding`` and
++#: ``FacetedEncoding`` -- every channel an encoding block may carry.
++_LINT_CHANNEL_NAMES: frozenset[str] = frozenset(
++    {
++        "angle",
++        "color",
++        "column",
++        "description",
++        "detail",
++        "facet",
++        "fill",
++        "fillOpacity",
++        "href",
++        "key",
++        "latitude",
++        "latitude2",
++        "longitude",
++        "longitude2",
++        "opacity",
++        "order",
++        "radius",
++        "radius2",
++        "row",
++        "shape",
++        "size",
++        "stroke",
++        "strokeDash",
++        "strokeOpacity",
++        "strokeWidth",
++        "text",
++        "theta",
++        "theta2",
++        "time",
++        "tooltip",
++        "url",
++        "x",
++        "x2",
++        "xError",
++        "xError2",
++        "xOffset",
++        "y",
++        "y2",
++        "yError",
++        "yError2",
++        "yOffset",
++    }
++)
++
++#: Secondary position channels and the base channel they require (rule
++#: W001).
++_LINT_SECONDARY_CHANNELS: dict[str, str] = {
++    "x2": "x",
++    "y2": "y",
++    "longitude2": "longitude",
++    "latitude2": "latitude",
++}
++
++#: Composite keys that turn a spec node into a wrapper (non-unit) view.
++_LINT_COMPOSITE_LIST_KEYS = ("layer", "concat", "hconcat", "vconcat")
++
++#: Channel-definition keys whose presence means the channel carries no
++#: field reference (and therefore skips all field-oriented rules).
++_LINT_NON_FIELD_KEYS = ("value", "datum")
++
++
++class LintIssue:
++    """A single finding produced by :func:`altair.lint`.
++
++    Attributes
++    ----------
++    code : str
++        Stable rule identifier, e.g. ``"E003"``.  ``E``-prefixed codes are
++        errors, ``W``-prefixed codes are warnings.
++    severity : str
++        Either ``"error"`` or ``"warning"``.
++    path : str
++        Location of the offending node in the (possibly nested) chart,
++        using dotted keys and ``[i]`` indices; the root chart itself is
++        ``""``.  Examples: ``"encoding.x"``, ``"layer[1].encoding.y"``,
++        ``"spec.facet.row"``, ``"params[0]"``.
++    message : str
++        Human-readable description of the problem.  For rules that are
++        triggered by a concrete value (an unknown mark, aggregate, sort,
++        scale type, ...) the offending value is included in the message
++        so callers can find the exact spot without having to re-derive it
++        from the path alone.
++
++    Notes
++    -----
++    :class:`LintIssue` objects are immutable value objects: they support
++    equality and hashing based on their four attributes.  This makes them
++    safe to use as dictionary keys and to compare against a frozen set of
++    expected findings in tests.
++    """
++
++    __slots__ = ("code", "severity", "path", "message")
++
++    def __init__(self, code: str, severity: str, path: str, message: str) -> None:
++        if severity not in (_LINT_SEVERITY_ERROR, _LINT_SEVERITY_WARNING):
++            msg = (
++                f"LintIssue: severity must be 'error' or 'warning', "
++                f"got {severity!r}"
++            )
++            raise ValueError(msg)
++        self.code = code
++        self.severity = severity
++        self.path = path
++        self.message = message
++
++    def __eq__(self, other: Any) -> bool:
++        if not isinstance(other, LintIssue):
++            return NotImplemented
++        return (
++            self.code,
++            self.severity,
++            self.path,
++            self.message,
++        ) == (other.code, other.severity, other.path, other.message)
++
++    def __hash__(self) -> int:
++        return hash((self.code, self.severity, self.path, self.message))
++
++    def __repr__(self) -> str:
++        return (
++            f"LintIssue(code={self.code!r}, severity={self.severity!r}, "
++            f"path={self.path!r}, message={self.message!r})"
++        )
++
++    def __str__(self) -> str:
++        location = self.path if self.path else "<root>"
++        return f"{self.code} [{self.severity}] {location}: {self.message}"
++
++
++class LintError(ValueError):
++    """Raised by ``to_dict(strict_lint=True)`` when E-level issues are found.
++
++    Subclasses :class:`ValueError` so callers who already have a broad
++    ``except ValueError`` clause (e.g. around ``to_dict`` /
++    ``to_json`` / ``save``) automatically catch it.
++
++    Attributes
++    ----------
++    issues : list of LintIssue
++        The ``E``-level findings that caused this error.  ``W``-level
++        findings never trigger :class:`LintError`.
++    """
++
++    __slots__ = ("issues",)
++
++    def __init__(self, issues: list[LintIssue]) -> None:
++        self.issues = list(issues)
++        header = (
++            f"altair.lint reported {len(self.issues)} error"
++            f"{'s' if len(self.issues) != 1 else ''}:"
++        )
++        body = "\n".join(f"  {issue}" for issue in self.issues)
++        super().__init__(f"{header}\n{body}" if body else header)
++
++    def codes(self) -> list[str]:
++        """Rule codes of the wrapped :class:`LintIssue` objects, in order.
++
++        A small convenience helper for callers who want to check whether
++        a specific code was triggered without having to iterate over the
++        full issue list themselves.
++        """
++        return [issue.code for issue in self.issues]
++
++    def paths(self) -> list[str]:
++        """Paths of the wrapped :class:`LintIssue` objects, in order."""
++        return [issue.path for issue in self.issues]
++
++    def has_code(self, code: str) -> bool:
++        """Return ``True`` if any wrapped issue has the given rule ``code``."""
++        return any(issue.code == code for issue in self.issues)
++
++    def summary(self) -> str:
++        """Return a compact one-line summary of the wrapped issues.
++
++        The first line of :func:`str` on the exception body is the same
++        format, but this method returns just the summary without the
++        per-issue detail lines.
++        """
++        n = len(self.issues)
++        return (
++            f"altair.lint reported {n} error{'s' if n != 1 else ''}"
++        )
++
++
++#: The public rule catalog.  Each entry maps a rule code to a
++#: ``(severity, short description)`` pair.  Intended for tooling that
++#: wants to render its own reports (documentation generators, IDE
++#: integrations, CI comment bots).  The mapping is intentionally sorted
++#: by code so iteration order is stable.
++_LINT_RULE_CATALOG: dict[str, tuple[str, str]] = {
++    "E001": (
++        _LINT_SEVERITY_ERROR,
++        "encoding channel name is not a known Vega-Lite channel",
++    ),
++    "E002": (
++        _LINT_SEVERITY_ERROR,
++        "unit chart has no mark, or the mark type is unknown",
++    ),
++    "E003": (
++        _LINT_SEVERITY_ERROR,
++        "aggregate operation is not a known AggregateOp",
++    ),
++    "E004": (
++        _LINT_SEVERITY_ERROR,
++        "timeUnit is not a known Vega-Lite time unit",
++    ),
++    "E005": (
++        _LINT_SEVERITY_ERROR,
++        "encoding field type is not a known measurement type",
++    ),
++    "E006": (
++        _LINT_SEVERITY_ERROR,
++        "scale.type is not a known ScaleType",
++    ),
++    "E007": (
++        _LINT_SEVERITY_ERROR,
++        "scale.type is incompatible with the field type",
++    ),
++    "E008": (
++        _LINT_SEVERITY_ERROR,
++        "stack value is not a known StackOffset",
++    ),
++    "E009": (
++        _LINT_SEVERITY_ERROR,
++        "shorthand string cannot be parsed",
++    ),
++    "E010": (
++        _LINT_SEVERITY_ERROR,
++        "channel combines aggregate with bin",
++    ),
++    "E011": (
++        _LINT_SEVERITY_ERROR,
++        "sort string is not a known sort directive",
++    ),
++    "E012": (
++        _LINT_SEVERITY_ERROR,
++        "a parameter name is defined more than once in the chart tree",
++    ),
++    "E013": (
++        _LINT_SEVERITY_ERROR,
++        "bin string value other than 'binned'",
++    ),
++    "E014": (
++        _LINT_SEVERITY_ERROR,
++        "channel has neither field, value nor datum",
++    ),
++    "W001": (
++        _LINT_SEVERITY_WARNING,
++        "x2/y2/longitude2/latitude2 used without their base channel",
++    ),
++    "W002": (
++        _LINT_SEVERITY_WARNING,
++        "unit chart has an empty encoding (except geoshape)",
++    ),
++    "W003": (
++        _LINT_SEVERITY_WARNING,
++        "field/aggregate channel has no explicit type",
++    ),
++}
++
++
++def _lint_materialize(obj: Any) -> Any:
++    """Recursively convert a chart/schema object into plain Python data.
++
++    ``SchemaBase`` instances are turned into dictionaries built from their
++    stored keywords (``Undefined`` entries are dropped), mappings and
++    sequences are copied recursively, and everything else is passed
++    through unchanged.  The input is never mutated.
++
++    Unlike :meth:`SchemaBase.to_dict`, this function performs *no*
++    validation and *no* shorthand parsing, so malformed constructs survive
++    materialization and can be reported by the lint rules instead of
++    raising.
++    """
++    if isinstance(obj, SchemaBase):
++        return {
++            key: _lint_materialize(value)
++            for key, value in obj._kwds.items()
++            if value is not Undefined
++        }
++    if isinstance(obj, Mapping):
++        return {
++            key: _lint_materialize(value)
++            for key, value in obj.items()
++            if value is not Undefined
++        }
++    if isinstance(obj, (list, tuple)):
++        return [_lint_materialize(item) for item in obj]
++    return obj
++
++
++def _lint_join(prefix: str, segment: str) -> str:
++    """Join a path prefix and a segment with ``.`` (root-safe)."""
++    return f"{prefix}.{segment}" if prefix else segment
++
++
++def _lint_resolve_channel(
++    defn: dict[str, Any],
++) -> tuple[dict[str, Any], str | None]:
++    """Merge a channel definition's shorthand with its explicit properties.
++
++    Returns ``(resolved, error)`` where ``resolved`` is a dictionary of the
++    effective channel properties and ``error`` is a parse-error message (or
++    ``None`` when the shorthand -- if any -- parsed cleanly).
++
++    Explicit properties take precedence over values extracted from the
++    shorthand, mirroring how Altair itself serializes a channel.  A
++    definition that carries both ``shorthand`` and ``field`` is invalid,
++    matching the ``ValueError`` that ``FieldChannelMixin.to_dict`` raises.
++    """
++    resolved = {k: v for k, v in defn.items() if k != "shorthand"}
++    shorthand = defn.get("shorthand")
++    if shorthand is None:
++        return resolved, None
++    if "field" in defn:
++        return (
++            resolved,
++            (
++                f"channel specifies both shorthand={shorthand!r} and "
++                f"field={defn['field']!r}"
++            ),
++        )
++    if not isinstance(shorthand, str):
++        # Non-string shorthands are treated as a raw field reference by
++        # Altair; there is nothing to parse.
++        resolved.setdefault("field", shorthand)
++        return resolved, None
++    try:
++        parsed = utils.parse_shorthand(shorthand, errors="collect")
++    except (ValueError, TypeError) as exc:  # pragma: no cover - safety net
++        return resolved, f"cannot parse shorthand {shorthand!r}: {exc}"
++    parse_error = parsed.pop("__shorthand_error__", None)
++    if parse_error is not None:
++        return resolved, parse_error
++    merged = dict(parsed)
++    merged.update(resolved)
++    return merged, None
++
++
++def _lint_check_channel(
++    name: str,
++    defn: Any,
++    path: str,
++    issues: list[LintIssue],
++) -> None:
++    """Run every per-channel rule against one channel definition."""
++    # List-valued channels (tooltip, detail, order, ...) hold one
++    # definition per entry; check each entry individually.
++    if isinstance(defn, list):
++        for index, item in enumerate(defn):
++            _lint_check_channel(name, item, f"{path}[{index}]", issues)
++        return
++    # Bare strings (common in hand-written spec dicts) are shorthands.
++    if isinstance(defn, str):
++        defn = {"shorthand": defn}
++    if not isinstance(defn, dict):
++        # Numbers/booleans/None have no field semantics to inspect.
++        return
++    # A shorthand given as a list expands to one definition per entry.
++    shorthand = defn.get("shorthand")
++    if isinstance(shorthand, (list, tuple)):
++        rest = {k: v for k, v in defn.items() if k != "shorthand"}
++        for index, item in enumerate(shorthand):
++            _lint_check_channel(
++                name,
++                {**rest, "shorthand": item},
++                f"{path}[{index}]",
++                issues,
++            )
++        return
++
++    resolved, error = _lint_resolve_channel(defn)
++    if error is not None:
++        issues.append(
++            LintIssue("E009", _LINT_SEVERITY_ERROR, path, error)
++        )
++        return
++
++    # Conditional-only definitions (no field/value/datum of their own) are
++    # not inspected; the schema handles the ``condition`` branches.
++    if "condition" in resolved and not any(
++        key in resolved for key in ("field", "value", "datum")
++    ):
++        return
++
++    # Value/datum channels carry no field reference; the field-oriented
++    # rules below do not apply.
++    has_field_ref = "field" in resolved
++    if any(key in resolved for key in _LINT_NON_FIELD_KEYS) and not has_field_ref:
++        return
++
++    aggregate = resolved.get("aggregate")
++    time_unit = resolved.get("timeUnit")
++    field_type = resolved.get("type")
++    scale = resolved.get("scale")
++    stack = resolved.get("stack")
++    sort = resolved.get("sort")
++    bin_ = resolved.get("bin")
++
++    # E003: unknown aggregate operation.
++    if isinstance(aggregate, str) and aggregate not in _LINT_AGGREGATE_OPS:
++        issues.append(
++            LintIssue(
++                "E003",
++                _LINT_SEVERITY_ERROR,
++                path,
++                f"{aggregate!r} is not a valid Vega-Lite aggregate operation",
++            )
++        )
++
++    # E004: unknown time unit.
++    if isinstance(time_unit, str) and time_unit not in _LINT_TIME_UNITS:
++        issues.append(
++            LintIssue(
++                "E004",
++                _LINT_SEVERITY_ERROR,
++                path,
++                f"{time_unit!r} is not a valid Vega-Lite timeUnit",
++            )
++        )
++
++    # E005: unknown measurement type.
++    if isinstance(field_type, str) and field_type not in _LINT_FIELD_TYPES:
++        issues.append(
++            LintIssue(
++                "E005",
++                _LINT_SEVERITY_ERROR,
++                path,
++                (
++                    f"{field_type!r} is not a valid encoding data type "
++                    "(expected one of 'quantitative', 'ordinal', "
++                    "'temporal', 'nominal', 'geojson')"
++                ),
++            )
++        )
++
++    # E006/E007: scale type validity and scale/field-type compatibility.
++    if isinstance(scale, dict):
++        scale_type = scale.get("type")
++        if isinstance(scale_type, str):
++            if scale_type not in _LINT_SCALE_TYPES:
++                issues.append(
++                    LintIssue(
++                        "E006",
++                        _LINT_SEVERITY_ERROR,
++                        path,
++                        f"{scale_type!r} is not a valid Vega-Lite scale type",
++                    )
++                )
++            elif (
++                isinstance(field_type, str) and field_type in _LINT_FIELD_TYPES
++            ):
++                if (
++                    scale_type in _LINT_CONTINUOUS_ONLY_SCALES
++                    and field_type in _LINT_NON_CONTINUOUS_TYPES
++                ):
++                    issues.append(
++                        LintIssue(
++                            "E007",
++                            _LINT_SEVERITY_ERROR,
++                            path,
++                            (
++                                f"scale type {scale_type!r} cannot be "
++                                f"used with a {field_type!r} field"
++                            ),
++                        )
++                    )
++                elif (
++                    scale_type in _LINT_TEMPORAL_ONLY_SCALES
++                    and field_type != "temporal"
++                ):
++                    issues.append(
++                        LintIssue(
++                            "E007",
++                            _LINT_SEVERITY_ERROR,
++                            path,
++                            (
++                                f"scale type {scale_type!r} requires a "
++                                f"'temporal' field, not {field_type!r}"
++                            ),
++                        )
++                    )
++                elif (
++                    scale_type == "sequential"
++                    and field_type in _LINT_NON_SEQUENTIAL_TYPES
++                ):
++                    issues.append(
++                        LintIssue(
++                            "E007",
++                            _LINT_SEVERITY_ERROR,
++                            path,
++                            (
++                                "scale type 'sequential' cannot be used "
++                                f"with a {field_type!r} field"
++                            ),
++                        )
++                    )
++
++    # E008: unknown stack value.
++    if (
++        stack is not None
++        and not isinstance(stack, (dict, list))
++        and stack not in _LINT_STACK_VALUES
++    ):
++        issues.append(
++            LintIssue(
++                "E008",
++                _LINT_SEVERITY_ERROR,
++                path,
++                (
++                    f"{stack!r} is not a valid stack value "
++                    "(expected True, False, 'zero', 'center' or "
++                    "'normalize')"
++                ),
++            )
++        )
++
++    # E013: invalid string bin value.
++    if isinstance(bin_, str) and bin_ != "binned":
++        issues.append(
++            LintIssue(
++                "E013",
++                _LINT_SEVERITY_ERROR,
++                path,
++                (
++                    f"{bin_!r} is not a valid bin value "
++                    "(expected True, False, 'binned' or a bin parameter "
++                    "object)"
++                ),
++            )
++        )
++
++    # E010: aggregate combined with bin.
++    if aggregate is not None and (bin_ is True or isinstance(bin_, dict)):
++        issues.append(
++            LintIssue(
++                "E010",
++                _LINT_SEVERITY_ERROR,
++                path,
++                (
++                    f"channel combines aggregate={aggregate!r} with bin; "
++                    "a field cannot be both aggregated and binned"
++                ),
++            )
++        )
++
++    # E011: unknown sort directive.
++    if isinstance(sort, str) and sort not in _LINT_SORT_STRINGS:
++        issues.append(
++            LintIssue(
++                "E011",
++                _LINT_SEVERITY_ERROR,
++                path,
++                (
++                    f"{sort!r} is not a valid sort directive "
++                    "(expected 'ascending', 'descending', or an encoding "
++                    "channel name with an optional leading '-')"
++                ),
++            )
++        )
++
++    # E014: channel without any data reference.
++    if (
++        not has_field_ref
++        and aggregate != "count"
++        and not any(key in resolved for key in _LINT_NON_FIELD_KEYS)
++    ):
++        issues.append(
++            LintIssue(
++                "E014",
++                _LINT_SEVERITY_ERROR,
++                path,
++                "channel definition has neither 'field', 'value' nor 'datum'",
++            )
++        )
++
++    # W003: field/aggregate channel without an explicit measurement type.
++    if (has_field_ref or aggregate is not None) and "type" not in resolved:
++        issues.append(
++            LintIssue(
++                "W003",
++                _LINT_SEVERITY_WARNING,
++                path,
++                (
++                    "channel has no explicit 'type'; the measurement "
++                    "type will have to be inferred from the data"
++                ),
++            )
++        )
++
++
++def _lint_check_encoding(
++    encoding: Any,
++    chart_path: str,
++    issues: list[LintIssue],
++) -> None:
++    """Run the encoding-block rules (unknown channels, W001 pairs)."""
++    if not isinstance(encoding, dict):
++        return
++    base = _lint_join(chart_path, "encoding")
++    for name, defn in encoding.items():
++        path = _lint_join(base, name)
++        if name not in _LINT_CHANNEL_NAMES:
++            issues.append(
++                LintIssue(
++                    "E001",
++                    _LINT_SEVERITY_ERROR,
++                    path,
++                    f"{name!r} is not a known Vega-Lite encoding channel",
++                )
++            )
++            continue
++        _lint_check_channel(name, defn, path, issues)
++    for secondary, required in _LINT_SECONDARY_CHANNELS.items():
++        if secondary in encoding and required not in encoding:
++            issues.append(
++                LintIssue(
++                    "W001",
++                    _LINT_SEVERITY_WARNING,
++                    _lint_join(base, secondary),
++                    (
++                        f"encoding channel {secondary!r} is used without "
++                        f"its base channel {required!r}"
++                    ),
++                )
++            )
++
++
++def _lint_check_facet(
++    facet: Any,
++    chart_path: str,
++    issues: list[LintIssue],
++) -> None:
++    """Check a ``FacetChart``'s facet mapping (row/column/facet)."""
++    if isinstance(facet, str):
++        facet = {"shorthand": facet}
++    if not isinstance(facet, dict):
++        return
++    if any(key in facet for key in ("row", "column", "facet")):
++        for key in ("row", "column", "facet"):
++            if key in facet:
++                _lint_check_channel(
++                    key,
++                    facet[key],
++                    _lint_join(_lint_join(chart_path, "facet"), key),
++                    issues,
++                )
++    else:
++        _lint_check_channel(
++            "facet",
++            facet,
++            _lint_join(chart_path, "facet"),
++            issues,
++        )
++
++
++def _lint_mark_type(mark: Any) -> Any:
++    """Extract the mark type string from a mark property (dict or scalar)."""
++    if isinstance(mark, dict):
++        return mark.get("type")
++    return mark
++
++
++def _lint_walk(
++    node: Any,
++    path: str,
++    issues: list[LintIssue],
++    seen_params: set[str],
++    has_shared_encoding: bool = False,
++) -> None:
++    """Recursively walk a (materialized) spec tree, applying all rules."""
++    if not isinstance(node, dict):
++        return
++
++    # E012: parameter names must be unique across the entire chart tree.
++    params = node.get("params")
++    if isinstance(params, list):
++        for index, param in enumerate(params):
++            if isinstance(param, dict):
++                name = param.get("name")
++                if isinstance(name, str) and name:
++                    if name in seen_params:
++                        issues.append(
++                            LintIssue(
++                                "E012",
++                                _LINT_SEVERITY_ERROR,
++                                _lint_join(path, f"params[{index}]"),
++                                (
++                                    f"parameter name {name!r} is defined "
++                                    "more than once in this chart"
++                                ),
++                            )
++                        )
++                    else:
++                        seen_params.add(name)
++
++    # Encoding blocks may appear on unit charts *and* (as shared
++    # encodings) on layer charts.
++    own_encoding = node.get("encoding")
++    if "encoding" in node:
++        _lint_check_encoding(own_encoding, path, issues)
++    # A non-empty encoding on a wrapper is inherited by its children, so
++    # those children do not count as "unencoded".
++    shared_below = has_shared_encoding or (
++        isinstance(own_encoding, dict) and bool(own_encoding)
++    )
++
++    # Facet mappings carry channel definitions too.
++    if "facet" in node:
++        _lint_check_facet(node["facet"], path, issues)
++
++    composite = (
++        any(key in node for key in _LINT_COMPOSITE_LIST_KEYS) or "spec" in node
++    )
++
++    if not composite:
++        # Unit chart: the mark must exist and be a known mark type.
++        mark = node.get("mark")
++        mark_type = _lint_mark_type(mark)
++        mark_path = _lint_join(path, "mark")
++        if mark_type is None:
++            issues.append(
++                LintIssue(
++                    "E002",
++                    _LINT_SEVERITY_ERROR,
++                    mark_path,
++                    "unit chart has no mark",
++                )
++            )
++        elif isinstance(mark_type, str) and mark_type not in _LINT_MARK_TYPES:
++            issues.append(
++                LintIssue(
++                    "E002",
++                    _LINT_SEVERITY_ERROR,
++                    mark_path,
++                    f"{mark_type!r} is not a known Vega-Lite mark type",
++                )
++            )
++        # W002: a unit chart with an empty encoding renders nothing
++        # meaningful -- except ``geoshape`` (which draws the data's
++        # geometry) and children that inherit a shared encoding from
++        # their parent.
++        encoding = node.get("encoding")
++        if (
++            mark_type != "geoshape"
++            and not has_shared_encoding
++            and (not isinstance(encoding, dict) or not encoding)
++        ):
++            issues.append(
++                LintIssue(
++                    "W002",
++                    _LINT_SEVERITY_WARNING,
++                    path,
++                    (
++                        "unit chart has an empty encoding; nothing will "
++                        "be drawn from the data"
++                    ),
++                )
++            )
++
++    # Recurse into child views.
++    for key in _LINT_COMPOSITE_LIST_KEYS:
++        children = node.get(key)
++        if isinstance(children, list):
++            for index, child in enumerate(children):
++                _lint_walk(
++                    child,
++                    _lint_join(path, f"{key}[{index}]"),
++                    issues,
++                    seen_params,
++                    shared_below,
++                )
++    spec = node.get("spec")
++    if isinstance(spec, dict):
++        _lint_walk(
++            spec, _lint_join(path, "spec"), issues, seen_params, shared_below
++        )
++
++
++def lint(chart: Any) -> list[LintIssue]:
++    """Statically check a chart (or spec dictionary) for common problems.
++
++    The chart is *not* rendered and :meth:`to_dict` is never called, so
++    problems that would otherwise raise during serialization or at
++    schema-validation time are surfaced as :class:`LintIssue` objects
++    instead.  All checks are local and deterministic: the data itself is
++    never inspected.
++
++    Parameters
++    ----------
++    chart :
++        Any top-level Altair chart (:class:`Chart`, :class:`LayerChart`,
++        :class:`ConcatChart`, :class:`HConcatChart`, :class:`VConcatChart`,
++        :class:`FacetChart` or :class:`RepeatChart`) or a plain dictionary
++        holding an Altair / Vega-Lite specification.
++
++    Returns
++    -------
++    list of LintIssue
++        The findings, sorted by ``(path, code)``.  An empty list means no
++        rule fired.
++
++    Raises
++    ------
++    TypeError
++        If ``chart`` is neither a chart object nor a dictionary.
++
++    Examples
++    --------
++    A well-formed chart lints clean:
++
++    >>> import altair as alt
++    >>> chart = alt.Chart().mark_point().encode(x="a:Q", y="sum(b):Q")
++    >>> alt.lint(chart)
++    []
++
++    Unknown encoding channel (rule E001):
++
++    >>> spec = {
++    ...     "mark": "point",
++    ...     "encoding": {"colour": {"field": "c", "type": "nominal"}},
++    ... }
++    >>> [i.code for i in alt.lint(spec)]
++    ['E001']
++
++    Unknown mark type (rule E002):
++
++    >>> spec = {
++    ...     "mark": "wibble",
++    ...     "encoding": {"x": {"field": "a", "type": "quantitative"}},
++    ... }
++    >>> [i.code for i in alt.lint(spec)]
++    ['E002']
++
++    Unknown aggregate operation (rule E003):
++
++    >>> spec = {
++    ...     "mark": "bar",
++    ...     "encoding": {
++    ...         "y": {
++    ...             "field": "b",
++    ...             "type": "quantitative",
++    ...             "aggregate": "wibble",
++    ...         }
++    ...     },
++    ... }
++    >>> [i.code for i in alt.lint(spec)]
++    ['E003']
++
++    Duplicate parameter names across the whole tree (rule E012):
++
++    >>> spec = {
++    ...     "params": [{"name": "brush"}],
++    ...     "layer": [
++    ...         {
++    ...             "mark": "point",
++    ...             "params": [{"name": "brush"}],
++    ...             "encoding": {
++    ...                 "x": {"field": "a", "type": "quantitative"}
++    ...             },
++    ...         }
++    ...     ],
++    ... }
++    >>> [(i.code, i.path) for i in alt.lint(spec)]
++    [('E012', 'layer[0].params[0]')]
++
++    Warnings do not raise -- they are reported alongside errors:
++
++    >>> spec = {"mark": "area", "encoding": {"x2": "b:Q"}}
++    >>> [i.code for i in alt.lint(spec) if i.code.startswith("W")]
++    ['W001']
++    """
++    if isinstance(chart, SchemaBase):
++        tree = _lint_materialize(chart)
++    elif isinstance(chart, Mapping):
++        tree = _lint_materialize(chart)
++    else:
++        msg = (
++            "lint() expects an Altair chart object or a specification "
++            f"dictionary, got {type(chart).__name__!r}"
++        )
++        raise TypeError(msg)
++
++    issues: list[LintIssue] = []
++    _lint_walk(tree, "", issues, set())
++    issues.sort(key=lambda issue: (issue.path, issue.code))
++    return issues
++
++
++def _lint_errors_only(chart_or_spec: Any) -> list[LintIssue]:
++    """Return the subset of :func:`lint` findings whose severity is error."""
++    return [
++        issue
++        for issue in lint(chart_or_spec)
++        if issue.severity == _LINT_SEVERITY_ERROR
++    ]
++
++
++def _lint_warnings_only(chart_or_spec: Any) -> list[LintIssue]:
++    """Return the subset of :func:`lint` findings whose severity is warning."""
++    return [
++        issue
++        for issue in lint(chart_or_spec)
++        if issue.severity == _LINT_SEVERITY_WARNING
++    ]
++
++
++def _lint_group_by_code(
++    issues: Sequence[LintIssue],
++) -> dict[str, list[LintIssue]]:
++    """Group :class:`LintIssue` objects by their rule code.
++
++    Useful for tests and for building higher-level tools that want to
++    report findings rule-by-rule; not used by :func:`lint` itself.
++    """
++    grouped: dict[str, list[LintIssue]] = {}
++    for issue in issues:
++        grouped.setdefault(issue.code, []).append(issue)
++    return grouped
++
++
++def _lint_group_by_path(
++    issues: Sequence[LintIssue],
++) -> dict[str, list[LintIssue]]:
++    """Group :class:`LintIssue` objects by their ``path`` attribute.
++
++    Companion to :func:`_lint_group_by_code`.  The insertion order of the
++    outer dictionary follows the first appearance of each path in
++    ``issues``.
++    """
++    grouped: dict[str, list[LintIssue]] = {}
++    for issue in issues:
++        grouped.setdefault(issue.path, []).append(issue)
++    return grouped
++
++
++def _lint_format(issues: Sequence[LintIssue]) -> str:
++    """Format a list of :class:`LintIssue` objects as a human-readable block.
++
++    The result is a newline-joined sequence of ``str(issue)`` lines.  An
++    empty issue list yields the empty string so calling code can safely
++    ``print(_lint_format(chart.lint()))`` on a clean chart.
++    """
++    return "\n".join(str(issue) for issue in issues)
++
++
++def _lint_summary(issues: Sequence[LintIssue]) -> str:
++    """Return a one-line summary counting issues by severity.
++
++    Useful for tooling and for the string form of :class:`LintError`.
++    A clean issue list yields ``"altair.lint: 0 issues"``.
++    """
++    errors = sum(1 for i in issues if i.severity == _LINT_SEVERITY_ERROR)
++    warnings = sum(1 for i in issues if i.severity == _LINT_SEVERITY_WARNING)
++    total = errors + warnings
++    if total == 0:
++        return "altair.lint: 0 issues"
++    parts = [f"{errors} error{'s' if errors != 1 else ''}"]
++    parts.append(f"{warnings} warning{'s' if warnings != 1 else ''}")
++    return f"altair.lint: {total} issue{'s' if total != 1 else ''} "\
++           f"({', '.join(parts)})"
++
++
+ class TopLevelMixin(mixins.ConfigMethodMixin):
+     """Mixin for top-level chart objects such as Chart, LayeredChart, etc."""
+ 
+     _class_is_valid_at_instantiation: bool = False
+     data: Any
+ 
++    def lint(self) -> list[LintIssue]:
++        """Statically check this chart for common specification problems.
++
++        Sugar for :func:`altair.lint`: the chart is inspected without being
++        rendered or serialized and a sorted list of :class:`LintIssue`
++        objects is returned.  An empty list means every rule was silent.
++
++        Returns
++        -------
++        list of LintIssue
++            The findings, sorted by ``(path, code)``.
++
++        Examples
++        --------
++        >>> import altair as alt
++        >>> chart = alt.Chart().mark_point().encode(x="a:Q", y="sum(b):Q")
++        >>> chart.lint()
++        []
++        """
++        return lint(self)
++
+     def to_dict(  # noqa: C901
+         self,
+         validate: bool = True,
+@@ -2047,6 +3318,7 @@
+         format: Literal["vega-lite", "vega"] = "vega-lite",
+         ignore: list[str] | None = None,
+         context: dict[str, Any] | None = None,
++        strict_lint: bool = False,
+     ) -> dict[str, Any]:
+         """
+         Convert the chart to a dictionary suitable for JSON export.
+@@ -2073,12 +3345,32 @@
+         -----
+         - ``ignore``, ``context`` are usually not needed to be specified as a user.
+         - *Technical*: ``ignore`` will **not** be passed to child :meth:`.to_dict()`.
++
++        The keyword-only ``strict_lint`` flag defaults to ``False`` and
++        preserves the historical behavior of this method.  When set to
++        ``True`` the chart is passed through :func:`altair.lint` before
++        serialization; if any ``E``-level :class:`LintIssue` is found a
++        :class:`LintError` is raised so the caller does not have to wait
++        for schema validation or the Vega-Lite compiler to report the
++        problem.  ``W``-level findings never raise.
+         """
+         # Validate format
+         if format not in {"vega-lite", "vega"}:
+             msg = f'The format argument must be either "vega-lite" or "vega". Received {format!r}'
+             raise ValueError(msg)
+ 
++        # ``strict_lint`` only fires at the top of the tree.  A user call
++        # arrives either with ``context=None`` (LayerChart / FacetChart /
++        # concats / RepeatChart go straight through TopLevelMixin) or with
++        # a still-fresh dict that ``Chart.to_dict`` created before
++        # delegating to super().  In both cases ``"top_level"`` has not
++        # been stamped yet -- the recursion below is what stamps it,
++        # which is exactly how we tell the outer call from an inner one.
++        if strict_lint and (context is None or context.get("top_level", True)):
++            errors = _lint_errors_only(self)
++            if errors:
++                raise LintError(errors)
++
+         # We make use of three context markers:
+         # - 'data' points to the data that should be referenced for column type
+         #   inference.
+@@ -2165,6 +3457,7 @@
+         ignore: list[str] | None = None,
+         context: dict[str, Any] | None = None,
+         ensure_ascii: bool = False,
++        strict_lint: bool = False,
+         **kwargs: Any,
+     ) -> str:
+         """
+@@ -2201,13 +3494,22 @@
+         -----
+         - ``ignore``, ``context`` are usually not needed to be specified as a user.
+         - *Technical*: ``ignore`` will **not** be passed to child :meth:`.to_dict()`.
++
++        Setting ``strict_lint=True`` runs :func:`altair.lint` first and
++        raises :class:`LintError` on any ``E``-level finding, before
++        starting the serialization or the schema validation.  Default is
++        ``False``; every existing caller keeps its behavior unchanged.
+         """
+         if ignore is None:
+             ignore = []
+         if context is None:
+             context = {}
+         spec = self.to_dict(
+-            validate=validate, format=format, ignore=ignore, context=context
++            validate=validate,
++            format=format,
++            ignore=ignore,
++            context=context,
++            strict_lint=strict_lint,
+         )
+         return json.dumps(
+             spec,
+@@ -4145,6 +5447,7 @@
+         format: Literal["vega-lite", "vega"] = "vega-lite",
+         ignore: list[str] | None = None,
+         context: dict[str, Any] | None = None,
++        strict_lint: bool = False,
+     ) -> dict[str, Any]:
+         """
+         Convert the ``Chart`` to a dictionary suitable for JSON export.
+@@ -4171,6 +5474,12 @@
+         -----
+         - ``ignore``, ``context`` are usually not needed to be specified as a user.
+         - *Technical*: ``ignore`` will **not** be passed to child :meth:`.to_dict()`.
++
++        The keyword-only ``strict_lint`` flag defaults to ``False`` and
++        preserves the historical behavior of this method.  When set to
++        ``True`` the chart is passed through :func:`altair.lint` before
++        serialization; any ``E``-level :class:`LintIssue` raises a
++        :class:`LintError` before schema validation runs.
+         """
+         context = context or {}
+         kwds: Map = {
+@@ -4178,6 +5487,7 @@
+             "format": format,
+             "ignore": ignore,
+             "context": context,
++            "strict_lint": strict_lint,
+         }
+         if self.data is Undefined and "data" not in context:
+             # No data specified here or in parent: inject empty data
+diff --git a/tests/test_lint.py b/tests/test_lint.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_lint.py
+@@ -0,0 +1,905 @@
++"""In-repo tests for the static chart-specification linter.
++
++These tests exercise the ``altair.lint`` / ``altair.LintIssue`` /
++``altair.LintError`` public surface plus its integration with
++``to_dict`` / ``to_json`` via the ``strict_lint`` keyword.  They are
++independent from the external ``tests/test_outputs.py`` grading suite
++and are meant to be run alongside the rest of the repository's test
++suite so contributors get local feedback while iterating on the
++linter.
++
++Every expectation is frozen inside this file: no value is derived
++from the state of the schema or of the linter's own internals, and
++no test looks at private attributes such as the ``_LINT_*`` set
++tables.
++"""
++
++from __future__ import annotations
++
++import warnings
++
++import pytest
++
++import altair as alt
++from altair import LintError, LintIssue, lint
++from altair.utils.core import SHORTHAND_ERROR_KEY, parse_shorthand
++
++
++DATA = alt.Data(values=[{"a": 1, "b": 2, "c": "x", "d": "2020-01-01"}])
++
++
++def codes(issues):
++    return [issue.code for issue in issues]
++
++
++def paths(issues):
++    return [issue.path for issue in issues]
++
++
++def by_code(issues, code):
++    return [issue for issue in issues if issue.code == code]
++
++
++# ---------------------------------------------------------------------------
++# LintIssue value-object contract
++# ---------------------------------------------------------------------------
++
++
++class TestLintIssue:
++    def test_attributes_frozen(self):
++        issue = LintIssue("E001", "error", "encoding.x", "boom")
++        assert issue.code == "E001"
++        assert issue.severity == "error"
++        assert issue.path == "encoding.x"
++        assert issue.message == "boom"
++
++    def test_invalid_severity_rejected(self):
++        with pytest.raises(ValueError, match="severity"):
++            LintIssue("E001", "fatal", "", "boom")
++
++    def test_equality_is_structural(self):
++        first = LintIssue("E001", "error", "encoding.x", "boom")
++        second = LintIssue("E001", "error", "encoding.x", "boom")
++        other = LintIssue("E002", "error", "encoding.x", "boom")
++        assert first == second
++        assert first != other
++        assert first != "not an issue"
++        assert hash(first) == hash(second)
++
++    def test_str_carries_code_severity_and_path(self):
++        issue = LintIssue("W001", "warning", "layer[0].encoding.x2", "boom")
++        text = str(issue)
++        assert "W001" in text
++        assert "warning" in text
++        assert "layer[0].encoding.x2" in text
++        assert "boom" in text
++
++    def test_str_root_path_has_placeholder(self):
++        issue = LintIssue("W002", "warning", "", "boom")
++        assert "<root>" in str(issue)
++
++    def test_repr_round_trips_attributes(self):
++        issue = LintIssue("E012", "error", "params[1]", "dup")
++        text = repr(issue)
++        assert "E012" in text
++        assert "params[1]" in text
++        assert "dup" in text
++
++
++# ---------------------------------------------------------------------------
++# Input handling & result contract
++# ---------------------------------------------------------------------------
++
++
++class TestInput:
++    def test_chart_object_accepted(self):
++        chart = alt.Chart().mark_point().encode(x="a:Q")
++        assert lint(chart) == []
++
++    def test_method_equivalent_to_function(self):
++        chart = alt.Chart().mark_point().encode(
++            y=alt.Y("b:Q", aggregate="wibble")
++        )
++        assert chart.lint() == lint(chart)
++
++    def test_method_available_on_all_chart_classes(self):
++        unit = alt.Chart(DATA).mark_point().encode(x="a:Q")
++        assert unit.lint() == []
++        assert alt.layer(unit).lint() == []
++        assert alt.concat(unit).lint() == []
++        assert alt.hconcat(unit).lint() == []
++        assert alt.vconcat(unit).lint() == []
++        assert unit.facet("c:N").lint() == []
++        assert unit.repeat(repeat=["a", "b"]).lint() == []
++
++    def test_dict_spec_accepted(self):
++        spec = {
++            "mark": "point",
++            "encoding": {"x": {"field": "a", "type": "quantitative"}},
++        }
++        assert lint(spec) == []
++
++    def test_bare_string_channel_in_dict_spec(self):
++        spec = {"mark": "point", "encoding": {"x": "a:Q"}}
++        assert lint(spec) == []
++
++    def test_input_is_not_mutated(self):
++        chart = alt.Chart().mark_point().encode(
++            y=alt.Y("b:Q", aggregate="wibble")
++        )
++        before = repr(chart)
++        lint(chart)
++        assert repr(chart) == before
++
++    @pytest.mark.parametrize("bad", ["nope", 42, None, ["mark"], 3.14])
++    def test_unsupported_input_raises_type_error(self, bad):
++        with pytest.raises(TypeError, match="lint"):
++            lint(bad)
++
++    def test_result_sorted_by_path_then_code(self):
++        chart = alt.Chart().mark_point().encode(
++            x2="b:Q",
++            y=alt.Y("c:Q", aggregate="wibble"),
++        )
++        issues = lint(chart)
++        keys = [(issue.path, issue.code) for issue in issues]
++        assert keys == sorted(keys)
++
++    def test_every_issue_has_contract_attributes(self):
++        chart = alt.Chart().mark_point().encode(
++            x2="b:Q",
++            y=alt.Y("c:Q", aggregate="wibble"),
++        )
++        for issue in lint(chart):
++            assert isinstance(issue.code, str) and issue.code
++            assert issue.severity in ("error", "warning")
++            assert isinstance(issue.path, str)
++            assert isinstance(issue.message, str) and issue.message
++
++    def test_repeatable_results(self):
++        chart = alt.Chart().mark_point().encode(
++            y=alt.Y("b:Q", aggregate="wibble")
++        )
++        first = lint(chart)
++        second = lint(chart)
++        assert first == second
++
++
++# ---------------------------------------------------------------------------
++# Rule tests -- E001 through W003
++# ---------------------------------------------------------------------------
++
++
++class TestE001UnknownChannel:
++    def test_unknown_key(self):
++        spec = {
++            "mark": "point",
++            "encoding": {
++                "x": {"field": "a", "type": "quantitative"},
++                "colour": {"field": "c", "type": "nominal"},
++            },
++        }
++        issues = by_code(lint(spec), "E001")
++        assert len(issues) == 1
++        assert issues[0].path == "encoding.colour"
++        assert issues[0].severity == "error"
++        assert "colour" in issues[0].message
++
++    def test_known_channels_clean(self):
++        spec = {
++            "mark": "point",
++            "encoding": {
++                "x": {"field": "a", "type": "quantitative"},
++                "y": {"field": "b", "type": "quantitative"},
++                "color": {"field": "c", "type": "nominal"},
++                "tooltip": {"field": "d", "type": "temporal"},
++                "xOffset": {"value": 3},
++                "row": {"field": "c", "type": "nominal"},
++            },
++        }
++        assert by_code(lint(spec), "E001") == []
++
++
++class TestE002Mark:
++    def test_unknown_mark(self):
++        chart = alt.Chart().mark_point().encode(x="a:Q")
++        chart.mark = "wibble"
++        issues = by_code(lint(chart), "E002")
++        assert len(issues) == 1
++        assert issues[0].path == "mark"
++        assert "wibble" in issues[0].message
++
++    def test_missing_mark(self):
++        chart = alt.Chart().encode(x="a:Q")
++        assert len(by_code(lint(chart), "E002")) == 1
++
++    def test_known_marks_clean(self):
++        for mark in [
++            "arc", "area", "bar", "image", "line", "point", "rect", "rule",
++            "text", "tick", "trail", "circle", "square", "geoshape",
++            "boxplot", "errorbar", "errorband",
++        ]:
++            spec = {
++                "mark": mark,
++                "encoding": {"x": {"field": "a", "type": "quantitative"}},
++            }
++            assert by_code(lint(spec), "E002") == [], mark
++
++    def test_dict_form_uses_type(self):
++        spec = {
++            "mark": {"type": "point", "color": "red"},
++            "encoding": {"x": {"field": "a", "type": "quantitative"}},
++        }
++        assert by_code(lint(spec), "E002") == []
++
++
++class TestE003Aggregate:
++    def test_unknown(self):
++        chart = alt.Chart().mark_bar().encode(
++            y=alt.Y("b:Q", aggregate="wibble")
++        )
++        issues = by_code(lint(chart), "E003")
++        assert len(issues) == 1
++        assert issues[0].path == "encoding.y"
++        assert "wibble" in issues[0].message
++
++    def test_valid_ops_clean(self):
++        for op in [
++            "argmax", "argmin", "average", "count", "distinct", "max",
++            "mean", "median", "min", "missing", "product", "q1", "q3",
++            "ci0", "ci1", "stderr", "stdev", "stdevp", "sum", "valid",
++            "values", "variance", "variancep", "exponential",
++            "exponentialb",
++        ]:
++            spec = {
++                "mark": "bar",
++                "encoding": {
++                    "y": {
++                        "field": "b",
++                        "type": "quantitative",
++                        "aggregate": op,
++                    }
++                },
++            }
++            assert by_code(lint(spec), "E003") == [], op
++
++
++class TestE004TimeUnit:
++    def test_unknown(self):
++        spec = {
++            "mark": "line",
++            "encoding": {
++                "x": {
++                    "field": "d",
++                    "type": "temporal",
++                    "timeUnit": "fortnight",
++                }
++            },
++        }
++        issues = by_code(lint(spec), "E004")
++        assert len(issues) == 1
++        assert "fortnight" in issues[0].message
++
++    @pytest.mark.parametrize(
++        "unit",
++        [
++            "year", "quarter", "month", "week", "day", "dayofyear",
++            "date", "hours", "minutes", "seconds", "milliseconds",
++            "utcyear", "utcmonth", "utcmilliseconds",
++            "yearmonth", "yearmonthdatehoursminutesseconds", "weekday",
++            "utcyearweekdayhours", "utcsecondsmilliseconds",
++            "binnedyear", "binnedutcyearmonthdate", "binnedyeardayofyear",
++        ],
++    )
++    def test_valid_units_clean(self, unit):
++        spec = {
++            "mark": "line",
++            "encoding": {
++                "x": {"field": "d", "type": "temporal", "timeUnit": unit}
++            },
++        }
++        assert by_code(lint(spec), "E004") == [], unit
++
++
++class TestE005Type:
++    def test_unknown(self):
++        spec = {
++            "mark": "point",
++            "encoding": {"x": {"field": "a", "type": "integer"}},
++        }
++        issues = by_code(lint(spec), "E005")
++        assert len(issues) == 1
++        assert "integer" in issues[0].message
++
++    @pytest.mark.parametrize(
++        "field_type",
++        ["quantitative", "ordinal", "temporal", "nominal", "geojson"],
++    )
++    def test_valid_types_clean(self, field_type):
++        spec = {
++            "mark": "point",
++            "encoding": {"x": {"field": "a", "type": field_type}},
++        }
++        assert by_code(lint(spec), "E005") == [], field_type
++
++
++class TestE006ScaleType:
++    def test_unknown(self):
++        chart = alt.Chart().mark_point().encode(
++            x=alt.X("a:Q", scale={"type": "hyperbolic"})
++        )
++        issues = by_code(lint(chart), "E006")
++        assert len(issues) == 1
++        assert issues[0].path == "encoding.x"
++        assert "hyperbolic" in issues[0].message
++
++    @pytest.mark.parametrize(
++        "scale_type",
++        [
++            "linear", "log", "pow", "sqrt", "symlog", "identity",
++            "sequential", "time", "utc", "quantile", "quantize",
++            "threshold", "bin-ordinal", "ordinal", "point", "band",
++        ],
++    )
++    def test_valid_scale_types_clean(self, scale_type):
++        spec = {
++            "mark": "point",
++            "encoding": {
++                "x": {
++                    "field": "a",
++                    "type": "quantitative",
++                    "scale": {"type": scale_type},
++                }
++            },
++        }
++        assert by_code(lint(spec), "E006") == [], scale_type
++
++
++class TestE007ScaleFieldCompat:
++    @pytest.mark.parametrize("scale_type", ["log", "pow", "sqrt", "symlog"])
++    @pytest.mark.parametrize(
++        "field_type", ["nominal", "ordinal", "geojson"]
++    )
++    def test_continuous_scale_with_discrete_field(
++        self, scale_type, field_type
++    ):
++        spec = {
++            "mark": "point",
++            "encoding": {
++                "x": {
++                    "field": "a",
++                    "type": field_type,
++                    "scale": {"type": scale_type},
++                }
++            },
++        }
++        assert len(by_code(lint(spec), "E007")) == 1
++
++    @pytest.mark.parametrize("scale_type", ["time", "utc"])
++    def test_temporal_scale_requires_temporal_field(self, scale_type):
++        spec = {
++            "mark": "point",
++            "encoding": {
++                "x": {
++                    "field": "a",
++                    "type": "quantitative",
++                    "scale": {"type": scale_type},
++                }
++            },
++        }
++        assert len(by_code(lint(spec), "E007")) == 1
++
++    def test_sequential_with_nominal(self):
++        spec = {
++            "mark": "point",
++            "encoding": {
++                "color": {
++                    "field": "c",
++                    "type": "nominal",
++                    "scale": {"type": "sequential"},
++                }
++            },
++        }
++        assert len(by_code(lint(spec), "E007")) == 1
++
++    def test_compatible_combinations_clean(self):
++        spec = {
++            "mark": "point",
++            "encoding": {
++                "x": {
++                    "field": "a",
++                    "type": "quantitative",
++                    "scale": {"type": "log"},
++                },
++                "y": {
++                    "field": "d",
++                    "type": "temporal",
++                    "scale": {"type": "utc"},
++                },
++            },
++        }
++        assert by_code(lint(spec), "E007") == []
++
++
++class TestE008Stack:
++    def test_unknown(self):
++        chart = alt.Chart().mark_bar().encode(
++            y=alt.Y("b:Q", stack="sideways")
++        )
++        issues = by_code(lint(chart), "E008")
++        assert len(issues) == 1
++        assert "sideways" in issues[0].message
++
++    @pytest.mark.parametrize(
++        "stack", [True, False, None, "zero", "center", "normalize"]
++    )
++    def test_valid_values_clean(self, stack):
++        chart = alt.Chart().mark_bar().encode(
++            y=alt.Y("b:Q", stack=stack)
++        )
++        assert by_code(lint(chart), "E008") == [], stack
++
++
++class TestE009Shorthand:
++    def test_bad_type_code(self):
++        chart = alt.Chart().mark_point().encode(x="a:X")
++        issues = by_code(lint(chart), "E009")
++        assert len(issues) == 1
++        assert issues[0].path == "encoding.x"
++
++    def test_shorthand_and_field_conflict(self):
++        spec = {
++            "mark": "point",
++            "encoding": {
++                "x": {
++                    "shorthand": "a:Q",
++                    "field": "b",
++                    "type": "quantitative",
++                }
++            },
++        }
++        assert len(by_code(lint(spec), "E009")) == 1
++
++    def test_list_valued_channel(self):
++        chart = alt.Chart().mark_point().encode(
++            x="a:Q", tooltip=["b:Q", "c:W"]
++        )
++        issues = by_code(lint(chart), "E009")
++        assert paths(issues) == ["encoding.tooltip[1]"]
++
++    def test_lint_works_where_to_dict_would_raise(self):
++        chart = alt.Chart().mark_point().encode(x="a:X")
++        # bare `Chart()` without data still raises for the bad shorthand
++        with pytest.raises(Exception):
++            chart.to_dict()
++        assert by_code(lint(chart), "E009") != []
++
++
++class TestE010AggregatePlusBin:
++    def test_true_bin(self):
++        chart = alt.Chart().mark_bar().encode(
++            x=alt.X("a:Q", bin=True, aggregate="sum")
++        )
++        assert len(by_code(lint(chart), "E010")) == 1
++
++    def test_bin_dict(self):
++        spec = {
++            "mark": "bar",
++            "encoding": {
++                "x": {
++                    "field": "a",
++                    "type": "quantitative",
++                    "aggregate": "mean",
++                    "bin": {"maxbins": 20},
++                }
++            },
++        }
++        assert len(by_code(lint(spec), "E010")) == 1
++
++    def test_bin_without_aggregate_clean(self):
++        chart = alt.Chart().mark_bar().encode(
++            x=alt.X("a:Q", bin=True), y="count():Q"
++        )
++        assert by_code(lint(chart), "E010") == []
++
++    def test_binned_string_not_bin_true(self):
++        spec = {
++            "mark": "bar",
++            "encoding": {
++                "x": {
++                    "field": "a",
++                    "type": "quantitative",
++                    "aggregate": "mean",
++                    "bin": "binned",
++                }
++            },
++        }
++        assert by_code(lint(spec), "E010") == []
++
++
++class TestE011Sort:
++    def test_unknown(self):
++        chart = alt.Chart().mark_bar().encode(
++            x=alt.X("c:N", sort="sideways")
++        )
++        issues = by_code(lint(chart), "E011")
++        assert len(issues) == 1
++        assert "sideways" in issues[0].message
++
++    @pytest.mark.parametrize(
++        "sort",
++        ["ascending", "descending", "-y", "x", "color", "-size", "-shape"],
++    )
++    def test_valid_strings_clean(self, sort):
++        spec = {
++            "mark": "bar",
++            "encoding": {
++                "x": {"field": "c", "type": "nominal", "sort": sort}
++            },
++        }
++        assert by_code(lint(spec), "E011") == [], sort
++
++    def test_list_valued_sort_clean(self):
++        spec = {
++            "mark": "bar",
++            "encoding": {
++                "x": {
++                    "field": "c",
++                    "type": "nominal",
++                    "sort": ["b", "a"],
++                }
++            },
++        }
++        assert by_code(lint(spec), "E011") == []
++
++
++class TestE012DuplicateParams:
++    def test_within_one_view(self):
++        spec = {
++            "mark": "point",
++            "params": [{"name": "brush"}, {"name": "brush"}],
++            "encoding": {"x": {"field": "a", "type": "quantitative"}},
++        }
++        issues = by_code(lint(spec), "E012")
++        assert len(issues) == 1
++        assert issues[0].path == "params[1]"
++        assert "brush" in issues[0].message
++
++    def test_across_layers(self):
++        spec = {
++            "params": [{"name": "p"}],
++            "layer": [
++                {
++                    "mark": "point",
++                    "params": [{"name": "p"}],
++                    "encoding": {
++                        "x": {"field": "a", "type": "quantitative"}
++                    },
++                }
++            ],
++        }
++        issues = by_code(lint(spec), "E012")
++        assert paths(issues) == ["layer[0].params[0]"]
++
++    def test_unique_clean(self):
++        spec = {
++            "mark": "point",
++            "params": [{"name": "p"}, {"name": "q"}],
++            "encoding": {"x": {"field": "a", "type": "quantitative"}},
++        }
++        assert lint(spec) == []
++
++
++class TestE013Bin:
++    def test_invalid_string(self):
++        chart = alt.Chart().mark_bar().encode(x=alt.X("a:Q", bin="yes"))
++        issues = by_code(lint(chart), "E013")
++        assert len(issues) == 1
++        assert "yes" in issues[0].message
++
++    def test_binned_ok(self):
++        chart = alt.Chart().mark_bar().encode(x=alt.X("a:Q", bin="binned"))
++        assert by_code(lint(chart), "E013") == []
++
++
++class TestE014NoData:
++    def test_empty_channel(self):
++        chart = alt.Chart().mark_point().encode(x="")
++        issues = by_code(lint(chart), "E014")
++        assert len(issues) == 1
++
++    def test_count_exempt(self):
++        chart = alt.Chart().mark_bar().encode(y="count():Q", x="c:N")
++        assert lint(chart) == []
++
++    def test_value_datum_exempt(self):
++        chart = alt.Chart().mark_point().encode(
++            x="a:Q", color=alt.value("red"), y=alt.datum(5)
++        )
++        assert by_code(lint(chart), "E014") == []
++
++
++class TestW001SecondaryChannel:
++    def test_x2_without_x(self):
++        chart = alt.Chart().mark_area().encode(x2="b:Q")
++        issues = by_code(lint(chart), "W001")
++        assert len(issues) == 1
++        assert issues[0].severity == "warning"
++
++    def test_all_pairs(self):
++        for secondary, base in [
++            ("x2", "x"),
++            ("y2", "y"),
++            ("longitude2", "longitude"),
++            ("latitude2", "latitude"),
++        ]:
++            spec = {"mark": "point", "encoding": {secondary: {"value": 3}}}
++            assert paths(by_code(lint(spec), "W001")) == [
++                f"encoding.{secondary}"
++            ]
++            spec = {
++                "mark": "point",
++                "encoding": {
++                    secondary: {"value": 3},
++                    base: {"field": "a", "type": "quantitative"},
++                },
++            }
++            assert by_code(lint(spec), "W001") == []
++
++
++class TestW002Empty:
++    def test_empty_chart(self):
++        chart = alt.Chart().mark_point()
++        issues = by_code(lint(chart), "W002")
++        assert len(issues) == 1
++        assert issues[0].path == ""
++
++    def test_geoshape_exempt(self):
++        assert lint(alt.Chart().mark_geoshape()) == []
++
++    def test_shared_layer_encoding_exempt(self):
++        chart = alt.layer(
++            alt.Chart().mark_point(),
++            alt.Chart().mark_line(),
++        ).encode(x="a:Q", y="b:Q")
++        assert lint(chart) == []
++
++
++class TestW003ImplicitType:
++    def test_missing_type(self):
++        chart = alt.Chart().mark_point().encode(x="a")
++        issues = by_code(lint(chart), "W003")
++        assert len(issues) == 1
++        assert issues[0].severity == "warning"
++
++    def test_value_channel_no_warning(self):
++        chart = alt.Chart().mark_point().encode(
++            x="a:Q", color=alt.value("red")
++        )
++        assert by_code(lint(chart), "W003") == []
++
++
++# ---------------------------------------------------------------------------
++# strict_lint integration with to_dict / to_json
++# ---------------------------------------------------------------------------
++
++
++class TestStrictLintToDict:
++    def test_default_preserves_behavior_on_clean_chart(self):
++        chart = alt.Chart(DATA).mark_point().encode(x="a:Q")
++        assert chart.to_dict()["mark"] == {"type": "point"}
++        assert chart.to_dict(strict_lint=True)["mark"] == {"type": "point"}
++
++    def test_raises_on_e_level(self):
++        chart = alt.Chart(DATA).mark_bar().encode(
++            y=alt.Y("b:Q", aggregate="wibble")
++        )
++        with pytest.raises(LintError) as info:
++            chart.to_dict(strict_lint=True)
++        assert [i.code for i in info.value.issues] == ["E003"]
++        assert isinstance(info.value, ValueError)
++
++    def test_w_level_does_not_raise(self):
++        chart = alt.Chart(DATA).mark_point()  # W002
++        assert chart.to_dict(strict_lint=True)["mark"] == {"type": "point"}
++
++    def test_nested_layer_reports_from_inside(self):
++        chart = alt.layer(
++            alt.Chart(DATA).mark_bar().encode(
++                y=alt.Y("b:Q", aggregate="wibble")
++            )
++        )
++        with pytest.raises(LintError) as info:
++            chart.to_dict(strict_lint=True)
++        assert [(i.code, i.path) for i in info.value.issues] == [
++            ("E003", "layer[0].encoding.y")
++        ]
++
++    def test_multiple_errors_all_reported(self):
++        chart = alt.Chart(DATA).encode(x=alt.X("a:Q", aggregate="wibble"))
++        with pytest.raises(LintError) as info:
++            chart.to_dict(strict_lint=True)
++        codes_seen = {i.code for i in info.value.issues}
++        assert "E002" in codes_seen
++        assert "E003" in codes_seen
++
++
++class TestStrictLintToJson:
++    def test_clean_still_works(self):
++        chart = alt.Chart(DATA).mark_point().encode(x="a:Q")
++        text = chart.to_json(strict_lint=True)
++        assert '"mark"' in text
++
++    def test_raises_on_e_level(self):
++        chart = alt.Chart(DATA).mark_bar().encode(
++            y=alt.Y("b:Q", aggregate="wibble")
++        )
++        with pytest.raises(LintError):
++            chart.to_json(strict_lint=True)
++
++
++# ---------------------------------------------------------------------------
++# Regression: parse_shorthand's classic behavior is untouched
++# ---------------------------------------------------------------------------
++
++
++class TestParseShorthandRegression:
++    def test_field(self):
++        assert parse_shorthand("name") == {"field": "name"}
++
++    def test_field_with_type(self):
++        assert parse_shorthand("name:Q") == {
++            "field": "name",
++            "type": "quantitative",
++        }
++
++    def test_aggregate(self):
++        assert parse_shorthand("average(col)") == {
++            "aggregate": "average",
++            "field": "col",
++        }
++
++    def test_time_unit(self):
++        assert parse_shorthand("month(col)") == {
++            "field": "col",
++            "timeUnit": "month",
++            "type": "temporal",
++        }
++
++    def test_count(self):
++        assert parse_shorthand("count()") == {
++            "aggregate": "count",
++            "type": "quantitative",
++        }
++
++    def test_bad_type_still_raises_by_default(self):
++        with pytest.raises(ValueError):
++            parse_shorthand("a:X")
++
++
++class TestParseShorthandCollect:
++    def test_unknown_type_collected(self):
++        result = parse_shorthand("a:X", errors="collect")
++        assert SHORTHAND_ERROR_KEY in result
++        assert "X" in result[SHORTHAND_ERROR_KEY]
++
++    def test_valid_shorthand_unchanged(self):
++        assert parse_shorthand("a:Q", errors="collect") == {
++            "field": "a",
++            "type": "quantitative",
++        }
++
++    def test_trailing_colon_collected(self):
++        result = parse_shorthand(":", errors="collect")
++        assert SHORTHAND_ERROR_KEY in result
++
++    def test_trailing_colon_raises_default(self):
++        with pytest.raises(ValueError):
++            parse_shorthand(":")
++
++    def test_invalid_errors_argument(self):
++        with pytest.raises(ValueError):
++            parse_shorthand("a:Q", errors="drop")
++
++
++# ---------------------------------------------------------------------------
++# Nested path formatting
++# ---------------------------------------------------------------------------
++
++
++class TestNestedPaths:
++    def test_layer(self):
++        spec = {
++            "layer": [
++                {
++                    "mark": "point",
++                    "encoding": {"x": {"field": "a", "type": "integer"}},
++                },
++                {
++                    "mark": "line",
++                    "encoding": {"y": {"field": "b", "type": "integer"}},
++                },
++            ]
++        }
++        issues = by_code(lint(spec), "E005")
++        assert paths(issues) == [
++            "layer[0].encoding.x",
++            "layer[1].encoding.y",
++        ]
++
++    def test_concat_layer(self):
++        chart = alt.concat(
++            alt.Chart(DATA).mark_point().encode(x="a:Q"),
++            alt.layer(
++                alt.Chart(DATA).mark_point().encode(
++                    y=alt.Y("b:Q", aggregate="wibble")
++                )
++            ),
++        )
++        issues = by_code(lint(chart), "E003")
++        assert paths(issues) == ["concat[1].layer[0].encoding.y"]
++
++    def test_facet_spec(self):
++        spec = {
++            "facet": {
++                "column": {
++                    "field": "c",
++                    "type": "nominal",
++                    "sort": "sideways",
++                }
++            },
++            "spec": {
++                "mark": "point",
++                "encoding": {"x": {"field": "a", "type": "integer"}},
++            },
++        }
++        issues = lint(spec)
++        assert paths(by_code(issues, "E011")) == ["facet.column"]
++        assert paths(by_code(issues, "E005")) == ["spec.encoding.x"]
++
++    def test_facet_shorthand_path(self):
++        chart = alt.Chart(DATA).mark_point().encode(x="a:Q").facet("c:X")
++        assert paths(by_code(lint(chart), "E009")) == ["facet"]
++
++    def test_hconcat(self):
++        spec = {
++            "hconcat": [
++                {
++                    "mark": "point",
++                    "encoding": {"x": {"field": "a", "type": "integer"}},
++                }
++            ]
++        }
++        issues = by_code(lint(spec), "E005")
++        assert paths(issues) == ["hconcat[0].encoding.x"]
++
++
++# ---------------------------------------------------------------------------
++# Non-mutation and repeatability
++# ---------------------------------------------------------------------------
++
++
++class TestSideEffects:
++    def test_input_not_mutated(self):
++        chart = alt.Chart(DATA).mark_point().encode(
++            y=alt.Y("b:Q", aggregate="wibble")
++        )
++        before = repr(chart)
++        lint(chart)
++        assert repr(chart) == before
++
++    def test_still_serializable_after_lint(self):
++        chart = alt.Chart(DATA).mark_point().encode(x="a:Q")
++        lint(chart)
++        # This must not raise -- lint must never mutate the chart.
++        chart.to_dict()
++
++    def test_no_warning_emitted_by_lint(self):
++        chart = alt.Chart(DATA).mark_point()  # W002
++        with warnings.catch_warnings():
++            warnings.simplefilter("error")
++            # Even though W002 fires, ``lint()`` returns the issue list
++            # instead of calling ``warnings.warn`` -- otherwise these
++            # would become exceptions here.
++            issues = lint(chart)
++        assert any(i.code == "W002" for i in issues)

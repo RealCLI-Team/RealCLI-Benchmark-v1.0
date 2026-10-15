@@ -1,0 +1,2923 @@
+diff --git a/docs/package_reference/sentence_transformer/evaluation.md b/docs/package_reference/sentence_transformer/evaluation.md
+index e6cc556..47f0d1a 100644
+--- a/docs/package_reference/sentence_transformer/evaluation.md
++++ b/docs/package_reference/sentence_transformer/evaluation.md
+@@ -10,6 +10,12 @@ See also the modules from `sentence_transformers.base.evaluation` in [Base > Eva
+ .. autoclass:: sentence_transformers.sentence_transformer.evaluation.BinaryClassificationEvaluator
+ ```
+ 
++## ClusteringEvaluator
++
++```{eval-rst}
++.. autoclass:: sentence_transformers.sentence_transformer.evaluation.ClusteringEvaluator
++```
++
+ ## EmbeddingSimilarityEvaluator
+ 
+ ```{eval-rst}
+diff --git a/docs/package_reference/util/clustering.rst b/docs/package_reference/util/clustering.rst
+new file mode 100644
+index 0000000..69b17d9
+--- /dev/null
++++ b/docs/package_reference/util/clustering.rst
+@@ -0,0 +1,5 @@
++clustering
++==========
++
++.. automodule:: sentence_transformers.util.clustering
++    :members:
+diff --git a/docs/package_reference/util/index.rst b/docs/package_reference/util/index.rst
+index e5fd427..1d6d393 100644
+--- a/docs/package_reference/util/index.rst
++++ b/docs/package_reference/util/index.rst
+@@ -4,6 +4,7 @@ Utility Functions
+ 
+ .. toctree::
+ 
++   clustering
+    dataset
+    distributed
+    environment
+diff --git a/docs/sentence_transformer/usage/usage.rst b/docs/sentence_transformer/usage/usage.rst
+index 22fb8eb..4a6927e 100644
+--- a/docs/sentence_transformer/usage/usage.rst
++++ b/docs/sentence_transformer/usage/usage.rst
+@@ -155,3 +155,127 @@ These methods accept all the same input types as :meth:`~sentence_transformers.s
+    mteb_evaluation
+    efficiency
+ 
++
++Semantic Clustering
++-------------------
++
++Embeddings that are close in vector space carry similar meanings, which makes them a natural fit for
++**clustering**: grouping a corpus into coherent topics without any labels. The
++:mod:`sentence_transformers.util.clustering` module provides deterministic implementations of the two
++most common clustering strategies, plus helpers for inspecting the results:
++
++- :func:`~sentence_transformers.util.kmeans_clustering` partitions the corpus into a fixed number of
++  clusters. It uses a seeded k-means++ initialization, so repeated runs on the same data produce
++  identical clusters.
++- :func:`~sentence_transformers.util.agglomerative_clustering` builds the clusters bottom-up and
++  stops either at a target number of clusters or when the closest clusters are farther apart than a
++  distance threshold. The ``linkage`` parameter controls how distances between clusters are computed
++  (``"single"``, ``"complete"``, or ``"average"``).
++
++::
++
++    from sentence_transformers import SentenceTransformer
++    from sentence_transformers.util import agglomerative_clustering, kmeans_clustering
++
++    model = SentenceTransformer("all-MiniLM-L6-v2")
++    embeddings = model.encode(corpus)
++
++    # 1) k-means with a fixed number of clusters
++    clustering = kmeans_clustering(embeddings, num_clusters=10, seed=42)
++    print(clustering.num_clusters, clustering.cluster_sizes)
++    for cluster_id, indices in clustering.largest_clusters(3):
++        print(f"Cluster {cluster_id}: {[corpus[i] for i in indices[:5]]}")
++
++    # 2) Agglomerative clustering with a distance threshold: the number of clusters
++    #    emerges from the data instead of being fixed upfront.
++    clustering = agglomerative_clustering(embeddings, threshold=0.3, linkage="average")
++    print(f"Found {clustering.num_clusters} clusters")
++
++Both functions return a :class:`~sentence_transformers.util.clustering.ClusteringResult`, which maps
++every input index to a cluster id (``result.labels``) and offers convenience views such as
++``result.clusters``, ``result.cluster_sizes`` and ``result.largest_clusters(n)``. Cluster ids are
++normalized so that the cluster containing the first input is always cluster 0.
++
++To extract the most typical sentences of every cluster, use
++:func:`~sentence_transformers.util.select_representatives`, which picks the members closest to each
++cluster centroid::
++
++    from sentence_transformers.util import select_representatives
++
++    representatives = select_representatives(embeddings, clustering, top_k=3)
++    for cluster_id, indices in representatives.items():
++        print(f"Cluster {cluster_id} is about: {[corpus[i] for i in indices]}")
++
++Semantic Deduplication
++----------------------
++
++Real-world corpora often contain (near-)duplicates: boilerplate, reposts, slightly edited copies.
++:func:`~sentence_transformers.util.semantic_deduplication` flags embeddings whose cosine similarity
++exceeds a threshold and resolves them into duplicate groups with a union-find pass, so duplicates are
++detected **transitively**: if A matches B and B matches C, all three land in one group even if A and
++C never pass the threshold directly. From every group the earliest sentence is kept as the
++representative::
++
++    from sentence_transformers.util import semantic_deduplication
++
++    result = semantic_deduplication(embeddings, threshold=0.9)
++    unique_corpus = result.apply(corpus)
++    print(f"Kept {result.num_kept} of {len(corpus)} sentences")
++    for removed, kept in result.duplicate_of.items():
++        print(f"{corpus[removed]!r} is a duplicate of {corpus[kept]!r}")
++
++The returned :class:`~sentence_transformers.util.clustering.DeduplicationResult` exposes
++``keep_indices`` / ``remove_indices`` for index-based filtering, ``duplicate_of`` for the
++removed-to-representative mapping, and ``groups`` for the full duplicate groups.
++
++Evaluating Clustering Quality
++-----------------------------
++
++When gold labels are available (e.g. topic or intent annotations), the clustering can be scored
++against them. The metric helpers in :mod:`sentence_transformers.util.clustering` cover the standard
++clustering metrics:
++
++- :func:`~sentence_transformers.util.v_measure_score`: harmonic mean of homogeneity (clusters contain
++  a single class) and completeness (a class lives in a single cluster);
++- :func:`~sentence_transformers.util.homogeneity_score` and
++  :func:`~sentence_transformers.util.completeness_score`: the two components individually;
++- :func:`~sentence_transformers.util.adjusted_rand_score`: chance-corrected agreement between the two
++  partitions;
++- :func:`~sentence_transformers.util.normalized_mutual_info_score`: shared information between gold
++  labels and clusters;
++- :func:`~sentence_transformers.util.fowlkes_mallows_score`: geometric mean of pairwise precision and
++  recall;
++- :func:`~sentence_transformers.util.purity_score`: majority-class purity per cluster;
++- :func:`~sentence_transformers.util.cluster_accuracy_score`: classification accuracy after matching
++  clusters to labels with an optimal (Hungarian) assignment.
++
++::
++
++    from sentence_transformers.util import v_measure_score
++
++    clustering = kmeans_clustering(embeddings, num_clusters=len(set(gold_labels)))
++    score = v_measure_score(gold_labels, clustering.labels)
++    print(f"V-measure: {score:.4f}")
++
++For monitoring a model *during training*,
++:class:`~sentence_transformers.sentence_transformer.evaluation.ClusteringEvaluator` wraps the whole
++pipeline: it encodes a held-out set of sentences, clusters the embeddings, scores the clusters
++against gold labels, and reports the metrics to the trainer and to a CSV file::
++
++    from sentence_transformers import SentenceTransformer, SentenceTransformerTrainer
++    from sentence_transformers.evaluation import ClusteringEvaluator
++
++    model = SentenceTransformer("all-MiniLM-L6-v2")
++    evaluator = ClusteringEvaluator(
++        sentences=dev_sentences,
++        labels=dev_labels,
++        algorithm="kmeans",  # or "agglomerative"
++        name="topic_dev",
++    )
++    # score = evaluator(model)  # standalone evaluation
++    # Or plug it into the trainer like any other evaluator:
++    # trainer = SentenceTransformerTrainer(model=model, eval_dataset=..., evaluator=evaluator, ...)
++
++The evaluator returns a dictionary with ``v_measure``, ``adjusted_rand``, ``normalized_mutual_info``
++and ``accuracy`` (prefixed with the evaluator name), and exposes ``v_measure`` as its
++``primary_metric`` for model selection.
+diff --git a/sentence_transformers/sentence_transformer/evaluation/__init__.py b/sentence_transformers/sentence_transformer/evaluation/__init__.py
+index 047b0a2..bb9f90c 100644
+--- a/sentence_transformers/sentence_transformer/evaluation/__init__.py
++++ b/sentence_transformers/sentence_transformer/evaluation/__init__.py
+@@ -6,6 +6,7 @@ from ...base.evaluation.evaluator import BaseEvaluator, SentenceEvaluator
+ from ...base.evaluation.sequential import SequentialEvaluator
+ from ...util.similarity import SimilarityFunction
+ from .binary_classification import BinaryClassificationEvaluator
++from .clustering import ClusteringEvaluator
+ from .embedding_similarity import EmbeddingSimilarityEvaluator
+ from .information_retrieval import InformationRetrievalEvaluator
+ from .label_accuracy import LabelAccuracyEvaluator
+@@ -22,6 +23,7 @@ __all__ = [
+     "SentenceEvaluator",
+     "SimilarityFunction",
+     "BinaryClassificationEvaluator",
++    "ClusteringEvaluator",
+     "EmbeddingSimilarityEvaluator",
+     "InformationRetrievalEvaluator",
+     "LabelAccuracyEvaluator",
+diff --git a/sentence_transformers/sentence_transformer/evaluation/clustering.py b/sentence_transformers/sentence_transformer/evaluation/clustering.py
+new file mode 100644
+index 0000000..68d27cb
+--- /dev/null
++++ b/sentence_transformers/sentence_transformer/evaluation/clustering.py
+@@ -0,0 +1,203 @@
++from __future__ import annotations
++
++import csv
++import logging
++import os
++from typing import TYPE_CHECKING, Literal
++
++from sentence_transformers.base.evaluation.evaluator import BaseEvaluator
++from sentence_transformers.util.clustering import (
++    adjusted_rand_score,
++    agglomerative_clustering,
++    cluster_accuracy_score,
++    kmeans_clustering,
++    normalized_mutual_info_score,
++    v_measure_score,
++)
++
++if TYPE_CHECKING:
++    from sentence_transformers.sentence_transformer.model import SentenceTransformer
++
++logger = logging.getLogger(__name__)
++
++
++class ClusteringEvaluator(BaseEvaluator):
++    """
++    Evaluate a model by clustering the embeddings of ``sentences`` and comparing the clusters against
++    gold ``labels``.
++
++    The evaluator encodes the sentences with the model, clusters the embeddings with either
++    :func:`~sentence_transformers.util.kmeans_clustering` or
++    :func:`~sentence_transformers.util.agglomerative_clustering`, and reports four metrics:
++
++    - ``v_measure``: the V-measure (harmonic mean of homogeneity and completeness);
++    - ``adjusted_rand``: the adjusted Rand index;
++    - ``normalized_mutual_info``: the normalized mutual information (arithmetic average);
++    - ``accuracy``: the clustering accuracy under an optimal (Hungarian) cluster-to-label matching.
++
++    The returned score dictionary uses ``v_measure`` as the primary metric: it is exposed via
++    ``primary_metric`` (prefixed with ``name`` if one is given) and used for model selection.
++
++    Args:
++        sentences (List[str]): The sentences to cluster.
++        labels (List): The gold label of every sentence. Labels may be of any hashable type.
++        algorithm (str, optional): The clustering algorithm: ``"kmeans"`` or ``"agglomerative"``.
++            Defaults to ``"kmeans"``.
++        num_clusters (Optional[int], optional): The number of clusters. Defaults to the number of
++            distinct gold labels.
++        threshold (Optional[float], optional): Only for ``algorithm="agglomerative"``: stop merging
++            when the closest pair of clusters exceeds this cosine distance. Mutually exclusive with
++            ``num_clusters``.
++        linkage (str, optional): Only for ``algorithm="agglomerative"``: the cluster linkage
++            (``"single"``, ``"complete"``, or ``"average"``). Defaults to ``"average"``.
++        seed (int, optional): Only for ``algorithm="kmeans"``: the seed of the k-means++
++            initialization. Defaults to 22.
++        batch_size (int, optional): The batch size used for encoding. Defaults to 32.
++        name (str, optional): The name of the evaluator, used as prefix for the metrics and in the
++            CSV file name. Defaults to "".
++        show_progress_bar (bool, optional): Whether to show a progress bar during encoding.
++            Defaults to False.
++        write_csv (bool, optional): Whether to append the evaluation results to a CSV file in
++            ``output_path``. Defaults to True.
++
++    Example:
++        ::
++
++            from sentence_transformers import SentenceTransformer
++            from sentence_transformers.evaluation import ClusteringEvaluator
++
++            model = SentenceTransformer("all-MiniLM-L6-v2")
++            evaluator = ClusteringEvaluator(
++                sentences=["apple", "banana", "dog", "cat"],
++                labels=["fruit", "fruit", "animal", "animal"],
++                name="toy_dev",
++            )
++            results = evaluator(model)
++            print(evaluator.primary_metric)
++            # => "toy_dev_v_measure"
++            print(results[evaluator.primary_metric])
++            # => 1.0
++    """
++
++    def __init__(
++        self,
++        sentences: list[str],
++        labels: list,
++        algorithm: Literal["kmeans", "agglomerative"] = "kmeans",
++        num_clusters: int | None = None,
++        threshold: float | None = None,
++        linkage: Literal["single", "complete", "average"] = "average",
++        seed: int = 22,
++        batch_size: int = 32,
++        name: str = "",
++        show_progress_bar: bool = False,
++        write_csv: bool = True,
++    ):
++        super().__init__()
++        if len(sentences) != len(labels):
++            raise ValueError(
++                f"sentences and labels must have the same length, got {len(sentences)} and {len(labels)}"
++            )
++        if algorithm not in ("kmeans", "agglomerative"):
++            raise ValueError(f"Unsupported algorithm {algorithm!r}; expected 'kmeans' or 'agglomerative'")
++        if algorithm == "kmeans" and threshold is not None:
++            raise ValueError("threshold is only supported for algorithm='agglomerative'")
++
++        self.sentences = sentences
++        self.labels = list(labels)
++        self.algorithm = algorithm
++        self.num_clusters = num_clusters if num_clusters is not None else len(set(self.labels))
++        self.threshold = threshold
++        self.linkage = linkage
++        self.seed = seed
++        self.batch_size = batch_size
++        self.name = name
++        self.show_progress_bar = show_progress_bar
++        self.write_csv = write_csv
++
++        self.csv_file = "clustering_evaluation" + ("_" + name if name else "") + "_results.csv"
++        self.csv_headers = ["epoch", "steps", "v_measure", "adjusted_rand", "normalized_mutual_info", "accuracy"]
++        self.primary_metric = "v_measure"
++
++    @classmethod
++    def from_input_examples(cls, examples, **kwargs):
++        sentences = [example.texts[0] for example in examples]
++        labels = [example.label for example in examples]
++        return cls(sentences, labels, **kwargs)
++
++    def cluster_embeddings(self, embeddings):
++        """Cluster a matrix of embeddings according to the evaluator configuration."""
++        if self.algorithm == "kmeans":
++            return kmeans_clustering(embeddings, num_clusters=self.num_clusters, seed=self.seed)
++        return agglomerative_clustering(
++            embeddings,
++            num_clusters=self.num_clusters if self.threshold is None else None,
++            threshold=self.threshold,
++            linkage=self.linkage,
++        )
++
++    def __call__(
++        self, model: SentenceTransformer, output_path: str | None = None, epoch: int = -1, steps: int = -1
++    ) -> dict[str, float]:
++        if epoch != -1:
++            if steps == -1:
++                out_txt = f" after epoch {epoch}"
++            else:
++                out_txt = f" in epoch {epoch} after {steps} steps"
++        else:
++            out_txt = ""
++        logger.info(f"ClusteringEvaluator: Evaluating the model on the {self.name} dataset{out_txt}:")
++
++        embeddings = model.encode(
++            self.sentences,
++            batch_size=self.batch_size,
++            show_progress_bar=self.show_progress_bar,
++            convert_to_numpy=True,
++        )
++
++        clustering = self.cluster_embeddings(embeddings)
++        predicted = clustering.labels
++
++        metrics = {
++            "v_measure": v_measure_score(self.labels, predicted),
++            "adjusted_rand": adjusted_rand_score(self.labels, predicted),
++            "normalized_mutual_info": normalized_mutual_info_score(self.labels, predicted),
++            "accuracy": cluster_accuracy_score(self.labels, predicted),
++        }
++        logger.info(
++            "V-Measure: {:.4f}\tAdjusted Rand: {:.4f}\tNMI: {:.4f}\tAccuracy: {:.4f}".format(
++                metrics["v_measure"], metrics["adjusted_rand"], metrics["normalized_mutual_info"], metrics["accuracy"]
++            )
++        )
++
++        if output_path is not None and self.write_csv:
++            os.makedirs(output_path, exist_ok=True)
++            csv_path = os.path.join(output_path, self.csv_file)
++            output_file_exists = os.path.isfile(csv_path)
++            with open(csv_path, newline="", mode="a" if output_file_exists else "w", encoding="utf-8") as f:
++                writer = csv.writer(f)
++                if not output_file_exists:
++                    writer.writerow(self.csv_headers)
++                writer.writerow(
++                    [
++                        epoch,
++                        steps,
++                        metrics["v_measure"],
++                        metrics["adjusted_rand"],
++                        metrics["normalized_mutual_info"],
++                        metrics["accuracy"],
++                    ]
++                )
++
++        metrics = self.prefix_name_to_metrics(metrics, self.name)
++        self.store_metrics_in_model_card_data(model=model, metrics=metrics, epoch=epoch, step=steps)
++        return metrics
++
++    def get_config_dict(self) -> dict:
++        return {
++            "algorithm": self.algorithm,
++            "num_clusters": self.num_clusters,
++            "threshold": self.threshold,
++            "linkage": self.linkage,
++            "seed": self.seed,
++        }
+diff --git a/sentence_transformers/util/__init__.py b/sentence_transformers/util/__init__.py
+index cfa56f8..2dcc239 100644
+--- a/sentence_transformers/util/__init__.py
++++ b/sentence_transformers/util/__init__.py
+@@ -1,5 +1,22 @@
+ from __future__ import annotations
+ 
++from .clustering import (
++    ClusteringResult,
++    CommunityDetectionResult,
++    DeduplicationResult,
++    adjusted_rand_score,
++    agglomerative_clustering,
++    cluster_accuracy_score,
++    completeness_score,
++    fowlkes_mallows_score,
++    homogeneity_score,
++    kmeans_clustering,
++    normalized_mutual_info_score,
++    purity_score,
++    select_representatives,
++    semantic_deduplication,
++    v_measure_score,
++)
+ from .dataset import resolve_ids
+ from .decorators import save_to_hub_args_decorator
+ from .distributed import all_gather, all_gather_padded, all_gather_with_grad, get_rank, get_world_size
+@@ -67,6 +84,22 @@ from .tensor import (
+ )
+ 
+ __all__ = [
++    # From clustering.py
++    "ClusteringResult",
++    "CommunityDetectionResult",
++    "DeduplicationResult",
++    "adjusted_rand_score",
++    "agglomerative_clustering",
++    "cluster_accuracy_score",
++    "completeness_score",
++    "fowlkes_mallows_score",
++    "homogeneity_score",
++    "kmeans_clustering",
++    "normalized_mutual_info_score",
++    "purity_score",
++    "select_representatives",
++    "semantic_deduplication",
++    "v_measure_score",
+     # From decorators.py
+     "save_to_hub_args_decorator",
+     # From distributed.py
+diff --git a/sentence_transformers/util/clustering.py b/sentence_transformers/util/clustering.py
+new file mode 100644
+index 0000000..5faea5b
+--- /dev/null
++++ b/sentence_transformers/util/clustering.py
+@@ -0,0 +1,974 @@
++"""Semantic clustering and deduplication utilities.
++
++This module groups the embedding-based clustering helpers of Sentence Transformers:
++
++- :func:`kmeans_clustering` and :func:`agglomerative_clustering` partition a set of embeddings into
++  clusters. Both are fully deterministic: identical inputs always produce identical clusters.
++- :func:`semantic_deduplication` finds (near-)duplicate embeddings via a cosine-similarity
++  threshold and transitive grouping.
++- :func:`select_representatives` extracts the most typical members of every cluster.
++- The metric functions (:func:`v_measure_score`, :func:`homogeneity_score`,
++  :func:`completeness_score`, :func:`normalized_mutual_info_score`, :func:`adjusted_rand_score`,
++  :func:`fowlkes_mallows_score`, :func:`purity_score`, :func:`cluster_accuracy_score`) score a
++  clustering against gold labels.
++
++All functions accept embeddings as a 2D torch tensor, numpy array, or nested Python lists, and all
++results follow the conventions of :class:`ClusteringResult` and :class:`DeduplicationResult`.
++"""
++
++from __future__ import annotations
++
++import math
++from collections.abc import Sequence
++from dataclasses import dataclass, field
++from typing import Any, Literal
++
++import numpy as np
++import torch
++
++__all__ = [
++    "ClusteringResult",
++    "CommunityDetectionResult",
++    "DeduplicationResult",
++    "kmeans_clustering",
++    "agglomerative_clustering",
++    "semantic_deduplication",
++    "v_measure_score",
++    "normalized_mutual_info_score",
++    "adjusted_rand_score",
++    "cluster_accuracy_score",
++    "homogeneity_score",
++    "completeness_score",
++    "fowlkes_mallows_score",
++    "purity_score",
++    "select_representatives",
++]
++
++ArrayLike = Any
++
++
++def _to_float64_tensor(embeddings: ArrayLike) -> torch.Tensor:
++    """Convert torch/numpy/list embeddings to a 2D float64 CPU tensor."""
++    if isinstance(embeddings, torch.Tensor):
++        tensor = embeddings.detach().to(dtype=torch.float64, device="cpu")
++    elif isinstance(embeddings, np.ndarray):
++        tensor = torch.from_numpy(np.asarray(embeddings)).to(dtype=torch.float64)
++    else:
++        tensor = torch.tensor(np.asarray(embeddings), dtype=torch.float64)
++    if tensor.ndim == 1:
++        tensor = tensor.unsqueeze(0)
++    if tensor.ndim != 2:
++        raise ValueError(f"Embeddings must be a 2D matrix, got shape {tuple(tensor.shape)}")
++    return tensor
++
++
++@dataclass
++class ClusteringResult:
++    """
++    The result of a clustering run over a set of embeddings.
++
++    Attributes:
++        labels (List[int]): The cluster id of every input embedding, in input order. Cluster ids are
++            contiguous integers starting at 0 and are ordered by the smallest member index of each
++            cluster, i.e. the cluster that contains index 0 is always cluster 0, the cluster with the
++            next-smallest first member is cluster 1, and so on.
++    """
++
++    labels: list[int]
++
++    @property
++    def num_clusters(self) -> int:
++        """The number of distinct clusters."""
++        return len(set(self.labels)) if self.labels else 0
++
++    @property
++    def clusters(self) -> dict[int, list[int]]:
++        """A mapping from cluster id to the sorted list of member indices."""
++        clusters: dict[int, list[int]] = {}
++        for idx, label in enumerate(self.labels):
++            clusters.setdefault(label, []).append(idx)
++        return clusters
++
++    @property
++    def cluster_sizes(self) -> dict[int, int]:
++        """A mapping from cluster id to the number of members in that cluster."""
++        return {cluster_id: len(indices) for cluster_id, indices in self.clusters.items()}
++
++    def cluster_indices(self, cluster_id: int) -> list[int]:
++        """Return the sorted member indices of one cluster. Raises KeyError for unknown ids."""
++        return self.clusters[cluster_id]
++
++    def largest_clusters(self, n: int = 10) -> list[tuple[int, list[int]]]:
++        """
++        Return the ``n`` largest clusters as ``(cluster_id, member_indices)`` tuples, ordered by
++        descending size. Ties are broken by ascending cluster id.
++        """
++        clusters = sorted(self.clusters.items(), key=lambda item: (-len(item[1]), item[0]))
++        return clusters[:n]
++
++    def smallest_clusters(self, n: int = 10) -> list[tuple[int, list[int]]]:
++        """
++        Return the ``n`` smallest clusters as ``(cluster_id, member_indices)`` tuples, ordered by
++        ascending size. Ties are broken by ascending cluster id.
++        """
++        clusters = sorted(self.clusters.items(), key=lambda item: (len(item[1]), item[0]))
++        return clusters[:n]
++
++    def partition_equals(self, other: "ClusteringResult") -> bool:
++        """
++        Check whether two results describe the same partition of the inputs, ignoring the concrete
++        cluster ids. Two clusterings are equal if they group exactly the same indices together.
++        """
++        if len(self.labels) != len(other.labels):
++            return False
++        mapping: dict[int, int] = {}
++        used: set[int] = set()
++        for a, b in zip(self.labels, other.labels):
++            if a in mapping:
++                if mapping[a] != b:
++                    return False
++            else:
++                if b in used:
++                    return False
++                mapping[a] = b
++                used.add(b)
++        return True
++
++    def __len__(self) -> int:
++        return len(self.labels)
++
++
++@dataclass
++class CommunityDetectionResult:
++    """
++    Structured result of :func:`~sentence_transformers.util.community_detection`.
++
++    ``community_detection`` traditionally returns a ``list[list[int]]`` where each inner list is a
++    community whose first element is the central point. When called with ``return_result=True`` it
++    returns an instance of this class instead, exposing the same information via named attributes so
++    downstream code does not have to remember the list-of-lists convention.
++
++    Attributes:
++        communities (List[List[int]]): The communities in the same shape and order as the legacy
++            list-of-lists return: descending community size, ties broken by ascending central index.
++            Each inner list has the central point as its first element followed by the remaining
++            members ordered by decreasing similarity to the central point (ties broken by ascending
++            index).
++        central_indices (List[int]): ``[community[0] for community in communities]``, extracted for
++            convenience. Same length as ``communities``.
++        unclustered_indices (List[int]): Sorted list of embedding indices that ended up in no
++            community. This includes all-zero embeddings, embeddings without enough neighbors, and
++            embeddings that lost to a larger overlapping community. Never overlaps with any
++            community.
++        num_embeddings (int): The total number of input embeddings the result was computed from.
++    """
++
++    communities: list[list[int]]
++    central_indices: list[int]
++    unclustered_indices: list[int]
++    num_embeddings: int
++
++    @property
++    def num_communities(self) -> int:
++        """Number of detected communities."""
++        return len(self.communities)
++
++    @property
++    def sizes(self) -> list[int]:
++        """Sizes of the detected communities, in the same order as :attr:`communities`."""
++        return [len(community) for community in self.communities]
++
++    @property
++    def labels(self) -> list[int]:
++        """
++        Per-embedding community id: ``labels[i]`` is the index of the community containing
++        embedding ``i``, or ``-1`` if the embedding is in :attr:`unclustered_indices`.
++
++        Community ids are contiguous integers starting at 0 in the same order as
++        :attr:`communities` (i.e. by decreasing community size, ties broken by ascending central
++        index). This numbering scheme is intentionally different from
++        :class:`ClusteringResult`'s "first-member-index" numbering because community detection is
++        primarily size-driven, and reordering by first-member would obscure the "largest first"
++        semantic.
++        """
++        labels = [-1] * self.num_embeddings
++        for community_id, members in enumerate(self.communities):
++            for member in members:
++                labels[member] = community_id
++        return labels
++
++    def as_clustering_result(self) -> "ClusteringResult":
++        """
++        Convert this community-detection result into a
++        :class:`~sentence_transformers.util.clustering.ClusteringResult`, so it can be fed to
++        :func:`select_representatives` or any of the metric helpers.
++
++        Unclustered indices are collected into their own cluster after all detected communities;
++        that cluster gets the id ``num_communities`` (i.e. one past the highest community id). If
++        every embedding was clustered the "unclustered" bucket is omitted and the result is a
++        proper k-way partition of ``range(num_embeddings)``.
++        """
++        labels = [-1] * self.num_embeddings
++        for community_id, members in enumerate(self.communities):
++            for member in members:
++                labels[member] = community_id
++        if self.unclustered_indices:
++            outlier_label = self.num_communities
++            for idx in self.unclustered_indices:
++                labels[idx] = outlier_label
++        # If any label is still -1 (should not happen given the invariants), promote it to outliers.
++        outlier_label = self.num_communities
++        for idx, label in enumerate(labels):
++            if label == -1:
++                labels[idx] = outlier_label
++        return ClusteringResult(labels=labels)
++
++
++@dataclass
++class DeduplicationResult:
++    """
++    The result of :func:`semantic_deduplication`.
++
++    Attributes:
++        keep_indices (List[int]): Sorted indices of the embeddings to keep: exactly one representative
++            per duplicate group (the lowest index of the group) plus all singletons.
++        remove_indices (List[int]): Sorted indices of the embeddings that are duplicates of an earlier
++            embedding and should be dropped.
++        duplicate_of (Dict[int, int]): Maps every removed index to the kept representative it is a
++            duplicate of.
++        groups (List[List[int]]): All duplicate groups of size >= 2. Each group is sorted ascending and
++            starts with the kept representative; groups are ordered by their representative index.
++    """
++
++    keep_indices: list[int]
++    remove_indices: list[int]
++    duplicate_of: dict[int, int]
++    groups: list[list[int]] = field(default_factory=list)
++
++    @property
++    def num_duplicates(self) -> int:
++        """The number of embeddings flagged as duplicates."""
++        return len(self.remove_indices)
++
++    @property
++    def num_kept(self) -> int:
++        """The number of embeddings kept after deduplication."""
++        return len(self.keep_indices)
++
++    def apply(self, items: Sequence) -> list:
++        """
++        Apply the deduplication to any sequence aligned with the embeddings (e.g. the original
++        sentences) and return the items that are kept, in their original order.
++        """
++        return [items[idx] for idx in self.keep_indices]
++
++
++def _normalize_rows(matrix: torch.Tensor) -> torch.Tensor:
++    """L2-normalize the rows of a matrix; zero rows stay zero."""
++    norms = matrix.norm(dim=1, keepdim=True)
++    return torch.where(norms > 0, matrix / norms.clamp_min(1e-300), matrix)
++
++
++def _pairwise_cosine_similarity(matrix: torch.Tensor) -> torch.Tensor:
++    normalized = _normalize_rows(matrix)
++    sim = normalized @ normalized.T
++    return sim.clamp(-1.0, 1.0)
++
++
++def _pairwise_distance(matrix: torch.Tensor, metric: str) -> torch.Tensor:
++    if metric == "cosine":
++        return 1.0 - _pairwise_cosine_similarity(matrix)
++    if metric == "euclidean":
++        sq_norms = (matrix * matrix).sum(dim=1)
++        dist_sq = sq_norms.unsqueeze(1) + sq_norms.unsqueeze(0) - 2.0 * (matrix @ matrix.T)
++        return dist_sq.clamp_min(0.0).sqrt()
++    raise ValueError(f"Unsupported metric {metric!r}; expected 'cosine' or 'euclidean'")
++
++
++def _relabel_by_first_member(labels: Sequence[int]) -> list[int]:
++    """Relabel cluster ids so they are 0..k-1 ordered by the smallest member index of each cluster."""
++    first_member: dict[int, int] = {}
++    for idx, label in enumerate(labels):
++        if label not in first_member:
++            first_member[label] = idx
++    ordered = sorted(first_member, key=lambda label: first_member[label])
++    remap = {label: new_id for new_id, label in enumerate(ordered)}
++    return [remap[label] for label in labels]
++
++
++def kmeans_clustering(
++    embeddings: ArrayLike,
++    num_clusters: int,
++    seed: int = 22,
++    max_iter: int = 100,
++    tol: float = 1e-6,
++) -> ClusteringResult:
++    """
++    Cluster embeddings with a deterministic k-means that uses k-means++ initialization seeded by
++    ``seed``. Identical inputs and parameters always produce identical outputs, independent of the
++    number of CPU threads.
++
++    The algorithm minimizes the within-cluster sum of squared Euclidean distances. For normalized
++    embeddings this is (up to a monotone transformation) equivalent to maximizing within-cluster
++    cosine similarity.
++
++    Args:
++        embeddings: A 2D matrix of embeddings (torch tensor, numpy array, or nested lists).
++        num_clusters (int): The number of clusters ``k``. Must satisfy ``1 <= k <= n_embeddings``.
++        seed (int, optional): Seed for the k-means++ initialization. Defaults to 22.
++        max_iter (int, optional): Maximum number of Lloyd iterations. Defaults to 100.
++        tol (float, optional): Convergence tolerance on the largest centroid shift between two
++            iterations. Defaults to 1e-6.
++
++    Returns:
++        ClusteringResult: The clustering result; ``result.labels[i]`` is the cluster id of
++        ``embeddings[i]``.
++
++    Raises:
++        ValueError: If ``num_clusters`` is not in ``[1, n_embeddings]``.
++
++    Example:
++        ::
++
++            from sentence_transformers import SentenceTransformer
++            from sentence_transformers.util import kmeans_clustering
++
++            model = SentenceTransformer("all-MiniLM-L6-v2")
++            embeddings = model.encode(corpus)
++            result = kmeans_clustering(embeddings, num_clusters=5)
++            for cluster_id, indices in result.largest_clusters(3):
++                print(cluster_id, [corpus[i] for i in indices])
++    """
++    matrix = _to_float64_tensor(embeddings)
++    n_embeddings = matrix.shape[0]
++    if not isinstance(num_clusters, int) or isinstance(num_clusters, bool):
++        raise ValueError(f"num_clusters must be an int, got {type(num_clusters).__name__}")
++    if num_clusters < 1 or num_clusters > n_embeddings:
++        raise ValueError(
++            f"num_clusters must be between 1 and the number of embeddings ({n_embeddings}), got {num_clusters}"
++        )
++
++    if num_clusters == n_embeddings:
++        return ClusteringResult(labels=list(range(n_embeddings)))
++    if num_clusters == 1:
++        return ClusteringResult(labels=[0] * n_embeddings)
++
++    generator = torch.Generator().manual_seed(seed)
++
++    # k-means++ initialization
++    center_indices = [int(torch.randint(n_embeddings, (1,), generator=generator).item())]
++    min_dist_sq = ((matrix - matrix[center_indices[0]]) ** 2).sum(dim=1)
++    for _ in range(1, num_clusters):
++        total = float(min_dist_sq.sum())
++        if total <= 0:
++            # All remaining points coincide with chosen centers: pick uniformly at random
++            next_index = int(torch.randint(n_embeddings, (1,), generator=generator).item())
++        else:
++            probs = min_dist_sq / total
++            next_index = int(torch.multinomial(probs, 1, generator=generator).item())
++        center_indices.append(next_index)
++        dist_sq = ((matrix - matrix[next_index]) ** 2).sum(dim=1)
++        min_dist_sq = torch.minimum(min_dist_sq, dist_sq)
++
++    centers = matrix[center_indices].clone()
++
++    labels = torch.zeros(n_embeddings, dtype=torch.long)
++    for _ in range(max_iter):
++        distances = torch.cdist(matrix, centers)  # (n, k), deterministic on CPU
++        new_labels = distances.argmin(dim=1)  # torch.argmin breaks ties by lowest index
++
++        new_centers = centers.clone()
++        for cluster_id in range(num_clusters):
++            members = new_labels == cluster_id
++            if members.any():
++                new_centers[cluster_id] = matrix[members].mean(dim=0)
++            else:
++                # Reinitialize an empty cluster at the point that is currently worst explained
++                worst_index = int(
++                    distances.gather(1, new_labels.unsqueeze(1)).squeeze(1).argmax().item()
++                )
++                new_centers[cluster_id] = matrix[worst_index]
++
++        shift = (new_centers - centers).norm(dim=1).max()
++        centers = new_centers
++        labels = new_labels
++        if shift < tol:
++            break
++
++    return ClusteringResult(labels=_relabel_by_first_member(labels.tolist()))
++
++
++def agglomerative_clustering(
++    embeddings: ArrayLike,
++    num_clusters: int | None = None,
++    threshold: float | None = None,
++    linkage: Literal["single", "complete", "average"] = "average",
++    metric: Literal["cosine", "euclidean"] = "cosine",
++) -> ClusteringResult:
++    """
++    Cluster embeddings with deterministic (bottom-up) agglomerative hierarchical clustering.
++
++    Every embedding starts as its own cluster; the two closest clusters are merged greedily until
++    either exactly ``num_clusters`` clusters remain or the closest pair of clusters is farther apart
++    than ``threshold``. When several pairs are equally close, the pair with the lowest cluster indices
++    is merged first, so the output is fully deterministic.
++
++    Args:
++        embeddings: A 2D matrix of embeddings (torch tensor, numpy array, or nested lists).
++        num_clusters (Optional[int]): Stop when this many clusters remain. Exactly one of
++            ``num_clusters`` and ``threshold`` must be given.
++        threshold (Optional[float]): Stop when the smallest distance between two clusters exceeds this
++            value. For ``metric="cosine"`` this is a cosine *distance* (``1 - cosine_similarity``), so
++            e.g. ``threshold=0.25`` merges clusters down to a cosine similarity of 0.75.
++        linkage (str): How the distance between two clusters is computed from the pairwise distances
++            of their members: ``"single"`` (minimum), ``"complete"`` (maximum), or ``"average"``
++            (mean). Defaults to ``"average"``.
++        metric (str): The pairwise distance metric: ``"cosine"`` or ``"euclidean"``. Defaults to
++            ``"cosine"``.
++
++    Returns:
++        ClusteringResult: The clustering result; ``result.labels[i]`` is the cluster id of
++        ``embeddings[i]``.
++
++    Raises:
++        ValueError: If both or neither of ``num_clusters`` and ``threshold`` are given, if
++            ``num_clusters`` is out of range, if ``threshold`` is negative, or if ``linkage`` or
++            ``metric`` are unsupported.
++
++    Example:
++        ::
++
++            from sentence_transformers.util import agglomerative_clustering
++
++            result = agglomerative_clustering(embeddings, threshold=0.3, linkage="average")
++            print(result.num_clusters, result.cluster_sizes)
++    """
++    if (num_clusters is None) == (threshold is None):
++        raise ValueError("Exactly one of num_clusters and threshold must be provided")
++    if linkage not in ("single", "complete", "average"):
++        raise ValueError(f"Unsupported linkage {linkage!r}; expected 'single', 'complete', or 'average'")
++    if metric not in ("cosine", "euclidean"):
++        raise ValueError(f"Unsupported metric {metric!r}; expected 'cosine' or 'euclidean'")
++
++    matrix = _to_float64_tensor(embeddings)
++    n_embeddings = matrix.shape[0]
++
++    if num_clusters is not None:
++        if not isinstance(num_clusters, int) or isinstance(num_clusters, bool):
++            raise ValueError(f"num_clusters must be an int, got {type(num_clusters).__name__}")
++        if num_clusters < 1 or num_clusters > n_embeddings:
++            raise ValueError(
++                f"num_clusters must be between 1 and the number of embeddings ({n_embeddings}), got {num_clusters}"
++            )
++    if threshold is not None and threshold < 0:
++        raise ValueError(f"threshold must be non-negative, got {threshold}")
++
++    point_dist = _pairwise_distance(matrix, metric).numpy()
++
++    # clusters[cluster_idx] = sorted list of member point indices
++    clusters: list[list[int]] = [[i] for i in range(n_embeddings)]
++    # dist[i, j] = current distance between cluster i and cluster j (i != j)
++    dist = point_dist.copy()
++
++    def cluster_distance(members_a: list[int], members_b: list[int]) -> float:
++        pairwise = point_dist[np.ix_(members_a, members_b)]
++        if linkage == "single":
++            return float(pairwise.min())
++        if linkage == "complete":
++            return float(pairwise.max())
++        return float(pairwise.mean())
++
++    while len(clusters) > 1:
++        if num_clusters is not None and len(clusters) <= num_clusters:
++            break
++
++        n_clusters = len(clusters)
++        # Find the closest pair; ties are broken by lowest (i, j) in row-major order
++        best_pair: tuple[int, int] | None = None
++        best_value = math.inf
++        for i in range(n_clusters):
++            for j in range(i + 1, n_clusters):
++                value = dist[i, j]
++                if value < best_value - 1e-15:
++                    best_value = value
++                    best_pair = (i, j)
++        if best_pair is None:
++            break
++        if threshold is not None and best_value > threshold:
++            break
++
++        i, j = best_pair
++        clusters[i] = sorted(clusters[i] + clusters[j])
++        del clusters[j]
++
++        # Recompute distances from the merged cluster to all remaining clusters
++        dist = np.delete(np.delete(dist, j, axis=0), j, axis=1)
++        for other in range(len(clusters)):
++            if other == i:
++                continue
++            value = cluster_distance(clusters[i], clusters[other])
++            dist[i, other] = value
++            dist[other, i] = value
++
++    labels = [0] * n_embeddings
++    for cluster_id, members in enumerate(clusters):
++        for member in members:
++            labels[member] = cluster_id
++    return ClusteringResult(labels=_relabel_by_first_member(labels))
++
++
++def semantic_deduplication(
++    embeddings: ArrayLike,
++    threshold: float = 0.9,
++) -> DeduplicationResult:
++    """
++    Find semantically (near-)duplicate embeddings: two embeddings are considered duplicates when
++    their cosine similarity is greater than or equal to ``threshold``.
++
++    Duplicates are resolved transitively (union-find): if A matches B and B matches C, all three form
++    one duplicate group even if A and C are below the threshold. From every group the embedding with
++    the lowest input index is kept as the representative; all other members are flagged for removal.
++
++    Args:
++        embeddings: A 2D matrix of embeddings (torch tensor, numpy array, or nested lists).
++        threshold (float, optional): Cosine similarity threshold in ``[-1, 1]`` above which two
++            embeddings count as duplicates. Defaults to 0.9.
++
++    Returns:
++        DeduplicationResult: The kept/removed indices, the duplicate mapping, and the duplicate
++        groups. Use ``result.apply(sentences)`` to directly deduplicate an aligned sequence.
++
++    Raises:
++        ValueError: If ``threshold`` is not in ``[-1, 1]``.
++
++    Example:
++        ::
++
++            from sentence_transformers.util import semantic_deduplication
++
++            result = semantic_deduplication(embeddings, threshold=0.85)
++            unique_sentences = result.apply(sentences)
++            for removed, kept in result.duplicate_of.items():
++                print(f"{sentences[removed]!r} duplicates {sentences[kept]!r}")
++    """
++    if threshold < -1.0 or threshold > 1.0:
++        raise ValueError(f"threshold must be in [-1, 1], got {threshold}")
++
++    matrix = _to_float64_tensor(embeddings)
++    n_embeddings = matrix.shape[0]
++    if n_embeddings == 0:
++        return DeduplicationResult(keep_indices=[], remove_indices=[], duplicate_of={}, groups=[])
++
++    sim = _pairwise_cosine_similarity(matrix).numpy()
++
++    parent = list(range(n_embeddings))
++
++    def find(x: int) -> int:
++        while parent[x] != x:
++            parent[x] = parent[parent[x]]
++            x = parent[x]
++        return x
++
++    def union(a: int, b: int) -> None:
++        ra, rb = find(a), find(b)
++        if ra == rb:
++            return
++        # Attach the larger root under the smaller one: representative = lowest index
++        if ra < rb:
++            parent[rb] = ra
++        else:
++            parent[ra] = rb
++
++    for i in range(n_embeddings):
++        row = sim[i]
++        for j in range(i + 1, n_embeddings):
++            if row[j] >= threshold:
++                union(i, j)
++
++    components: dict[int, list[int]] = {}
++    for idx in range(n_embeddings):
++        components.setdefault(find(idx), []).append(idx)
++
++    keep_indices: list[int] = []
++    remove_indices: list[int] = []
++    duplicate_of: dict[int, int] = {}
++    groups: list[list[int]] = []
++    for root in sorted(components):
++        members = sorted(components[root])
++        representative = members[0]
++        keep_indices.append(representative)
++        if len(members) >= 2:
++            groups.append(members)
++        for member in members[1:]:
++            remove_indices.append(member)
++            duplicate_of[member] = representative
++
++    return DeduplicationResult(
++        keep_indices=keep_indices,
++        remove_indices=sorted(remove_indices),
++        duplicate_of=duplicate_of,
++        groups=groups,
++    )
++
++
++def _contingency_table(labels_true: Sequence[int], labels_pred: Sequence[int]) -> np.ndarray:
++    """Build the contingency matrix: rows = true labels, columns = predicted clusters."""
++    true_ids = {label: idx for idx, label in enumerate(sorted(set(labels_true), key=repr))}
++    pred_ids = {label: idx for idx, label in enumerate(sorted(set(labels_pred), key=repr))}
++    table = np.zeros((len(true_ids), len(pred_ids)), dtype=np.int64)
++    for t, p in zip(labels_true, labels_pred):
++        table[true_ids[t], pred_ids[p]] += 1
++    return table
++
++
++def _entropy(counts: np.ndarray, total: float) -> float:
++    probs = counts[counts > 0] / total
++    return float(-(probs * np.log(probs)).sum())
++
++
++def v_measure_score(labels_true: Sequence[int], labels_pred: Sequence[int], beta: float = 1.0) -> float:
++    """
++    Compute the V-measure (harmonic mean of homogeneity and completeness) between gold labels and a
++    clustering, following the conventions of ``sklearn.metrics.v_measure_score``.
++
++    Homogeneity: every predicted cluster contains only members of a single gold class.
++    Completeness: all members of a gold class are assigned to the same predicted cluster.
++
++    Args:
++        labels_true: The gold label of every sample.
++        labels_pred: The predicted cluster id of every sample.
++        beta (float, optional): Weight of homogeneity vs. completeness. Defaults to 1.0.
++
++    Returns:
++        float: The V-measure in ``[0, 1]``; 1.0 means the clustering matches the gold labels exactly.
++    """
++    labels_true = list(labels_true)
++    labels_pred = list(labels_pred)
++    if len(labels_true) != len(labels_pred):
++        raise ValueError("labels_true and labels_pred must have the same length")
++    if len(labels_true) == 0:
++        raise ValueError("labels must not be empty")
++    if beta < 0:
++        raise ValueError(f"beta must be non-negative, got {beta}")
++
++    table = _contingency_table(labels_true, labels_pred).astype(np.float64)
++    total = table.sum()
++
++    entropy_true = _entropy(table.sum(axis=1), total)
++    entropy_pred = _entropy(table.sum(axis=0), total)
++
++    # Conditional entropies from the contingency table
++    row_totals = table.sum(axis=1)
++    col_totals = table.sum(axis=0)
++    h_true_given_pred = 0.0
++    h_pred_given_true = 0.0
++    for row in range(table.shape[0]):
++        for col in range(table.shape[1]):
++            count = table[row, col]
++            if count == 0:
++                continue
++            h_true_given_pred -= count / total * math.log(count / col_totals[col])
++            h_pred_given_true -= count / total * math.log(count / row_totals[row])
++
++    homogeneity = 1.0 if entropy_true == 0.0 else 1.0 - h_true_given_pred / entropy_true
++    completeness = 1.0 if entropy_pred == 0.0 else 1.0 - h_pred_given_true / entropy_pred
++
++    if homogeneity + completeness == 0.0:
++        return 0.0
++    return float((1 + beta) * homogeneity * completeness / (beta * homogeneity + completeness))
++
++
++def normalized_mutual_info_score(labels_true: Sequence[int], labels_pred: Sequence[int]) -> float:
++    """
++    Compute the normalized mutual information (NMI) between gold labels and a clustering using the
++    arithmetic mean of the two entropies as the normalizer, following
++    ``sklearn.metrics.normalized_mutual_info_score`` with ``average_method="arithmetic"``.
++
++    Args:
++        labels_true: The gold label of every sample.
++        labels_pred: The predicted cluster id of every sample.
++
++    Returns:
++        float: The NMI in ``[0, 1]``; 1.0 means the clustering matches the gold labels exactly.
++    """
++    labels_true = list(labels_true)
++    labels_pred = list(labels_pred)
++    if len(labels_true) != len(labels_pred):
++        raise ValueError("labels_true and labels_pred must have the same length")
++    if len(labels_true) == 0:
++        raise ValueError("labels must not be empty")
++
++    table = _contingency_table(labels_true, labels_pred).astype(np.float64)
++    total = table.sum()
++
++    entropy_true = _entropy(table.sum(axis=1), total)
++    entropy_pred = _entropy(table.sum(axis=0), total)
++
++    if entropy_true == 0.0 and entropy_pred == 0.0:
++        return 1.0
++
++    # Mutual information from the joint distribution
++    row_totals = table.sum(axis=1)
++    col_totals = table.sum(axis=0)
++    mutual_info = 0.0
++    for row in range(table.shape[0]):
++        for col in range(table.shape[1]):
++            count = table[row, col]
++            if count == 0:
++                continue
++            mutual_info += count / total * math.log(count * total / (row_totals[row] * col_totals[col]))
++
++    normalizer = (entropy_true + entropy_pred) / 2.0
++    if normalizer == 0.0:
++        return 1.0
++    return float(mutual_info / normalizer)
++
++
++def adjusted_rand_score(labels_true: Sequence[int], labels_pred: Sequence[int]) -> float:
++    """
++    Compute the adjusted Rand index (ARI) between gold labels and a clustering, following
++    ``sklearn.metrics.adjusted_rand_score``. The ARI is corrected-for-chance: random partitions score
++    close to 0 and identical partitions score 1.
++
++    Args:
++        labels_true: The gold label of every sample.
++        labels_pred: The predicted cluster id of every sample.
++
++    Returns:
++        float: The ARI in ``[-1, 1]``.
++    """
++    labels_true = list(labels_true)
++    labels_pred = list(labels_pred)
++    if len(labels_true) != len(labels_pred):
++        raise ValueError("labels_true and labels_pred must have the same length")
++    if len(labels_true) == 0:
++        raise ValueError("labels must not be empty")
++
++    table = _contingency_table(labels_true, labels_pred).astype(np.float64)
++    total = table.sum()
++
++    def comb2(values: np.ndarray) -> float:
++        return float((values * (values - 1) / 2.0).sum())
++
++    sum_cells = comb2(table.ravel())
++    sum_rows = comb2(table.sum(axis=1))
++    sum_cols = comb2(table.sum(axis=0))
++    total_pairs = total * (total - 1) / 2.0
++
++    if total_pairs == 0:
++        return 1.0
++
++    expected = sum_rows * sum_cols / total_pairs
++    maximum = (sum_rows + sum_cols) / 2.0
++    denominator = maximum - expected
++    if denominator == 0:
++        return 1.0 if sum_cells == maximum else 0.0
++    return float((sum_cells - expected) / denominator)
++
++
++def cluster_accuracy_score(labels_true: Sequence[int], labels_pred: Sequence[int]) -> float:
++    """
++    Compute the clustering accuracy: the fraction of samples correctly assigned after matching every
++    predicted cluster to at most one gold label with an optimal (Hungarian) assignment.
++
++    Args:
++        labels_true: The gold label of every sample.
++        labels_pred: The predicted cluster id of every sample.
++
++    Returns:
++        float: The accuracy in ``[0, 1]``.
++    """
++    from scipy.optimize import linear_sum_assignment
++
++    labels_true = list(labels_true)
++    labels_pred = list(labels_pred)
++    if len(labels_true) != len(labels_pred):
++        raise ValueError("labels_true and labels_pred must have the same length")
++    if len(labels_true) == 0:
++        raise ValueError("labels must not be empty")
++
++    table = _contingency_table(labels_true, labels_pred).astype(np.float64)
++    row_ind, col_ind = linear_sum_assignment(-table)
++    correct = table[row_ind, col_ind].sum()
++    return float(correct / table.sum())
++
++
++def homogeneity_score(labels_true: Sequence[int], labels_pred: Sequence[int]) -> float:
++    """
++    Compute the homogeneity of a clustering: every predicted cluster should contain only members of a
++    single gold class. Follows ``sklearn.metrics.homogeneity_score``.
++
++    Args:
++        labels_true: The gold label of every sample.
++        labels_pred: The predicted cluster id of every sample.
++
++    Returns:
++        float: The homogeneity in ``[0, 1]``.
++    """
++    labels_true = list(labels_true)
++    labels_pred = list(labels_pred)
++    if len(labels_true) != len(labels_pred):
++        raise ValueError("labels_true and labels_pred must have the same length")
++    if len(labels_true) == 0:
++        raise ValueError("labels must not be empty")
++
++    table = _contingency_table(labels_true, labels_pred).astype(np.float64)
++    total = table.sum()
++    entropy_true = _entropy(table.sum(axis=1), total)
++    if entropy_true == 0.0:
++        return 1.0
++
++    col_totals = table.sum(axis=0)
++    h_true_given_pred = 0.0
++    for row in range(table.shape[0]):
++        for col in range(table.shape[1]):
++            count = table[row, col]
++            if count == 0:
++                continue
++            h_true_given_pred -= count / total * math.log(count / col_totals[col])
++    return float(1.0 - h_true_given_pred / entropy_true)
++
++
++def completeness_score(labels_true: Sequence[int], labels_pred: Sequence[int]) -> float:
++    """
++    Compute the completeness of a clustering: all members of a gold class should be assigned to the
++    same predicted cluster. Follows ``sklearn.metrics.completeness_score``.
++
++    Args:
++        labels_true: The gold label of every sample.
++        labels_pred: The predicted cluster id of every sample.
++
++    Returns:
++        float: The completeness in ``[0, 1]``.
++    """
++    labels_true = list(labels_true)
++    labels_pred = list(labels_pred)
++    if len(labels_true) != len(labels_pred):
++        raise ValueError("labels_true and labels_pred must have the same length")
++    if len(labels_true) == 0:
++        raise ValueError("labels must not be empty")
++
++    table = _contingency_table(labels_true, labels_pred).astype(np.float64)
++    total = table.sum()
++    entropy_pred = _entropy(table.sum(axis=0), total)
++    if entropy_pred == 0.0:
++        return 1.0
++
++    row_totals = table.sum(axis=1)
++    h_pred_given_true = 0.0
++    for row in range(table.shape[0]):
++        for col in range(table.shape[1]):
++            count = table[row, col]
++            if count == 0:
++                continue
++            h_pred_given_true -= count / total * math.log(count / row_totals[row])
++    return float(1.0 - h_pred_given_true / entropy_pred)
++
++
++def fowlkes_mallows_score(labels_true: Sequence[int], labels_pred: Sequence[int]) -> float:
++    """
++    Compute the Fowlkes-Mallows index between gold labels and a clustering: the geometric mean of the
++    pairwise precision and recall over sample pairs. Follows
++    ``sklearn.metrics.fowlkes_mallows_score``.
++
++    Args:
++        labels_true: The gold label of every sample.
++        labels_pred: The predicted cluster id of every sample.
++
++    Returns:
++        float: The Fowlkes-Mallows index in ``[0, 1]``.
++    """
++    labels_true = list(labels_true)
++    labels_pred = list(labels_pred)
++    if len(labels_true) != len(labels_pred):
++        raise ValueError("labels_true and labels_pred must have the same length")
++    if len(labels_true) == 0:
++        raise ValueError("labels must not be empty")
++
++    table = _contingency_table(labels_true, labels_pred).astype(np.float64)
++
++    def comb2(values: np.ndarray) -> float:
++        return float((values * (values - 1) / 2.0).sum())
++
++    tp = comb2(table.ravel())
++    tp_plus_fn = comb2(table.sum(axis=1))  # pairs in the same gold class
++    tp_plus_fp = comb2(table.sum(axis=0))  # pairs in the same predicted cluster
++    if tp_plus_fn == 0.0 or tp_plus_fp == 0.0:
++        return 0.0
++    return float(tp / math.sqrt(tp_plus_fn * tp_plus_fp))
++
++
++def purity_score(labels_true: Sequence[int], labels_pred: Sequence[int]) -> float:
++    """
++    Compute the purity of a clustering: for every predicted cluster, count the members of its
++    majority gold class, then divide by the total number of samples.
++
++    Args:
++        labels_true: The gold label of every sample.
++        labels_pred: The predicted cluster id of every sample.
++
++    Returns:
++        float: The purity in ``[0, 1]``.
++    """
++    labels_true = list(labels_true)
++    labels_pred = list(labels_pred)
++    if len(labels_true) != len(labels_pred):
++        raise ValueError("labels_true and labels_pred must have the same length")
++    if len(labels_true) == 0:
++        raise ValueError("labels must not be empty")
++
++    table = _contingency_table(labels_true, labels_pred).astype(np.float64)
++    return float(table.max(axis=0).sum() / table.sum())
++
++
++def select_representatives(
++    embeddings: ArrayLike,
++    clustering: ClusteringResult,
++    top_k: int = 1,
++) -> dict[int, list[int]]:
++    """
++    Select the ``top_k`` most representative members of every cluster: the members closest to the
++    cluster centroid (the arithmetic mean of the cluster's embeddings) in Euclidean distance. Ties
++    are broken by the lowest input index, so the output is deterministic.
++
++    Args:
++        embeddings: The 2D matrix of embeddings that was clustered.
++        clustering (ClusteringResult): A clustering of those embeddings.
++        top_k (int, optional): How many representatives to select per cluster. Must be at least 1;
++            selecting more representatives than a cluster has members returns the whole cluster.
++
++    Returns:
++        Dict[int, List[int]]: Maps every cluster id to the indices of its representatives, ordered
++        by increasing distance to the centroid.
++
++    Raises:
++        ValueError: If ``top_k`` is smaller than 1 or the number of labels does not match the number
++            of embeddings.
++
++    Example:
++        ::
++
++            from sentence_transformers.util import kmeans_clustering, select_representatives
++
++            clustering = kmeans_clustering(embeddings, num_clusters=10)
++            representatives = select_representatives(embeddings, clustering, top_k=3)
++            for cluster_id, indices in representatives.items():
++                print(cluster_id, [corpus[i] for i in indices])
++    """
++    if top_k < 1:
++        raise ValueError(f"top_k must be at least 1, got {top_k}")
++    matrix = _to_float64_tensor(embeddings)
++    if matrix.shape[0] != len(clustering.labels):
++        raise ValueError(
++            f"Got {matrix.shape[0]} embeddings but {len(clustering.labels)} cluster labels"
++        )
++
++    representatives: dict[int, list[int]] = {}
++    for cluster_id, indices in clustering.clusters.items():
++        members = matrix[indices]
++        centroid = members.mean(dim=0, keepdim=True)
++        distances = (members - centroid).norm(dim=1)
++        order = sorted(range(len(indices)), key=lambda pos: (float(distances[pos]), indices[pos]))
++        selected = [indices[pos] for pos in order[:top_k]]
++        representatives[cluster_id] = selected
++    return representatives
+diff --git a/sentence_transformers/util/deprecated_import.py b/sentence_transformers/util/deprecated_import.py
+index ab7f7f3..967c72b 100644
+--- a/sentence_transformers/util/deprecated_import.py
++++ b/sentence_transformers/util/deprecated_import.py
+@@ -32,6 +32,7 @@ DEPRECATED_MODULE_PATHS = {
+     "sentence_transformers.datasets.SentencesDataset": "sentence_transformers.sentence_transformer.datasets.sentences",
+     "sentence_transformers.evaluation": "sentence_transformers.sentence_transformer.evaluation",
+     "sentence_transformers.evaluation.BinaryClassificationEvaluator": "sentence_transformers.sentence_transformer.evaluation.binary_classification",
++    "sentence_transformers.evaluation.ClusteringEvaluator": "sentence_transformers.sentence_transformer.evaluation.clustering",
+     "sentence_transformers.evaluation.EmbeddingSimilarityEvaluator": "sentence_transformers.sentence_transformer.evaluation.embedding_similarity",
+     "sentence_transformers.evaluation.InformationRetrievalEvaluator": "sentence_transformers.sentence_transformer.evaluation.information_retrieval",
+     "sentence_transformers.evaluation.LabelAccuracyEvaluator": "sentence_transformers.sentence_transformer.evaluation.label_accuracy",
+diff --git a/sentence_transformers/util/retrieval.py b/sentence_transformers/util/retrieval.py
+index 75261bf..03d058b 100644
+--- a/sentence_transformers/util/retrieval.py
++++ b/sentence_transformers/util/retrieval.py
+@@ -4,7 +4,7 @@ import heapq
+ import logging
+ import queue
+ from collections.abc import Callable
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, overload
+ 
+ import numpy as np
+ import torch
+@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
+ if TYPE_CHECKING:
+     from sentence_transformers.sentence_transformer.model import SentenceTransformer
+ 
++    from .clustering import CommunityDetectionResult
++
+ 
+ def paraphrase_mining(
+     model: SentenceTransformer,
+@@ -255,105 +257,249 @@ def semantic_search(
+     return queries_result_list
+ 
+ 
++@overload
++def community_detection(
++    embeddings: torch.Tensor | np.ndarray,
++    threshold: float = ...,
++    min_community_size: int = ...,
++    batch_size: int = ...,
++    show_progress_bar: bool = ...,
++    *,
++    return_result: bool = False,
++) -> list[list[int]]: ...
++
++
++@overload
++def community_detection(
++    embeddings: torch.Tensor | np.ndarray,
++    threshold: float = ...,
++    min_community_size: int = ...,
++    batch_size: int = ...,
++    show_progress_bar: bool = ...,
++    *,
++    return_result: bool = True,
++) -> CommunityDetectionResult: ...
++
++
+ def community_detection(
+     embeddings: torch.Tensor | np.ndarray,
+     threshold: float = 0.75,
+     min_community_size: int = 10,
+     batch_size: int = 1024,
+     show_progress_bar: bool = False,
+-) -> list[list[int]]:
++    *,
++    return_result: bool = False,
++) -> list[list[int]] | CommunityDetectionResult:
+     """
+     Function for Fast Community Detection.
+ 
+-    Finds in the embeddings all communities, i.e. embeddings that are close (closer than threshold).
+-    Returns only communities that are larger than min_community_size. The communities are returned
+-    in decreasing order. The first element in each list is the central point in the community.
++    Finds in the embeddings all communities, i.e. groups of embeddings whose pairwise cosine
++    similarity is greater than or equal to ``threshold``. Only communities of size at least
++    ``min_community_size`` are returned. Each community is a list of embedding indices; the first
++    index is the *central* point of the community (the point that anchored the group), followed by
++    the community members ordered by decreasing similarity to the central point (ties broken by
++    ascending index).
++
++    The output ordering is fully deterministic: communities are sorted primarily by descending size
++    and secondarily by ascending central index, so identical embeddings always produce identical
++    output regardless of ``batch_size`` or other implementation-level choices. All-zero embeddings
++    (rows with zero norm) can never participate in a community; they show up in
++    ``unclustered_indices`` when ``return_result=True``.
+ 
+     Args:
+         embeddings (torch.Tensor or numpy.ndarray): The input embeddings.
+-        threshold (float): The threshold for determining if two embeddings are close. Defaults to 0.75.
+-        min_community_size (int): The minimum size of a community to be considered. Defaults to 10.
++        threshold (float): Cosine-similarity threshold for two embeddings to count as neighbors in
++            the community graph. Must be in ``[-1, 1]``. Defaults to 0.75.
++        min_community_size (int): Minimum community size to be reported. Must be at least 1.
++            Defaults to 10.
+         batch_size (int): The batch size for computing cosine similarity scores. Defaults to 1024.
+-        show_progress_bar (bool): Whether to show a progress bar during computation. Defaults to False.
++            Changing ``batch_size`` never changes the returned communities or their order.
++        show_progress_bar (bool): Whether to show a progress bar during computation. Defaults to
++            False.
++        return_result (bool, keyword-only): If ``True``, return a
++            :class:`~sentence_transformers.util.clustering.CommunityDetectionResult`; if ``False``
++            (the default, preserved for backward compatibility), return a ``list[list[int]]``.
+ 
+     Returns:
+-        List[List[int]]: A list of communities, where each community is represented as a list of indices.
++        list[list[int]] or CommunityDetectionResult: The detected communities. Every community's
++        first element is the central point; the remaining elements are ordered by decreasing
++        similarity to the central point.
++
++    Raises:
++        ValueError: If ``threshold`` is outside ``[-1, 1]`` or ``min_community_size`` is less than
++            1.
+     """
++    if not isinstance(threshold, (int, float)) or threshold < -1.0 or threshold > 1.0:
++        raise ValueError(f"threshold must be in [-1, 1], got {threshold!r}")
++    if not isinstance(min_community_size, int) or isinstance(min_community_size, bool) or min_community_size < 1:
++        raise ValueError(f"min_community_size must be a positive int, got {min_community_size!r}")
++
+     if not isinstance(embeddings, torch.Tensor):
+         embeddings = torch.tensor(embeddings)
+ 
+-    threshold = torch.tensor(threshold, device=embeddings.device)
+-    embeddings = normalize_embeddings(embeddings)
+-
+-    extracted_communities = []
++    n_embeddings = len(embeddings)
++    if n_embeddings == 0:
++        if return_result:
++            from .clustering import CommunityDetectionResult
+ 
+-    # Maximum size for community
+-    min_community_size = min(min_community_size, len(embeddings))
+-    sort_max_size = min(max(2 * min_community_size, 50), len(embeddings))
++            return CommunityDetectionResult(
++                communities=[], central_indices=[], unclustered_indices=[], num_embeddings=0
++            )
++        return []
++
++    threshold_tensor = torch.tensor(threshold, device=embeddings.device)
++
++    # Rows with zero norm carry no direction: normalizing produces the zero row (or NaNs on older
++    # numeric paths), which then leaks into topk tie-breaks. Guard here so an all-zero embedding
++    # neither anchors nor joins a community. We keep the zero rows in place so indices into
++    # ``embeddings`` stay aligned with the caller's indexing.
++    norms = embeddings.detach().to(torch.float64).norm(dim=1)
++    zero_mask = norms <= 0.0
++
++    normalized = normalize_embeddings(embeddings)
++    if zero_mask.any() and not normalized.is_sparse:
++        # ``torch.nn.functional.normalize`` clamps its denominator to ``eps``, so a zero row already
++        # comes out as zero; force it defensively so downstream matmul is bit-for-bit identical
++        # regardless of the torch build.
++        normalized = normalized.clone()
++        normalized[zero_mask] = 0.0
++
++    # Cap the effective community size to the number of embeddings but do NOT clamp
++    # min_community_size = 0 as before; we already rejected < 1 above.
++    min_size_effective = min(min_community_size, n_embeddings)
++    sort_max_size = min(max(2 * min_size_effective, 50), n_embeddings)
++
++    # ``extracted_communities`` collects tentative communities as (central_index, members) tuples,
++    # where ``members`` is a numpy uint32 array whose first element equals ``central_index``.
++    extracted_communities: list[tuple[int, np.ndarray]] = []
+ 
+     for start_idx in tqdm(
+-        range(0, len(embeddings), batch_size), desc="Finding clusters", disable=not show_progress_bar
++        range(0, n_embeddings, batch_size), desc="Finding clusters", disable=not show_progress_bar
+     ):
+-        # Compute cosine similarity scores
+-        cos_scores = embeddings[start_idx : start_idx + batch_size] @ embeddings.T
++        cos_scores = normalized[start_idx : start_idx + batch_size] @ normalized.T
+ 
+-        # Use a torch-heavy approach if the embeddings are on CUDA, otherwise a loop-heavy one
+-        if embeddings.device.type in ["cuda", "npu"]:
+-            # Threshold the cos scores and determine how many close embeddings exist per embedding
+-            threshold_mask = cos_scores >= threshold
++        if normalized.device.type in ["cuda", "npu"]:
++            threshold_mask = cos_scores >= threshold_tensor
+             row_wise_count = threshold_mask.sum(1)
+ 
+-            # Only consider embeddings with enough close other embeddings
+-            large_enough_mask = row_wise_count >= min_community_size
++            large_enough_mask = row_wise_count >= min_size_effective
+             if not large_enough_mask.any():
+                 continue
+ 
++            # We still need the batch-local row index to compute the correct central index.
++            local_indices = torch.arange(cos_scores.size(0), device=cos_scores.device)[large_enough_mask]
+             row_wise_count = row_wise_count[large_enough_mask]
+-            cos_scores = cos_scores[large_enough_mask]
+-
+-            # The max is the largest potential community, so we use that in topk
+-            k = row_wise_count.max()
+-            _, top_k_indices = cos_scores.topk(k=k, largest=True)
++            cos_scores_selected = cos_scores[large_enough_mask]
+ 
+-            # Move the batch indices to CPU once, then slice per community
++            k = int(row_wise_count.max().item())
++            _, top_k_indices = cos_scores_selected.topk(k=k, largest=True)
+             top_k_indices = top_k_indices.cpu()
+-            for count, indices in zip(row_wise_count.tolist(), top_k_indices):
+-                extracted_communities.append(indices[:count].numpy().astype(np.uint32))
++            for local_idx, count, indices in zip(local_indices.tolist(), row_wise_count.tolist(), top_k_indices):
++                central_index = start_idx + int(local_idx)
++                if bool(zero_mask[central_index].item()):
++                    continue
++                members = indices[:count].numpy().astype(np.uint32)
++                extracted_communities.append((central_index, members))
+         else:
+-            # Minimum size for a community
+-            top_k_values, _ = cos_scores.topk(k=min_community_size, largest=True)
+-
+-            # Filter for rows >= min_threshold
+-            for i in range(len(top_k_values)):
+-                if top_k_values[i][-1] >= threshold:
+-                    # Only check top k most similar entries
+-                    top_val_large, top_idx_large = cos_scores[i].topk(k=sort_max_size, largest=True)
+-
+-                    # Check if we need to increase sort_max_size
+-                    while top_val_large[-1] >= threshold and sort_max_size < len(embeddings):
+-                        sort_max_size = min(2 * sort_max_size, len(embeddings))
+-                        top_val_large, top_idx_large = cos_scores[i].topk(k=sort_max_size, largest=True)
+-
+-                    extracted_communities.append(
+-                        top_idx_large[top_val_large >= threshold].cpu().numpy().astype(np.uint32)
++            # Determine which rows have at least ``min_size_effective`` neighbors above threshold.
++            top_k_values, _ = cos_scores.topk(k=min_size_effective, largest=True)
++            row_qualifies = (top_k_values[:, -1] >= threshold_tensor).cpu().numpy()
++
++            for local_i in range(cos_scores.size(0)):
++                if not bool(row_qualifies[local_i]):
++                    continue
++                central_index = start_idx + local_i
++                if bool(zero_mask[central_index].item()):
++                    # Zero rows never anchor a community even if the code above thinks they do
++                    # (defensive: the top-k value of a zero row cannot exceed threshold when
++                    # threshold >= 0, but we guard for negative thresholds too).
++                    continue
++
++                current_max = sort_max_size
++                top_val_large, top_idx_large = cos_scores[local_i].topk(k=current_max, largest=True)
++                while (
++                    top_val_large[-1] >= threshold_tensor and current_max < n_embeddings
++                ):
++                    current_max = min(2 * current_max, n_embeddings)
++                    top_val_large, top_idx_large = cos_scores[local_i].topk(k=current_max, largest=True)
++
++                mask = (top_val_large >= threshold_tensor).cpu().numpy()
++                members = top_idx_large[torch.from_numpy(mask)].cpu().numpy().astype(np.uint32)
++                # Filter out any zero-vector rows that may have snuck in with similarity 0
++                if zero_mask.any():
++                    keep_mask = ~zero_mask[members.astype(np.int64)].cpu().numpy()
++                    members = members[keep_mask]
++                if len(members) < min_size_effective:
++                    continue
++                # Ensure the central index is first for reproducibility; topk should already do
++                # this for a normalized row against itself (self-similarity == 1), but ties are
++                # broken by torch's implementation-defined order. Move central_index to the front
++                # deterministically.
++                if int(members[0]) != central_index and central_index in members.tolist():
++                    without_center = [m for m in members.tolist() if m != central_index]
++                    members = np.array([central_index] + without_center, dtype=np.uint32)
++                # Preserve topk ordering after the central index; tie-break by ascending index by
++                # re-sorting on (-similarity, index).
++                tail_indices = members[1:].tolist()
++                if tail_indices:
++                    tail_scores = cos_scores[local_i, tail_indices].cpu().numpy()
++                    tail_order = sorted(
++                        range(len(tail_indices)),
++                        key=lambda pos: (-float(tail_scores[pos]), tail_indices[pos]),
+                     )
++                    ordered_tail = [tail_indices[pos] for pos in tail_order]
++                    members = np.array([central_index] + ordered_tail, dtype=np.uint32)
++                extracted_communities.append((central_index, members))
+ 
+-    # Largest cluster first
+-    extracted_communities = sorted(extracted_communities, key=lambda x: len(x), reverse=True)
++    # Step 2) Remove overlapping communities. First sort candidates so the tie-break is
++    # well-defined: larger communities win, and among same-size communities the one with the
++    # *smallest* central index wins. This is invariant across ``batch_size`` choices.
++    extracted_communities.sort(key=lambda item: (-len(item[1]), int(item[0])))
+ 
+-    # Step 2) Remove overlapping communities using a dense boolean mask of already claimed indices
+-    unique_communities = []
+-    used = np.zeros(len(embeddings), dtype=bool)
++    unique_communities: list[tuple[int, np.ndarray]] = []
++    used = np.zeros(n_embeddings, dtype=bool)
+ 
+-    for community in extracted_communities:
+-        # community keeps its topk order, so the central point stays first
++    for central_index, community in extracted_communities:
+         non_overlapped_community = community[~used[community]]
+-        if len(non_overlapped_community) >= min_community_size:
+-            unique_communities.append(non_overlapped_community)
+-            used[non_overlapped_community] = True
++        if len(non_overlapped_community) >= min_size_effective:
++            # Recompute the ordering of the reduced community so the central point stays first if
++            # still present; otherwise the smallest remaining index becomes the new central.
++            member_list = non_overlapped_community.tolist()
++            if central_index in member_list:
++                without_center = [m for m in member_list if m != central_index]
++                # Order the tail by descending similarity to the central point, tie-broken by
++                # index.
++                if without_center:
++                    tail_scores = (
++                        normalized[central_index].to(torch.float64)
++                        @ normalized[without_center].to(torch.float64).T
++                    ).cpu().numpy()
++                    tail_order = sorted(
++                        range(len(without_center)),
++                        key=lambda pos: (-float(tail_scores[pos]), without_center[pos]),
++                    )
++                    ordered_tail = [without_center[pos] for pos in tail_order]
++                    member_list = [central_index] + ordered_tail
++                else:
++                    member_list = [central_index]
++                new_central = central_index
++            else:
++                member_list = sorted(member_list)
++                new_central = member_list[0]
++            unique_communities.append((new_central, np.array(member_list, dtype=np.uint32)))
++            used[np.array(member_list, dtype=np.int64)] = True
++
++    # Final deterministic sort: descending size, then ascending central index.
++    unique_communities.sort(key=lambda item: (-len(item[1]), int(item[0])))
++
++    if return_result:
++        from .clustering import CommunityDetectionResult
+ 
+-    unique_communities = [
+-        community.tolist() for community in sorted(unique_communities, key=lambda x: len(x), reverse=True)
+-    ]
++        return CommunityDetectionResult(
++            communities=[members.tolist() for _, members in unique_communities],
++            central_indices=[int(c) for c, _ in unique_communities],
++            unclustered_indices=[int(i) for i in np.where(~used)[0].tolist()],
++            num_embeddings=n_embeddings,
++        )
+ 
+-    return unique_communities
++    return [community.tolist() for _, community in unique_communities]
+diff --git a/tests/sentence_transformer/evaluation/test_clustering_evaluator.py b/tests/sentence_transformer/evaluation/test_clustering_evaluator.py
+new file mode 100644
+index 0000000..c10b71c
+--- /dev/null
++++ b/tests/sentence_transformer/evaluation/test_clustering_evaluator.py
+@@ -0,0 +1,336 @@
++from __future__ import annotations
++
++import csv
++import os
++
++import numpy as np
++import pytest
++
++from sentence_transformers.sentence_transformer.evaluation import ClusteringEvaluator
++
++
++class StubModel:
++    """A minimal stand-in for SentenceTransformer: returns fixed embeddings."""
++
++    def __init__(self, embeddings):
++        self.embeddings = np.asarray(embeddings, dtype=np.float64)
++        self.encode_calls = []
++
++    def encode(self, sentences, batch_size=32, show_progress_bar=False, convert_to_numpy=True, **kwargs):
++        self.encode_calls.append(
++            {
++                "sentences": list(sentences),
++                "batch_size": batch_size,
++                "show_progress_bar": show_progress_bar,
++                "convert_to_numpy": convert_to_numpy,
++            }
++        )
++        return self.embeddings[: len(sentences)]
++
++    class _ModelCardData:
++        def set_evaluation_metrics(self, evaluator, metrics, epoch, step):
++            pass
++
++    model_card_data = _ModelCardData()
++
++
++# Two tight groups along orthogonal directions: labels match the groups exactly
++SENTENCES = ["a1", "a2", "a3", "b1", "b2", "b3"]
++LABELS = ["fruit", "fruit", "fruit", "animal", "animal", "animal"]
++EMBEDDINGS = [
++    [1.0, 0.0],
++    [1.0, 0.05],
++    [0.95, 0.0],
++    [0.0, 1.0],
++    [0.05, 1.0],
++    [0.0, 0.95],
++]
++# Same sentences, but the embeddings of "a3" and "b3" are swapped: the clustering
++# no longer matches the labels perfectly
++MIXED_EMBEDDINGS = [
++    [1.0, 0.0],
++    [1.0, 0.05],
++    [0.0, 0.95],
++    [0.0, 1.0],
++    [0.05, 1.0],
++    [0.95, 0.0],
++]
++
++
++class TestClusteringEvaluator:
++    def test_mismatched_sentences_and_labels_raise(self):
++        with pytest.raises(ValueError):
++            ClusteringEvaluator(sentences=["a", "b"], labels=["x"])
++
++    def test_unknown_algorithm_raises(self):
++        with pytest.raises(ValueError):
++            ClusteringEvaluator(sentences=["a"], labels=["x"], algorithm="dbscan")
++
++    def test_threshold_with_kmeans_raises(self):
++        with pytest.raises(ValueError):
++            ClusteringEvaluator(sentences=["a"], labels=["x"], algorithm="kmeans", threshold=0.5)
++
++    def test_perfect_clustering_scores_one(self, tmp_path):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS, name="toy")
++        metrics = evaluator(model, output_path=str(tmp_path))
++        assert evaluator.primary_metric == "toy_v_measure"
++        assert metrics["toy_v_measure"] == pytest.approx(1.0)
++        assert metrics["toy_adjusted_rand"] == pytest.approx(1.0)
++        assert metrics["toy_normalized_mutual_info"] == pytest.approx(1.0)
++        assert metrics["toy_accuracy"] == pytest.approx(1.0)
++
++    def test_encodes_with_evaluator_sentences(self):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS, batch_size=7)
++        evaluator(model)
++        assert len(model.encode_calls) == 1
++        call = model.encode_calls[0]
++        assert call["sentences"] == SENTENCES
++        assert call["batch_size"] == 7
++        assert call["convert_to_numpy"] is True
++
++    def test_num_clusters_defaults_to_distinct_labels(self):
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS)
++        assert evaluator.num_clusters == 2
++
++    def test_mixed_clustering_scores_between_zero_and_one(self):
++        model = StubModel(MIXED_EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS)
++        metrics = evaluator(model)
++        assert 0.0 < metrics["v_measure"] < 1.0
++        assert metrics["accuracy"] == pytest.approx(4 / 6)
++
++    def test_agglomerative_algorithm(self):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS, algorithm="agglomerative")
++        metrics = evaluator(model)
++        assert metrics["v_measure"] == pytest.approx(1.0)
++
++    def test_agglomerative_with_threshold(self):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(
++            sentences=SENTENCES, labels=LABELS, algorithm="agglomerative", threshold=0.5
++        )
++        metrics = evaluator(model)
++        assert metrics["v_measure"] == pytest.approx(1.0)
++
++    def test_csv_is_written_with_headers(self, tmp_path):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS, name="toy")
++        evaluator(model, output_path=str(tmp_path), epoch=1, steps=100)
++        csv_path = tmp_path / "clustering_evaluation_toy_results.csv"
++        assert csv_path.exists()
++        with open(csv_path, newline="", encoding="utf-8") as f:
++            rows = list(csv.reader(f))
++        assert rows[0] == ["epoch", "steps", "v_measure", "adjusted_rand", "normalized_mutual_info", "accuracy"]
++        assert len(rows) == 2
++        assert rows[1][0] == "1"
++        assert rows[1][1] == "100"
++        assert float(rows[1][2]) == pytest.approx(1.0)
++
++    def test_csv_appends_on_repeated_calls(self, tmp_path):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS)
++        evaluator(model, output_path=str(tmp_path), epoch=1, steps=50)
++        evaluator(model, output_path=str(tmp_path), epoch=2, steps=100)
++        csv_path = tmp_path / "clustering_evaluation_results.csv"
++        with open(csv_path, newline="", encoding="utf-8") as f:
++            rows = list(csv.reader(f))
++        assert len(rows) == 3  # header + two epochs
++        assert [row[0] for row in rows[1:]] == ["1", "2"]
++
++    def test_no_csv_without_output_path(self, tmp_path):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS)
++        evaluator(model, output_path=None)
++        assert not os.path.exists(os.path.join(str(tmp_path), "clustering_evaluation_results.csv"))
++
++    def test_no_csv_when_write_csv_disabled(self, tmp_path):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS, write_csv=False)
++        evaluator(model, output_path=str(tmp_path))
++        assert not (tmp_path / "clustering_evaluation_results.csv").exists()
++
++    def test_greater_is_better(self):
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS)
++        assert evaluator.greater_is_better is True
++
++    def test_metrics_are_prefixed_with_name(self):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS, name="dev")
++        metrics = evaluator(model)
++        assert set(metrics) == {
++            "dev_v_measure",
++            "dev_adjusted_rand",
++            "dev_normalized_mutual_info",
++            "dev_accuracy",
++        }
++        assert evaluator.primary_metric == "dev_v_measure"
++
++
++class TestClusteringEvaluatorMisc:
++    def test_get_config_dict(self):
++        evaluator = ClusteringEvaluator(
++            sentences=SENTENCES,
++            labels=LABELS,
++            algorithm="agglomerative",
++            num_clusters=3,
++            linkage="complete",
++            seed=11,
++        )
++        config = evaluator.get_config_dict()
++        assert config["algorithm"] == "agglomerative"
++        assert config["num_clusters"] == 3
++        assert config["linkage"] == "complete"
++        assert config["seed"] == 11
++
++    def test_from_input_examples(self):
++        from sentence_transformers import InputExample
++
++        examples = [InputExample(texts=[sentence], label=label) for sentence, label in zip(SENTENCES, LABELS)]
++        evaluator = ClusteringEvaluator.from_input_examples(examples, name="examples")
++        assert evaluator.sentences == SENTENCES
++        assert evaluator.labels == LABELS
++        model = StubModel(EMBEDDINGS)
++        metrics = evaluator(model)
++        assert metrics["examples_v_measure"] == pytest.approx(1.0)
++
++    def test_sequential_evaluator_compatibility(self):
++        from sentence_transformers.evaluation import SequentialEvaluator
++
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS, name="c")
++        sequential = SequentialEvaluator([evaluator])
++        metrics = sequential(model)
++        assert metrics["c_v_measure"] == pytest.approx(1.0)
++
++    def test_seed_is_used_for_kmeans(self):
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS, seed=123)
++        assert evaluator.seed == 123
++        model = StubModel(EMBEDDINGS)
++        first = evaluator(model)
++        second = evaluator(model)
++        assert first == second  # deterministic across calls
++
++    def test_description_property(self):
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS)
++        assert evaluator.description == "Clustering"
++
++    def test_show_progress_bar_forwarded(self):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS, show_progress_bar=False)
++        evaluator(model)
++        assert model.encode_calls[0]["show_progress_bar"] is False
++
++    def test_csv_not_created_when_output_path_is_none_even_with_name(self):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS, name="toy")
++        metrics = evaluator(model, output_path=None)
++        assert metrics["toy_v_measure"] == pytest.approx(1.0)
++
++    def test_labels_can_be_integers(self):
++        model = StubModel(EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=[0, 0, 0, 1, 1, 1])
++        metrics = evaluator(model)
++        assert metrics["v_measure"] == pytest.approx(1.0)
++
++    def test_csv_rows_match_returned_metrics(self, tmp_path):
++        model = StubModel(MIXED_EMBEDDINGS)
++        evaluator = ClusteringEvaluator(sentences=SENTENCES, labels=LABELS)
++        metrics = evaluator(model, output_path=str(tmp_path), epoch=0, steps=-1)
++        csv_path = tmp_path / "clustering_evaluation_results.csv"
++        with open(csv_path, newline="", encoding="utf-8") as f:
++            rows = list(csv.reader(f))
++        row = rows[1]
++        assert float(row[2]) == pytest.approx(metrics["v_measure"])
++        assert float(row[3]) == pytest.approx(metrics["adjusted_rand"])
++        assert float(row[4]) == pytest.approx(metrics["normalized_mutual_info"])
++        assert float(row[5]) == pytest.approx(metrics["accuracy"])
++
++
++class TestClusteringEvaluatorIntegration:
++    """End-to-end checks with a real (tiny, randomly initialized) SentenceTransformer."""
++
++    @pytest.fixture()
++    def tiny_model_path(self, tmp_path):
++        import torch
++        from tokenizers import Tokenizer, models, pre_tokenizers
++        from transformers import BertConfig, BertModel, BertTokenizerFast
++
++        torch.manual_seed(0)
++        vocab = {
++            "[PAD]": 0,
++            "[UNK]": 1,
++            "[CLS]": 2,
++            "[SEP]": 3,
++            "[MASK]": 4,
++            "apple": 5,
++            "banana": 6,
++            "orange": 7,
++            "dog": 8,
++            "cat": 9,
++            "bird": 10,
++        }
++        backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="[UNK]"))
++        backend.pre_tokenizer = pre_tokenizers.Whitespace()
++        tokenizer = BertTokenizerFast(
++            tokenizer_object=backend, unk_token="[UNK]", sep_token="[SEP]", pad_token="[PAD]", cls_token="[CLS]", mask_token="[MASK]"
++        )
++        config = BertConfig(
++            vocab_size=len(vocab),
++            hidden_size=32,
++            num_hidden_layers=2,
++            num_attention_heads=2,
++            intermediate_size=64,
++            max_position_embeddings=32,
++        )
++        model_dir = tmp_path / "tiny-st-model"
++        BertModel(config).save_pretrained(model_dir)
++        tokenizer.save_pretrained(model_dir)
++        return model_dir
++
++    def test_evaluator_with_real_model(self, tiny_model_path, tmp_path):
++        pytest.importorskip("transformers")
++        from sentence_transformers import SentenceTransformer
++
++        model = SentenceTransformer(str(tiny_model_path), device="cpu")
++        evaluator = ClusteringEvaluator(
++            sentences=["apple banana", "apple orange", "dog cat", "dog bird"],
++            labels=["fruit", "fruit", "animal", "animal"],
++            name="tiny",
++        )
++        metrics = evaluator(model, output_path=str(tmp_path), epoch=1, steps=10)
++        assert set(metrics) == {
++            "tiny_v_measure",
++            "tiny_adjusted_rand",
++            "tiny_normalized_mutual_info",
++            "tiny_accuracy",
++        }
++        assert evaluator.primary_metric == "tiny_v_measure"
++        for key, value in metrics.items():
++            assert -1.0 <= value <= 1.0, (key, value)
++        csv_path = tmp_path / "clustering_evaluation_tiny_results.csv"
++        assert csv_path.exists()
++        with open(csv_path, newline="", encoding="utf-8") as f:
++            rows = list(csv.reader(f))
++        assert rows[0] == ["epoch", "steps", "v_measure", "adjusted_rand", "normalized_mutual_info", "accuracy"]
++        assert len(rows) == 2
++
++    def test_evaluator_embeddings_match_manual_clustering(self, tiny_model_path):
++        pytest.importorskip("transformers")
++        from sentence_transformers import SentenceTransformer
++
++        from sentence_transformers.util import agglomerative_clustering, v_measure_score
++
++        model = SentenceTransformer(str(tiny_model_path), device="cpu")
++        sentences = ["apple banana", "apple orange", "dog cat", "dog bird"]
++        labels = ["fruit", "fruit", "animal", "animal"]
++
++        evaluator = ClusteringEvaluator(sentences=sentences, labels=labels, algorithm="agglomerative")
++        metrics = evaluator(model)
++
++        embeddings = model.encode(sentences, convert_to_numpy=True)
++        clustering = agglomerative_clustering(embeddings, num_clusters=2)
++        expected = v_measure_score(labels, clustering.labels)
++        assert metrics["v_measure"] == pytest.approx(expected, abs=1e-9)
+diff --git a/tests/util/test_clustering.py b/tests/util/test_clustering.py
+new file mode 100644
+index 0000000..5968a6c
+--- /dev/null
++++ b/tests/util/test_clustering.py
+@@ -0,0 +1,798 @@
++from __future__ import annotations
++
++import numpy as np
++import pytest
++import torch
++
++from sentence_transformers.util import (
++    ClusteringResult,
++    DeduplicationResult,
++    adjusted_rand_score,
++    agglomerative_clustering,
++    cluster_accuracy_score,
++    completeness_score,
++    fowlkes_mallows_score,
++    homogeneity_score,
++    kmeans_clustering,
++    normalized_mutual_info_score,
++    purity_score,
++    select_representatives,
++    semantic_deduplication,
++    v_measure_score,
++)
++
++# Three well-separated blobs of 2D points, 4 points each; separated under both
++# cosine and Euclidean distance (no zero vectors)
++BLOB_POINTS = [
++    [1.0, 0.0],
++    [1.0, 0.05],
++    [0.95, 0.0],
++    [0.95, 0.05],
++    [0.0, 1.0],
++    [0.05, 1.0],
++    [0.0, 0.95],
++    [0.05, 0.95],
++    [-1.0, 0.0],
++    [-1.0, 0.05],
++    [-0.95, 0.0],
++    [-0.95, 0.05],
++]
++BLOB_PARTITION = {frozenset({0, 1, 2, 3}), frozenset({4, 5, 6, 7}), frozenset({8, 9, 10, 11})}
++
++# 1D chain where single and complete linkage disagree
++CHAIN_POINTS = [[0.0], [0.9], [2.0], [2.9], [4.1]]
++
++
++def as_partition(result: ClusteringResult) -> set[frozenset[int]]:
++    return {frozenset(indices) for indices in result.clusters.values()}
++
++
++class TestKMeansClustering:
++    @pytest.mark.parametrize(
++        "embeddings",
++        [
++            BLOB_POINTS,
++            np.array(BLOB_POINTS),
++            torch.tensor(BLOB_POINTS),
++            torch.tensor(BLOB_POINTS, dtype=torch.float32),
++        ],
++    )
++    def test_recovers_blobs_for_all_input_types(self, embeddings):
++        result = kmeans_clustering(embeddings, num_clusters=3, seed=22)
++        assert as_partition(result) == BLOB_PARTITION
++
++    def test_is_deterministic(self):
++        first = kmeans_clustering(BLOB_POINTS, num_clusters=3, seed=7)
++        second = kmeans_clustering(BLOB_POINTS, num_clusters=3, seed=7)
++        assert first.labels == second.labels
++
++    def test_seed_changes_initialization_but_not_partition_on_easy_data(self):
++        for seed in (0, 1, 13, 99):
++            result = kmeans_clustering(BLOB_POINTS, num_clusters=3, seed=seed)
++            assert as_partition(result) == BLOB_PARTITION
++
++    def test_labels_are_ordered_by_first_member(self):
++        result = kmeans_clustering(BLOB_POINTS, num_clusters=3)
++        assert result.labels[0] == 0
++        # Cluster ids are contiguous 0..k-1
++        assert sorted(set(result.labels)) == [0, 1, 2]
++        # First occurrences appear in increasing cluster-id order
++        first_occurrence = {}
++        for idx, label in enumerate(result.labels):
++            first_occurrence.setdefault(label, idx)
++        assert [first_occurrence[label] for label in sorted(first_occurrence)] == sorted(
++            first_occurrence.values()
++        )
++
++    def test_num_clusters_equals_n_embeddings(self):
++        result = kmeans_clustering(BLOB_POINTS, num_clusters=len(BLOB_POINTS))
++        assert result.num_clusters == len(BLOB_POINTS)
++        assert result.labels == list(range(len(BLOB_POINTS)))
++
++    def test_num_clusters_one(self):
++        result = kmeans_clustering(BLOB_POINTS, num_clusters=1)
++        assert result.labels == [0] * len(BLOB_POINTS)
++
++    @pytest.mark.parametrize("num_clusters", [0, -1, len(BLOB_POINTS) + 1, 100])
++    def test_invalid_num_clusters_raises(self, num_clusters):
++        with pytest.raises(ValueError):
++            kmeans_clustering(BLOB_POINTS, num_clusters=num_clusters)
++
++    def test_non_integer_num_clusters_raises(self):
++        with pytest.raises(ValueError):
++            kmeans_clustering(BLOB_POINTS, num_clusters=2.5)
++
++    def test_cluster_sizes_sum_to_n(self):
++        result = kmeans_clustering(BLOB_POINTS, num_clusters=3)
++        assert sum(result.cluster_sizes.values()) == len(BLOB_POINTS)
++
++    def test_largest_and_smallest_clusters(self):
++        result = kmeans_clustering(BLOB_POINTS, num_clusters=3)
++        largest = result.largest_clusters(2)
++        assert len(largest) == 2
++        assert len(largest[0][1]) >= len(largest[1][1])
++        smallest = result.smallest_clusters(1)
++        assert len(smallest) == 1
++
++    def test_partition_equals(self):
++        first = kmeans_clustering(BLOB_POINTS, num_clusters=3, seed=1)
++        second = kmeans_clustering(BLOB_POINTS, num_clusters=3, seed=2)
++        assert first.partition_equals(second)
++        other = ClusteringResult(labels=[0] * 6 + [1] * 6)
++        assert not first.partition_equals(other)
++
++    def test_duplicate_points_do_not_crash(self):
++        embeddings = [[1.0, 0.0]] * 5 + [[0.0, 1.0]] * 5
++        result = kmeans_clustering(embeddings, num_clusters=2, seed=3)
++        assert as_partition(result) == {frozenset(range(5)), frozenset(range(5, 10))}
++
++
++class TestAgglomerativeClustering:
++    def test_requires_exactly_one_stopping_criterion(self):
++        with pytest.raises(ValueError):
++            agglomerative_clustering(BLOB_POINTS)
++        with pytest.raises(ValueError):
++            agglomerative_clustering(BLOB_POINTS, num_clusters=3, threshold=0.5)
++
++    def test_invalid_num_clusters_raises(self):
++        with pytest.raises(ValueError):
++            agglomerative_clustering(BLOB_POINTS, num_clusters=0)
++        with pytest.raises(ValueError):
++            agglomerative_clustering(BLOB_POINTS, num_clusters=len(BLOB_POINTS) + 1)
++
++    def test_invalid_linkage_and_metric_raise(self):
++        with pytest.raises(ValueError):
++            agglomerative_clustering(BLOB_POINTS, num_clusters=3, linkage="ward")
++        with pytest.raises(ValueError):
++            agglomerative_clustering(BLOB_POINTS, num_clusters=3, metric="manhattan")
++
++    def test_negative_threshold_raises(self):
++        with pytest.raises(ValueError):
++            agglomerative_clustering(BLOB_POINTS, threshold=-0.1)
++
++    def test_recovers_blobs_cosine(self):
++        result = agglomerative_clustering(BLOB_POINTS, num_clusters=3, metric="cosine")
++        assert as_partition(result) == BLOB_PARTITION
++
++    def test_recovers_blobs_euclidean(self):
++        result = agglomerative_clustering(BLOB_POINTS, num_clusters=3, metric="euclidean")
++        assert as_partition(result) == BLOB_PARTITION
++
++    def test_single_linkage_chains(self):
++        result = agglomerative_clustering(CHAIN_POINTS, num_clusters=2, linkage="single", metric="euclidean")
++        assert as_partition(result) == {frozenset({0, 1, 2, 3}), frozenset({4})}
++
++    def test_complete_linkage_does_not_chain(self):
++        result = agglomerative_clustering(CHAIN_POINTS, num_clusters=2, linkage="complete", metric="euclidean")
++        assert as_partition(result) == {frozenset({0, 1}), frozenset({2, 3, 4})}
++
++    def test_average_linkage_with_threshold(self):
++        result = agglomerative_clustering(CHAIN_POINTS, threshold=1.0, linkage="average", metric="euclidean")
++        assert as_partition(result) == {frozenset({0, 1}), frozenset({2, 3}), frozenset({4})}
++
++    def test_threshold_zero_keeps_only_identical_points(self):
++        embeddings = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
++        result = agglomerative_clustering(embeddings, threshold=1e-9, metric="euclidean")
++        assert as_partition(result) == {frozenset({0, 1}), frozenset({2})}
++
++    def test_is_deterministic(self):
++        first = agglomerative_clustering(BLOB_POINTS, num_clusters=4)
++        second = agglomerative_clustering(BLOB_POINTS, num_clusters=4)
++        assert first.labels == second.labels
++
++    def test_labels_ordered_by_first_member(self):
++        result = agglomerative_clustering(BLOB_POINTS, num_clusters=3)
++        assert result.labels[0] == 0
++        assert sorted(set(result.labels)) == [0, 1, 2]
++
++
++class TestSemanticDeduplication:
++    def test_exact_duplicates(self):
++        embeddings = [
++            [1.0, 0.0],
++            [1.0, 0.0],
++            [0.0, 1.0],
++            [0.0, 1.0],
++            [1.0, 1.0],
++        ]
++        result = semantic_deduplication(embeddings, threshold=0.99)
++        assert isinstance(result, DeduplicationResult)
++        assert result.keep_indices == [0, 2, 4]
++        assert result.remove_indices == [1, 3]
++        assert result.duplicate_of == {1: 0, 3: 2}
++        assert result.groups == [[0, 1], [2, 3]]
++        assert result.num_duplicates == 2
++        assert result.num_kept == 3
++
++    def test_transitive_duplicates(self):
++        # v0 ~ v1 and v1 ~ v2 are above the threshold, but v0 ~ v2 is not:
++        # all three must end up in one group (transitive union-find)
++        embeddings = [
++            [1.0, 0.0],
++            [0.9961946980917455, 0.08715574274765817],  # 5 degrees
++            [0.984807753012208, 0.17364817766693033],  # 10 degrees
++            [0.0, 1.0],
++        ]
++        result = semantic_deduplication(embeddings, threshold=0.99)
++        assert result.groups == [[0, 1, 2]]
++        assert result.keep_indices == [0, 3]
++        assert result.duplicate_of == {1: 0, 2: 0}
++
++    def test_no_duplicates(self):
++        embeddings = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
++        result = semantic_deduplication(embeddings, threshold=0.99)
++        assert result.keep_indices == [0, 1, 2]
++        assert result.remove_indices == []
++        assert result.duplicate_of == {}
++        assert result.groups == []
++
++    def test_threshold_boundary_is_inclusive(self):
++        # cosine similarity between [1, 0] and [3, 4] is exactly 3/5 = 0.6
++        embeddings = [[1.0, 0.0], [3.0, 4.0]]
++        above = semantic_deduplication(embeddings, threshold=0.6)
++        assert above.keep_indices == [0]
++        assert above.duplicate_of == {1: 0}
++        below = semantic_deduplication(embeddings, threshold=0.6000001)
++        assert below.keep_indices == [0, 1]
++
++    def test_invalid_threshold_raises(self):
++        with pytest.raises(ValueError):
++            semantic_deduplication([[1.0, 0.0]], threshold=1.5)
++        with pytest.raises(ValueError):
++            semantic_deduplication([[1.0, 0.0]], threshold=-1.5)
++
++    def test_apply_deduplicates_aligned_sequence(self):
++        sentences = ["the cat sits", "the cat sits", "a dog runs", "completely different"]
++        embeddings = [
++            [1.0, 0.0, 0.0],
++            [1.0, 0.0, 0.0],
++            [0.0, 1.0, 0.0],
++            [0.0, 0.0, 1.0],
++        ]
++        result = semantic_deduplication(embeddings, threshold=0.99)
++        assert result.apply(sentences) == ["the cat sits", "a dog runs", "completely different"]
++
++    def test_unnormalized_embeddings_use_cosine(self):
++        # Scaling must not change the duplicate decision
++        embeddings = [[1.0, 0.0], [100.0, 0.0], [0.0, 1.0]]
++        result = semantic_deduplication(embeddings, threshold=0.99)
++        assert result.keep_indices == [0, 2]
++        assert result.duplicate_of == {1: 0}
++
++    def test_empty_input(self):
++        result = semantic_deduplication(np.zeros((0, 4)), threshold=0.9)
++        assert result.keep_indices == []
++        assert result.apply([]) == []
++
++
++class TestClusteringMetrics:
++    def test_perfect_match_scores_one(self):
++        labels_true = [0, 0, 1, 1, 2, 2]
++        labels_pred = [5, 5, 3, 3, 9, 9]  # identical partition, different ids
++        assert v_measure_score(labels_true, labels_pred) == pytest.approx(1.0)
++        assert normalized_mutual_info_score(labels_true, labels_pred) == pytest.approx(1.0)
++        assert adjusted_rand_score(labels_true, labels_pred) == pytest.approx(1.0)
++        assert cluster_accuracy_score(labels_true, labels_pred) == pytest.approx(1.0)
++
++    def test_label_names_do_not_matter(self):
++        labels_true = ["a", "a", "b", "b"]
++        labels_pred = ["x", "x", "y", "y"]
++        assert v_measure_score(labels_true, labels_pred) == pytest.approx(1.0)
++        assert adjusted_rand_score(labels_true, labels_pred) == pytest.approx(1.0)
++
++    def test_worst_case_scores(self):
++        # Perfectly interleaved partition: ARI drops below zero (worse than chance),
++        # accuracy stays at the chance level of 0.5
++        labels_true = [0, 0, 1, 1]
++        labels_pred = [0, 1, 0, 1]
++        assert adjusted_rand_score(labels_true, labels_pred) == pytest.approx(-0.5)
++        assert cluster_accuracy_score(labels_true, labels_pred) == pytest.approx(0.5)
++
++    def test_v_measure_between_zero_and_one(self):
++        rng = np.random.RandomState(42)
++        labels_true = rng.randint(0, 4, size=50).tolist()
++        labels_pred = rng.randint(0, 4, size=50).tolist()
++        for metric in (v_measure_score, normalized_mutual_info_score, cluster_accuracy_score):
++            value = metric(labels_true, labels_pred)
++            assert 0.0 <= value <= 1.0
++
++    def test_mismatched_lengths_raise(self):
++        with pytest.raises(ValueError):
++            v_measure_score([0, 1], [0])
++        with pytest.raises(ValueError):
++            normalized_mutual_info_score([0, 1], [0])
++        with pytest.raises(ValueError):
++            adjusted_rand_score([0, 1], [0])
++        with pytest.raises(ValueError):
++            cluster_accuracy_score([0, 1], [0])
++
++    def test_empty_labels_raise(self):
++        with pytest.raises(ValueError):
++            v_measure_score([], [])
++
++    def test_single_cluster_is_perfect(self):
++        labels_true = [1, 1, 1]
++        labels_pred = [0, 0, 0]
++        assert v_measure_score(labels_true, labels_pred) == pytest.approx(1.0)
++        assert normalized_mutual_info_score(labels_true, labels_pred) == pytest.approx(1.0)
++
++    def test_beta_shifts_v_measure(self):
++        labels_true = [0, 0, 0, 1, 1, 1]
++        labels_pred = [0, 0, 1, 1, 2, 2]
++        balanced = v_measure_score(labels_true, labels_pred, beta=1.0)
++        homogeneity_weighted = v_measure_score(labels_true, labels_pred, beta=0.5)
++        completeness_weighted = v_measure_score(labels_true, labels_pred, beta=2.0)
++        assert balanced != pytest.approx(homogeneity_weighted)
++        assert balanced != pytest.approx(completeness_weighted)
++
++
++class TestClusteringResult:
++    def test_clusters_mapping(self):
++        result = ClusteringResult(labels=[0, 1, 0, 2])
++        assert result.clusters == {0: [0, 2], 1: [1], 2: [3]}
++        assert result.cluster_sizes == {0: 2, 1: 1, 2: 1}
++        assert result.num_clusters == 3
++        assert result.cluster_indices(0) == [0, 2]
++        with pytest.raises(KeyError):
++            result.cluster_indices(7)
++
++    def test_largest_smallest_tie_break(self):
++        result = ClusteringResult(labels=[2, 0, 1, 0, 1])
++        # sizes: cluster 0 -> 2, cluster 1 -> 2, cluster 2 -> 1
++        largest = result.largest_clusters(2)
++        assert [cluster_id for cluster_id, _ in largest] == [0, 1]
++        smallest = result.smallest_clusters(1)
++        assert smallest[0][0] == 2
++
++    def test_len(self):
++        assert len(ClusteringResult(labels=[0, 1, 1])) == 3
++
++
++class TestExtendedMetrics:
++    def test_perfect_partition_scores_one(self):
++        labels_true = [0, 0, 1, 1, 2, 2]
++        labels_pred = [2, 2, 0, 0, 1, 1]
++        assert homogeneity_score(labels_true, labels_pred) == pytest.approx(1.0)
++        assert completeness_score(labels_true, labels_pred) == pytest.approx(1.0)
++        assert fowlkes_mallows_score(labels_true, labels_pred) == pytest.approx(1.0)
++        assert purity_score(labels_true, labels_pred) == pytest.approx(1.0)
++
++    def test_split_class_hurts_completeness_not_homogeneity(self):
++        # Each predicted cluster is pure, but class 0 is split across two clusters
++        labels_true = [0, 0, 0, 1, 1, 1]
++        labels_pred = [0, 0, 1, 2, 2, 2]
++        assert homogeneity_score(labels_true, labels_pred) == pytest.approx(1.0)
++        assert completeness_score(labels_true, labels_pred) < 1.0
++        assert purity_score(labels_true, labels_pred) == pytest.approx(1.0)
++
++    def test_merged_classes_hurt_homogeneity_not_completeness(self):
++        labels_true = [0, 0, 1, 1]
++        labels_pred = [0, 0, 0, 0]
++        assert completeness_score(labels_true, labels_pred) == pytest.approx(1.0)
++        assert homogeneity_score(labels_true, labels_pred) < 1.0
++
++    def test_homogeneity_completeness_average_matches_v_measure(self):
++        labels_true = [0, 0, 0, 1, 1, 1, 2, 2, 2, 2]
++        labels_pred = [0, 0, 1, 1, 1, 2, 2, 2, 3, 3]
++        h = homogeneity_score(labels_true, labels_pred)
++        c = completeness_score(labels_true, labels_pred)
++        v = v_measure_score(labels_true, labels_pred)
++        assert v == pytest.approx(2 * h * c / (h + c))
++
++    def test_fowlkes_mallows_pairwise(self):
++        # 4 samples: same-cluster pairs = 3 ((0,1),(0,2),(1,2)), same-class pairs = 2, shared = 1
++        labels_true = [0, 0, 1, 1]
++        labels_pred = [0, 0, 0, 1]
++        assert fowlkes_mallows_score(labels_true, labels_pred) == pytest.approx(1 / 6**0.5)
++
++    def test_fowlkes_mallows_all_singletons_is_zero(self):
++        labels_true = [0, 0, 1, 1]
++        labels_pred = [0, 1, 2, 3]
++        # No predicted pair exists, so precision is undefined -> 0
++        assert fowlkes_mallows_score(labels_true, labels_pred) == pytest.approx(0.0)
++
++    def test_purity_majority_vote(self):
++        labels_true = [0, 0, 1, 1, 1, 0]
++        labels_pred = [0, 0, 0, 1, 1, 1]
++        # cluster 0: {0, 0, 1} -> majority 2; cluster 1: {1, 1, 0} -> majority 2; purity = 4/6
++        assert purity_score(labels_true, labels_pred) == pytest.approx(4 / 6)
++
++    def test_extended_metrics_length_validation(self):
++        with pytest.raises(ValueError):
++            homogeneity_score([0, 1], [0])
++        with pytest.raises(ValueError):
++            completeness_score([0, 1], [0])
++        with pytest.raises(ValueError):
++            fowlkes_mallows_score([0, 1], [0])
++        with pytest.raises(ValueError):
++            purity_score([0, 1], [0])
++
++    def test_extended_metrics_empty_validation(self):
++        with pytest.raises(ValueError):
++            homogeneity_score([], [])
++        with pytest.raises(ValueError):
++            completeness_score([], [])
++        with pytest.raises(ValueError):
++            fowlkes_mallows_score([], [])
++        with pytest.raises(ValueError):
++            purity_score([], [])
++
++    def test_metrics_match_sklearn(self):
++        sklearn = pytest.importorskip("sklearn.metrics")
++        rng = np.random.RandomState(17)
++        labels_true = rng.randint(0, 3, size=40).tolist()
++        labels_pred = rng.randint(0, 5, size=40).tolist()
++        assert v_measure_score(labels_true, labels_pred) == pytest.approx(
++            sklearn.v_measure_score(labels_true, labels_pred), abs=1e-9
++        )
++        assert homogeneity_score(labels_true, labels_pred) == pytest.approx(
++            sklearn.homogeneity_score(labels_true, labels_pred), abs=1e-9
++        )
++        assert completeness_score(labels_true, labels_pred) == pytest.approx(
++            sklearn.completeness_score(labels_true, labels_pred), abs=1e-9
++        )
++        assert normalized_mutual_info_score(labels_true, labels_pred) == pytest.approx(
++            sklearn.normalized_mutual_info_score(labels_true, labels_pred), abs=1e-9
++        )
++        assert adjusted_rand_score(labels_true, labels_pred) == pytest.approx(
++            sklearn.adjusted_rand_score(labels_true, labels_pred), abs=1e-9
++        )
++        assert fowlkes_mallows_score(labels_true, labels_pred) == pytest.approx(
++            sklearn.fowlkes_mallows_score(labels_true, labels_pred), abs=1e-9
++        )
++
++
++class TestSelectRepresentatives:
++    def test_medoid_of_symmetric_cluster(self):
++        embeddings = [
++            [0.0, 0.0],
++            [1.0, 0.0],
++            [0.5, 0.0],  # closest to centroid (0.5, 0)
++            [10.0, 10.0],
++            [11.0, 10.0],
++            [10.5, 10.0],  # closest to centroid (10.5, 10)
++        ]
++        clustering = ClusteringResult(labels=[0, 0, 0, 1, 1, 1])
++        representatives = select_representatives(embeddings, clustering, top_k=1)
++        assert representatives == {0: [2], 1: [5]}
++
++    def test_top_k_returns_closest_members_in_order(self):
++        embeddings = [
++            [0.0, 0.0],
++            [2.0, 0.0],
++            [0.9, 0.0],
++            [1.1, 0.0],
++        ]
++        clustering = ClusteringResult(labels=[0, 0, 0, 0])
++        representatives = select_representatives(embeddings, clustering, top_k=2)
++        # centroid = (1.0, 0.0); closest: index 2 (dist 0.1), then index 3 (dist 0.1, higher index)
++        assert representatives[0] == [2, 3]
++
++    def test_ties_broken_by_lowest_index(self):
++        embeddings = [[1.0, 0.0], [0.0, 1.0]]
++        clustering = ClusteringResult(labels=[0, 0])
++        representatives = select_representatives(embeddings, clustering, top_k=1)
++        assert representatives == {0: [0]}
++
++    def test_top_k_larger_than_cluster_returns_whole_cluster(self):
++        embeddings = [[0.0, 0.0], [1.0, 0.0]]
++        clustering = ClusteringResult(labels=[0, 0])
++        representatives = select_representatives(embeddings, clustering, top_k=10)
++        assert sorted(representatives[0]) == [0, 1]
++
++    def test_invalid_top_k_raises(self):
++        with pytest.raises(ValueError):
++            select_representatives([[0.0, 0.0]], ClusteringResult(labels=[0]), top_k=0)
++
++    def test_mismatched_lengths_raise(self):
++        with pytest.raises(ValueError):
++            select_representatives([[0.0, 0.0], [1.0, 1.0]], ClusteringResult(labels=[0]), top_k=1)
++
++    def test_works_with_clustering_algorithms(self):
++        result = kmeans_clustering(BLOB_POINTS, num_clusters=3, seed=22)
++        representatives = select_representatives(BLOB_POINTS, result, top_k=2)
++        assert set(representatives) == {0, 1, 2}
++        for cluster_id, indices in representatives.items():
++            assert len(indices) == 2
++            assert all(idx in result.cluster_indices(cluster_id) for idx in indices)
++
++
++class TestAgglomerativeEdgeCases:
++    def test_two_embeddings(self):
++        result = agglomerative_clustering([[1.0, 0.0], [0.0, 1.0]], num_clusters=1)
++        assert result.labels == [0, 0]
++
++    def test_single_embedding(self):
++        result = agglomerative_clustering([[1.0, 2.0]], num_clusters=1)
++        assert result.labels == [0]
++        result = agglomerative_clustering([[1.0, 2.0]], threshold=0.1)
++        assert result.labels == [0]
++
++    def test_zero_threshold_keeps_everything_separate(self):
++        # All pairwise Euclidean distances are positive, so nothing merges
++        result = agglomerative_clustering(BLOB_POINTS, threshold=1e-12, metric="euclidean")
++        assert result.num_clusters == len(BLOB_POINTS)
++
++    def test_very_large_threshold_merges_everything(self):
++        result = agglomerative_clustering(BLOB_POINTS, threshold=2.0, metric="cosine")
++        assert result.num_clusters == 1
++
++    def test_numpy_and_torch_inputs_agree(self):
++        numpy_result = agglomerative_clustering(np.array(BLOB_POINTS), num_clusters=2)
++        torch_result = agglomerative_clustering(torch.tensor(BLOB_POINTS), num_clusters=2)
++        assert numpy_result.labels == torch_result.labels
++
++
++class TestKMeansEdgeCases:
++    def test_two_points_two_clusters(self):
++        result = kmeans_clustering([[0.0, 0.0], [10.0, 10.0]], num_clusters=2, seed=1)
++        assert result.num_clusters == 2
++
++    def test_accepts_1d_single_sample(self):
++        result = kmeans_clustering([0.5, 0.5, 0.5], num_clusters=1)
++        assert result.labels == [0]
++
++    def test_higher_dimensional_input(self):
++        rng = np.random.RandomState(5)
++        blob_a = rng.normal(loc=0.0, scale=0.01, size=(20, 16))
++        blob_b = rng.normal(loc=1.0, scale=0.01, size=(20, 16))
++        embeddings = np.vstack([blob_a, blob_b])
++        result = kmeans_clustering(embeddings, num_clusters=2, seed=22)
++        partition = {frozenset(indices) for indices in result.clusters.values()}
++        assert partition == {frozenset(range(20)), frozenset(range(20, 40))}
++
++    def test_invalid_ndim_raises(self):
++        with pytest.raises(ValueError):
++            kmeans_clustering(np.zeros((2, 2, 2)), num_clusters=2)
++
++
++class TestDeterminismUnderThreading:
++    def test_kmeans_independent_of_thread_count(self):
++        embeddings = np.random.RandomState(3).normal(size=(60, 8))
++        torch.set_num_threads(1)
++        single = kmeans_clustering(embeddings, num_clusters=4, seed=5).labels
++        torch.set_num_threads(4)
++        multi = kmeans_clustering(embeddings, num_clusters=4, seed=5).labels
++        assert single == multi
++
++    def test_deduplication_independent_of_input_dtype(self):
++        embeddings = [[1.0, 0.0], [1.0, 1e-9], [0.0, 1.0]]
++        float32 = semantic_deduplication(np.array(embeddings, dtype=np.float32), threshold=0.99)
++        float64 = semantic_deduplication(np.array(embeddings, dtype=np.float64), threshold=0.99)
++        assert float32.keep_indices == float64.keep_indices
++
++
++class TestDeduplicationAdvanced:
++    def test_multiple_groups_ordered_by_representative(self):
++        embeddings = [
++            [1.0, 0.0, 0.0],  # 0
++            [0.0, 1.0, 0.0],  # 1
++            [1.0, 1e-9, 0.0],  # 2 ~ 0
++            [0.0, 0.0, 1.0],  # 3
++            [0.0, 1.0, 1e-9],  # 4 ~ 1
++            [1.0, 0.0, 1e-9],  # 5 ~ 0
++        ]
++        result = semantic_deduplication(embeddings, threshold=0.999)
++        assert result.groups == [[0, 2, 5], [1, 4]]
++        assert result.keep_indices == [0, 1, 3]
++        assert result.remove_indices == [2, 4, 5]
++        assert result.duplicate_of == {2: 0, 4: 1, 5: 0}
++
++    def test_all_identical(self):
++        embeddings = [[1.0, 2.0, 3.0]] * 6
++        result = semantic_deduplication(embeddings, threshold=0.999)
++        assert result.keep_indices == [0]
++        assert result.remove_indices == [1, 2, 3, 4, 5]
++        assert result.groups == [[0, 1, 2, 3, 4, 5]]
++        assert result.num_duplicates == 5
++
++    def test_negative_threshold_merges_everything(self):
++        # With threshold -1 every pair is similar enough
++        embeddings = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
++        result = semantic_deduplication(embeddings, threshold=-1.0)
++        assert result.keep_indices == [0]
++
++    def test_high_dimensional_near_duplicates(self):
++        rng = np.random.RandomState(11)
++        base = rng.normal(size=(10, 64))
++        noisy = base + rng.normal(scale=1e-4, size=(10, 64))
++        embeddings = np.vstack([base, noisy])
++        result = semantic_deduplication(embeddings, threshold=0.9999)
++        assert result.keep_indices == list(range(10))
++        assert result.num_duplicates == 10
++        assert result.apply(list(range(20))) == list(range(10))
++
++    def test_apply_on_numpy_array(self):
++        items = np.array(["a", "b", "c"])
++        embeddings = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
++        result = semantic_deduplication(embeddings, threshold=0.99)
++        kept = result.apply(items)
++        assert list(kept) == ["a", "c"]
++
++
++class TestClusteringResultAdvanced:
++    def test_partition_equals_relabels(self):
++        first = ClusteringResult(labels=[0, 0, 1, 1])
++        second = ClusteringResult(labels=[7, 7, 3, 3])
++        assert first.partition_equals(second)
++        third = ClusteringResult(labels=[0, 1, 1, 0])
++        assert not first.partition_equals(third)
++        assert not first.partition_equals(ClusteringResult(labels=[0, 0, 1]))
++
++    def test_empty_result(self):
++        result = ClusteringResult(labels=[])
++        assert result.num_clusters == 0
++        assert result.clusters == {}
++        assert result.largest_clusters(3) == []
++
++    def test_clusters_are_sorted_index_lists(self):
++        result = ClusteringResult(labels=[1, 0, 1, 0, 1])
++        assert result.clusters == {0: [1, 3], 1: [0, 2, 4]}
++
++
++class TestAgglomerativeGolden:
++    def test_average_linkage_merge_order(self):
++        # Two tight groups far apart; average linkage recovers them for k=2
++        points = [[0.0], [0.5], [1.0], [10.0], [10.5], [11.0]]
++        result = agglomerative_clustering(points, num_clusters=2, linkage="average", metric="euclidean")
++        assert as_partition(result) == {frozenset({0, 1, 2}), frozenset({3, 4, 5})}
++
++    def test_cosine_metric_on_directions(self):
++        # Points on three rays; cosine clustering groups by direction, not magnitude
++        embeddings = [
++            [1.0, 0.0],
++            [2.0, 0.0],
++            [0.5, 0.0],
++            [0.0, 1.0],
++            [0.0, 3.0],
++        ]
++        result = agglomerative_clustering(embeddings, num_clusters=2, metric="cosine")
++        assert as_partition(result) == {frozenset({0, 1, 2}), frozenset({3, 4})}
++
++    def test_num_clusters_one_merges_all(self):
++        result = agglomerative_clustering(BLOB_POINTS, num_clusters=1)
++        assert result.labels == [0] * len(BLOB_POINTS)
++
++    def test_num_clusters_n_keeps_all_separate(self):
++        result = agglomerative_clustering(BLOB_POINTS, num_clusters=len(BLOB_POINTS))
++        assert result.num_clusters == len(BLOB_POINTS)
++
++
++class TestMetricEdgeCases:
++    def test_v_measure_beta_zero_is_completeness(self):
++        labels_true = [0, 0, 1, 1]
++        labels_pred = [0, 1, 0, 1]
++        assert v_measure_score(labels_true, labels_pred, beta=0.0) == pytest.approx(
++            completeness_score(labels_true, labels_pred)
++        )
++
++    def test_negative_beta_raises(self):
++        with pytest.raises(ValueError):
++            v_measure_score([0, 1], [0, 1], beta=-1.0)
++
++    def test_ari_can_be_negative(self):
++        labels_true = [0, 0, 0, 0, 1, 1, 1, 1]
++        labels_pred = [0, 1, 2, 3, 0, 1, 2, 3]
++        assert adjusted_rand_score(labels_true, labels_pred) < 0.0
++
++    def test_nmi_partial_agreement(self):
++        labels_true = [0, 0, 1, 1]
++        labels_pred = [0, 0, 0, 1]
++        value = normalized_mutual_info_score(labels_true, labels_pred)
++        assert 0.0 < value < 1.0
++
++    def test_accuracy_with_more_clusters_than_classes(self):
++        labels_true = [0, 0, 0, 1, 1, 1]
++        labels_pred = [0, 1, 2, 3, 4, 5]
++        # Each gold class can only be matched to a single cluster, so with all-singleton
++        # clusters only 2 of the 6 samples are covered by the optimal assignment
++        assert cluster_accuracy_score(labels_true, labels_pred) == pytest.approx(2 / 6)
++
++    def test_string_and_mixed_label_types(self):
++        labels_true = ["cat", "cat", "dog", "dog"]
++        labels_pred = [1, 1, 0, 0]
++        assert v_measure_score(labels_true, labels_pred) == pytest.approx(1.0)
++        assert cluster_accuracy_score(labels_true, labels_pred) == pytest.approx(1.0)
++
++
++class TestModuleExports:
++    def test_exported_from_util_namespace(self):
++        import sentence_transformers.util as util
++
++        for name in (
++            "ClusteringResult",
++            "DeduplicationResult",
++            "kmeans_clustering",
++            "agglomerative_clustering",
++            "semantic_deduplication",
++            "v_measure_score",
++            "normalized_mutual_info_score",
++            "adjusted_rand_score",
++            "cluster_accuracy_score",
++            "homogeneity_score",
++            "completeness_score",
++            "fowlkes_mallows_score",
++            "purity_score",
++            "select_representatives",
++        ):
++            assert hasattr(util, name), name
++            assert name in util.__all__, name
++
++    def test_importable_from_module_path(self):
++        from sentence_transformers.util.clustering import (  # noqa: F401
++            ClusteringResult,
++            DeduplicationResult,
++            agglomerative_clustering,
++            kmeans_clustering,
++            semantic_deduplication,
++        )
++
++
++class TestKMeansGoldenValues:
++    @pytest.mark.parametrize("seed", [0, 1, 7, 13, 22, 99])
++    def test_blob_labels_are_stable_goldens(self, seed):
++        # Frozen golden: on this well-separated fixture every seed must produce exactly
++        # this labeling (three blobs in input order)
++        result = kmeans_clustering(BLOB_POINTS, num_clusters=3, seed=seed)
++        assert result.labels == [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]
++
++    def test_centroids_follow_blobs(self):
++        result = kmeans_clustering(BLOB_POINTS, num_clusters=3, seed=22)
++        for cluster_id, indices in result.clusters.items():
++            xs = [BLOB_POINTS[idx][0] for idx in indices]
++            ys = [BLOB_POINTS[idx][1] for idx in indices]
++            centroid_x = sum(xs) / len(xs)
++            centroid_y = sum(ys) / len(ys)
++            if cluster_id == 0:
++                assert centroid_x == pytest.approx(0.975)
++                assert centroid_y == pytest.approx(0.025)
++            elif cluster_id == 1:
++                assert centroid_x == pytest.approx(0.025)
++                assert centroid_y == pytest.approx(0.975)
++            else:
++                assert centroid_x == pytest.approx(-0.975)
++                assert centroid_y == pytest.approx(0.025)
++
++
++class TestInputHandling:
++    def test_list_of_lists_and_tensor_agree(self):
++        as_lists = kmeans_clustering(BLOB_POINTS, num_clusters=3, seed=4)
++        as_tensor = kmeans_clustering(torch.tensor(BLOB_POINTS), num_clusters=3, seed=4)
++        assert as_lists.labels == as_tensor.labels
++
++    def test_agglomerative_list_input(self):
++        result = agglomerative_clustering([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]], num_clusters=2)
++        assert as_partition(result) == {frozenset({0, 1}), frozenset({2})}
++
++    def test_deduplication_torch_input(self):
++        result = semantic_deduplication(torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]), threshold=0.99)
++        assert result.keep_indices == [0, 2]
++
++    def test_representatives_torch_input(self):
++        clustering = ClusteringResult(labels=[0, 0])
++        result = select_representatives(torch.tensor([[0.0, 0.0], [2.0, 0.0]]), clustering, top_k=1)
++        # centroid = (1, 0); both at distance 1 -> lowest index wins
++        assert result == {0: [0]}
++
++
++class TestDeduplicationResultDataclass:
++    def test_defaults(self):
++        result = DeduplicationResult(keep_indices=[0], remove_indices=[], duplicate_of={})
++        assert result.groups == []
++        assert result.num_duplicates == 0
++        assert result.num_kept == 1
++
++    def test_apply_preserves_order(self):
++        result = DeduplicationResult(
++            keep_indices=[0, 2, 3], remove_indices=[1], duplicate_of={1: 0}, groups=[[0, 1]]
++        )
++        assert result.apply(["a", "b", "c", "d"]) == ["a", "c", "d"]
++
++    def test_apply_on_tuples(self):
++        result = DeduplicationResult(keep_indices=[1, 2], remove_indices=[0], duplicate_of={0: 1})
++        assert result.apply(("x", "y", "z")) == ["y", "z"]
++
++    def test_keep_remove_partition_all_indices(self):
++        embeddings = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1e-9], [0.0, 0.9]]
++        result = semantic_deduplication(embeddings, threshold=0.99)
++        assert sorted(result.keep_indices + result.remove_indices) == list(range(5))

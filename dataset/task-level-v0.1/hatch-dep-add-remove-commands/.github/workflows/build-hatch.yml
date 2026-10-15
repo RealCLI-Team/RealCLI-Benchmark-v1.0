@@ -1,0 +1,623 @@
+name: build hatch
+
+on:
+  push:
+    tags:
+    - hatch-v*
+    branches:
+    - master
+  pull_request:
+    branches:
+    - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  APP_NAME: hatch
+  PYTHON_VERSION: "3.12"
+  PYOXIDIZER_VERSION: "0.24.0"
+  DIST_URL: "https://github.com/pypa/hatch/releases/download"
+
+permissions:
+  contents: read
+
+jobs:
+  python-artifacts:
+    name: Build wheel and source distribution
+    runs-on: ubuntu-latest
+
+    outputs:
+      old-version: ${{ steps.version.outputs.old-version }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Set up Python ${{ env.PYTHON_VERSION }}
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install UV
+      uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
+      with:
+        enable-cache: false
+
+    - name: Install tools
+      run: |-
+        uv pip install --system build
+        uv pip install --system .
+        hatch env create
+
+    # Windows installers don't accept non-integer versions so we ubiquitously
+    # perform the following transformation: X.Y.Z.devN -> X.Y.Z.N
+    - name: Set project version
+      id: version
+      run: |-
+        old_version="$(hatch version)"
+        version="${old_version/dev/}"
+
+        echo "old-version=$old_version" >> $GITHUB_OUTPUT
+        echo "version=$version" >> $GITHUB_OUTPUT
+        echo "$version"
+
+    - name: Build
+      run: python -m build
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: python-artifacts
+        path: dist/*
+        if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+    needs: python-artifacts
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+
+    steps:
+    - name: Download Python artifacts
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        name: python-artifacts
+        path: dist
+
+    - name: Push Python artifacts to PyPI
+      uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+      with:
+        skip-existing: true
+
+  binaries:
+    name: Binary ${{ matrix.job.target }} (${{ matrix.job.os }})
+    needs:
+    - python-artifacts
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+        # Linux
+        - target: aarch64-unknown-linux-gnu
+          os: ubuntu-22.04
+          use-dist: true
+          cross: true
+        - target: x86_64-unknown-linux-gnu
+          os: ubuntu-22.04
+          use-dist: true
+          cross: true
+        - target: x86_64-unknown-linux-musl
+          os: ubuntu-22.04
+          cross: true
+        - target: powerpc64le-unknown-linux-gnu
+          os: ubuntu-22.04
+          cross: true
+        # Windows
+        - target: x86_64-pc-windows-msvc
+          os: windows-2022
+          use-dist: true
+        - target: i686-pc-windows-msvc
+          os: windows-2022
+        # macOS
+        - target: aarch64-apple-darwin
+          os: macos-14
+          use-dist: true
+        - target: x86_64-apple-darwin
+          os: macos-14
+          use-dist: true
+
+    env:
+      CARGO: cargo
+      CARGO_BUILD_TARGET: ${{ matrix.job.target }}
+      PYAPP_REPO: pyapp
+      PYAPP_VERSION: "0.22.0"
+      PYAPP_UV_ENABLED: "true"
+      PYAPP_PASS_LOCATION: "true"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Fetch PyApp
+      run: >-
+        mkdir $PYAPP_REPO && curl -L
+        https://github.com/ofek/pyapp/releases/download/v$PYAPP_VERSION/source.tar.gz
+        |
+        tar --strip-components=1 -xzf - -C $PYAPP_REPO
+
+    - name: Set up Python ${{ env.PYTHON_VERSION }}
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install UV
+      uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
+      with:
+        enable-cache: false
+
+    - name: Install Hatch
+      run: |-
+        uv pip install --system -e .
+        hatch env create
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      with:
+        targets: ${{ matrix.job.target }}
+
+    - name: Set up cross compiling
+      if: matrix.job.cross
+      uses: taiki-e/install-action@704f92c11daa75bff5b4e01fcb083350c16c47b9 # v2
+      with:
+        tool: cross
+
+    - name: Configure cross compiling
+      if: matrix.job.cross
+      run: echo "CARGO=cross" >> $GITHUB_ENV
+
+    - name: Configure target
+      run: |-
+        config_file="$PYAPP_REPO/.cargo/config_${{ matrix.job.target }}.toml"
+        if [[ -f "$config_file" ]]; then
+          mv "$config_file" "$PYAPP_REPO/.cargo/config.toml"
+        fi
+
+    - name: Download Python artifacts
+      if: ${{ !startsWith(github.event.ref, 'refs/tags') }}
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        name: python-artifacts
+        path: dist
+
+    - name: Configure embedded project
+      if: ${{ !startsWith(github.event.ref, 'refs/tags') }}
+      run: |-
+        cd dist
+        wheel="$(echo *.whl)"
+        mv "$wheel" "../$PYAPP_REPO"
+        echo "PYAPP_PROJECT_PATH=$wheel" >> $GITHUB_ENV
+
+    - name: Configure release with distribution
+      if: startsWith(github.event.ref, 'refs/tags') && matrix.job.use-dist
+      run: |-
+        echo "PYAPP_SKIP_INSTALL=true" >> $GITHUB_ENV
+        echo "PYAPP_FULL_ISOLATION=true" >> $GITHUB_ENV
+        echo "PYAPP_DISTRIBUTION_SOURCE=${{ env.DIST_URL }}/hatch-v${NEEDS_PYTHON_ARTIFACTS_OUTPUTS_VERSION}/hatch-dist-${{ matrix.job.target }}.tar.gz" >> $GITHUB_ENV
+        echo "PYAPP_DISTRIBUTION_PATH_PREFIX=python" >> $GITHUB_ENV
+        echo "PYAPP_ALLOW_UPDATES=true" >> $GITHUB_ENV
+
+        # Disable in the case of self updates
+        echo "PYAPP_UV_ENABLED=false" >> $GITHUB_ENV
+      env:
+        NEEDS_PYTHON_ARTIFACTS_OUTPUTS_VERSION: ${{ needs.python-artifacts.outputs.version }}
+
+    - name: Build binary
+      run: hatch build --target binary
+
+    - name: Correct binary version
+      run: |-
+        old_version="${NEEDS_PYTHON_ARTIFACTS_OUTPUTS_OLD_VERSION}"
+        version="${NEEDS_PYTHON_ARTIFACTS_OUTPUTS_VERSION}"
+
+        if [[ "$version" != "$old_version" ]]; then
+          cd dist/binary
+          old_binary="$(ls)"
+          binary="${old_binary/$old_version/$version}"
+          mv "$old_binary" "$binary"
+        fi
+      env:
+        NEEDS_PYTHON_ARTIFACTS_OUTPUTS_OLD_VERSION: ${{ needs.python-artifacts.outputs.old-version }}
+        NEEDS_PYTHON_ARTIFACTS_OUTPUTS_VERSION: ${{ needs.python-artifacts.outputs.version }}
+
+    - name: Archive binary
+      run: |-
+        mkdir packaging
+        cd dist/binary
+
+        old_binary="$(ls)"
+
+        if [[ "$old_binary" =~ -pc-windows- ]]; then
+          new_binary="${{ env.APP_NAME }}.exe"
+          mv "$old_binary" "$new_binary"
+          7z a "../../packaging/${{ env.APP_NAME }}-${{ matrix.job.target }}.zip" "$new_binary"
+        else
+          new_binary="${{ env.APP_NAME }}"
+          mv "$old_binary" "$new_binary"
+          chmod +x "$new_binary"
+          tar -czf "../../packaging/${{ env.APP_NAME }}-${{ matrix.job.target }}.tar.gz" "$new_binary"
+        fi
+
+    - name: Upload staged archive
+      if: runner.os != 'Linux'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: staged-${{ runner.os }}-${{ matrix.job.target }}
+        path: packaging/*
+        if-no-files-found: error
+
+    - name: Upload archive
+      if: runner.os == 'Linux'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: standalone-${{ matrix.job.target }}
+        path: packaging/*
+        if-no-files-found: error
+
+  windows-packaging:
+    name: Build Windows installers
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    needs:
+    - binaries
+    - python-artifacts
+    runs-on: windows-2022
+
+    env:
+      VERSION: ${{ needs.python-artifacts.outputs.version }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python ${{ env.PYTHON_VERSION }}
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install UV
+      uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
+      with:
+        enable-cache: false
+
+    - name: Install PyOxidizer ${{ env.PYOXIDIZER_VERSION }}
+      run: uv pip install --system pyoxidizer==${{ env.PYOXIDIZER_VERSION }}
+
+    - name: Download staged binaries
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        pattern: staged-${{ runner.os }}-*
+        path: archives
+        merge-multiple: true
+
+    - name: Extract staged binaries
+      run: |-
+        mkdir bin
+
+        cd archives
+        for f in *; do
+          binary_id=${f:0:-4}
+          7z e "$f" -o../bin
+          mv "../bin/${{ env.APP_NAME }}.exe" "../bin/$binary_id.exe"
+        done
+
+    # bin/<APP_NAME>-<TARGET>.exe -> targets/<TARGET>/<APP_NAME>.exe
+    - name: Prepare binaries
+      run: |-
+        mkdir targets
+        for f in bin/*; do
+          if [[ "$f" =~ ${{ env.APP_NAME }}-(.+).exe$ ]]; then
+            target="${BASH_REMATCH[1]}"
+            mkdir "targets/$target"
+            mv "$f" "targets/$target/${{ env.APP_NAME }}.exe"
+          fi
+        done
+
+    - name: Build installers
+      run: >-
+        pyoxidizer build windows_installers
+        --release
+        --var version ${VERSION}
+
+    - name: Prepare installers
+      run: |-
+        mkdir installers
+        mv build/*/release/*/*.{exe,msi} installers
+
+        cd installers
+        universal_installer="$(ls *.exe)"
+        mv "$universal_installer" "${{ env.APP_NAME }}-universal.exe"
+
+    - name: Upload binaries
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: standalone-${{ runner.os }}
+        path: archives/*
+        if-no-files-found: error
+
+    - name: Upload installers
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: installers-${{ runner.os }}
+        path: installers/*
+        if-no-files-found: error
+
+  macos-packaging:
+    name: Build macOS installer and sign/notarize artifacts
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    needs:
+    - binaries
+    - python-artifacts
+    runs-on: macos-14
+
+    env:
+      VERSION: ${{ needs.python-artifacts.outputs.version }}
+      NOTARY_WAIT_TIME: "3600"  # 1 hour
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python ${{ env.PYTHON_VERSION }}
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install UV
+      uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
+      with:
+        enable-cache: false
+
+    - name: Install PyOxidizer ${{ env.PYOXIDIZER_VERSION }}
+      run: uv pip install --system pyoxidizer==${{ env.PYOXIDIZER_VERSION }}
+
+    - name: Install rcodesign
+      env:
+        ARCHIVE_NAME: "apple-codesign-0.27.0-x86_64-apple-darwin"
+      run: >-
+        curl -L
+        "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.27.0/$ARCHIVE_NAME.tar.gz"
+        |
+        tar --strip-components=1 -xzf - -C /usr/local/bin "$ARCHIVE_NAME/rcodesign"
+
+    - name: Download staged binaries
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        pattern: staged-${{ runner.os }}-*
+        path: archives
+        merge-multiple: true
+
+    - name: Extract staged binaries
+      run: |-
+        mkdir bin
+
+        cd archives
+        for f in *; do
+          binary_id=${f:0:${#f}-7}
+          tar -xzf "$f" -C ../bin
+          mv "../bin/${{ env.APP_NAME }}" "../bin/$binary_id"
+        done
+
+    - name: Write credentials
+      env:
+        APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE: "${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE }}"
+        APPLE_DEVELOPER_ID_APPLICATION_PRIVATE_KEY: "${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_PRIVATE_KEY }}"
+        APPLE_DEVELOPER_ID_INSTALLER_CERTIFICATE: "${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_CERTIFICATE }}"
+        APPLE_DEVELOPER_ID_INSTALLER_PRIVATE_KEY: "${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_PRIVATE_KEY }}"
+        APPLE_APP_STORE_CONNECT_API_DATA: "${{ secrets.APPLE_APP_STORE_CONNECT_API_DATA }}"
+      run: |-
+        echo "$APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE" > /tmp/certificate-application.pem
+        echo "$APPLE_DEVELOPER_ID_APPLICATION_PRIVATE_KEY" > /tmp/private-key-application.pem
+        echo "$APPLE_DEVELOPER_ID_INSTALLER_CERTIFICATE" > /tmp/certificate-installer.pem
+        echo "$APPLE_DEVELOPER_ID_INSTALLER_PRIVATE_KEY" > /tmp/private-key-installer.pem
+        echo "$APPLE_APP_STORE_CONNECT_API_DATA" > /tmp/app-store-connect.json
+
+    # https://developer.apple.com/documentation/security/hardened_runtime
+    - name: Sign binaries
+      run: |-
+        for f in bin/*; do
+          rcodesign sign -vv \
+          --pem-source /tmp/certificate-application.pem \
+          --pem-source /tmp/private-key-application.pem \
+          --code-signature-flags runtime \
+          "$f"
+        done
+
+    # https://developer.apple.com/documentation/security/notarizing_macos_software_before_distribution
+    - name: Notarize binaries
+      run: |-
+        mkdir notarize-bin
+
+        cd bin
+        for f in *; do
+          zip "../notarize-bin/$f.zip" "$f"
+        done
+
+        cd ../notarize-bin
+        for f in *; do
+          rcodesign notary-submit -vv \
+          --max-wait-seconds ${{ env.NOTARY_WAIT_TIME }} \
+          --api-key-path /tmp/app-store-connect.json \
+          "$f"
+        done
+
+    - name: Archive binaries
+      run: |-
+        rm archives/*
+
+        cd bin
+        for f in *; do
+          mv "$f" "${{ env.APP_NAME }}"
+          tar -czf "../archives/$f.tar.gz" "${{ env.APP_NAME }}"
+          mv "${{ env.APP_NAME }}" "$f"
+        done
+
+    # bin/<APP_NAME>-<TARGET> -> targets/<TARGET>/<APP_NAME>
+    - name: Prepare binaries
+      run: |-
+        mkdir targets
+        for f in bin/*; do
+          if [[ "$f" =~ ${{ env.APP_NAME }}-(.+)$ ]]; then
+            target="${BASH_REMATCH[1]}"
+            mkdir "targets/$target"
+            mv "$f" "targets/$target/${{ env.APP_NAME }}"
+          fi
+        done
+
+    - name: Build universal binary
+      run: >-
+        pyoxidizer build macos_universal_binary
+        --release
+        --var version ${VERSION}
+
+    - name: Prepare universal binary
+      id: binary
+      run: |-
+        binary=$(echo build/*/release/*/${{ env.APP_NAME }})
+        chmod +x "$binary"
+        echo "path=$binary" >> "$GITHUB_OUTPUT"
+
+    - name: Build PKG
+      run: >-
+        python release/macos/build_pkg.py
+        --binary ${STEPS_BINARY_OUTPUTS_PATH}
+        --version ${VERSION}
+        staged
+      env:
+        STEPS_BINARY_OUTPUTS_PATH: ${{ steps.binary.outputs.path }}
+
+    - name: Stage PKG
+      id: pkg
+      run: |-
+        mkdir signed
+        pkg_file="$(ls staged)"
+        echo "path=$pkg_file" >> "$GITHUB_OUTPUT"
+
+    - name: Sign PKG
+      run: >-
+        rcodesign sign -vv
+        --pem-source /tmp/certificate-installer.pem
+        --pem-source /tmp/private-key-installer.pem
+        "staged/${STEPS_PKG_OUTPUTS_PATH}"
+        "signed/${STEPS_PKG_OUTPUTS_PATH}"
+      env:
+        STEPS_PKG_OUTPUTS_PATH: ${{ steps.pkg.outputs.path }}
+
+    - name: Notarize PKG
+      run: >-
+        rcodesign notary-submit -vv
+        --max-wait-seconds ${{ env.NOTARY_WAIT_TIME }}
+        --api-key-path /tmp/app-store-connect.json
+        --staple
+        "signed/${STEPS_PKG_OUTPUTS_PATH}"
+      env:
+        STEPS_PKG_OUTPUTS_PATH: ${{ steps.pkg.outputs.path }}
+
+    - name: Upload binaries
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: standalone-${{ runner.os }}
+        path: archives/*
+        if-no-files-found: error
+
+    - name: Upload installer
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: installers-${{ runner.os }}
+        path: signed/${{ steps.pkg.outputs.path }}
+        if-no-files-found: error
+
+  distributions-dev:
+    name: Build development distributions
+    if: ${{ !startsWith(github.event.ref, 'refs/tags') }}
+    uses: ./.github/workflows/build-distributions.yml
+    # This actually does not need the binary jobs but we want to prioritize
+    # resources for the test jobs therefore this forces these later on
+    needs: binaries
+
+  distributions-release:
+    name: Build release distributions
+    needs:
+    - python-artifacts
+    - publish-pypi
+    if: startsWith(github.event.ref, 'refs/tags')
+    uses: ./.github/workflows/build-distributions.yml
+    with:
+      version: ${{ needs.python-artifacts.outputs.version }}
+
+  publish-release:
+    name: Publish distributions
+    if: startsWith(github.event.ref, 'refs/tags')
+    needs:
+    - binaries
+    - windows-packaging
+    - macos-packaging
+    - distributions-release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+    - name: Download distributions
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        pattern: distribution-*
+        path: distributions
+        merge-multiple: true
+
+    - name: Download binaries
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        pattern: standalone-*
+        path: archives
+        merge-multiple: true
+
+    - name: Download installers
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        pattern: installers-*
+        path: installers
+        merge-multiple: true
+
+    - name: Add assets to draft release
+      run:
+        gh release upload "$RELEASE_TAG" \
+          archives/* \
+          distributions/* \
+          installers/* \
+          --repo "$REPO"
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_TAG: ${{ github.ref_name }}
+        REPO: ${{ github.repository }}

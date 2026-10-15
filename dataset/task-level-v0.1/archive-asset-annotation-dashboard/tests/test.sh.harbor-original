@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# 验证最终状态：标注清单、统计报告、离线看板
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+resolve_task_root() {
+  for candidate in "${TASK_ROOT:-}" /app /workspace "$(cd "$SCRIPT_DIR/.." && pwd)" "$(pwd)"; do
+    [ -n "$candidate" ] || continue
+    if [ -d "$candidate/inputs" ] || [ -d "$candidate/outputs" ] || [ -d "$candidate/output" ] || [ -f "$candidate/task.toml" ] || [ -d "$candidate/rootfs" ] || [ -f "$candidate/Makefile" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  cd "$SCRIPT_DIR/.." && pwd
+}
+TASK_ROOT="$(resolve_task_root)"
+cd "$TASK_ROOT"
+ROOT="$TASK_ROOT"
+ROOT_DIR="$TASK_ROOT"
+task_root="$TASK_ROOT"
+HERE="$SCRIPT_DIR"
+script_dir="$SCRIPT_DIR"
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+CSV="${ROOT}/annotated_inventory.csv"
+REPORT="${ROOT}/validation_report.json"
+HTML="${ROOT}/dashboard.html"
+
+[ -f "${CSV}" ]    || fail "missing annotated_inventory.csv"
+[ -f "${REPORT}" ] || fail "missing validation_report.json"
+[ -f "${HTML}" ]   || fail "missing dashboard.html"
+
+ZIP="${ROOT}/inputs/2023zlablearning.zip"
+[ -f "${ZIP}" ] || fail "missing input archive"
+
+python3 - "$CSV" "$REPORT" "$ZIP" << 'PYEOF'
+import sys, csv, json, zipfile
+
+csv_path, report_path, zip_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# expected file count from archive (regular files only, no dir entries)
+with zipfile.ZipFile(zip_path) as z:
+    expected = [n for n in z.namelist() if not n.endswith("/")]
+expected_count = len(expected)
+
+# --- CSV checks ---
+with open(csv_path, newline="", encoding="utf-8") as fh:
+    reader = csv.DictReader(fh)
+    cols = reader.fieldnames or []
+    rows = list(reader)
+
+for c in ["file_path", "type_tag", "size_bytes", "status"]:
+    assert c in cols, "CSV missing column: %s" % c
+
+assert len(rows) == expected_count, \
+    "CSV row count %d != archive file count %d" % (len(rows), expected_count)
+
+allowed = {"normal", "duplicate", "anomaly", "unknown"}
+counts = {k: 0 for k in allowed}
+for r in rows:
+    st = r["status"]
+    assert st in allowed, "illegal status value: %r" % st
+    counts[st] += 1
+    int(r["size_bytes"])  # size_bytes must be integer
+
+# --- JSON checks ---
+with open(report_path, encoding="utf-8") as fh:
+    rep = json.load(fh)
+
+for k in ["total_files", "duplicate_count", "anomaly_count", "type_distribution"]:
+    assert k in rep, "report missing key: %s" % k
+
+assert rep["total_files"] == expected_count, \
+    "total_files %s != archive file count %d" % (rep["total_files"], expected_count)
+
+# self-consistency: total == sum of four status classes
+assert rep["total_files"] == sum(counts.values()), \
+    "total_files != sum of status classes"
+
+assert rep["duplicate_count"] == counts["duplicate"], \
+    "duplicate_count mismatch with CSV"
+assert rep["anomaly_count"] == counts["anomaly"], \
+    "anomaly_count mismatch with CSV"
+
+td = rep["type_distribution"]
+assert isinstance(td, dict) and td, "type_distribution must be a non-empty object"
+assert sum(int(v) for v in td.values()) == rep["total_files"], \
+    "type_distribution values do not sum to total_files"
+
+# there is at least one duplicate and one anomaly in this archive
+assert rep["duplicate_count"] >= 1, "expected at least one duplicate"
+assert rep["anomaly_count"] >= 1, "expected at least one anomaly"
+
+print("data checks OK: total=%d dup=%d anom=%d" %
+      (rep["total_files"], rep["duplicate_count"], rep["anomaly_count"]))
+PYEOF
+
+# --- HTML checks ---
+grep -qi "<!DOCTYPE html" "${HTML}" || fail "dashboard.html missing DOCTYPE"
+grep -qi "<html" "${HTML}"          || fail "dashboard.html missing <html>"
+grep -qi "</html>" "${HTML}"        || fail "dashboard.html missing </html>"
+grep -q "<table" "${HTML}"          || fail "dashboard.html missing a table"
+
+# key metric labels present
+grep -q "总文件数" "${HTML}" || fail "dashboard.html missing total metric"
+grep -q "异常"     "${HTML}" || fail "dashboard.html missing anomaly section/metric"
+grep -q "文件类型分布" "${HTML}" || fail "dashboard.html missing type distribution chart"
+
+# must be fully offline: no remote URLs
+if grep -Eiq "https?://" "${HTML}"; then
+  fail "dashboard.html references a remote URL (must be offline)"
+fi
+
+echo "ALL TESTS PASSED"

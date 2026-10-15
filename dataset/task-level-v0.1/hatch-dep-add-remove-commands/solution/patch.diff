@@ -1,0 +1,2686 @@
+diff --git a/docs/how-to/environment/edit-dependencies.md b/docs/how-to/environment/edit-dependencies.md
+new file mode 100644
+index 0000000..6e2a733
+--- /dev/null
++++ b/docs/how-to/environment/edit-dependencies.md
+@@ -0,0 +1,145 @@
++# Editing dependencies
++
++-----
++
++Rather than editing `pyproject.toml` by hand, you can use the `hatch dep add`
++and `hatch dep remove` commands to manage the dependencies of your project
++and its environments. Every edit preserves the existing formatting and
++comments of `pyproject.toml`, and nothing is written unless the whole set of
++requested changes is valid.
++
++## Adding dependencies
++
++By default, requirements are appended to `project.dependencies`:
++
++```console
++$ hatch dep add "requests>=2"
++```
++
++The stored text is exactly what you passed, except that markers use single
++quotes to avoid escaping inside the TOML string. If a dependency with the
++same (normalized) distribution name is already present in the target field,
++the command exits with an error; pass `--force` to replace the existing
++entry in place instead:
++
++```console
++$ hatch dep add "requests>=3" --force
++```
++
++`--force` also removes marker-split duplicates of the same name, leaving
++exactly one entry for the requested requirement.
++
++### Features
++
++Use `--optional`/`-o` to add to a feature of
++[`project.optional-dependencies`](../../config/metadata.md#optional) instead,
++creating the feature if it does not exist yet:
++
++```console
++$ hatch dep add pytest -o test
++```
++
++The option may be given multiple times to add the same requirement to
++several features atomically – if any of those features would raise a
++conflict, none of them are modified.
++
++### Dependency groups
++
++Use `--group`/`-g` to add to a [PEP 735](https://peps.python.org/pep-0735/)
++[dependency group](../../config/dependency.md), creating the group if it
++does not exist yet:
++
++```console
++$ hatch dep add ruff -g lint
++```
++
++Groups may contain [`include-group`](https://peps.python.org/pep-0735/#specifying-a-project-as-a-dependency)
++entries that reference other groups. Those entries are left untouched by
++`dep add` and `dep remove`.
++
++### Environments
++
++Use `--env` to add to the [`dependencies`](../../config/environment/overview.md#dependencies)
++of an environment defined in `tool.hatch.envs`:
++
++```console
++$ hatch dep add ipython --env default
++```
++
++The environment must already be defined, except for the `default`
++environment whose table is created on demand. Add `--extra` to target the
++environment's [`extra-dependencies`](../../config/environment/overview.md#extra-dependencies)
++instead:
++
++```console
++$ hatch dep add debugpy --env default --extra
++```
++
++The `--env` option cannot be combined with `--optional` or `--group`.
++
++Fields that are declared [dynamic](../../config/metadata.md#dynamic) cannot
++be edited and produce an error.
++
++### Dry runs
++
++Passing `--dry-run` performs the full validation cycle and prints a unified
++diff of the change that would be applied to `pyproject.toml`, without
++writing the file:
++
++```console
++$ hatch dep add "requests>=2" --dry-run
++--- a/pyproject.toml
+++++ b/pyproject.toml
++@@ -1,3 +1,3 @@
++ [project]
++ name = "demo"
++-dependencies = ["click"]
+++dependencies = ["click", "requests>=2"]
++```
++
++## Removing dependencies
++
++The remove command takes bare distribution names and matches entries by
++their normalized name, ignoring extras, version specifiers and markers:
++
++```console
++$ hatch dep remove requests
++```
++
++Without any scope option, every static location is searched: the project
++dependencies, all optional features and all dependency groups. Every
++matching entry (including marker-split duplicates for the same name) is
++removed, and each removal is reported. If a name is not found anywhere,
++the command exits with an error and nothing is written.
++
++Use `--optional`/`-o`, `--group`/`-g` or `--env` (optionally with
++`--extra`) to restrict the removal to specific fields:
++
++```console
++$ hatch dep remove pytest -o test
++$ hatch dep remove ruff -g lint
++$ hatch dep remove ipython --env default
++$ hatch dep remove debugpy --env default --extra
++```
++
++Environments are intentionally *not* part of the default scope – a bare
++`hatch dep remove <name>` will not touch any environment table. If you
++want to remove a dependency from an environment, pass `--env` explicitly.
++
++Requirement strings (with extras, version specifiers, markers or URLs) are
++rejected as arguments – if you tried `hatch dep remove "requests>=2"` you
++will get an error hinting that only the bare name should be passed.
++
++`--dry-run` behaves the same as it does for `dep add`.
++
++## Atomicity
++
++Both commands validate every requested change before writing anything.
++When you ask to add or remove multiple dependencies across multiple
++targets, either the whole change lands or none of it does. If a single
++one of the changes is invalid, the command exits with a non-zero status
++and `pyproject.toml` is not touched.
++
++The write itself goes through an atomic ``os.replace`` on the same
++directory, so a crash midway through leaves you with the *previous*
++`pyproject.toml` bytes rather than a half-written file.
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 4ff3f8c..63d0e3a 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -136,6 +136,7 @@ nav:
+       - Select installer: how-to/environment/select-installer.md
+       - Dependency resolution: how-to/environment/dependency-resolution.md
+       - Lockfiles: how-to/environment/lockfiles.md
++      - Editing dependencies: how-to/environment/edit-dependencies.md
+       - Workspace: how-to/environment/workspace.md
+     - Static analysis:
+       - Customize behavior: how-to/static-analysis/behavior.md
+diff --git a/src/hatch/cli/dep/__init__.py b/src/hatch/cli/dep/__init__.py
+index b555251..88db5b0 100644
+--- a/src/hatch/cli/dep/__init__.py
++++ b/src/hatch/cli/dep/__init__.py
+@@ -253,3 +253,126 @@ def requirements(app, project_only, env_only, features, all_features):
+ 
+     for dependency in get_normalized_dependencies(all_requirements):
+         app.display(dependency)
++
++
++@dep.command(
++    "add",
++    short_help="Add dependencies to the project, a feature, a dependency group, or an environment",
++)
++@click.argument("requirements", nargs=-1, required=True)
++@click.option(
++    "--optional",
++    "-o",
++    "features",
++    multiple=True,
++    metavar="FEATURE",
++    help="Add to the given feature of `project.optional-dependencies` (may be used multiple times)",
++)
++@click.option(
++    "--group",
++    "-g",
++    "groups",
++    multiple=True,
++    metavar="GROUP",
++    help="Add to the given PEP 735 dependency group (may be used multiple times)",
++)
++@click.option(
++    "--env",
++    "env_name",
++    metavar="ENV",
++    help="Add to the dependencies of the named environment in `tool.hatch.envs`",
++)
++@click.option(
++    "--extra",
++    is_flag=True,
++    help="With --env, add to the environment's `extra-dependencies` instead of `dependencies`",
++)
++@click.option(
++    "--force",
++    "-f",
++    is_flag=True,
++    help="Replace an existing entry with the same distribution name instead of failing",
++)
++@click.option(
++    "--dry-run",
++    is_flag=True,
++    help="Show the change that would be applied to `pyproject.toml` without writing it",
++)
++@click.pass_obj
++def add(app, requirements, features, groups, env_name, extra, force, dry_run):
++    """Add dependencies to the project, a feature, a dependency group, or an environment.
++
++    Every edit preserves the existing formatting and comments of
++    `pyproject.toml`. If any of the requested changes cannot be applied,
++    the command exits with a non-zero status and does not touch the file.
++    """
++    from hatch.dep.edit import add_dependencies
++
++    add_dependencies(
++        app,
++        requirements,
++        features=features,
++        groups=groups,
++        env_name=env_name,
++        extra=extra,
++        force=force,
++        dry_run=dry_run,
++    )
++
++
++@dep.command(
++    "remove",
++    short_help="Remove dependencies from the project, a feature, a dependency group, or an environment",
++)
++@click.argument("names", nargs=-1, required=True)
++@click.option(
++    "--optional",
++    "-o",
++    "features",
++    multiple=True,
++    metavar="FEATURE",
++    help="Only remove from the given feature of `project.optional-dependencies` (may be used multiple times)",
++)
++@click.option(
++    "--group",
++    "-g",
++    "groups",
++    multiple=True,
++    metavar="GROUP",
++    help="Only remove from the given PEP 735 dependency group (may be used multiple times)",
++)
++@click.option(
++    "--env",
++    "env_name",
++    metavar="ENV",
++    help="Only remove from the dependencies of the named environment in `tool.hatch.envs`",
++)
++@click.option(
++    "--extra",
++    is_flag=True,
++    help="With --env, remove from the environment's `extra-dependencies` instead of `dependencies`",
++)
++@click.option(
++    "--dry-run",
++    is_flag=True,
++    help="Show the change that would be applied to `pyproject.toml` without writing it",
++)
++@click.pass_obj
++def remove(app, names, features, groups, env_name, extra, dry_run):
++    """Remove dependencies from the project, a feature, a dependency group, or an environment.
++
++    The argument is a bare distribution name, matched case-insensitively
++    after PEP 503 normalization. Requirement strings (with extras, version
++    specifiers, markers or URLs) are rejected.
++    """
++    from hatch.dep.edit import remove_dependencies
++
++    remove_dependencies(
++        app,
++        names,
++        features=features,
++        groups=groups,
++        env_name=env_name,
++        extra=extra,
++        dry_run=dry_run,
++    )
+diff --git a/src/hatch/dep/core.py b/src/hatch/dep/core.py
+index f208364..3e8b448 100644
+--- a/src/hatch/dep/core.py
++++ b/src/hatch/dep/core.py
+@@ -6,10 +6,29 @@ from packaging.requirements import InvalidRequirement, Requirement
+ 
+ from hatch.utils.fs import Path
+ 
++# Re-exported alias so that callers who want to catch the specific
++# "the string could not be parsed as a PEP 508 requirement" error can
++# refer to it under a name that is not tied to the ``packaging`` API
++# name. The ``hatch dep add`` command wraps this exception with a
++# more actionable error message.
+ InvalidDependencyError = InvalidRequirement
+ 
+ 
+ class Dependency(Requirement):
++    """A PEP 508 requirement enriched with Hatch-specific helpers.
++
++    Extends :class:`packaging.requirements.Requirement` with:
++
++    * ``editable`` – whether the requirement should be installed with
++      the ``-e`` flag by the environment installer.
++    * ``path`` / ``subdirectory`` – convenience accessors that unpack
++      the ``file://`` URLs used by editable local requirements.
++    * ``canonical_name`` – the PEP 503 canonical form of ``name``.
++      This is what the round-trip editors in :mod:`hatch.dep.edit`
++      use to decide whether two requirement strings refer to the same
++      distribution.
++    """
++
+     def __init__(self, s: str, *, editable: bool = False) -> None:
+         super().__init__(s)
+ 
+@@ -23,6 +42,21 @@ class Dependency(Requirement):
+     def editable(self) -> bool:
+         return self.__editable
+ 
++    @cached_property
++    def canonical_name(self) -> str:
++        """The PEP 503 canonical form of ``self.name``.
++
++        Two dependencies refer to the same distribution iff their
++        canonical names are equal. This is orthogonal to extras,
++        version specifiers, markers and URLs; the same rule PyPI uses
++        for URL routing. Cached because :func:`normalize_project_name`
++        is a plain regex substitution and every ``dep add`` /
++        ``dep remove`` call hits it once per requirement.
++        """
++        from hatchling.metadata.utils import normalize_project_name
++
++        return normalize_project_name(self.name)
++
+     @cached_property
+     def path(self) -> Path | None:
+         from urllib.parse import unquote
+diff --git a/src/hatch/dep/edit.py b/src/hatch/dep/edit.py
+new file mode 100644
+index 0000000..3f9e3e9
+--- /dev/null
++++ b/src/hatch/dep/edit.py
+@@ -0,0 +1,723 @@
++"""In-place editors for the dependency-carrying arrays of ``pyproject.toml``.
++
++The two public entry points are :func:`add_dependencies` and
++:func:`remove_dependencies`, which back the ``hatch dep add`` and
++``hatch dep remove`` CLI commands respectively.
++
++The module has a hard atomicity guarantee: every user-facing failure must
++raise before any bytes are written to disk, so a partially-applied edit is
++never observable. To honour that guarantee both commands share the same
++skeleton:
++
++1. Load ``pyproject.toml`` into a :mod:`tomlkit` document (round-trip
++   friendly parser).
++2. Resolve every editing *target* – i.e. every array of dependency strings
++   that this invocation will touch. If a target cannot be resolved (feature
++   is missing, environment is not declared, field is ``dynamic``) the
++   command aborts immediately.
++3. Validate every requested change against every target *before* touching
++   the document. For ``dep add`` that means parsing each requirement and
++   checking for name conflicts. For ``dep remove`` that means confirming
++   every requested name matches at least one entry across the selected
++   scope.
++4. Apply the edits to the in-memory document.
++5. Either save the document atomically or, in ``--dry-run`` mode, print a
++   unified diff against the original bytes.
++
++The module deliberately stays free of ``click`` imports: control flow is
++routed through :class:`hatch.cli.application.Application` (``app.abort``,
++``app.display_success``, ``app.display``) so that error messages, exit
++codes and output channels match the rest of the CLI.
++"""
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any, NamedTuple
++
++if TYPE_CHECKING:
++    from collections.abc import Iterator
++
++    import tomlkit
++    from tomlkit.items import Array
++
++    from hatch.cli.application import Application
++    from hatch.project.core import Project
++    from hatch.utils.fs import Path
++
++
++# ---------------------------------------------------------------------------
++# Data structures
++# ---------------------------------------------------------------------------
++
++
++class EditTarget(NamedTuple):
++    """A single dependency array in ``pyproject.toml`` that the command edits.
++
++    Attributes:
++        field: Dotted path of the field, used in success and error messages
++            (e.g. ``project.dependencies``,
++            ``project.optional-dependencies.docs``,
++            ``dependency-groups.lint`` or
++            ``tool.hatch.envs.default.dependencies``).
++        array: The underlying :class:`tomlkit.items.Array` instance whose
++            entries the command manipulates.
++    """
++
++    field: str
++    array: "Array"
++
++
++# ---------------------------------------------------------------------------
++# I/O helpers
++# ---------------------------------------------------------------------------
++
++
++def get_project_file(project: Project) -> Path:
++    """Return the path of the ``pyproject.toml`` file of ``project``.
++
++    The routine mirrors the guard used by ``hatch version`` and other
++    project-scoped commands: if no project could be located we abort with
++    the same ``No project detected`` message the rest of the CLI uses, so
++    the two commands do not invent a private failure vocabulary.
++    """
++    if project.root is None:
++        if project.chosen_name is None:
++            project.app.abort("No project detected")
++        else:
++            project.app.abort(f"Project {project.chosen_name} (not a project)")
++
++    return project.location / "pyproject.toml"
++
++
++def load_document(project_file: Path) -> tomlkit.TOMLDocument:
++    """Parse ``pyproject.toml`` while preserving formatting and comments."""
++    import tomlkit
++
++    return tomlkit.parse(project_file.read_text("utf-8"))
++
++
++def save_document(project_file: Path, document: tomlkit.TOMLDocument) -> None:
++    """Serialize ``document`` back to ``project_file`` atomically.
++
++    The atomic write reuses :meth:`hatch.utils.fs.Path.write_atomic`, which
++    goes through ``tempfile.mkstemp`` + ``os.replace`` so that a crash
++    between the last valid state and the next one is impossible – either
++    the previous ``pyproject.toml`` bytes are observed or the new bytes
++    are.
++    """
++    import tomlkit
++
++    text = tomlkit.dumps(document)
++    # tomlkit sometimes strips the trailing newline. Every file we've ever
++    # written ends with ``\n`` so keep the invariant.
++    if not text.endswith("\n"):
++        text += "\n"
++
++    project_file.write_atomic(text, "w", encoding="utf-8")
++
++
++def diff_document(old_text: str, document: tomlkit.TOMLDocument) -> str:
++    """Return a unified diff between the on-disk bytes and ``document``.
++
++    The diff uses ``a/pyproject.toml`` and ``b/pyproject.toml`` as the file
++    labels so that its output can be piped straight into ``patch -p1`` or
++    ``git apply``.
++    """
++    from difflib import unified_diff
++
++    import tomlkit
++
++    new_text = tomlkit.dumps(document)
++    if not new_text.endswith("\n"):
++        new_text += "\n"
++
++    return "".join(
++        unified_diff(
++            old_text.splitlines(keepends=True),
++            new_text.splitlines(keepends=True),
++            fromfile="a/pyproject.toml",
++            tofile="b/pyproject.toml",
++        )
++    )
++
++
++# ---------------------------------------------------------------------------
++# Name normalization helpers
++# ---------------------------------------------------------------------------
++
++
++def canonical_name(requirement: Any) -> str:
++    """Return the PEP 503 canonical form of ``requirement.name``.
++
++    Two requirements refer to the same distribution iff their canonical
++    names are equal. This is *independent* of extras, version specifiers,
++    markers and URLs – the same rule PyPI uses for URL routing.
++    """
++    from hatchling.metadata.utils import normalize_project_name
++
++    return normalize_project_name(requirement.name)
++
++
++def parse_requirement(app: Application, raw: str) -> Any:
++    """Parse a PEP 508 requirement, aborting on failure with a consistent message."""
++    from hatch.dep.core import Dependency, InvalidDependencyError
++
++    try:
++        return Dependency(raw)
++    except InvalidDependencyError as e:
++        app.abort(f"Invalid requirement `{raw}`: {e}")
++
++
++def normalize_requirement_text(raw: str) -> str:
++    """Return the requirement string as it should be stored in ``pyproject.toml``.
++
++    Two normalizations happen:
++
++    * Leading/trailing whitespace is trimmed so ``"  requests>=2 "`` and
++      ``"requests>=2"`` compare equal.
++    * Marker double quotes are lowered to single quotes. PEP 508 markers
++      require quoted string operands and by convention example code uses
++      double quotes; but the TOML string that wraps the requirement is
++      itself delimited by double quotes, so keeping the inner double
++      quotes would force TOML escaping (``\\\"``) that most human readers
++      find ugly. Since PEP 508 accepts either quote character we swap
++      the inner ones to single quotes.
++    """
++    from hatch.utils.dep import normalize_marker_quoting
++
++    return normalize_marker_quoting(raw.strip())
++
++
++def validate_dependency_name(app: Application, raw: str) -> str:
++    """Validate and canonicalize a bare distribution name for ``dep remove``.
++
++    Anything other than a PEP 508 project name (no extras, no specifiers,
++    no markers, no URLs) is rejected. The message tells the user precisely
++    what form is expected, so a common mistake like
++    ``hatch dep remove "requests>=2"`` produces a helpful hint instead of
++    a cryptic parse error.
++    """
++    from hatchling.metadata.utils import is_valid_project_name, normalize_project_name
++
++    name = raw.strip()
++    if not name or not is_valid_project_name(name):
++        app.abort(
++            f"Invalid dependency name `{raw}`; pass a distribution name like `requests`, "
++            "not a requirement with extras, version specifiers, markers or URLs"
++        )
++
++    return normalize_project_name(name)
++
++
++def validate_feature_name(app: Application, raw: str) -> str:
++    from hatchling.metadata.utils import is_valid_project_name, normalize_project_name
++
++    name = raw.strip()
++    if not name or not is_valid_project_name(name):
++        app.abort(f"Invalid feature name: {raw}")
++
++    return normalize_project_name(name)
++
++
++def validate_group_name(app: Application, raw: str) -> str:
++    """Validate and canonicalize a PEP 735 dependency group name.
++
++    Per PEP 735 the name grammar is inherited from PEP 508 and the
++    normalization rule is PEP 503. That keeps ``dev`` and ``Dev`` from
++    silently referring to different groups.
++    """
++    from hatchling.metadata.utils import is_valid_project_name, normalize_project_name
++
++    name = raw.strip()
++    if not name or not is_valid_project_name(name):
++        app.abort(f"Invalid dependency group name: {raw}")
++
++    return normalize_project_name(name)
++
++
++# ---------------------------------------------------------------------------
++# Structural helpers
++# ---------------------------------------------------------------------------
++
++
++def _require_array(app: Application, value: Any, field: str) -> Array:
++    """Return ``value`` if it is a tomlkit Array or an empty one when absent.
++
++    Errors on anything else so misconfigured pyproject.toml files fail
++    loudly instead of getting silently coerced.
++    """
++    import tomlkit
++
++    if value is None:
++        return tomlkit.array()
++
++    if not isinstance(value, tomlkit.items.Array):
++        app.abort(f"Field `{field}` must be an array")
++
++    return value
++
++
++def _project_table(app: Application, document: tomlkit.TOMLDocument, field: str) -> Any:
++    """Return the ``[project]`` table or abort with a project-shaped error."""
++    project = document.get("project")
++    if project is None:
++        app.abort(f"Cannot edit `{field}` because the project does not define a `project` table")
++
++    return project
++
++
++def _check_not_dynamic(app: Application, project: Any, *fields: str) -> None:
++    """Refuse to edit fields declared dynamic in ``project.dynamic``.
++
++    PEP 621 defines dynamic fields as ones the build backend fills in at
++    build time; editing the static table would either be ignored (best
++    case) or contradict the resolved metadata (worst case). Either way we
++    refuse and tell the user why.
++    """
++    dynamic = project.get("dynamic", [])
++    for field in fields:
++        if field in dynamic:
++            app.abort(f"Field `project.{field}` is declared dynamic and cannot be edited")
++
++
++# ---------------------------------------------------------------------------
++# Target resolution
++# ---------------------------------------------------------------------------
++
++
++def resolve_env_target(
++    app: Application,
++    document: tomlkit.TOMLDocument,
++    *,
++    env_name: str,
++    extra: bool,
++    create: bool,
++) -> EditTarget:
++    """Resolve the ``dependencies`` (or ``extra-dependencies``) of an environment.
++
++    The ``default`` environment is created on demand because the Hatch
++    documentation treats it as always conceptually present – users often
++    interact with a project that has no ``[tool.hatch.envs.default]`` table
++    at all. Every other environment must be declared explicitly in the
++    file first; asking to write to ``--env qa`` on a project that has
++    never mentioned ``qa`` is a typo, and refusing early gives a much
++    better error than silently creating a phantom table.
++
++    ``create`` distinguishes the two commands: ``dep add`` may create the
++    default environment table, ``dep remove`` never does (the missing
++    array can't hold the name anyway).
++    """
++    import tomlkit
++
++    key = "extra-dependencies" if extra else "dependencies"
++    field = f"tool.hatch.envs.{env_name}.{key}"
++
++    tool = document.get("tool")
++    hatch_config = tool.get("hatch") if tool is not None else None
++    envs = hatch_config.get("envs") if hatch_config is not None else None
++    env_config = envs.get(env_name) if envs is not None else None
++
++    if env_config is None:
++        if env_name != "default":
++            app.abort(f"Environment `{env_name}` is not defined in `tool.hatch.envs`")
++
++        if not create:
++            app.abort(f"Field `{field}` is not defined")
++
++        if tool is None:
++            tool = document["tool"] = tomlkit.table()
++        if hatch_config is None:
++            hatch_config = tool["hatch"] = tomlkit.table()
++        if envs is None:
++            envs = hatch_config["envs"] = tomlkit.table()
++        env_config = envs[env_name] = tomlkit.table()
++
++    array = _require_array(app, env_config.get(key), field)
++    if key not in env_config:
++        env_config[key] = array
++
++    return EditTarget(field, array)
++
++
++def resolve_add_targets(
++    app: Application,
++    document: tomlkit.TOMLDocument,
++    *,
++    features: tuple[str, ...],
++    groups: tuple[str, ...],
++    env_name: str | None,
++    extra: bool,
++) -> list[EditTarget]:
++    """Resolve the set of arrays ``dep add`` will write to.
++
++    Every option combination has its own resolution path:
++
++    * ``--env`` (with optional ``--extra``) targets exactly one
++      environment array. ``--optional`` and ``--group`` are rejected in
++      that case – mixing a feature with an environment write would be
++      ambiguous.
++    * ``--optional`` targets one array per feature, creating features
++      that don't exist yet (the whole point of ``dep add`` is that the
++      user shouldn't have to hand-edit the file to declare a feature).
++    * ``--group`` behaves the same for PEP 735 dependency groups.
++    * Otherwise (the default) we target ``project.dependencies``, again
++      creating it if the field is not present yet.
++    """
++    if env_name is not None:
++        if features or groups:
++            app.abort("The --env option cannot be combined with --optional or --group")
++
++        return [resolve_env_target(app, document, env_name=env_name, extra=extra, create=True)]
++
++    if extra:
++        app.abort("The --extra option requires --env")
++
++    import tomlkit
++
++    targets: list[EditTarget] = []
++    if features:
++        project = _project_table(app, document, "project.optional-dependencies")
++        _check_not_dynamic(app, project, "optional-dependencies")
++
++        optional_dependencies = project.get("optional-dependencies")
++        if optional_dependencies is None:
++            optional_dependencies = project["optional-dependencies"] = tomlkit.table()
++
++        for raw_feature in features:
++            feature = validate_feature_name(app, raw_feature)
++            field = f"project.optional-dependencies.{feature}"
++            array = optional_dependencies.get(feature)
++            if array is None:
++                array = optional_dependencies[feature] = tomlkit.array()
++            elif not isinstance(array, tomlkit.items.Array):
++                app.abort(f"Field `{field}` must be an array")
++
++            targets.append(EditTarget(field, array))
++    elif groups:
++        dependency_groups = document.get("dependency-groups")
++        if dependency_groups is None:
++            dependency_groups = document["dependency-groups"] = tomlkit.table()
++
++        for raw_group in groups:
++            group = validate_group_name(app, raw_group)
++            field = f"dependency-groups.{group}"
++            array = dependency_groups.get(group)
++            if array is None:
++                array = dependency_groups[group] = tomlkit.array()
++            elif not isinstance(array, tomlkit.items.Array):
++                app.abort(f"Field `{field}` must be an array")
++
++            targets.append(EditTarget(field, array))
++    else:
++        project = _project_table(app, document, "project.dependencies")
++        _check_not_dynamic(app, project, "dependencies")
++
++        field = "project.dependencies"
++        array = _require_array(app, project.get("dependencies"), field)
++        if "dependencies" not in project:
++            project["dependencies"] = array
++
++        targets.append(EditTarget(field, array))
++
++    return targets
++
++
++def resolve_remove_targets(
++    app: Application,
++    document: tomlkit.TOMLDocument,
++    *,
++    features: tuple[str, ...],
++    groups: tuple[str, ...],
++    env_name: str | None,
++    extra: bool,
++) -> list[EditTarget]:
++    """Resolve the set of arrays ``dep remove`` will consider.
++
++    Unlike :func:`resolve_add_targets`, this function *never* creates a
++    field on the fly: removing from a non-existent feature or group is
++    always a typo. When no scope option is given, the default scope is
++    everything the project statically declares – project dependencies,
++    every optional feature and every dependency group. Environments are
++    intentionally *excluded* from that default: an env-only dependency is
++    a much more surgical thing to remove and we don't want a blanket
++    ``hatch dep remove foo`` to also strip it from every environment.
++    """
++    if env_name is not None:
++        if features or groups:
++            app.abort("The --env option cannot be combined with --optional or --group")
++
++        return [resolve_env_target(app, document, env_name=env_name, extra=extra, create=False)]
++
++    if extra:
++        app.abort("The --extra option requires --env")
++
++    import tomlkit
++
++    targets: list[EditTarget] = []
++    if features:
++        project = _project_table(app, document, "project.optional-dependencies")
++        _check_not_dynamic(app, project, "optional-dependencies")
++
++        optional_dependencies = project.get("optional-dependencies", {})
++        for raw_feature in features:
++            feature = validate_feature_name(app, raw_feature)
++            field = f"project.optional-dependencies.{feature}"
++            array = optional_dependencies.get(feature)
++            if array is None:
++                app.abort(f"Feature `{feature}` is not defined in field `project.optional-dependencies`")
++
++            if not isinstance(array, tomlkit.items.Array):
++                app.abort(f"Field `{field}` must be an array")
++
++            targets.append(EditTarget(field, array))
++    elif groups:
++        dependency_groups = document.get("dependency-groups", {})
++        for raw_group in groups:
++            group = validate_group_name(app, raw_group)
++            field = f"dependency-groups.{group}"
++            array = dependency_groups.get(group)
++            if array is None:
++                app.abort(f"Dependency group `{group}` is not defined")
++
++            if not isinstance(array, tomlkit.items.Array):
++                app.abort(f"Field `{field}` must be an array")
++
++            targets.append(EditTarget(field, array))
++    else:
++        project = document.get("project")
++        if project is not None:
++            _check_not_dynamic(app, project, "dependencies", "optional-dependencies")
++
++            array = project.get("dependencies")
++            if isinstance(array, tomlkit.items.Array):
++                targets.append(EditTarget("project.dependencies", array))
++
++            optional_dependencies = project.get("optional-dependencies", {})
++            for feature, array in optional_dependencies.items():
++                if isinstance(array, tomlkit.items.Array):
++                    targets.append(EditTarget(f"project.optional-dependencies.{feature}", array))
++
++        dependency_groups = document.get("dependency-groups", {})
++        for group, array in dependency_groups.items():
++            if isinstance(array, tomlkit.items.Array):
++                targets.append(EditTarget(f"dependency-groups.{group}", array))
++
++    return targets
++
++
++# ---------------------------------------------------------------------------
++# Array scanning helpers
++# ---------------------------------------------------------------------------
++
++
++def _iter_requirements(app: Application, target: EditTarget) -> Iterator[tuple[int, str, Any]]:
++    """Yield ``(index, raw, parsed)`` for every string entry of ``target``.
++
++    Non-string entries (most notably ``{include-group = "..."}`` inline
++    tables allowed in PEP 735 groups) are silently skipped: the caller is
++    only ever interested in requirement strings, and forwarding include
++    tables to :class:`packaging.requirements.Requirement` would raise
++    unhelpful parse errors.
++    """
++    for index, item in enumerate(target.array):
++        if not isinstance(item, str):
++            continue
++
++        yield index, item, parse_requirement(app, item)
++
++
++def find_matching_entries(app: Application, target: EditTarget, name: str) -> list[tuple[int, str]]:
++    """Return every ``(index, raw)`` in ``target`` whose canonical name matches.
++
++    ``name`` is expected to already be canonicalized (via
++    :func:`canonical_name`) so we only need one comparison per entry.
++    Marker-split duplicates such as
++    ``"colorama; sys_platform == 'win32'"`` and
++    ``"colorama; sys_platform == 'darwin'"`` are both returned.
++    """
++    matches: list[tuple[int, str]] = []
++    for index, raw, requirement in _iter_requirements(app, target):
++        if canonical_name(requirement) == name:
++            matches.append((index, raw))
++
++    return matches
++
++
++# ---------------------------------------------------------------------------
++# Planning and mutation
++# ---------------------------------------------------------------------------
++
++
++def plan_additions(
++    app: Application,
++    targets: list[EditTarget],
++    requirements: tuple[str, ...],
++    *,
++    force: bool,
++) -> list[tuple[str, str, str]]:
++    """Validate every requested addition, then mutate the in-memory document.
++
++    Validation happens up front for *every* (target, requirement) pair. A
++    single conflict aborts the whole call before any array is touched, so
++    ``hatch dep add A B`` never leaves you with only ``A`` written when
++    ``B`` was invalid or already present.
++
++    Returns a list of ``(raw, stored, field)`` tuples for the caller to
++    turn into user-facing success messages – ``raw`` is what the user
++    typed, ``stored`` is what we wrote (marker quotes swapped), and
++    ``field`` is the dotted name of the target array.
++    """
++    parsed = [(raw, parse_requirement(app, raw)) for raw in requirements]
++
++    for target in targets:
++        for raw, requirement in parsed:
++            name = canonical_name(requirement)
++            matches = find_matching_entries(app, target, name)
++            if matches and not force:
++                existing = matches[0][1]
++                app.abort(
++                    f"Dependency `{name}` is already defined in field `{target.field}` as "
++                    f"`{existing}`; use --force to replace it"
++                )
++
++    additions: list[tuple[str, str, str]] = []
++    for target in targets:
++        for raw, requirement in parsed:
++            name = canonical_name(requirement)
++            stored = normalize_requirement_text(raw)
++            matches = find_matching_entries(app, target, name)
++            if matches:
++                first_index = matches[0][0]
++                target.array[first_index] = stored
++                for index, _ in reversed(matches[1:]):
++                    del target.array[index]
++            else:
++                target.array.append(stored)
++
++            additions.append((raw, stored, target.field))
++
++    return additions
++
++
++def plan_removals(
++    app: Application,
++    targets: list[EditTarget],
++    names: tuple[str, ...],
++    *,
++    scoped: bool,
++) -> list[tuple[str, str]]:
++    """Validate every requested removal, then mutate the in-memory document.
++
++    Names are canonicalized once, up front. If any name is missing from
++    every selected target the call aborts before touching anything and
++    the error message lists exactly the missing names so the user knows
++    which typo to fix.
++
++    Returns a list of ``(canonical_name, field)`` tuples for the caller
++    to render as success messages – one per (name, target-where-it-was)
++    pair.
++    """
++    canonical_names = [validate_dependency_name(app, raw) for raw in names]
++
++    missing: list[str] = []
++    for name in canonical_names:
++        if not any(find_matching_entries(app, target, name) for target in targets):
++            missing.append(name)
++
++    if missing:
++        not_found = ", ".join(f"`{name}`" for name in missing)
++        if scoped:
++            app.abort(f"Dependencies not defined in the selected fields: {not_found}")
++        else:
++            app.abort(
++                "Dependencies not defined in field `project.dependencies` or in any feature "
++                f"or dependency group: {not_found}"
++            )
++
++    removals: list[tuple[str, str]] = []
++    for name in canonical_names:
++        for target in targets:
++            matches = find_matching_entries(app, target, name)
++            if not matches:
++                continue
++
++            for index, _ in reversed(matches):
++                del target.array[index]
++
++            removals.append((name, target.field))
++
++    return removals
++
++
++# ---------------------------------------------------------------------------
++# Public entry points
++# ---------------------------------------------------------------------------
++
++
++def add_dependencies(
++    app: Application,
++    requirements: tuple[str, ...],
++    *,
++    features: tuple[str, ...],
++    groups: tuple[str, ...],
++    env_name: str | None,
++    extra: bool,
++    force: bool,
++    dry_run: bool,
++) -> None:
++    """Insert ``requirements`` into one or more dependency arrays."""
++    project_file = get_project_file(app.project)
++    old_text = project_file.read_text("utf-8")
++    document = load_document(project_file)
++
++    targets = resolve_add_targets(
++        app,
++        document,
++        features=features,
++        groups=groups,
++        env_name=env_name,
++        extra=extra,
++    )
++    additions = plan_additions(app, targets, requirements, force=force)
++
++    if dry_run:
++        app.display(diff_document(old_text, document), markup=False, highlight=False)
++        return
++
++    save_document(project_file, document)
++    for raw, _, field in additions:
++        app.display_success(f"Added `{raw}` to field `{field}`")
++
++
++def remove_dependencies(
++    app: Application,
++    names: tuple[str, ...],
++    *,
++    features: tuple[str, ...],
++    groups: tuple[str, ...],
++    env_name: str | None,
++    extra: bool,
++    dry_run: bool,
++) -> None:
++    """Delete every entry with the given canonical names from selected arrays."""
++    project_file = get_project_file(app.project)
++    old_text = project_file.read_text("utf-8")
++    document = load_document(project_file)
++
++    targets = resolve_remove_targets(
++        app,
++        document,
++        features=features,
++        groups=groups,
++        env_name=env_name,
++        extra=extra,
++    )
++    scoped = bool(features or groups or env_name is not None)
++    removals = plan_removals(app, targets, names, scoped=scoped)
++
++    if dry_run:
++        app.display(diff_document(old_text, document), markup=False, highlight=False)
++        return
++
++    save_document(project_file, document)
++    for name, field in removals:
++        app.display_success(f"Removed `{name}` from field `{field}`")
+diff --git a/src/hatch/project/core.py b/src/hatch/project/core.py
+index 57df723..1550f19 100644
+--- a/src/hatch/project/core.py
++++ b/src/hatch/project/core.py
+@@ -454,6 +454,100 @@ class Project:
+         with open(str(self._project_file_path), "w", encoding="utf-8") as f:
+             f.write(tomlkit.dumps(config))
+ 
++    # ------------------------------------------------------------------
++    # Round-trip pyproject.toml helpers
++    #
++    # These are used by the `hatch dep add` / `hatch dep remove` commands
++    # (see :mod:`hatch.dep.edit`) but are exposed here so any future
++    # command that needs to edit `pyproject.toml` in place has the same
++    # single entry point.
++    # ------------------------------------------------------------------
++
++    @property
++    def pyproject_toml_path(self) -> Path | None:
++        """Absolute path of the ``pyproject.toml`` file backing this project.
++
++        Returns ``None`` when no project file was located (e.g. running
++        Hatch outside of a project). The path is cached during
++        :meth:`find_project_root`; accessing it does *not* re-read the
++        file from disk.
++        """
++        # Ensure the search has actually run so ``_project_file_path`` is set.
++        _ = self.root
++        return self._project_file_path
++
++    def read_pyproject_toml_document(self):
++        """Parse ``pyproject.toml`` with :mod:`tomlkit`, preserving formatting.
++
++        The returned object is a mutable :class:`tomlkit.TOMLDocument`;
++        callers wishing to persist their changes should route them
++        through :meth:`save_pyproject_toml_document` so that the write
++        stays atomic.
++        """
++        import tomlkit
++
++        project_file = self.pyproject_toml_path
++        if project_file is None:
++            msg = "No pyproject.toml file has been located for this project"
++            raise FileNotFoundError(msg)
++
++        return tomlkit.parse(project_file.read_text("utf-8"))
++
++    def save_pyproject_toml_document(self, document) -> None:
++        """Write ``document`` back to ``pyproject.toml`` atomically.
++
++        The routine reuses :meth:`hatch.utils.fs.Path.write_atomic`,
++        which combines ``tempfile.mkstemp`` and ``os.replace`` to make
++        a crash mid-write impossible to observe: either the previous
++        bytes are on disk or the new ones are.
++        """
++        import tomlkit
++
++        project_file = self.pyproject_toml_path
++        if project_file is None:
++            msg = "No pyproject.toml file has been located for this project"
++            raise FileNotFoundError(msg)
++
++        text = tomlkit.dumps(document)
++        if not text.endswith("\n"):
++            text += "\n"
++
++        project_file.write_atomic(text, "w", encoding="utf-8")
++
++    def has_dynamic_field(self, name: str) -> bool:
++        """Return whether ``name`` appears in ``project.dynamic``.
++
++        PEP 621 defines "dynamic" fields as the ones the build backend
++        fills in at build time; editing the static table for a dynamic
++        field would either be ignored (best case) or contradict the
++        resolved metadata (worst case). The dependency editor calls
++        this before touching ``dependencies`` or
++        ``optional-dependencies``.
++        """
++        dynamic_fields = self.raw_config.get("project", {}).get("dynamic", [])
++        if not isinstance(dynamic_fields, list):
++            return False
++
++        return name in dynamic_fields
++
++    def iter_environment_names(self):
++        """Yield every environment name declared in ``tool.hatch.envs``.
++
++        Yields nothing when the project has no environment configuration
++        table. The routine is a plain generator so it can be used both
++        as ``list(project.iter_environment_names())`` and to short-
++        circuit lookups (``if name in project.iter_environment_names()``).
++        """
++        raw_envs = (
++            self.raw_config
++            .get("tool", {})
++            .get("hatch", {})
++            .get("envs", {})
++        )
++
++        if isinstance(raw_envs, dict):
++            yield from raw_envs
++
+     @staticmethod
+     def initialize(project_file_path, template_config):
+         import tomlkit
+diff --git a/src/hatch/utils/dep.py b/src/hatch/utils/dep.py
+index 6253cd1..0b7f4ba 100644
+--- a/src/hatch/utils/dep.py
++++ b/src/hatch/utils/dep.py
+@@ -1,3 +1,21 @@
++"""Helpers around Python dependency specifications.
++
++The module owns two related but distinct concerns:
++
++* **Normalization** – functions that answer "what is the canonical
++  spelling of this requirement/name?". These are used both by the
++  dependency-hashing pipeline (``hatch dep hash``) and by the
++  round-trip editors in :mod:`hatch.dep.edit` (``hatch dep add`` /
++  ``hatch dep remove``). Keeping the rule in one place is important
++  because a mismatch between "is this a duplicate?" for edits and
++  "is this the same entry?" for hashing would produce user-visible
++  drift.
++
++* **Collection wrappers** – ``get_complex_dependencies``,
++  ``get_complex_features`` and ``get_complex_dependency_group`` map
++  raw pyproject.toml shapes to :class:`hatch.dep.core.Dependency`
++  instances that the rest of the CLI can operate on.
++"""
+ from __future__ import annotations
+ 
+ from typing import TYPE_CHECKING, Any
+@@ -10,17 +28,90 @@ if TYPE_CHECKING:
+     from hatch.dep.core import Dependency
+ 
+ 
++# ---------------------------------------------------------------------------
++# Marker quoting
++# ---------------------------------------------------------------------------
++
++
+ def normalize_marker_quoting(text: str) -> str:
+-    # All TOML writers use double quotes, so allow copy/pasting to avoid escaping
++    """Return ``text`` with marker double quotes turned into single quotes.
++
++    Every TOML writer we ship (tomlkit, tomli-w) delimits strings with
++    double quotes. PEP 508 markers require quoted string operands and
++    the canonical spelling in most tutorials uses double quotes
++    (``python_version >= "3.9"``). Storing the double-quoted marker
++    would force escaping (``\\"``) in the TOML string; since PEP 508
++    accepts either quote character we swap the inner ones instead. The
++    routine is intentionally a plain ``str.replace`` – the outer TOML
++    quotes have not been added yet at this point, so we can safely
++    substitute every double quote.
++    """
+     return text.replace('"', "'")
+ 
+ 
++# ---------------------------------------------------------------------------
++# Name canonicalization
++# ---------------------------------------------------------------------------
++
++
++def canonical_requirement_name(requirement: Any) -> str:
++    """Return the PEP 503 canonical form of ``requirement.name``.
++
++    Two requirement strings refer to the same distribution iff their
++    canonical names match. This intentionally *does not* look at
++    extras, version specifiers, markers or URLs; the same rule PyPI
++    uses when deciding whether ``Foo`` and ``foo-bar`` point at the
++    same project. Callers who need a canonical distribution name for
++    display or dictionary keys use this instead of hand-rolling their
++    own normalization.
++    """
++    return normalize_project_name(requirement.name)
++
++
++def canonical_name_from_string(raw: str) -> str:
++    """Parse ``raw`` and return the canonical form of the resulting name.
++
++    Convenience wrapper for callers that receive a string and want to
++    treat it as a full requirement (extras, specifiers, markers all
++    allowed). Raises :class:`packaging.requirements.InvalidRequirement`
++    on parse failure so callers can decide how to render the message.
++    """
++    from hatch.dep.core import Dependency
++
++    return canonical_requirement_name(Dependency(raw))
++
++
++# ---------------------------------------------------------------------------
++# Hashing / normalized sorting
++# ---------------------------------------------------------------------------
++
++
+ def get_normalized_dependencies(requirements: list[Requirement]) -> list[str]:
++    """Return the sorted list of ``get_normalized_dependency`` strings.
++
++    Duplicates are collapsed and the result is sorted so the output is
++    deterministic regardless of input ordering. This is what the
++    ``hatch dep show requirements`` command consumes to render its
++    output.
++    """
+     normalized_dependencies = {get_normalized_dependency(requirement) for requirement in requirements}
+     return sorted(normalized_dependencies)
+ 
+ 
+ def hash_dependencies(requirements: list[Dependency]) -> str:
++    """Return a stable SHA-256 hash of the deduped, normalized requirements.
++
++    Two invocations with equivalent inputs must produce the same hash
++    across Python versions and platforms, so we:
++
++    * Normalize every requirement to a canonical string
++      (``get_normalized_dependency``): lower-cases the name, sorts
++      extras, lower-cases the specifier operators.
++    * Deduplicate at the normalized-string level.
++    * Strip internal whitespace – PEP 440 treats ``foo >= 1`` and
++      ``foo>=1`` as equal, so the hash must too.
++    * Sort deterministically and hash the concatenation.
++    """
+     from hashlib import sha256
+ 
+     data = "".join(
+@@ -34,10 +125,21 @@ def hash_dependencies(requirements: list[Dependency]) -> str:
+     return sha256(data).hexdigest()
+ 
+ 
++# ---------------------------------------------------------------------------
++# Complex-dependency wrappers
++# ---------------------------------------------------------------------------
++
++
+ def get_complex_dependencies(dependencies: list[str]) -> dict[str, Dependency]:
++    """Parse every requirement string into a :class:`Dependency`.
++
++    The returned dict keeps insertion order and is keyed by the raw
++    requirement string, which lets callers correlate the parsed
++    requirement with the exact spelling the user provided.
++    """
+     from hatch.dep.core import Dependency
+ 
+-    dependencies_complex = {}
++    dependencies_complex: dict[str, Dependency] = {}
+     for dependency in dependencies:
+         dependencies_complex[dependency] = Dependency(dependency)
+ 
+@@ -45,9 +147,15 @@ def get_complex_dependencies(dependencies: list[str]) -> dict[str, Dependency]:
+ 
+ 
+ def get_complex_features(features: dict[str, list[str]]) -> dict[str, dict[str, Dependency]]:
++    """Map a ``project.optional-dependencies`` shape to :class:`Dependency` values.
++
++    The outer key is the feature name (as written in ``pyproject.toml``,
++    not canonicalized) and the inner mapping matches the shape returned
++    by :func:`get_complex_dependencies`.
++    """
+     from hatch.dep.core import Dependency
+ 
+-    optional_dependencies_complex = {}
++    optional_dependencies_complex: dict[str, dict[str, Dependency]] = {}
+     for feature, optional_dependencies in features.items():
+         optional_dependencies_complex[feature] = {
+             optional_dependency: Dependency(optional_dependency) for optional_dependency in optional_dependencies
+@@ -59,6 +167,12 @@ def get_complex_features(features: dict[str, list[str]]) -> dict[str, dict[str,
+ def get_complex_dependency_group(
+     dependency_groups: dict[str, Any], group: str, past_groups: tuple[str, ...] = ()
+ ) -> list[Dependency]:
++    """Resolve a PEP 735 dependency group into a flat list of dependencies.
++
++    ``include-group`` entries are recursively expanded; cycles raise
++    ``ValueError``. Non-string items other than ``{include-group = ...}``
++    raise ``ValueError`` too, which matches the PEP 735 grammar.
++    """
+     from hatch.dep.core import Dependency
+ 
+     if group in past_groups:
+@@ -74,7 +188,7 @@ def get_complex_dependency_group(
+         msg = f"Dependency group '{group}' is not a list"
+         raise TypeError(msg)
+ 
+-    realized_group = []
++    realized_group: list[Dependency] = []
+     for item in raw_group:
+         if isinstance(item, str):
+             realized_group.append(Dependency(item))
+@@ -90,3 +204,48 @@ def get_complex_dependency_group(
+             raise TypeError(msg)
+ 
+     return realized_group
++
++
++# ---------------------------------------------------------------------------
++# Round-trip TOML helpers (shared with hatch.dep.edit)
++# ---------------------------------------------------------------------------
++
++
++def iter_string_entries(array: Any) -> Any:
++    """Yield ``(index, raw_string)`` for every string entry in ``array``.
++
++    ``array`` is a :class:`tomlkit.items.Array`. Non-string entries –
++    most notably the ``{include-group = "..."}`` tables allowed inside
++    PEP 735 groups – are skipped. The routine deliberately does not
++    parse the strings so it can be used from callers that only need
++    the raw text (for example when comparing byte-exact after a
++    dry-run).
++    """
++    for index, item in enumerate(array):
++        if isinstance(item, str):
++            yield index, item
++
++
++def match_dependency_indices(app: Any, array: Any, canonical: str) -> list[int]:
++    """Return the indices of ``array`` entries with the given canonical name.
++
++    ``app`` is threaded through so that a malformed entry can be
++    reported via ``app.abort`` rather than raising a bare exception
++    from the middle of a CLI invocation. ``canonical`` must already be
++    the PEP 503 canonical form – callers are expected to have run the
++    argument through :func:`canonical_requirement_name` or the
++    ``normalize_project_name`` helper.
++    """
++    from hatch.dep.core import Dependency, InvalidDependencyError
++
++    indices: list[int] = []
++    for index, raw in iter_string_entries(array):
++        try:
++            requirement = Dependency(raw)
++        except InvalidDependencyError as e:
++            app.abort(f"Invalid requirement `{raw}`: {e}")
++
++        if canonical_requirement_name(requirement) == canonical:
++            indices.append(index)
++
++    return indices
+diff --git a/src/hatch/utils/toml.py b/src/hatch/utils/toml.py
+index 0d06178..e4eb5ed 100644
+--- a/src/hatch/utils/toml.py
++++ b/src/hatch/utils/toml.py
+@@ -1,7 +1,24 @@
++"""TOML parsing helpers used across Hatch.
++
++Two parsers coexist because they serve different use cases:
++
++* :func:`load_toml_data` and :func:`load_toml_file` use the standard
++  library's ``tomllib`` (or the ``tomli`` backport on Python 3.10) to
++  parse into plain ``dict``. This is the fast path for read-only
++  consumers that only need to inspect the parsed data.
++* :func:`load_pyproject_document` and :func:`dump_pyproject_document`
++  go through :mod:`tomlkit`, whose parse tree preserves formatting,
++  comments and array layout. This is what the ``hatch dep add`` /
++  ``hatch dep remove`` commands use so that edits round-trip
++  losslessly.
++"""
+ from __future__ import annotations
+ 
+ import sys
+-from typing import Any
++from typing import TYPE_CHECKING, Any
++
++if TYPE_CHECKING:
++    from hatch.utils.fs import Path
+ 
+ if sys.version_info >= (3, 11):
+     import tomllib
+@@ -9,10 +26,73 @@ else:
+     import tomli as tomllib
+ 
+ 
++# ---------------------------------------------------------------------------
++# Plain-dict parsers (fast, read-only)
++# ---------------------------------------------------------------------------
++
++
+ def load_toml_data(data: str) -> dict[str, Any]:
++    """Parse ``data`` as TOML using the standard library backend.
++
++    The result is a plain ``dict``; comments and formatting are
++    discarded. Prefer this over the tomlkit-backed parsers when the
++    caller only needs to read a value out.
++    """
+     return tomllib.loads(data)
+ 
+ 
+ def load_toml_file(path: str) -> dict[str, Any]:
++    """Read ``path`` and parse its contents as TOML.
++
++    Same guarantees as :func:`load_toml_data`. The file is read with an
++    explicit UTF-8 encoding so that behaviour does not depend on the
++    system locale.
++    """
+     with open(path, encoding="utf-8") as f:
+         return tomllib.loads(f.read())
++
++
++# ---------------------------------------------------------------------------
++# Round-trip parsers (formatting-preserving)
++# ---------------------------------------------------------------------------
++
++
++def load_pyproject_document(path: Path):
++    """Parse ``path`` with :mod:`tomlkit`, preserving formatting.
++
++    Returns a :class:`tomlkit.TOMLDocument` instance that behaves like
++    an ordered ``dict`` but also remembers comment placement, string
++    quoting style and array layout (inline vs multiline).
++    """
++    import tomlkit
++
++    return tomlkit.parse(path.read_text("utf-8"))
++
++
++def dump_pyproject_document(document) -> str:
++    """Serialize a :class:`tomlkit.TOMLDocument` back to a TOML string.
++
++    A trailing newline is always appended so the resulting text obeys
++    the POSIX convention that text files end with ``\\n``. Every
++    reader we ship handles both variants but tools such as ``git diff``
++    render the missing-newline case with a distracting warning that we
++    would rather avoid.
++    """
++    import tomlkit
++
++    text = tomlkit.dumps(document)
++    if not text.endswith("\n"):
++        text += "\n"
++
++    return text
++
++
++def save_pyproject_document(document, path: Path) -> None:
++    """Write ``document`` to ``path`` atomically.
++
++    Uses :meth:`hatch.utils.fs.Path.write_atomic` (``mkstemp`` +
++    ``os.replace``) so that a crash between the last valid state and
++    the next one is impossible – the reader on the other side sees
++    either the previous bytes or the new ones.
++    """
++    path.write_atomic(dump_pyproject_document(document), "w", encoding="utf-8")
+diff --git a/tests/cli/dep/test_add.py b/tests/cli/dep/test_add.py
+new file mode 100644
+index 0000000..8504467
+--- /dev/null
++++ b/tests/cli/dep/test_add.py
+@@ -0,0 +1,703 @@
++from __future__ import annotations
++
++
++def write_project(path, body):
++    path.mkdir(parents=True, exist_ok=True)
++    (path / "pyproject.toml").write_text(body, encoding="utf-8")
++
++
++def read_project(path):
++    return (path / "pyproject.toml").read_text(encoding="utf-8")
++
++
++class TestNoProject:
++    def test_bare_directory(self, hatch, temp_dir):
++        with temp_dir.as_cwd():
++            result = hatch("dep", "add", "requests")
++
++        assert result.exit_code == 1, result.output
++        assert "No project detected" in result.output
++
++
++class TestProjectDependencies:
++    def test_append_to_existing_multiline_array(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = [
++                    "click>=8",
++                ]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "requests>=2")
++
++        assert result.exit_code == 0, result.output
++        assert "Added `requests>=2` to field `project.dependencies`" in result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = [
++                "click>=8",
++                "requests>=2",
++            ]
++            """
++        )
++
++    def test_create_dependencies_field_when_missing(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "requests>=2")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["requests>=2"]
++            """
++        )
++
++    def test_inline_array_stays_inline(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = ["click>=8"]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "requests>=2")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["click>=8", "requests>=2"]
++            """
++        )
++
++    def test_preserves_leading_and_trailing_comments(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"  # the name
++                version = "0.1.0"
++                # pinned for reproducibility
++                dependencies = [
++                    "click>=8",  # CLI framework
++                ]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "requests>=2")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"  # the name
++            version = "0.1.0"
++            # pinned for reproducibility
++            dependencies = [
++                "click>=8",  # CLI framework
++                "requests>=2",
++            ]
++            """
++        )
++
++    def test_missing_project_table_rejected(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [tool.hatch.envs.default]
++                dependencies = ["ipython"]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "requests>=2")
++
++        assert result.exit_code == 1, result.output
++        assert "project" in result.output.lower()
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [tool.hatch.envs.default]
++            dependencies = ["ipython"]
++            """
++        )
++
++    def test_dynamic_dependencies_rejected(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dynamic = ["dependencies"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "requests>=2")
++
++        assert result.exit_code == 1, result.output
++        assert "dynamic" in result.output
++        assert read_project(project_path) == original
++
++    def test_invalid_requirement_reports_source_string(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "requests>=>2")
++
++        assert result.exit_code == 1, result.output
++        assert "requests>=>2" in result.output
++        assert read_project(project_path) == original
++
++    def test_marker_double_quotes_lowered_to_single(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = []
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", 'requests>=2; python_version >= "3.9"')
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["requests>=2; python_version >= '3.9'"]
++            """
++        )
++
++    def test_multiple_requirements_appended_in_order(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = []
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "click", "requests", "httpx")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["click", "requests", "httpx"]
++            """
++        )
++
++
++class TestConflicts:
++    def test_conflict_without_force_writes_nothing(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["Click>=8"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "click>=9")
++
++        assert result.exit_code == 1, result.output
++        assert "--force" in result.output
++        assert "click" in result.output.lower()
++        assert read_project(project_path) == original
++
++    def test_force_replaces_in_place(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = [
++                    "foo",
++                    "Click>=8",
++                    "bar",
++                ]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "click>=9", "--force")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = [
++                "foo",
++                "click>=9",
++                "bar",
++            ]
++            """
++        )
++
++    def test_force_removes_marker_split_duplicates(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = [
++                    "click; sys_platform == 'win32'",
++                    "click; sys_platform == 'darwin'",
++                    "requests",
++                ]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "click>=9", "--force")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = [
++                "click>=9",
++                "requests",
++            ]
++            """
++        )
++
++    def test_force_is_byte_for_byte_idempotent(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = []
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            first = hatch("dep", "add", "requests>=2")
++            assert first.exit_code == 0, first.output
++            after_first = read_project(project_path)
++
++            second = hatch("dep", "add", "requests>=2", "--force")
++            assert second.exit_code == 0, second.output
++            assert read_project(project_path) == after_first
++
++
++class TestFeatures:
++    def test_new_feature_created_with_normalized_name(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = ["click"]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "mkdocs", "-o", "Docs")
++
++        assert result.exit_code == 0, result.output
++        assert "Added `mkdocs` to field `project.optional-dependencies.docs`" in result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["click"]
++
++            [project.optional-dependencies]
++            docs = ["mkdocs"]
++            """
++        )
++
++    def test_existing_feature_appended(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++
++                [project.optional-dependencies]
++                test = ["pytest"]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "coverage", "-o", "test")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++
++            [project.optional-dependencies]
++            test = ["pytest", "coverage"]
++            """
++        )
++
++    def test_add_to_multiple_features(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "coverage", "-o", "test", "-o", "docs")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++
++            [project.optional-dependencies]
++            test = ["coverage"]
++            docs = ["coverage"]
++            """
++        )
++
++    def test_conflict_in_one_feature_aborts_all(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++
++            [project.optional-dependencies]
++            test = ["coverage"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "coverage", "-o", "docs", "-o", "test")
++
++        assert result.exit_code == 1, result.output
++        assert "--force" in result.output
++        # `docs` must not have been created despite being fine on its own
++        assert read_project(project_path) == original
++
++    def test_dynamic_optional_dependencies_rejected(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dynamic = ["optional-dependencies"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "pytest", "-o", "test")
++
++        assert result.exit_code == 1, result.output
++        assert "dynamic" in result.output
++        assert read_project(project_path) == original
++
++
++class TestDependencyGroups:
++    def test_new_group_created(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [tool.hatch.envs.default]
++                dependencies = ["ipython"]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "pytest", "-g", "Test")
++
++        assert result.exit_code == 0, result.output
++        assert "Added `pytest` to field `dependency-groups.test`" in result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [tool.hatch.envs.default]
++            dependencies = ["ipython"]
++
++            [dependency-groups]
++            test = ["pytest"]
++            """
++        )
++
++    def test_include_group_entries_untouched(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [dependency-groups]
++                lint = ["ruff"]
++                dev = [
++                    {include-group = "lint"},
++                    "mypy",
++                ]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "coverage", "-g", "dev")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [dependency-groups]
++            lint = ["ruff"]
++            dev = [
++                {include-group = "lint"},
++                "mypy",
++                "coverage",
++            ]
++            """
++        )
++
++
++class TestEnvironments:
++    def test_default_env_created_on_demand(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "ipython", "--env", "default")
++
++        assert result.exit_code == 0, result.output
++        assert "tool.hatch.envs.default.dependencies" in result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++
++            [tool.hatch.envs.default]
++            dependencies = ["ipython"]
++            """
++        )
++
++    def test_unknown_env_rejected(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "pytest", "--env", "qa")
++
++        assert result.exit_code == 1, result.output
++        assert "qa" in result.output
++        assert read_project(project_path) == original
++
++    def test_extra_dependencies_target(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [tool.hatch.envs.lint]
++                dependencies = ["ruff"]
++                extra-dependencies = ["mypy"]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "debugpy", "--env", "lint", "--extra")
++
++        assert result.exit_code == 0, result.output
++        assert (
++            "Added `debugpy` to field `tool.hatch.envs.lint.extra-dependencies`" in result.output
++        )
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [tool.hatch.envs.lint]
++            dependencies = ["ruff"]
++            extra-dependencies = ["mypy", "debugpy"]
++            """
++        )
++
++    def test_env_cannot_combine_with_optional(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "pytest", "--env", "default", "-o", "test")
++
++        assert result.exit_code == 1, result.output
++        assert "--env" in result.output
++        assert read_project(project_path) == original
++
++    def test_extra_without_env_rejected(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "pytest", "--extra")
++
++        assert result.exit_code == 1, result.output
++        assert "--extra" in result.output
++        assert read_project(project_path) == original
++
++
++class TestDryRun:
++    def test_dry_run_shows_diff(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["click"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "add", "requests>=2", "--dry-run")
++
++        assert result.exit_code == 0, result.output
++        assert "--- a/pyproject.toml" in result.output
++        assert "+++ b/pyproject.toml" in result.output
++        assert '-dependencies = ["click"]' in result.output
++        assert '+dependencies = ["click", "requests>=2"]' in result.output
++        # nothing must be written to disk
++        assert read_project(project_path) == original
+diff --git a/tests/cli/dep/test_remove.py b/tests/cli/dep/test_remove.py
+new file mode 100644
+index 0000000..33d9c17
+--- /dev/null
++++ b/tests/cli/dep/test_remove.py
+@@ -0,0 +1,454 @@
++from __future__ import annotations
++
++
++def write_project(path, body):
++    path.mkdir(parents=True, exist_ok=True)
++    (path / "pyproject.toml").write_text(body, encoding="utf-8")
++
++
++def read_project(path):
++    return (path / "pyproject.toml").read_text(encoding="utf-8")
++
++
++class TestNoProject:
++    def test_bare_directory(self, hatch, temp_dir):
++        with temp_dir.as_cwd():
++            result = hatch("dep", "remove", "requests")
++
++        assert result.exit_code == 1, result.output
++        assert "No project detected" in result.output
++
++
++class TestProjectDependencies:
++    def test_remove_single_entry(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = [
++                    "click>=8",
++                    "requests>=2",
++                    "httpx",
++                ]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "requests")
++
++        assert result.exit_code == 0, result.output
++        assert "Removed `requests` from field `project.dependencies`" in result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = [
++                "click>=8",
++                "httpx",
++            ]
++            """
++        )
++
++    def test_name_matching_is_pep503_normalized(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = ["Foo.Bar_Baz>=1"]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "foo-bar-baz")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = []
++            """
++        )
++
++    def test_marker_split_duplicates_removed_together(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = [
++                    "colorama; sys_platform == 'win32'",
++                    "colorama; sys_platform == 'darwin'",
++                    "click",
++                ]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "colorama")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = [
++                "click",
++            ]
++            """
++        )
++
++    def test_default_scope_covers_dependencies_features_and_groups(
++        self, hatch, temp_dir, helpers
++    ):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [build-system]
++                requires = ["hatchling"]
++                build-backend = "hatchling.build"
++
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = ["coverage", "click>=8"]
++
++                [project.optional-dependencies]
++                test = ["pytest", "coverage"]
++
++                [dependency-groups]
++                dev = ["coverage", "ruff"]
++
++                [tool.hatch.envs.default]
++                dependencies = ["ipython"]
++
++                [tool.hatch.envs.lint]
++                dependencies = ["ruff"]
++                extra-dependencies = ["mypy"]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "coverage")
++
++        assert result.exit_code == 0, result.output
++        assert "Removed `coverage` from field `project.dependencies`" in result.output
++        assert "Removed `coverage` from field `project.optional-dependencies.test`" in result.output
++        assert "Removed `coverage` from field `dependency-groups.dev`" in result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [build-system]
++            requires = ["hatchling"]
++            build-backend = "hatchling.build"
++
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["click>=8"]
++
++            [project.optional-dependencies]
++            test = ["pytest"]
++
++            [dependency-groups]
++            dev = ["ruff"]
++
++            [tool.hatch.envs.default]
++            dependencies = ["ipython"]
++
++            [tool.hatch.envs.lint]
++            dependencies = ["ruff"]
++            extra-dependencies = ["mypy"]
++            """
++        )
++
++    def test_environments_not_touched_by_default_scope(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++
++            [tool.hatch.envs.default]
++            dependencies = ["ipython"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "ipython")
++
++        assert result.exit_code == 1, result.output
++        assert "ipython" in result.output
++        assert read_project(project_path) == original
++
++
++class TestErrors:
++    def test_name_not_found_writes_nothing(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["click"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "requests")
++
++        assert result.exit_code == 1, result.output
++        assert "requests" in result.output
++        assert read_project(project_path) == original
++
++    def test_partial_match_aborts_everything(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["click", "requests"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "requests", "httpx")
++
++        assert result.exit_code == 1, result.output
++        assert "httpx" in result.output
++        # Neither name is removed
++        assert read_project(project_path) == original
++
++    def test_requirement_string_rejected(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["requests>=2"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "requests>=2")
++
++        assert result.exit_code == 1, result.output
++        assert "requests>=2" in result.output
++        assert read_project(project_path) == original
++
++
++class TestScopedRemoval:
++    def test_feature_scope(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = ["coverage"]
++
++                [project.optional-dependencies]
++                test = ["pytest", "coverage"]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "coverage", "-o", "test")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["coverage"]
++
++            [project.optional-dependencies]
++            test = ["pytest"]
++            """
++        )
++
++    def test_undefined_feature_rejected(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++
++            [project.optional-dependencies]
++            test = ["pytest"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "pytest", "-o", "docs")
++
++        assert result.exit_code == 1, result.output
++        assert "docs" in result.output
++        assert read_project(project_path) == original
++
++    def test_group_scope(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [dependency-groups]
++                lint = ["ruff"]
++                dev = [
++                    {include-group = "lint"},
++                    "mypy",
++                    "coverage",
++                ]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "coverage", "-g", "dev")
++
++        assert result.exit_code == 0, result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [dependency-groups]
++            lint = ["ruff"]
++            dev = [
++                {include-group = "lint"},
++                "mypy",
++            ]
++            """
++        )
++
++    def test_undefined_group_rejected(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [dependency-groups]
++            dev = ["mypy"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "mypy", "-g", "lint")
++
++        assert result.exit_code == 1, result.output
++        assert "lint" in result.output
++        assert read_project(project_path) == original
++
++    def test_env_scope(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [project]
++                name = "demo"
++                version = "0.1.0"
++                dependencies = ["ipython"]
++
++                [tool.hatch.envs.default]
++                dependencies = ["ipython", "rich"]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "ipython", "--env", "default")
++
++        assert result.exit_code == 0, result.output
++        assert "Removed `ipython` from field `tool.hatch.envs.default.dependencies`" in result.output
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["ipython"]
++
++            [tool.hatch.envs.default]
++            dependencies = ["rich"]
++            """
++        )
++
++    def test_env_extra_scope(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        write_project(
++            project_path,
++            helpers.dedent(
++                """
++                [tool.hatch.envs.lint]
++                dependencies = ["ruff"]
++                extra-dependencies = ["mypy", "debugpy"]
++                """
++            ),
++        )
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "debugpy", "--env", "lint", "--extra")
++
++        assert result.exit_code == 0, result.output
++        assert (
++            "Removed `debugpy` from field `tool.hatch.envs.lint.extra-dependencies`" in result.output
++        )
++        assert read_project(project_path) == helpers.dedent(
++            """
++            [tool.hatch.envs.lint]
++            dependencies = ["ruff"]
++            extra-dependencies = ["mypy"]
++            """
++        )
++
++
++class TestDryRun:
++    def test_dry_run_shows_diff_without_writing(self, hatch, temp_dir, helpers):
++        project_path = temp_dir / "demo"
++        original = helpers.dedent(
++            """
++            [project]
++            name = "demo"
++            version = "0.1.0"
++            dependencies = ["click", "requests>=2"]
++            """
++        )
++        write_project(project_path, original)
++
++        with project_path.as_cwd():
++            result = hatch("dep", "remove", "requests", "--dry-run")
++
++        assert result.exit_code == 0, result.output
++        assert "--- a/pyproject.toml" in result.output
++        assert "+++ b/pyproject.toml" in result.output
++        assert '-dependencies = ["click", "requests>=2"]' in result.output
++        assert '+dependencies = ["click"]' in result.output
++        assert read_project(project_path) == original

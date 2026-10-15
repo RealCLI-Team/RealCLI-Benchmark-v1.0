@@ -1,0 +1,3505 @@
+diff --git a/moviepy/Effect.py b/moviepy/Effect.py
+index 531e07c..48dd656 100644
+--- a/moviepy/Effect.py
++++ b/moviepy/Effect.py
+@@ -1,6 +1,7 @@
+ """Defines the base class for all effects in MoviePy."""
+ 
+ import copy as _copy
++import numbers
+ from abc import ABCMeta, abstractmethod
+ 
+ from moviepy.Clip import Clip
+@@ -40,3 +41,178 @@ class Effect(metaclass=ABCMeta):
+ 
+         """
+         pass
++
++    # ------------------------------------------------------------------
++    # Shared helpers for resolving time-varying effect parameters.
++    #
++    # These are used by effects that historically accepted either a static
++    # value or a ``lambda t: value`` (``Resize``, ``Rotate``,
++    # ``MultiplyColor``, ``VideoClip.with_position``, ``with_opacity`` ...).
++    # They now also accept a :class:`~moviepy.keyframe.KeyframeTrack`.
++    # The behaviour on static values and callables is preserved byte for
++    # byte -- the only new branch is the ``KeyframeTrack`` one.
++    #
++    # The helpers are defined on ``Effect`` so that ``KeyframeMotion`` and
++    # the classical effects share exactly the same resolution logic; users
++    # who write custom effects can call them too.
++    # ------------------------------------------------------------------
++
++    @staticmethod
++    def _is_number(value):
++        """Return True for real numbers (booleans are rejected)."""
++        return isinstance(value, numbers.Real) and not isinstance(value, bool)
++
++    @classmethod
++    def _resolve_time_varying(
++        cls,
++        value,
++        name,
++        expected="scalar",
++        minimum=None,
++        maximum=None,
++        allow_callable=True,
++    ):
++        """Resolve an effect parameter into a callable ``t -> value``.
++
++        Parameters
++        ----------
++        value
++            The user-supplied parameter. Accepted forms:
++
++            * ``None`` -- returned as-is.
++            * A number (when ``expected in ("scalar", "any")``).
++            * A 2-tuple/list of numbers (when ``expected in ("pair", "any")``).
++            * A :class:`~moviepy.keyframe.KeyframeTrack` matching the
++              expected kind.
++            * Any callable (when ``allow_callable`` is true) -- returned
++              as-is; its output is trusted at render time.
++
++        name
++            Parameter name, used in error messages only.
++
++        expected
++            ``"scalar"`` (a number), ``"pair"`` (an ``(a, b)`` pair), or
++            ``"any"`` (either).
++
++        minimum, maximum
++            Optional bounds enforced on scalar values and on every
++            keyframe of a :class:`KeyframeTrack`. Tuple values are checked
++            componentwise.
++
++        allow_callable
++            When true (the default) a plain callable is accepted and
++            returned untouched. Set to false for parameters that must be
++            a static value or a track (e.g. opacity in
++            :class:`KeyframeMotion`).
++
++        Returns
++        -------
++        callable
++            A function ``t -> resolved value`` (or ``None`` if ``value``
++            was ``None``).
++
++        Raises
++        ------
++        TypeError
++            If the value shape does not match ``expected`` or is not a
++            recognised parameter kind.
++        ValueError
++            If a numeric bound is violated.
++        """
++        # Import here to avoid a circular import at module load time.
++        from moviepy.keyframe import KeyframeTrack
++
++        if value is None:
++            return None
++
++        if isinstance(value, KeyframeTrack):
++            return cls._track_to_callable(
++                value, name, expected=expected, minimum=minimum, maximum=maximum
++            )
++
++        if expected in ("scalar", "any") and cls._is_number(value):
++            v = float(value)
++            cls._check_bounds(v, name, minimum, maximum)
++            return lambda t, _v=v: _v
++
++        if expected in ("pair", "any") and isinstance(value, (tuple, list)):
++            if len(value) != 2:
++                raise TypeError(
++                    f"{name} must be a (x, y) pair, got {value!r}"
++                )
++            a, b = value
++            if not (cls._is_number(a) and cls._is_number(b)):
++                raise TypeError(
++                    f"{name} components must be numbers, got {value!r}"
++                )
++            a, b = float(a), float(b)
++            cls._check_bounds(a, name, minimum, maximum)
++            cls._check_bounds(b, name, minimum, maximum)
++            pair = (a, b)
++            return lambda t, _pair=pair: _pair
++
++        if allow_callable and callable(value):
++            return value
++
++        raise TypeError(
++            f"{name} must be a number, a (x, y) pair, a KeyframeTrack, "
++            f"or a callable (got {type(value).__name__!r})"
++        )
++
++    @classmethod
++    def _track_to_callable(
++        cls, track, name, expected="scalar", minimum=None, maximum=None
++    ):
++        """Convert a :class:`KeyframeTrack` into a ``t -> value`` callable.
++
++        Enforces the shape (``scalar`` or ``pair``) and the numeric
++        bounds on every keyframe value before returning.
++        """
++        # Import here to avoid a circular import at module load time.
++        from moviepy.keyframe import KeyframeTrack
++
++        if not isinstance(track, KeyframeTrack):  # pragma: no cover - defensive
++            raise TypeError(
++                f"{name} must be a KeyframeTrack, got {type(track).__name__!r}"
++            )
++
++        if expected == "scalar":
++            if track.is_tuple:
++                raise TypeError(
++                    f"{name} requires a scalar KeyframeTrack, "
++                    "got a tuple-valued track"
++                )
++            for v in track.values:
++                cls._check_bounds(v, name, minimum, maximum)
++        elif expected == "pair":
++            if not track.is_tuple or len(track.values[0]) != 2:
++                raise ValueError(
++                    f"{name} requires a KeyframeTrack of (x, y) pairs"
++                )
++            for v in track.values:
++                cls._check_bounds(v[0], name, minimum, maximum)
++                cls._check_bounds(v[1], name, minimum, maximum)
++        elif expected == "any":
++            if track.is_tuple:
++                for v in track.values:
++                    for component in v:
++                        cls._check_bounds(component, name, minimum, maximum)
++            else:
++                for v in track.values:
++                    cls._check_bounds(v, name, minimum, maximum)
++        else:  # pragma: no cover - defensive
++            raise ValueError(f"unknown expected kind {expected!r}")
++
++        return track.value_at
++
++    @staticmethod
++    def _check_bounds(value, name, minimum, maximum):
++        """Raise ``ValueError`` if ``value`` is outside ``[minimum, maximum]``."""
++        if minimum is not None and value < minimum:
++            raise ValueError(
++                f"{name} values must be >= {minimum}, got {value!r}"
++            )
++        if maximum is not None and value > maximum:
++            raise ValueError(
++                f"{name} values must be <= {maximum}, got {value!r}"
++            )
+diff --git a/moviepy/__init__.py b/moviepy/__init__.py
+index 2d4d60c..3acae49 100644
+--- a/moviepy/__init__.py
++++ b/moviepy/__init__.py
+@@ -10,7 +10,9 @@ from moviepy.audio.AudioClip import (
+     concatenate_audioclips,
+ )
+ from moviepy.audio.io.AudioFileClip import AudioFileClip
++from moviepy import easing
+ from moviepy.Effect import Effect
++from moviepy.keyframe import KeyframeTrack
+ from moviepy.tools import convert_to_seconds
+ from moviepy.version import __version__
+ from moviepy.video import fx as vfx, tools as videotools
+@@ -60,6 +62,8 @@ __all__ = [
+     "concatenate_audioclips",
+     "AudioFileClip",
+     "Effect",
++    "KeyframeTrack",
++    "easing",
+     "vfx",
+     "afx",
+     "videotools",
+diff --git a/moviepy/easing.py b/moviepy/easing.py
+new file mode 100644
+index 0000000..5b46e47
+--- /dev/null
++++ b/moviepy/easing.py
+@@ -0,0 +1,341 @@
++"""Easing (interpolation) functions for keyframe animation.
++
++Each easing function maps a normalized progress ``p`` in ``[0, 1]`` to an
++eased progress, also nominally in ``[0, 1]`` (``back``/``elastic`` may
++overshoot). All functions satisfy ``f(0) == 0`` and ``f(1) == 1``, except
++``hold`` which only reaches ``1`` exactly at ``p == 1``.
++
++The functions follow the classic Robert Penner easing equations, matching
++the reference implementations published on https://easings.net.
++
++Use ``get_easing`` to resolve an easing given either a registered name or
++an arbitrary callable.
++"""
++
++import math
++
++
++def linear(p):
++    """No easing: ``f(p) = p``."""
++    return p
++
++
++def hold(p):
++    """Step easing: stays at the start value until the very end.
++
++    ``f(p) = 0`` for every ``p < 1`` and ``f(1) = 1``.
++    """
++    return 0.0 if p < 1.0 else 1.0
++
++
++# ---------------------------------------------------------------------- quad
++
++
++def ease_in_quad(p):
++    """Quadratic ease in: ``f(p) = p ** 2``."""
++    return p * p
++
++
++def ease_out_quad(p):
++    """Quadratic ease out: ``f(p) = 1 - (1 - p) ** 2``."""
++    return 1.0 - (1.0 - p) * (1.0 - p)
++
++
++def ease_in_out_quad(p):
++    """Quadratic ease in/out."""
++    if p < 0.5:
++        return 2.0 * p * p
++    return 1.0 - ((-2.0 * p + 2.0) ** 2) / 2.0
++
++
++# --------------------------------------------------------------------- cubic
++
++
++def ease_in_cubic(p):
++    """Cubic ease in: ``f(p) = p ** 3``."""
++    return p * p * p
++
++
++def ease_out_cubic(p):
++    """Cubic ease out: ``f(p) = 1 - (1 - p) ** 3``."""
++    return 1.0 - (1.0 - p) ** 3
++
++
++def ease_in_out_cubic(p):
++    """Cubic ease in/out."""
++    if p < 0.5:
++        return 4.0 * p * p * p
++    return 1.0 - ((-2.0 * p + 2.0) ** 3) / 2.0
++
++
++# --------------------------------------------------------------------- quart
++
++
++def ease_in_quart(p):
++    """Quartic ease in: ``f(p) = p ** 4``."""
++    return p * p * p * p
++
++
++def ease_out_quart(p):
++    """Quartic ease out: ``f(p) = 1 - (1 - p) ** 4``."""
++    return 1.0 - (1.0 - p) ** 4
++
++
++def ease_in_out_quart(p):
++    """Quartic ease in/out."""
++    if p < 0.5:
++        return 8.0 * p * p * p * p
++    return 1.0 - ((-2.0 * p + 2.0) ** 4) / 2.0
++
++
++# --------------------------------------------------------------------- quint
++
++
++def ease_in_quint(p):
++    """Quintic ease in: ``f(p) = p ** 5``."""
++    return p * p * p * p * p
++
++
++def ease_out_quint(p):
++    """Quintic ease out: ``f(p) = 1 - (1 - p) ** 5``."""
++    return 1.0 - (1.0 - p) ** 5
++
++
++def ease_in_out_quint(p):
++    """Quintic ease in/out."""
++    if p < 0.5:
++        return 16.0 * p * p * p * p * p
++    return 1.0 - ((-2.0 * p + 2.0) ** 5) / 2.0
++
++
++# ---------------------------------------------------------------------- sine
++
++
++def ease_in_sine(p):
++    """Sinusoidal ease in: ``f(p) = 1 - cos(p * pi / 2)``."""
++    return 1.0 - math.cos(p * math.pi / 2.0)
++
++
++def ease_out_sine(p):
++    """Sinusoidal ease out: ``f(p) = sin(p * pi / 2)``."""
++    return math.sin(p * math.pi / 2.0)
++
++
++def ease_in_out_sine(p):
++    """Sinusoidal ease in/out: ``f(p) = -(cos(pi * p) - 1) / 2``."""
++    return -(math.cos(math.pi * p) - 1.0) / 2.0
++
++
++# ---------------------------------------------------------------------- expo
++
++
++def ease_in_expo(p):
++    """Exponential ease in: ``f(p) = 2 ** (10 * p - 10)`` (``0`` at ``p = 0``)."""
++    if p == 0.0:
++        return 0.0
++    return 2.0 ** (10.0 * p - 10.0)
++
++
++def ease_out_expo(p):
++    """Exponential ease out: ``f(p) = 1 - 2 ** (-10 * p)`` (``1`` at ``p = 1``)."""
++    if p == 1.0:
++        return 1.0
++    return 1.0 - 2.0 ** (-10.0 * p)
++
++
++def ease_in_out_expo(p):
++    """Exponential ease in/out."""
++    if p == 0.0:
++        return 0.0
++    if p == 1.0:
++        return 1.0
++    if p < 0.5:
++        return (2.0 ** (20.0 * p - 10.0)) / 2.0
++    return (2.0 - 2.0 ** (-20.0 * p + 10.0)) / 2.0
++
++
++# ---------------------------------------------------------------------- circ
++
++
++def ease_in_circ(p):
++    """Circular ease in: ``f(p) = 1 - sqrt(1 - p ** 2)``."""
++    return 1.0 - math.sqrt(1.0 - p * p)
++
++
++def ease_out_circ(p):
++    """Circular ease out: ``f(p) = sqrt(1 - (p - 1) ** 2)``."""
++    return math.sqrt(1.0 - (p - 1.0) ** 2)
++
++
++def ease_in_out_circ(p):
++    """Circular ease in/out."""
++    if p < 0.5:
++        return (1.0 - math.sqrt(1.0 - (2.0 * p) ** 2)) / 2.0
++    return (math.sqrt(1.0 - (-2.0 * p + 2.0) ** 2) + 1.0) / 2.0
++
++
++# ---------------------------------------------------------------------- back
++
++
++def ease_in_back(p):
++    """Back ease in (slight overshoot backwards before progressing)."""
++    c1 = 1.70158
++    c3 = c1 + 1.0
++    return c3 * p * p * p - c1 * p * p
++
++
++def ease_out_back(p):
++    """Back ease out (overshoots the target before settling)."""
++    c1 = 1.70158
++    c3 = c1 + 1.0
++    return 1.0 + c3 * (p - 1.0) ** 3 + c1 * (p - 1.0) ** 2
++
++
++def ease_in_out_back(p):
++    """Back ease in/out."""
++    c1 = 1.70158
++    c2 = c1 * 1.525
++    if p < 0.5:
++        return ((2.0 * p) ** 2 * ((c2 + 1.0) * 2.0 * p - c2)) / 2.0
++    return ((2.0 * p - 2.0) ** 2 * ((c2 + 1.0) * (2.0 * p - 2.0) + c2) + 2.0) / 2.0
++
++
++# ------------------------------------------------------------------- elastic
++
++
++def ease_in_elastic(p):
++    """Elastic ease in (damped spring start)."""
++    c4 = (2.0 * math.pi) / 3.0
++    if p == 0.0:
++        return 0.0
++    if p == 1.0:
++        return 1.0
++    return -(2.0 ** (10.0 * p - 10.0)) * math.sin((10.0 * p - 10.75) * c4)
++
++
++def ease_out_elastic(p):
++    """Elastic ease out (damped spring settle)."""
++    c4 = (2.0 * math.pi) / 3.0
++    if p == 0.0:
++        return 0.0
++    if p == 1.0:
++        return 1.0
++    return 2.0 ** (-10.0 * p) * math.sin((10.0 * p - 0.75) * c4) + 1.0
++
++
++def ease_in_out_elastic(p):
++    """Elastic ease in/out."""
++    c5 = (2.0 * math.pi) / 4.5
++    if p == 0.0:
++        return 0.0
++    if p == 1.0:
++        return 1.0
++    if p < 0.5:
++        return -(2.0 ** (20.0 * p - 10.0) * math.sin((20.0 * p - 11.125) * c5)) / 2.0
++    return (2.0 ** (-20.0 * p + 10.0) * math.sin((20.0 * p - 11.125) * c5)) / 2.0 + 1.0
++
++
++# ------------------------------------------------------------------- bounce
++
++
++def ease_out_bounce(p):
++    """Bounce ease out (ball dropping and bouncing to rest)."""
++    n1 = 7.5625
++    d1 = 2.75
++    if p < 1.0 / d1:
++        return n1 * p * p
++    if p < 2.0 / d1:
++        p -= 1.5 / d1
++        return n1 * p * p + 0.75
++    if p < 2.5 / d1:
++        p -= 2.25 / d1
++        return n1 * p * p + 0.9375
++    p -= 2.625 / d1
++    return n1 * p * p + 0.984375
++
++
++def ease_in_bounce(p):
++    """Bounce ease in: mirror of :func:`ease_out_bounce`."""
++    return 1.0 - ease_out_bounce(1.0 - p)
++
++
++def ease_in_out_bounce(p):
++    """Bounce ease in/out."""
++    if p < 0.5:
++        return (1.0 - ease_out_bounce(1.0 - 2.0 * p)) / 2.0
++    return (1.0 + ease_out_bounce(2.0 * p - 1.0)) / 2.0
++
++
++# Registry of the built-in easing functions, by name.
++EASINGS = {
++    "linear": linear,
++    "hold": hold,
++    "ease_in_quad": ease_in_quad,
++    "ease_out_quad": ease_out_quad,
++    "ease_in_out_quad": ease_in_out_quad,
++    "ease_in_cubic": ease_in_cubic,
++    "ease_out_cubic": ease_out_cubic,
++    "ease_in_out_cubic": ease_in_out_cubic,
++    "ease_in_quart": ease_in_quart,
++    "ease_out_quart": ease_out_quart,
++    "ease_in_out_quart": ease_in_out_quart,
++    "ease_in_quint": ease_in_quint,
++    "ease_out_quint": ease_out_quint,
++    "ease_in_out_quint": ease_in_out_quint,
++    "ease_in_sine": ease_in_sine,
++    "ease_out_sine": ease_out_sine,
++    "ease_in_out_sine": ease_in_out_sine,
++    "ease_in_expo": ease_in_expo,
++    "ease_out_expo": ease_out_expo,
++    "ease_in_out_expo": ease_in_out_expo,
++    "ease_in_circ": ease_in_circ,
++    "ease_out_circ": ease_out_circ,
++    "ease_in_out_circ": ease_in_out_circ,
++    "ease_in_back": ease_in_back,
++    "ease_out_back": ease_out_back,
++    "ease_in_out_back": ease_in_out_back,
++    "ease_in_elastic": ease_in_elastic,
++    "ease_out_elastic": ease_out_elastic,
++    "ease_in_out_elastic": ease_in_out_elastic,
++    "ease_in_bounce": ease_in_bounce,
++    "ease_out_bounce": ease_out_bounce,
++    "ease_in_out_bounce": ease_in_out_bounce,
++}
++
++
++def get_easing(easing):
++    """Resolve an easing specification to a callable.
++
++    Parameters
++    ----------
++    easing : str or callable
++        Either the name of a registered easing function (see
++        ``EASINGS.keys()``) or an arbitrary callable mapping a progress in
++        ``[0, 1]`` to an eased progress.
++
++    Returns
++    -------
++    callable
++        The resolved easing function.
++
++    Raises
++    ------
++    ValueError
++        If ``easing`` is a string that is not a registered easing name.
++    TypeError
++        If ``easing`` is neither a string nor a callable.
++    """
++    if isinstance(easing, str):
++        try:
++            return EASINGS[easing]
++        except KeyError:
++            raise ValueError(
++                f"Unknown easing name {easing!r}. "
++                f"Available easings: {sorted(EASINGS)}"
++            ) from None
++    if callable(easing):
++        return easing
++    raise TypeError(
++        f"easing must be a registered easing name or a callable, "
++        f"got {type(easing).__name__!r}"
++    )
+diff --git a/moviepy/keyframe.py b/moviepy/keyframe.py
+new file mode 100644
+index 0000000..37215bc
+--- /dev/null
++++ b/moviepy/keyframe.py
+@@ -0,0 +1,293 @@
++"""Keyframe tracks: time-indexed values with eased interpolation.
++
++A :class:`KeyframeTrack` stores an ordered sequence of ``(time, value)``
++keyframes and evaluates values at arbitrary times by interpolating between
++neighbouring keyframes with an easing function (see :mod:`moviepy.easing`).
++
++Values can be plain numbers (scalar tracks) or tuples of numbers of a fixed
++length (tuple tracks, interpolated componentwise), which makes the class
++usable for animating scalars (opacity, rotation, zoom) as well as positions
++or scaling factors.
++"""
++
++import numbers
++
++from moviepy.easing import get_easing
++
++
++def _is_number(value):
++    """Return True for real numbers (excluding booleans)."""
++    return isinstance(value, numbers.Real) and not isinstance(value, bool)
++
++
++def _validate_value(value):
++    """Validate one keyframe value, returning ``(kind, converted)``.
++
++    ``kind`` is ``"scalar"`` for real numbers and ``"tuple"`` for
++    tuples/lists of real numbers. The converted value is a float for
++    scalars and a tuple of floats for tuples.
++    """
++    if _is_number(value):
++        return "scalar", float(value)
++    if isinstance(value, (tuple, list)):
++        if len(value) < 2:
++            raise ValueError(
++                "tuple keyframe values must contain at least two components, "
++                f"got {value!r}"
++            )
++        for component in value:
++            if not _is_number(component):
++                raise TypeError(
++                    "tuple keyframe values must only contain numbers, "
++                    f"got component {component!r}"
++                )
++        return "tuple", tuple(float(component) for component in value)
++    raise TypeError(
++        "keyframe values must be numbers or tuples/lists of numbers, "
++        f"got {type(value).__name__!r}"
++    )
++
++
++class KeyframeTrack:
++    """An ordered sequence of keyframes with eased interpolation.
++
++    Parameters
++    ----------
++
++    keyframes
++        A non-empty sequence of ``(time, value)`` pairs. Times must be
++        non-negative numbers, strictly increasing. Values must all be
++        either real numbers (scalar track) or tuples/lists of real numbers
++        of the same length (tuple track).
++
++    easing
++        The easing used between keyframes: either the name of a registered
++        easing function (see ``moviepy.easing.EASINGS``) or a callable
++        mapping a progress in ``[0, 1]`` to an eased progress. Defaults to
++        ``"linear"``.
++
++    Examples
++    --------
++
++    .. code:: python
++
++        track = KeyframeTrack([(0.0, 0.0), (2.0, 100.0)], easing="ease_in_out_quad")
++        track.value_at(0.0)   # 0.0
++        track.value_at(1.0)   # 50.0
++        track.value_at(5.0)   # 100.0 (clamped to the last keyframe)
++
++    """
++
++    def __init__(self, keyframes, easing="linear"):
++        if isinstance(keyframes, (str, bytes)) or not hasattr(keyframes, "__iter__"):
++            raise TypeError(
++                "keyframes must be a sequence of (time, value) pairs, "
++                f"got {type(keyframes).__name__!r}"
++            )
++        keyframes = list(keyframes)
++        if len(keyframes) == 0:
++            raise ValueError("a keyframe track needs at least one keyframe")
++
++        times = []
++        values = []
++        kind = None
++        tuple_length = None
++        for keyframe in keyframes:
++            try:
++                time, value = keyframe
++            except (TypeError, ValueError):
++                raise TypeError(
++                    "each keyframe must be a (time, value) pair, "
++                    f"got {keyframe!r}"
++                ) from None
++            if not _is_number(time):
++                raise TypeError(
++                    f"keyframe times must be numbers, got {time!r}"
++                )
++            time = float(time)
++            if time < 0.0:
++                raise ValueError(
++                    f"keyframe times must be non-negative, got {time!r}"
++                )
++            if times and time <= times[-1]:
++                raise ValueError(
++                    "keyframe times must be strictly increasing, got "
++                    f"{times[-1]!r} followed by {time!r}"
++                )
++            new_kind, converted = _validate_value(value)
++            if kind is None:
++                kind = new_kind
++                if new_kind == "tuple":
++                    tuple_length = len(converted)
++            elif new_kind != kind:
++                raise ValueError(
++                    "all keyframe values of a track must be of the same kind "
++                    f"(all scalars or all tuples), got {value!r}"
++                )
++            elif new_kind == "tuple" and len(converted) != tuple_length:
++                raise ValueError(
++                    "all tuple keyframe values of a track must have the same "
++                    f"length, expected {tuple_length}, got {len(converted)}"
++                )
++            times.append(time)
++            values.append(converted)
++
++        self._times = tuple(times)
++        self._values = tuple(values)
++        self._kind = kind
++        self._easing = get_easing(easing)
++
++    @classmethod
++    def constant(cls, value):
++        """Build a track holding ``value`` at all times.
++
++        ``value`` follows the same rules as keyframe values (a number or
++        a tuple/list of numbers). The resulting track has a single
++        keyframe at time ``0.0`` and therefore evaluates to ``value`` at
++        any time.
++        """
++        return cls([(0.0, value)])
++
++    @classmethod
++    def ramp(cls, start_value, end_value, duration, easing="linear"):
++        """Build a two-keyframe track going from one value to another.
++
++        The track starts at ``start_value`` at time ``0.0`` and reaches
++        ``end_value`` at time ``duration``, interpolating with the given
++        ``easing``. ``duration`` must be a number strictly greater than
++        zero; ``start_value`` and ``end_value`` follow the same rules as
++        keyframe values and must be of the same kind and shape.
++        """
++        if not _is_number(duration):
++            raise TypeError(
++                f"duration must be a number, got {type(duration).__name__!r}"
++            )
++        duration = float(duration)
++        if duration <= 0.0:
++            raise ValueError(
++                f"duration must be strictly positive, got {duration!r}"
++            )
++        return cls([(0.0, start_value), (duration, end_value)], easing=easing)
++
++    @property
++    def times(self):
++        """The keyframe times, as a tuple of floats."""
++        return self._times
++
++    @property
++    def values(self):
++        """The keyframe values, as a tuple (of floats or tuples of floats)."""
++        return self._values
++
++    @property
++    def easing(self):
++        """The easing function used between keyframes."""
++        return self._easing
++
++    @property
++    def duration(self):
++        """Time of the last keyframe (``0.0`` for single-keyframe tracks)."""
++        return self._times[-1]
++
++    @property
++    def is_tuple(self):
++        """True if the track values are tuples (interpolated componentwise)."""
++        return self._kind == "tuple"
++
++    def __len__(self):
++        return len(self._times)
++
++    def __repr__(self):
++        keyframes = list(zip(self._times, self._values))
++        return f"{type(self).__name__}({keyframes!r})"
++
++    def value_at(self, t):
++        """Evaluate the track at time ``t``.
++
++        Times before the first keyframe evaluate to the first value and
++        times at or after the last keyframe evaluate to the last value
++        (clamping). Between two keyframes the value is interpolated with
++        the track's easing applied to the segment progress; tuple values
++        are interpolated componentwise.
++
++        Scalar tracks return a float, tuple tracks return a tuple of
++        floats.
++        """
++        if not _is_number(t):
++            raise TypeError(f"t must be a number, got {t!r}")
++        t = float(t)
++        if t <= self._times[0]:
++            return self._values[0]
++        if t >= self._times[-1]:
++            return self._values[-1]
++        # find the segment containing t
++        index = 0
++        for index in range(len(self._times) - 1):
++            if self._times[index] <= t < self._times[index + 1]:
++                break
++        t0, t1 = self._times[index], self._times[index + 1]
++        v0, v1 = self._values[index], self._values[index + 1]
++        progress = (t - t0) / (t1 - t0)
++        eased = self._easing(progress)
++        if self._kind == "scalar":
++            return v0 + (v1 - v0) * eased
++        return tuple(
++            component0 + (component1 - component0) * eased
++            for component0, component1 in zip(v0, v1)
++        )
++
++    def rescaled(self, factor):
++        """Return a new track with every value multiplied by ``factor``.
++
++        ``factor`` must be a number; it is applied to scalar values or to
++        every component of tuple values. Times and easing are preserved.
++        The original track is left untouched.
++        """
++        if not _is_number(factor):
++            raise TypeError(f"factor must be a number, got {factor!r}")
++        factor = float(factor)
++        if self._kind == "scalar":
++            values = [v * factor for v in self._values]
++        else:
++            values = [
++                tuple(component * factor for component in v)
++                for v in self._values
++            ]
++        return KeyframeTrack(
++            list(zip(self._times, values)), easing=self._easing
++        )
++
++    def shifted(self, offset):
++        """Return a new track with every keyframe time shifted by ``offset``.
++
++        ``offset`` must be a number. All shifted times must remain
++        non-negative, otherwise ``ValueError`` is raised. Values and
++        easing are preserved. The original track is left untouched.
++        """
++        if not _is_number(offset):
++            raise TypeError(f"offset must be a number, got {offset!r}")
++        offset = float(offset)
++        times = [t + offset for t in self._times]
++        if times[0] < 0.0:
++            raise ValueError(
++                f"shifting by {offset!r} would make keyframe times negative"
++            )
++        return KeyframeTrack(
++            list(zip(times, self._values)), easing=self._easing
++        )
++
++    def reversed(self):
++        """Return a new track playing the same animation backwards in time.
++
++        The new track spans ``[0, duration]``: its first keyframe is the
++        original last value at time ``0`` and its last keyframe is the
++        original first value at time ``duration``. Formally the new track
++        ``r`` satisfies ``r.value_at(t) == self.value_at(duration - t)``
++        for tracks using the ``linear`` easing (other easings are kept
++        as-is, so the easing curve itself is *not* mirrored). The original
++        track is left untouched.
++        """
++        end = self._times[-1]
++        times = [end - t for t in reversed(self._times)]
++        values = list(reversed(self._values))
++        return KeyframeTrack(list(zip(times, values)), easing=self._easing)
+diff --git a/moviepy/video/VideoClip.py b/moviepy/video/VideoClip.py
+index 8f42d7e..a43f7e6 100644
+--- a/moviepy/video/VideoClip.py
++++ b/moviepy/video/VideoClip.py
+@@ -971,9 +971,35 @@ class VideoClip(Clip):
+         """Set the opacity/transparency level of the clip.
+ 
+         Returns a semi-transparent copy of the clip where the mask is
+-        multiplied by ``op`` (any float, normally between 0 and 1).
++        multiplied by ``opacity`` (a float, normally between 0 and 1,
++        or a callable ``t -> float``, or a scalar
++        :class:`~moviepy.keyframe.KeyframeTrack`).
++
++        Static numbers keep the old cheap ``image_transform`` code path.
++        Callables and :class:`KeyframeTrack` values switch to a
++        time-varying transform so opacity can animate over the clip.
+         """
+-        self.mask = self.mask.image_transform(lambda pic: opacity * pic)
++        from moviepy.keyframe import KeyframeTrack
++
++        if isinstance(opacity, KeyframeTrack):
++            if opacity.is_tuple:
++                raise TypeError(
++                    "with_opacity requires a scalar KeyframeTrack, "
++                    "got a tuple-valued track"
++                )
++            get_opacity = opacity.value_at
++            self.mask = self.mask.transform(
++                lambda gf, t, _op=get_opacity: _op(t) * gf(t),
++                keep_duration=True,
++            )
++        elif callable(opacity):
++            get_opacity = opacity
++            self.mask = self.mask.transform(
++                lambda gf, t, _op=get_opacity: _op(t) * gf(t),
++                keep_duration=True,
++            )
++        else:
++            self.mask = self.mask.image_transform(lambda pic: opacity * pic)
+ 
+     @apply_to_mask
+     @outplace
+@@ -982,9 +1008,13 @@ class VideoClip(Clip):
+ 
+         Sets the position that the clip will have when included
+         in compositions. The argument ``pos`` can be either a couple
+-        ``(x,y)`` or a function ``t-> (x,y)``. `x` and `y` mark the
+-        location of the top left corner of the clip, and can be
+-        of several types.
++        ``(x,y)``, a function ``t -> (x, y)``, or a
++        :class:`~moviepy.keyframe.KeyframeTrack` of ``(x, y)`` pairs
++        (which is converted to a ``t -> (x, y)`` callable so the rest of
++        the compositing pipeline sees the same interface).
++
++        ``x`` and ``y`` mark the location of the top left corner of the
++        clip and can be of several types.
+ 
+         Examples
+         --------
+@@ -1002,9 +1032,24 @@ class VideoClip(Clip):
+             # clip's position is horizontally centered, and moving up !
+             clip.with_position(lambda t: ('center', 50+t))
+ 
++            # animate through explicit keyframes
++            from moviepy import KeyframeTrack
++            clip.with_position(
++                KeyframeTrack([(0, (0, 0)), (2, (400, 100))],
++                              easing="ease_in_out_cubic")
++            )
++
+         """
++        from moviepy.keyframe import KeyframeTrack
++
+         self.relative_pos = relative
+-        if hasattr(pos, "__call__"):
++        if isinstance(pos, KeyframeTrack):
++            if not pos.is_tuple or len(pos.values[0]) != 2:
++                raise ValueError(
++                    "with_position requires a KeyframeTrack of (x, y) pairs"
++                )
++            self.pos = pos.value_at
++        elif hasattr(pos, "__call__"):
+             self.pos = pos
+         else:
+             self.pos = lambda t: pos
+diff --git a/moviepy/video/fx/KeyframeMotion.py b/moviepy/video/fx/KeyframeMotion.py
+new file mode 100644
+index 0000000..ded746b
+--- /dev/null
++++ b/moviepy/video/fx/KeyframeMotion.py
+@@ -0,0 +1,301 @@
++"""Keyframe-driven motion effect: animate scale, rotation, position, opacity."""
++
++import numbers
++from dataclasses import dataclass
++from typing import Optional, Union
++
++import numpy as np
++from PIL import Image
++
++from moviepy.Effect import Effect
++from moviepy.keyframe import KeyframeTrack
++
++
++def _is_number(value):
++    """Return True for real numbers (excluding booleans)."""
++    return isinstance(value, numbers.Real) and not isinstance(value, bool)
++
++
++def _static_scalar_track(value, name, minimum=None, maximum=None):
++    """Build a constant scalar :class:`KeyframeTrack` from a static value."""
++    if not _is_number(value):
++        raise TypeError(
++            f"{name} must be a number, a KeyframeTrack, or None, "
++            f"got {type(value).__name__!r}"
++        )
++    value = float(value)
++    if minimum is not None and value < minimum:
++        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
++    if maximum is not None and value > maximum:
++        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
++    return KeyframeTrack([(0.0, value)])
++
++
++def _resolve_scalar(value, name, minimum=None, maximum=None):
++    """Resolve a scalar parameter (rotation, opacity) to a track."""
++    if value is None:
++        return None
++    if isinstance(value, KeyframeTrack):
++        if value.is_tuple:
++            raise ValueError(
++                f"{name} requires a scalar keyframe track, "
++                "got a tuple-valued track"
++            )
++        for v in value.values:
++            if minimum is not None and v < minimum:
++                raise ValueError(
++                    f"{name} keyframe values must be >= {minimum}, got {v!r}"
++                )
++            if maximum is not None and v > maximum:
++                raise ValueError(
++                    f"{name} keyframe values must be <= {maximum}, got {v!r}"
++                )
++        return value
++    return _static_scalar_track(value, name, minimum=minimum, maximum=maximum)
++
++
++def _resolve_position(value):
++    """Resolve the ``position`` parameter to a 2-component tuple track."""
++    if value is None:
++        return None
++    if isinstance(value, KeyframeTrack):
++        if not value.is_tuple or len(value.values[0]) != 2:
++            raise ValueError(
++                "position requires a keyframe track of (x, y) pairs"
++            )
++        return value
++    if isinstance(value, (tuple, list)) and len(value) == 2:
++        x, y = value
++        if not (_is_number(x) and _is_number(y)):
++            raise TypeError(
++                f"position components must be numbers, got {value!r}"
++            )
++        return KeyframeTrack([(0.0, (float(x), float(y)))])
++    raise TypeError(
++        "position must be an (x, y) pair, a KeyframeTrack of (x, y) pairs, "
++        f"or None, got {type(value).__name__!r}"
++    )
++
++
++def _resolve_scale(value):
++    """Resolve the ``scale`` parameter to a 2-component tuple track.
++
++    A static number is expanded to a uniform ``(sx, sx)`` scale; a scalar
++    keyframe track is converted to a tuple track doing the same expansion
++    keyframe by keyframe.
++    """
++    if value is None:
++        return None
++    if isinstance(value, KeyframeTrack):
++        if value.is_tuple:
++            if len(value.values[0]) != 2:
++                raise ValueError(
++                    "scale requires a keyframe track of numbers or (sx, sy) pairs"
++                )
++            track = value
++        else:
++            track = KeyframeTrack(
++                [(t, (v, v)) for t, v in zip(value.times, value.values)],
++                easing=value.easing,
++            )
++        for v in track.values:
++            if v[0] <= 0.0 or v[1] <= 0.0:
++                raise ValueError(
++                    f"scale keyframe values must be > 0, got {v!r}"
++                )
++        return track
++    if _is_number(value):
++        scale = float(value)
++        if scale <= 0.0:
++            raise ValueError(f"scale must be > 0, got {scale!r}")
++        return KeyframeTrack([(0.0, (scale, scale))])
++    if isinstance(value, (tuple, list)) and len(value) == 2:
++        sx, sy = value
++        if not (_is_number(sx) and _is_number(sy)):
++            raise TypeError(f"scale components must be numbers, got {value!r}")
++        sx, sy = float(sx), float(sy)
++        if sx <= 0.0 or sy <= 0.0:
++            raise ValueError(f"scale components must be > 0, got {value!r}")
++        return KeyframeTrack([(0.0, (sx, sy))])
++    raise TypeError(
++        "scale must be a number, an (sx, sy) pair, a KeyframeTrack, or None, "
++        f"got {type(value).__name__!r}"
++    )
++
++
++def _paste_centered(canvas, image, center_x, center_y):
++    """Paste ``image`` onto ``canvas`` with the image center at the given point.
++
++    ``canvas`` is modified in place. Parts of the image falling outside the
++    canvas are clipped away.
++    """
++    canvas_h, canvas_w = canvas.shape[:2]
++    image_w, image_h = image.size
++    left = int(round(center_x - image_w / 2.0))
++    top = int(round(center_y - image_h / 2.0))
++
++    # intersection between the image footprint and the canvas
++    dst_left = max(0, left)
++    dst_top = max(0, top)
++    dst_right = min(canvas_w, left + image_w)
++    dst_bottom = min(canvas_h, top + image_h)
++    if dst_right <= dst_left or dst_bottom <= dst_top:
++        return
++
++    src_left = dst_left - left
++    src_top = dst_top - top
++    src_right = src_left + (dst_right - dst_left)
++    src_bottom = src_top + (dst_bottom - dst_top)
++
++    cropped = image.crop((src_left, src_top, src_right, src_bottom))
++    canvas[dst_top:dst_bottom, dst_left:dst_right] = np.array(cropped)
++
++
++@dataclass
++class KeyframeMotion(Effect):
++    """Animate a clip's scale, rotation, position and opacity with keyframes.
++
++    The effect renders the (transformed) frames of the clip onto a black
++    canvas of fixed size, so the resulting clip has a constant size even
++    while the content moves, grows or spins.
++
++    Parameters
++    ----------
++
++    position : tuple or KeyframeTrack, optional
++        Position ``(x, y)`` of the clip's *center* on the canvas, in
++        pixels. Either a static pair or a :class:`KeyframeTrack` of
++        ``(x, y)`` pairs. Defaults to the center of the canvas.
++
++    scale : float or tuple or KeyframeTrack, optional
++        Scaling factor applied to the clip about its own center, before
++        rotation. Either a static number (uniform scale) or ``(sx, sy)``,
++        or a keyframe track of either. All values must be strictly
++        positive. Defaults to ``1.0``.
++
++    rotation : float or KeyframeTrack, optional
++        Rotation angle in degrees, counterclockwise, about the clip's own
++        center. Either a static number or a scalar keyframe track.
++        Defaults to ``0.0``.
++
++    opacity : float or KeyframeTrack, optional
++        Opacity of the clip, between 0 (invisible) and 1 (fully opaque).
++        The clip is blended over the black canvas, so the final pixel
++        values are ``round(pixel * opacity)``. Either a static number or
++        a scalar keyframe track whose values all lie in ``[0, 1]``.
++        Defaults to ``1.0``.
++
++    canvas_size : tuple, optional
++        Size ``(width, height)`` in pixels of the output clip. Defaults to
++        the size of the input clip.
++
++    The transformations are applied in the order: scale, then rotation,
++    then translation; opacity is applied last. Scaling and rotation use
++    bilinear resampling. The output clip keeps the duration, fps, audio
++    and mask of the input clip. Mask clips (``is_mask=True``) are not
++    supported and raise ``ValueError``.
++
++    Examples
++    --------
++
++    .. code:: python
++
++        from moviepy import KeyframeTrack, vfx
++
++        motion = vfx.KeyframeMotion(
++            position=KeyframeTrack([(0, (100, 100)), (2, (500, 300))],
++                                   easing="ease_in_out_cubic"),
++            scale=KeyframeTrack([(0, 0.5), (2, 1.5)]),
++            rotation=KeyframeTrack([(0, 0), (2, 90)]),
++            opacity=KeyframeTrack([(0, 0.0), (1, 1.0)], easing="ease_out_quad"),
++        )
++        animated = clip.with_effects([motion])
++    """
++
++    position: Optional[Union[tuple, KeyframeTrack]] = None
++    scale: Optional[Union[float, tuple, KeyframeTrack]] = None
++    rotation: Optional[Union[float, KeyframeTrack]] = None
++    opacity: Optional[Union[float, KeyframeTrack]] = None
++    canvas_size: Optional[tuple] = None
++
++    def apply(self, clip):
++        """Apply the effect to the clip."""
++        if clip.is_mask:
++            raise ValueError(
++                "KeyframeMotion does not support mask clips (is_mask=True)"
++            )
++
++        canvas_w, canvas_h = self._resolve_canvas_size(clip)
++
++        position_track = _resolve_position(self.position)
++        scale_track = _resolve_scale(self.scale)
++        rotation_track = _resolve_scalar(self.rotation, "rotation")
++        opacity_track = _resolve_scalar(
++            self.opacity, "opacity", minimum=0.0, maximum=1.0
++        )
++
++        def motion_frame(get_frame, t):
++            frame = get_frame(t)
++            if frame.dtype != np.uint8:
++                frame = np.clip(np.rint(frame), 0, 255).astype(np.uint8)
++            image = Image.fromarray(frame)
++
++            sx, sy = (
++                scale_track.value_at(t) if scale_track is not None else (1.0, 1.0)
++            )
++            angle = (
++                rotation_track.value_at(t) if rotation_track is not None else 0.0
++            )
++            opacity = (
++                opacity_track.value_at(t) if opacity_track is not None else 1.0
++            )
++            center_x, center_y = (
++                position_track.value_at(t)
++                if position_track is not None
++                else (canvas_w / 2.0, canvas_h / 2.0)
++            )
++
++            width, height = image.size
++            new_width = max(1, int(round(width * sx)))
++            new_height = max(1, int(round(height * sy)))
++            if (new_width, new_height) != (width, height):
++                image = image.resize(
++                    (new_width, new_height), Image.Resampling.BILINEAR
++                )
++            if angle % 360.0 != 0.0:
++                image = image.rotate(
++                    angle, resample=Image.Resampling.BILINEAR, expand=False
++                )
++
++            canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
++            _paste_centered(canvas, image, center_x, center_y)
++
++            if opacity < 1.0:
++                canvas = np.rint(canvas.astype(np.float64) * opacity).astype(
++                    np.uint8
++                )
++            return canvas
++
++        new_clip = clip.transform(motion_frame, keep_duration=True)
++        new_clip.size = (canvas_w, canvas_h)
++        return new_clip
++
++    def _resolve_canvas_size(self, clip):
++        """Validate and resolve the output canvas size."""
++        if self.canvas_size is None:
++            return clip.size
++        size = self.canvas_size
++        if (
++            not isinstance(size, (tuple, list))
++            or len(size) != 2
++            or not all(_is_number(component) for component in size)
++        ):
++            raise TypeError(
++                f"canvas_size must be a (width, height) pair, got {size!r}"
++            )
++        width, height = int(size[0]), int(size[1])
++        if width <= 0 or height <= 0:
++            raise ValueError(
++                f"canvas_size components must be positive, got {size!r}"
++            )
++        return (width, height)
+diff --git a/moviepy/video/fx/MultiplyColor.py b/moviepy/video/fx/MultiplyColor.py
+index 6a3e1b7..05e115c 100644
+--- a/moviepy/video/fx/MultiplyColor.py
++++ b/moviepy/video/fx/MultiplyColor.py
+@@ -1,4 +1,5 @@
+ from dataclasses import dataclass
++from typing import Union
+ 
+ import numpy as np
+ 
+@@ -10,14 +11,58 @@ from moviepy.Effect import Effect
+ class MultiplyColor(Effect):
+     """
+     Multiplies the clip's colors by the given factor, can be used
+-    to decrease or increase the clip's brightness (is that the
+-    right word ?)
++    to decrease or increase the clip's brightness.
++
++    Parameters
++    ----------
++
++    factor : float or callable or KeyframeTrack
++        The multiplication factor. Either a static number, a callable
++        ``t -> number``, or a scalar
++        :class:`~moviepy.keyframe.KeyframeTrack`. All values must be
++        non-negative -- a negative factor would produce a signed image
++        which the ``uint8`` cast then wraps back into ``[0, 255]``. For
++        keyframe tracks the check happens at effect-application time; for
++        callables the check happens per frame the first time the effect
++        is rendered at that time.
+     """
+ 
+-    factor: float
++    factor: Union[float, callable]
+ 
+     def apply(self, clip: Clip) -> Clip:
+         """Apply the effect to the clip."""
+-        return clip.image_transform(
+-            lambda frame: np.minimum(255, (self.factor * frame)).astype("uint8")
+-        )
++        from moviepy.keyframe import KeyframeTrack
++
++        # Static number: preserve the existing image_transform code path
++        # exactly (no per-frame overhead, byte-for-byte compatible with
++        # the previous version of this class).
++        if isinstance(self.factor, KeyframeTrack):
++            if self.factor.is_tuple:
++                raise TypeError(
++                    "MultiplyColor(factor=...) requires a scalar "
++                    "KeyframeTrack, got a tuple-valued track"
++                )
++            for v in self.factor.values:
++                if v < 0:
++                    raise ValueError(
++                        "MultiplyColor(factor=...) keyframe values must "
++                        f"be >= 0, got {v!r}"
++                    )
++            get_factor = self.factor.value_at
++        elif callable(self.factor):
++            get_factor = self.factor
++        else:
++            factor = self.factor
++            if factor < 0:
++                raise ValueError(
++                    f"MultiplyColor(factor=...) must be >= 0, got {factor!r}"
++                )
++            return clip.image_transform(
++                lambda frame: np.minimum(255, (factor * frame)).astype("uint8")
++            )
++
++        def time_filter(get_frame, t):
++            f = get_factor(t)
++            return np.minimum(255, (f * get_frame(t))).astype("uint8")
++
++        return clip.transform(time_filter, keep_duration=True)
+diff --git a/moviepy/video/fx/Resize.py b/moviepy/video/fx/Resize.py
+index 44b857d..1c045b2 100644
+--- a/moviepy/video/fx/Resize.py
++++ b/moviepy/video/fx/Resize.py
+@@ -15,29 +15,41 @@ class Resize(Effect):
+     Parameters
+     ----------
+ 
+-    new_size : tuple or float or function, optional
++    new_size : tuple or float or function or KeyframeTrack, optional
+         Can be either
+-        - ``(width, height)`` in pixels or a float representing
+-        - A scaling factor, like ``0.5``.
+-        - A function of time returning one of these.
+ 
+-    height : int, optional
++        - ``(width, height)`` in pixels,
++        - a float representing a uniform scaling factor (like ``0.5``),
++        - a function of time returning one of these, or
++        - a :class:`~moviepy.keyframe.KeyframeTrack`. Scalar tracks are
++          interpreted as time-varying uniform scaling factors; tuple
++          tracks of length 2 are interpreted as time-varying
++          ``(width, height)`` pairs.
++
++    height : int or function or KeyframeTrack, optional
+         Height of the new clip in pixels. The width is then computed so
+-        that the width/height ratio is conserved.
++        that the width/height ratio is conserved. A callable or scalar
++        :class:`KeyframeTrack` can be used for a time-varying height.
+ 
+-    width : int, optional
++    width : int or function or KeyframeTrack, optional
+         Width of the new clip in pixels. The height is then computed so
+-        that the width/height ratio is conserved.
++        that the width/height ratio is conserved. A callable or scalar
++        :class:`KeyframeTrack` can be used for a time-varying width.
+ 
+     Examples
+     --------
+ 
+     .. code:: python
+ 
+-        clip.with_effects([vfx.Resize((460,720))]) # New resolution: (460,720)
+-        clip.with_effects([vfx.Resize(0.6)]) # width and height multiplied by 0.6
+-        clip.with_effects([vfx.Resize(width=800)]) # height computed automatically.
+-        clip.with_effects([vfx.Resize(lambda t : 1+0.02*t)]) # slow clip swelling
++        clip.with_effects([vfx.Resize((460, 720))])
++        clip.with_effects([vfx.Resize(0.6)])
++        clip.with_effects([vfx.Resize(width=800)])
++        clip.with_effects([vfx.Resize(lambda t : 1 + 0.02 * t)])
++
++        from moviepy import KeyframeTrack
++        clip.with_effects(
++            [vfx.Resize(KeyframeTrack([(0.0, 0.5), (2.0, 1.0)]))]
++        )
+     """
+ 
+     new_size: Union[tuple, float, callable] = None
+@@ -48,6 +60,11 @@ class Resize(Effect):
+     def resizer(self, pic, new_size):
+         """Resize the image using PIL."""
+         new_size = list(map(int, new_size))
++        # Guard against zero/negative sizes (which PIL would reject with a
++        # confusing error message). Time-varying scales can legitimately
++        # produce those at some ``t`` even when every keyframe is valid,
++        # so we clamp to 1x1 rather than raising.
++        new_size = [max(1, s) for s in new_size]
+         pil_img = Image.fromarray(pic)
+         resized_pil = pil_img.resize(new_size, Image.Resampling.LANCZOS)
+         return np.array(resized_pil)
+@@ -56,6 +73,11 @@ class Resize(Effect):
+         """Apply the effect to the clip."""
+         w, h = clip.size
+ 
++        # Normalise a KeyframeTrack (if any) into the same callable form
++        # the rest of this method already handles. This keeps every other
++        # code path -- static number, static (w, h), lambda -- unchanged.
++        self._normalise_track_parameters()
++
+         if self.new_size is not None:
+ 
+             def translate_new_size(new_size_):
+@@ -156,3 +178,44 @@ class Resize(Effect):
+             )
+ 
+         return new_clip
++
++    def _normalise_track_parameters(self):
++        """Turn any :class:`KeyframeTrack` parameters into ``t -> value``.
++
++        ``height``/``width`` accept only scalar tracks (a tuple track for
++        one of these dimensions doesn't make sense). ``new_size`` accepts
++        both scalar (uniform factor) and 2-component tuple (width, height)
++        tracks.
++        """
++        from moviepy.keyframe import KeyframeTrack
++
++        # height / width: scalar-only.
++        if isinstance(self.height, KeyframeTrack):
++            if self.height.is_tuple:
++                raise TypeError(
++                    "Resize(height=...) requires a scalar KeyframeTrack, "
++                    "got a tuple-valued track"
++                )
++            self.height = self.height.value_at
++        if isinstance(self.width, KeyframeTrack):
++            if self.width.is_tuple:
++                raise TypeError(
++                    "Resize(width=...) requires a scalar KeyframeTrack, "
++                    "got a tuple-valued track"
++                )
++            self.width = self.width.value_at
++
++        # new_size: scalar or 2-tuple track.
++        if isinstance(self.new_size, KeyframeTrack):
++            track = self.new_size
++            if track.is_tuple:
++                if len(track.values[0]) != 2:
++                    raise ValueError(
++                        "Resize(new_size=...) requires a KeyframeTrack of "
++                        "numbers or (width, height) pairs"
++                    )
++                self.new_size = track.value_at
++            else:
++                # Scalar track: forward as a uniform scaling factor -- the
++                # existing translate_new_size branch takes it from there.
++                self.new_size = track.value_at
+diff --git a/moviepy/video/fx/Rotate.py b/moviepy/video/fx/Rotate.py
+index 4fb9a59..462b452 100644
+--- a/moviepy/video/fx/Rotate.py
++++ b/moviepy/video/fx/Rotate.py
+@@ -24,8 +24,10 @@ class Rotate(Effect):
+     clip : VideoClip
+     A video clip.
+ 
+-    angle : float
+-    Either a value or a function angle(t) representing the angle of rotation.
++    angle : float or callable or KeyframeTrack
++    Either a value, a function ``angle(t)``, or a scalar
++    :class:`~moviepy.keyframe.KeyframeTrack` describing the angle of
++    rotation.
+ 
+     unit : str, optional
+     Unit of parameter `angle` (either "deg" for degrees or "rad" for radians).
+@@ -70,7 +72,18 @@ class Rotate(Effect):
+                 "'resample' argument must be either 'bilinear', 'nearest' or 'bicubic'"
+             )
+ 
+-        if hasattr(self.angle, "__call__"):
++        # Normalise ``angle`` when a KeyframeTrack is given. Static
++        # numbers and lambdas take the existing code path unchanged.
++        from moviepy.keyframe import KeyframeTrack
++
++        if isinstance(self.angle, KeyframeTrack):
++            if self.angle.is_tuple:
++                raise TypeError(
++                    "Rotate(angle=...) requires a scalar KeyframeTrack, "
++                    "got a tuple-valued track"
++                )
++            get_angle = self.angle.value_at
++        elif hasattr(self.angle, "__call__"):
+             get_angle = self.angle
+         else:
+             get_angle = lambda t: self.angle
+diff --git a/moviepy/video/fx/__init__.py b/moviepy/video/fx/__init__.py
+index 8e79ad2..207fbc4 100644
+--- a/moviepy/video/fx/__init__.py
++++ b/moviepy/video/fx/__init__.py
+@@ -16,6 +16,7 @@ from moviepy.video.fx.FreezeRegion import FreezeRegion
+ from moviepy.video.fx.GammaCorrection import GammaCorrection
+ from moviepy.video.fx.HeadBlur import HeadBlur
+ from moviepy.video.fx.InvertColors import InvertColors
++from moviepy.video.fx.KeyframeMotion import KeyframeMotion
+ from moviepy.video.fx.Loop import Loop
+ from moviepy.video.fx.LumContrast import LumContrast
+ from moviepy.video.fx.MakeLoopable import MakeLoopable
+@@ -53,6 +54,7 @@ __all__ = (
+     "GammaCorrection",
+     "HeadBlur",
+     "InvertColors",
++    "KeyframeMotion",
+     "Loop",
+     "LumContrast",
+     "MakeLoopable",
+diff --git a/tests/test_easing.py b/tests/test_easing.py
+new file mode 100644
+index 0000000..7067be0
+--- /dev/null
++++ b/tests/test_easing.py
+@@ -0,0 +1,325 @@
++"""Tests for :mod:`moviepy.easing`."""
++
++import math
++
++import pytest
++
++from moviepy import easing
++from moviepy.easing import EASINGS, get_easing
++
++
++ALL_NAMES = [
++    "linear",
++    "hold",
++    "ease_in_quad",
++    "ease_out_quad",
++    "ease_in_out_quad",
++    "ease_in_cubic",
++    "ease_out_cubic",
++    "ease_in_out_cubic",
++    "ease_in_quart",
++    "ease_out_quart",
++    "ease_in_out_quart",
++    "ease_in_quint",
++    "ease_out_quint",
++    "ease_in_out_quint",
++    "ease_in_sine",
++    "ease_out_sine",
++    "ease_in_out_sine",
++    "ease_in_expo",
++    "ease_out_expo",
++    "ease_in_out_expo",
++    "ease_in_circ",
++    "ease_out_circ",
++    "ease_in_out_circ",
++    "ease_in_back",
++    "ease_out_back",
++    "ease_in_out_back",
++    "ease_in_elastic",
++    "ease_out_elastic",
++    "ease_in_out_elastic",
++    "ease_in_bounce",
++    "ease_out_bounce",
++    "ease_in_out_bounce",
++]
++
++
++def test_registry_contains_all_documented_easings():
++    assert sorted(EASINGS) == sorted(ALL_NAMES)
++
++
++@pytest.mark.parametrize("name", ALL_NAMES)
++def test_registry_functions_are_callable(name):
++    assert callable(EASINGS[name])
++
++
++@pytest.mark.parametrize("name", ALL_NAMES)
++def test_endpoints(name):
++    """Every easing maps 0 -> 0 and 1 -> 1."""
++    func = EASINGS[name]
++    assert func(0.0) == pytest.approx(0.0, abs=1e-12)
++    assert func(1.0) == pytest.approx(1.0, abs=1e-12)
++
++
++@pytest.mark.parametrize("name", ALL_NAMES)
++def test_monotonic_or_bounded_output(name):
++    """Outputs stay within a sane range (back/elastic may overshoot)."""
++    func = EASINGS[name]
++    for i in range(101):
++        value = func(i / 100.0)
++        assert -2.0 < value < 3.0
++
++
++# ------------------------------------------------------------- exact formulas
++
++
++def test_linear():
++    assert easing.linear(0.0) == 0.0
++    assert easing.linear(0.37) == 0.37
++    assert easing.linear(1.0) == 1.0
++
++
++def test_hold():
++    assert easing.hold(0.0) == 0.0
++    assert easing.hold(0.999) == 0.0
++    assert easing.hold(1.0) == 1.0
++
++
++def test_quad_family():
++    assert easing.ease_in_quad(0.5) == pytest.approx(0.25)
++    assert easing.ease_out_quad(0.5) == pytest.approx(0.75)
++    assert easing.ease_in_out_quad(0.25) == pytest.approx(0.125)
++    assert easing.ease_in_out_quad(0.5) == pytest.approx(0.5)
++    assert easing.ease_in_out_quad(0.75) == pytest.approx(0.875)
++
++
++def test_cubic_family():
++    assert easing.ease_in_cubic(0.5) == pytest.approx(0.125)
++    assert easing.ease_out_cubic(0.5) == pytest.approx(0.875)
++    assert easing.ease_in_out_cubic(0.25) == pytest.approx(0.0625)
++    assert easing.ease_in_out_cubic(0.5) == pytest.approx(0.5)
++    assert easing.ease_in_out_cubic(0.75) == pytest.approx(0.9375)
++
++
++def test_quart_family():
++    assert easing.ease_in_quart(0.5) == pytest.approx(0.0625)
++    assert easing.ease_out_quart(0.5) == pytest.approx(0.9375)
++    assert easing.ease_in_out_quart(0.5) == pytest.approx(0.5)
++
++
++def test_quint_family():
++    assert easing.ease_in_quint(0.5) == pytest.approx(0.03125)
++    assert easing.ease_out_quint(0.5) == pytest.approx(0.96875)
++    assert easing.ease_in_out_quint(0.5) == pytest.approx(0.5)
++
++
++def test_sine_family():
++    assert easing.ease_in_sine(1.0) == pytest.approx(1.0)
++    assert easing.ease_out_sine(1.0) == pytest.approx(1.0)
++    assert easing.ease_in_sine(0.5) == pytest.approx(1.0 - math.cos(math.pi / 4.0))
++    assert easing.ease_out_sine(0.5) == pytest.approx(math.sin(math.pi / 4.0))
++    assert easing.ease_in_out_sine(0.5) == pytest.approx(0.5)
++
++
++def test_expo_family():
++    assert easing.ease_in_expo(0.0) == 0.0
++    assert easing.ease_in_expo(0.5) == pytest.approx(2.0 ** -5)
++    assert easing.ease_out_expo(1.0) == 1.0
++    assert easing.ease_out_expo(0.5) == pytest.approx(1.0 - 2.0 ** -5)
++    assert easing.ease_in_out_expo(0.0) == 0.0
++    assert easing.ease_in_out_expo(1.0) == 1.0
++    assert easing.ease_in_out_expo(0.5) == pytest.approx(0.5)
++
++
++def test_circ_family():
++    assert easing.ease_in_circ(0.5) == pytest.approx(1.0 - math.sqrt(0.75))
++    assert easing.ease_out_circ(0.5) == pytest.approx(math.sqrt(0.75))
++    assert easing.ease_in_out_circ(0.5) == pytest.approx(0.5)
++
++
++def test_back_family():
++    c1 = 1.70158
++    c3 = c1 + 1.0
++    assert easing.ease_in_back(0.5) == pytest.approx(c3 * 0.125 - c1 * 0.25)
++    assert easing.ease_out_back(0.5) == pytest.approx(
++        1.0 + c3 * (-0.5) ** 3 + c1 * 0.25
++    )
++    assert easing.ease_in_out_back(0.5) == pytest.approx(0.5)
++    # ease_in_back dips below zero (pull-back before moving forward)
++    assert easing.ease_in_back(0.3) < 0.0
++    # ease_out_back overshoots beyond one
++    assert easing.ease_out_back(0.7) > 1.0
++
++
++def test_elastic_family():
++    assert easing.ease_in_elastic(0.0) == 0.0
++    assert easing.ease_in_elastic(1.0) == 1.0
++    assert easing.ease_out_elastic(0.0) == 0.0
++    assert easing.ease_out_elastic(1.0) == 1.0
++    assert easing.ease_in_out_elastic(0.0) == 0.0
++    assert easing.ease_in_out_elastic(1.0) == 1.0
++    # the elastic out oscillates above 1 before settling
++    assert max(easing.ease_out_elastic(i / 100.0) for i in range(1, 100)) > 1.0
++    # the elastic in oscillates below 0
++    assert min(easing.ease_in_elastic(i / 100.0) for i in range(1, 100)) < 0.0
++
++
++def test_bounce_family():
++    n1 = 7.5625
++    # p in the first bounce segment: n1 * p * p
++    assert easing.ease_out_bounce(0.2) == pytest.approx(n1 * 0.04)
++    # ease_in_bounce is the mirror of ease_out_bounce
++    assert easing.ease_in_bounce(0.3) == pytest.approx(
++        1.0 - easing.ease_out_bounce(0.7)
++    )
++    assert easing.ease_in_out_bounce(0.25) == pytest.approx(
++        (1.0 - easing.ease_out_bounce(0.5)) / 2.0
++    )
++    assert easing.ease_in_out_bounce(0.75) == pytest.approx(
++        (1.0 + easing.ease_out_bounce(0.5)) / 2.0
++    )
++
++
++def test_in_out_symmetry():
++    """ease_in_out variants satisfy f(0.5) == 0.5 and f(p) == 1 - f(1 - p)."""
++    for name in ALL_NAMES:
++        if not name.startswith("ease_in_out_"):
++            continue
++        func = EASINGS[name]
++        assert func(0.5) == pytest.approx(0.5, abs=1e-9)
++        for i in range(1, 20):
++            p = i / 20.0
++            assert func(p) == pytest.approx(1.0 - func(1.0 - p), abs=1e-9)
++
++
++def test_in_out_mirror_of_in():
++    """ease_in_X(p) == 1 - ease_out_X(1 - p) for the polynomial families."""
++    pairs = [
++        ("quad", easing.ease_in_quad, easing.ease_out_quad),
++        ("cubic", easing.ease_in_cubic, easing.ease_out_cubic),
++        ("quart", easing.ease_in_quart, easing.ease_out_quart),
++        ("quint", easing.ease_in_quint, easing.ease_out_quint),
++        ("sine", easing.ease_in_sine, easing.ease_out_sine),
++        ("expo", easing.ease_in_expo, easing.ease_out_expo),
++        ("circ", easing.ease_in_circ, easing.ease_out_circ),
++        ("back", easing.ease_in_back, easing.ease_out_back),
++        ("elastic", easing.ease_in_elastic, easing.ease_out_elastic),
++        ("bounce", easing.ease_in_bounce, easing.ease_out_bounce),
++    ]
++    for _name, ease_in, ease_out in pairs:
++        for i in range(21):
++            p = i / 20.0
++            assert ease_in(p) == pytest.approx(1.0 - ease_out(1.0 - p), abs=1e-9)
++
++
++# ------------------------------------------------------------- get_easing
++
++
++def test_get_easing_by_name():
++    assert get_easing("linear") is easing.linear
++    assert get_easing("ease_out_bounce") is easing.ease_out_bounce
++
++
++def test_get_easing_passthrough_callable():
++    def custom(p):
++        return p * 0.5
++
++    assert get_easing(custom) is custom
++
++
++def test_get_easing_unknown_name():
++    with pytest.raises(ValueError):
++        get_easing("ease_sideways")
++
++
++def test_get_easing_bad_type():
++    with pytest.raises(TypeError):
++        get_easing(42)
++    with pytest.raises(TypeError):
++        get_easing(None)
++
++
++# ------------------------------------------------- frozen regression samples
++
++EASING_SAMPLES = {
++    "ease_in_back": [-0.01431422, -0.04645056, -0.08019954, -0.09935168, -0.0876975, -0.02902752, 0.09286774, 0.29419776, 0.59117202],
++    "ease_in_bounce": [0.011875, 0.06, 0.069375, 0.2275, 0.234375, 0.09, 0.319375, 0.6975, 0.924375],
++    "ease_in_circ": [0.00501256289338, 0.0202041028867, 0.0460607985831, 0.0834848610088, 0.133974596216, 0.2, 0.285857157146, 0.4, 0.564110105646],
++    "ease_in_cubic": [0.001, 0.008, 0.027, 0.064, 0.125, 0.216, 0.343, 0.512, 0.729],
++    "ease_in_elastic": [0.001953125, -0.001953125, -0.00390625, 0.015625, -0.015625, -0.03125, 0.125, -0.125, -0.25],
++    "ease_in_expo": [0.001953125, 0.00390625, 0.0078125, 0.015625, 0.03125, 0.0625, 0.125, 0.25, 0.5],
++    "ease_in_out_back": [-0.037518552, -0.092555656, -0.078833484, 0.089925792, 0.5, 0.910074208, 1.078833484, 1.092555656, 1.037518552],
++    "ease_in_out_bounce": [0.03, 0.11375, 0.045, 0.34875, 0.5, 0.65125, 0.955, 0.88625, 0.97],
++    "ease_in_out_circ": [0.0101020514434, 0.0417424305044, 0.1, 0.2, 0.5, 0.8, 0.9, 0.958257569496, 0.989897948557],
++    "ease_in_out_cubic": [0.004, 0.032, 0.108, 0.256, 0.5, 0.744, 0.892, 0.968, 0.996],
++    "ease_in_out_elastic": [0.000339156597006, -0.00390625, 0.0239388888475, -0.117461577598, 0.5, 1.1174615776, 0.976061111153, 1.00390625, 0.999660843403],
++    "ease_in_out_expo": [0.001953125, 0.0078125, 0.03125, 0.125, 0.5, 0.875, 0.96875, 0.9921875, 0.998046875],
++    "ease_in_out_quad": [0.02, 0.08, 0.18, 0.32, 0.5, 0.68, 0.82, 0.92, 0.98],
++    "ease_in_out_quart": [0.0008, 0.0128, 0.0648, 0.2048, 0.5, 0.7952, 0.9352, 0.9872, 0.9992],
++    "ease_in_out_quint": [0.00016, 0.00512, 0.03888, 0.16384, 0.5, 0.83616, 0.96112, 0.99488, 0.99984],
++    "ease_in_out_sine": [0.0244717418524, 0.0954915028125, 0.206107373854, 0.345491502813, 0.5, 0.654508497187, 0.793892626146, 0.904508497187, 0.975528258148],
++    "ease_in_quad": [0.01, 0.04, 0.09, 0.16, 0.25, 0.36, 0.49, 0.64, 0.81],
++    "ease_in_quart": [0.0001, 0.0016, 0.0081, 0.0256, 0.0625, 0.1296, 0.2401, 0.4096, 0.6561],
++    "ease_in_quint": [1e-05, 0.00032, 0.00243, 0.01024, 0.03125, 0.07776, 0.16807, 0.32768, 0.59049],
++    "ease_in_sine": [0.0123116594049, 0.0489434837048, 0.108993475812, 0.190983005625, 0.292893218813, 0.412214747708, 0.54600950026, 0.690983005625, 0.84356553496],
++    "ease_out_back": [0.40882798, 0.70580224, 0.90713226, 1.02902752, 1.0876975, 1.09935168, 1.08019954, 1.04645056, 1.01431422],
++    "ease_out_bounce": [0.075625, 0.3025, 0.680625, 0.91, 0.765625, 0.7725, 0.930625, 0.94, 0.988125],
++    "ease_out_circ": [0.435889894354, 0.6, 0.714142842854, 0.8, 0.866025403784, 0.916515138991, 0.953939201417, 0.979795897113, 0.994987437107],
++    "ease_out_cubic": [0.271, 0.488, 0.657, 0.784, 0.875, 0.936, 0.973, 0.992, 0.999],
++    "ease_out_elastic": [1.25, 1.125, 0.875, 1.03125, 1.015625, 0.984375, 1.00390625, 1.001953125, 0.998046875],
++    "ease_out_expo": [0.5, 0.75, 0.875, 0.9375, 0.96875, 0.984375, 0.9921875, 0.99609375, 0.998046875],
++    "ease_out_quad": [0.19, 0.36, 0.51, 0.64, 0.75, 0.84, 0.91, 0.96, 0.99],
++    "ease_out_quart": [0.3439, 0.5904, 0.7599, 0.8704, 0.9375, 0.9744, 0.9919, 0.9984, 0.9999],
++    "ease_out_quint": [0.40951, 0.67232, 0.83193, 0.92224, 0.96875, 0.98976, 0.99757, 0.99968, 0.99999],
++    "ease_out_sine": [0.15643446504, 0.309016994375, 0.45399049974, 0.587785252292, 0.707106781187, 0.809016994375, 0.891006524188, 0.951056516295, 0.987688340595],
++    "hold": [0, 0, 0, 0, 0, 0, 0, 0, 0],
++    "linear": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
++}
++
++
++def test_easings_match_frozen_regression_samples():
++    """Each registered easing must reproduce its frozen reference samples.
++
++    The values below were computed once from the documented Penner
++    formulas at p = 0.1, 0.2, ..., 0.9 and are frozen here so that any
++    accidental change to a formula breaks this test.
++    """
++    points = [i / 10.0 for i in range(1, 10)]
++    for name, expected in EASING_SAMPLES.items():
++        func = EASINGS[name]
++        actual = [func(p) for p in points]
++        assert actual == pytest.approx(expected, abs=1e-9), name
++
++
++def test_frozen_samples_table_covers_all_easings():
++    assert sorted(EASING_SAMPLES) == sorted(EASINGS)
++
++
++def test_expo_exact_endpoint_behavior():
++    # expo easings define p == 0 and p == 1 as exact special cases
++    assert easing.ease_in_expo(0.0) == 0.0
++    assert easing.ease_out_expo(1.0) == 1.0
++    assert easing.ease_in_out_expo(0.0) == 0.0
++    assert easing.ease_in_out_expo(1.0) == 1.0
++    # just inside the domain the values are non-exact powers of two
++    assert easing.ease_in_expo(0.1) == pytest.approx(2.0 ** -9)
++    assert easing.ease_out_expo(0.9) == pytest.approx(1.0 - 2.0 ** -9)
++
++
++def test_elastic_exact_endpoint_behavior():
++    assert easing.ease_in_elastic(0.0) == 0.0
++    assert easing.ease_in_elastic(1.0) == 1.0
++    assert easing.ease_out_elastic(0.0) == 0.0
++    assert easing.ease_out_elastic(1.0) == 1.0
++    assert easing.ease_in_out_elastic(0.5) == pytest.approx(
++        -(2.0 ** 0 * math.sin((10.0 - 11.125) * (2.0 * math.pi) / 4.5)) / 2.0,
++        rel=1e-9,
++    )
++
++
++def test_bounce_segment_boundaries_are_continuous():
++    d1 = 2.75
++    for boundary in (1.0 / d1, 2.0 / d1, 2.5 / d1):
++        left = easing.ease_out_bounce(boundary - 1e-9)
++        right = easing.ease_out_bounce(boundary + 1e-9)
++        assert left == pytest.approx(right, abs=1e-4)
+diff --git a/tests/test_keyframe_integration.py b/tests/test_keyframe_integration.py
+new file mode 100644
+index 0000000..a766a35
+--- /dev/null
++++ b/tests/test_keyframe_integration.py
+@@ -0,0 +1,303 @@
++"""Tests for :class:`~moviepy.keyframe.KeyframeTrack` used as a value for
++classical MoviePy effect parameters.
++
++The keyframe animation feature grew a small integration surface with the
++pre-existing effects: :class:`~moviepy.video.fx.Resize.Resize`,
++:class:`~moviepy.video.fx.Rotate.Rotate` and
++:class:`~moviepy.video.fx.MultiplyColor.MultiplyColor` accept a
++:class:`KeyframeTrack` in place of a static value or ``lambda t: ...``, and
++so do :meth:`~moviepy.video.VideoClip.VideoClip.with_position` /
++:meth:`~moviepy.video.VideoClip.VideoClip.with_opacity`. The tests here
++lock down that integration surface as well as the backward-compatibility
++guarantees on the old value/callable forms.
++"""
++
++import numpy as np
++import pytest
++
++from moviepy import (
++    ColorClip,
++    CompositeVideoClip,
++    KeyframeTrack,
++    VideoClip,
++    vfx,
++)
++
++
++# --------------------------------------------------------------------- helpers
++
++
++def _quadrant_frame(size=4):
++    half = size // 2
++    frame = np.zeros((size, size, 3), dtype=np.uint8)
++    frame[:half, :half] = (255, 0, 0)
++    frame[:half, half:] = (0, 255, 0)
++    frame[half:, :half] = (0, 0, 255)
++    frame[half:, half:] = (255, 255, 0)
++    return frame
++
++
++def _static_clip(frame, duration=2.0):
++    return VideoClip(frame_function=lambda t: frame.copy(), duration=duration)
++
++
++# ------------------------------------------------------------------ Effect
++
++
++def test_effect_base_class_exposes_resolver():
++    from moviepy import Effect
++
++    resolver = Effect._resolve_time_varying
++    assert callable(resolver)
++    fn = resolver(2.5, name="x", expected="scalar")
++    assert fn(0.0) == 2.5
++
++    pair_fn = resolver((3.0, 4.0), name="pair", expected="pair")
++    assert pair_fn(0.0) == (3.0, 4.0)
++
++    assert resolver(None, name="x", expected="scalar") is None
++
++
++def test_effect_base_class_bounds_are_enforced():
++    from moviepy import Effect
++
++    with pytest.raises(ValueError):
++        Effect._resolve_time_varying(-1.0, name="opacity", expected="scalar", minimum=0.0)
++    with pytest.raises(ValueError):
++        Effect._resolve_time_varying(2.0, name="opacity", expected="scalar", maximum=1.0)
++
++
++def test_effect_base_class_rejects_wrong_shape():
++    from moviepy import Effect
++
++    with pytest.raises(TypeError):
++        Effect._resolve_time_varying("nope", name="opacity", expected="scalar")
++    with pytest.raises(TypeError):
++        Effect._resolve_time_varying((1, 2, 3), name="pos", expected="pair")
++
++
++# ------------------------------------------------------------------ Resize
++
++
++def test_resize_static_number_backward_compat():
++    clip = ColorClip(size=(4, 4), color=(10, 20, 30), duration=1.0)
++    out = clip.with_effects([vfx.Resize(0.5)])
++    assert out.get_frame(0.0).shape == (2, 2, 3)
++
++
++def test_resize_lambda_backward_compat():
++    clip = ColorClip(size=(4, 4), color=(10, 20, 30), duration=1.0)
++    out = clip.with_effects([vfx.Resize(lambda t: 0.5 + 0.25 * t)])
++    assert out.get_frame(0.0).shape == (2, 2, 3)
++    assert out.get_frame(1.0).shape == (3, 3, 3)
++
++
++def test_resize_scalar_track_animates_uniform_scale():
++    clip = ColorClip(size=(4, 4), color=(10, 20, 30), duration=2.0)
++    track = KeyframeTrack([(0.0, 0.5), (2.0, 1.0)])
++    out = clip.with_effects([vfx.Resize(track)])
++    assert out.get_frame(0.0).shape == (2, 2, 3)
++    assert out.get_frame(1.0).shape == (3, 3, 3)
++    assert out.get_frame(2.0).shape == (4, 4, 3)
++
++
++def test_resize_tuple_track_animates_width_and_height():
++    clip = ColorClip(size=(4, 4), color=(10, 20, 30), duration=2.0)
++    track = KeyframeTrack([(0.0, (2.0, 2.0)), (2.0, (6.0, 4.0))])
++    out = clip.with_effects([vfx.Resize(track)])
++    assert out.get_frame(0.0).shape == (2, 2, 3)
++    # t=1 -> (4, 3), so shape is (H, W, 3) = (3, 4, 3)
++    assert out.get_frame(1.0).shape == (3, 4, 3)
++    assert out.get_frame(2.0).shape == (4, 6, 3)
++
++
++def test_resize_height_and_width_accept_scalar_track():
++    clip = ColorClip(size=(4, 4), color=(10, 20, 30), duration=1.0)
++    height_track = KeyframeTrack([(0.0, 2.0), (1.0, 4.0)])
++    out_h = clip.with_effects([vfx.Resize(height=height_track)])
++    assert out_h.get_frame(0.0).shape == (2, 2, 3)
++    assert out_h.get_frame(1.0).shape == (4, 4, 3)
++
++    width_track = KeyframeTrack([(0.0, 2.0), (1.0, 4.0)])
++    out_w = clip.with_effects([vfx.Resize(width=width_track)])
++    assert out_w.get_frame(0.0).shape == (2, 2, 3)
++    assert out_w.get_frame(1.0).shape == (4, 4, 3)
++
++
++def test_resize_height_rejects_tuple_track():
++    clip = ColorClip(size=(4, 4), color=(10, 20, 30), duration=1.0)
++    bad = KeyframeTrack([(0.0, (1.0, 2.0)), (1.0, (3.0, 4.0))])
++    with pytest.raises(TypeError):
++        clip.with_effects([vfx.Resize(height=bad)])
++
++
++def test_resize_new_size_track_of_pairs_only():
++    clip = ColorClip(size=(4, 4), color=(10, 20, 30), duration=1.0)
++    bad = KeyframeTrack(
++        [(0.0, (2.0, 2.0, 2.0)), (1.0, (4.0, 4.0, 4.0))]
++    )
++    with pytest.raises(ValueError):
++        clip.with_effects([vfx.Resize(bad)])
++
++
++# ------------------------------------------------------------------ Rotate
++
++
++def test_rotate_static_number_backward_compat():
++    frame = _quadrant_frame(4)
++    out = _static_clip(frame).with_effects([vfx.Rotate(angle=90.0)])
++    assert np.array_equal(out.get_frame(0.0), np.rot90(frame))
++
++
++def test_rotate_lambda_backward_compat():
++    frame = _quadrant_frame(4)
++    out = _static_clip(frame, duration=4.0).with_effects(
++        [vfx.Rotate(angle=lambda t: 90 * t, expand=False)]
++    )
++    assert np.array_equal(out.get_frame(0.0), frame)
++    assert np.array_equal(out.get_frame(1.0), np.rot90(frame))
++
++
++def test_rotate_scalar_track():
++    frame = _quadrant_frame(4)
++    track = KeyframeTrack([(0.0, 0.0), (4.0, 360.0)])
++    out = _static_clip(frame, duration=4.0).with_effects(
++        [vfx.Rotate(angle=track)]
++    )
++    assert np.array_equal(out.get_frame(0.0), frame)
++    assert np.array_equal(out.get_frame(1.0), np.rot90(frame))
++    assert np.array_equal(out.get_frame(2.0), np.rot90(frame, 2))
++    assert np.array_equal(out.get_frame(3.0), np.rot90(frame, 3))
++
++
++def test_rotate_rejects_tuple_track():
++    clip = _static_clip(_quadrant_frame(4))
++    bad = KeyframeTrack([(0.0, (0.0, 0.0)), (1.0, (90.0, 45.0))])
++    with pytest.raises(TypeError):
++        clip.with_effects([vfx.Rotate(angle=bad)])
++
++
++# ------------------------------------------------------------ MultiplyColor
++
++
++def test_multiplycolor_static_backward_compat():
++    clip = ColorClip(size=(1, 1), color=(200, 100, 48), duration=1.0)
++    out = clip.with_effects([vfx.MultiplyColor(0.5)])
++    assert list(out.get_frame(0.0)[0, 0]) == [100, 50, 24]
++
++
++def test_multiplycolor_callable_backward_compat():
++    clip = ColorClip(size=(1, 1), color=(200, 100, 48), duration=2.0)
++    out = clip.with_effects([vfx.MultiplyColor(lambda t: 1.0 - 0.25 * t)])
++    assert list(out.get_frame(0.0)[0, 0]) == [200, 100, 48]
++    # t=2 -> factor 0.5
++    assert list(out.get_frame(2.0)[0, 0]) == [100, 50, 24]
++
++
++def test_multiplycolor_scalar_track_animates_over_time():
++    clip = ColorClip(size=(1, 1), color=(200, 100, 48), duration=2.0)
++    track = KeyframeTrack([(0.0, 1.0), (2.0, 0.5)])
++    out = clip.with_effects([vfx.MultiplyColor(track)])
++    assert list(out.get_frame(0.0)[0, 0]) == [200, 100, 48]
++    assert list(out.get_frame(1.0)[0, 0]) == [150, 75, 36]
++    assert list(out.get_frame(2.0)[0, 0]) == [100, 50, 24]
++
++
++def test_multiplycolor_rejects_negative():
++    with pytest.raises(ValueError):
++        vfx.MultiplyColor(-1.0).apply(
++            ColorClip(size=(1, 1), color=(200, 100, 48), duration=1.0)
++        )
++    with pytest.raises(ValueError):
++        vfx.MultiplyColor(
++            KeyframeTrack([(0.0, 1.0), (1.0, -0.5)])
++        ).apply(ColorClip(size=(1, 1), color=(200, 100, 48), duration=1.0))
++
++
++def test_multiplycolor_rejects_tuple_track():
++    bad = KeyframeTrack([(0.0, (0.5, 0.5)), (1.0, (1.0, 1.0))])
++    with pytest.raises(TypeError):
++        vfx.MultiplyColor(bad).apply(
++            ColorClip(size=(1, 1), color=(200, 100, 48), duration=1.0)
++        )
++
++
++# ------------------------------------------------------------- with_opacity
++
++
++def test_with_opacity_static_backward_compat():
++    bg = ColorClip(size=(1, 1), color=(0, 0, 0), duration=1.0)
++    fg = ColorClip(size=(1, 1), color=(200, 100, 48), duration=1.0).with_opacity(0.5)
++    composite = CompositeVideoClip([bg, fg])
++    assert list(composite.get_frame(0.5)[0, 0]) == [100, 50, 24]
++
++
++def test_with_opacity_callable_is_time_varying():
++    bg = ColorClip(size=(1, 1), color=(0, 0, 0), duration=2.0)
++    fg = ColorClip(
++        size=(1, 1), color=(200, 100, 48), duration=2.0
++    ).with_opacity(lambda t: 1.0 - 0.25 * t)
++    composite = CompositeVideoClip([bg, fg])
++    assert list(composite.get_frame(0.0)[0, 0]) == [200, 100, 48]
++    assert list(composite.get_frame(1.0)[0, 0]) == [150, 75, 36]
++
++
++def test_with_opacity_accepts_scalar_track():
++    bg = ColorClip(size=(1, 1), color=(0, 0, 0), duration=2.0)
++    fg = ColorClip(size=(1, 1), color=(200, 100, 48), duration=2.0)
++    track = KeyframeTrack([(0.0, 1.0), (2.0, 0.5)])
++    composite = CompositeVideoClip([bg, fg.with_opacity(track)])
++    assert list(composite.get_frame(0.0)[0, 0]) == [200, 100, 48]
++    assert list(composite.get_frame(1.0)[0, 0]) == [150, 75, 36]
++
++
++def test_with_opacity_rejects_tuple_track():
++    fg = ColorClip(size=(1, 1), color=(200, 100, 48), duration=1.0)
++    bad = KeyframeTrack([(0.0, (1.0, 1.0)), (1.0, (0.5, 0.5))])
++    with pytest.raises(TypeError):
++        fg.with_opacity(bad)
++
++
++# ----------------------------------------------------------- with_position
++
++
++def test_with_position_pair_backward_compat():
++    bg = ColorClip(size=(6, 4), color=(0, 0, 0), duration=1.0)
++    small = ColorClip(size=(2, 2), color=(255, 255, 255), duration=1.0)
++    composite = CompositeVideoClip([bg, small.with_position((2, 1))])
++    frame = composite.get_frame(0.0)
++    white = np.argwhere(frame[:, :, 0] == 255).tolist()
++    assert white == [[1, 2], [1, 3], [2, 2], [2, 3]]
++
++
++def test_with_position_lambda_backward_compat():
++    bg = ColorClip(size=(6, 4), color=(0, 0, 0), duration=2.0)
++    small = ColorClip(size=(2, 2), color=(255, 255, 255), duration=2.0)
++    composite = CompositeVideoClip(
++        [bg, small.with_position(lambda t: (int(2 * t), 1))]
++    )
++    frame = composite.get_frame(1.0)
++    white = np.argwhere(frame[:, :, 0] == 255).tolist()
++    assert white == [[1, 2], [1, 3], [2, 2], [2, 3]]
++
++
++def test_with_position_accepts_pair_track():
++    bg = ColorClip(size=(6, 4), color=(0, 0, 0), duration=2.0)
++    small = ColorClip(size=(2, 2), color=(255, 255, 255), duration=2.0)
++    pos = KeyframeTrack([(0.0, (0.0, 0.0)), (2.0, (4.0, 2.0))])
++    composite = CompositeVideoClip([bg, small.with_position(pos)])
++    frame0 = composite.get_frame(0.0)
++    assert np.argwhere(frame0[:, :, 0] == 255).tolist() == [
++        [0, 0], [0, 1], [1, 0], [1, 1]
++    ]
++    frame1 = composite.get_frame(1.0)
++    assert np.argwhere(frame1[:, :, 0] == 255).tolist() == [
++        [1, 2], [1, 3], [2, 2], [2, 3]
++    ]
++
++
++def test_with_position_rejects_scalar_track():
++    small = ColorClip(size=(2, 2), color=(255, 255, 255), duration=1.0)
++    bad = KeyframeTrack([(0.0, 0.0), (1.0, 4.0)])
++    with pytest.raises(ValueError):
++        small.with_position(bad)
+diff --git a/tests/test_keyframe_motion.py b/tests/test_keyframe_motion.py
+new file mode 100644
+index 0000000..072bfac
+--- /dev/null
++++ b/tests/test_keyframe_motion.py
+@@ -0,0 +1,854 @@
++"""Tests for :class:`moviepy.video.fx.KeyframeMotion`."""
++
++import numpy as np
++import pytest
++
++from moviepy import ColorClip, KeyframeTrack, VideoClip, vfx
++from moviepy.video.fx.KeyframeMotion import KeyframeMotion
++
++
++def quadrant_frame(size=4):
++    """A ``size``x``size`` frame with four colored quadrants.
++
++    TL red, TR green, BL blue, BR yellow.
++    """
++    half = size // 2
++    frame = np.zeros((size, size, 3), dtype=np.uint8)
++    frame[:half, :half] = (255, 0, 0)
++    frame[:half, half:] = (0, 255, 0)
++    frame[half:, :half] = (0, 0, 255)
++    frame[half:, half:] = (255, 255, 0)
++    return frame
++
++
++def static_clip(frame, duration=2.0):
++    frame = np.ascontiguousarray(frame)
++    return VideoClip(frame_function=lambda t: frame.copy(), duration=duration)
++
++
++# ------------------------------------------------------------- effect basics
++
++
++def test_effect_is_registered_in_vfx():
++    assert vfx.KeyframeMotion is KeyframeMotion
++
++
++def test_default_effect_is_identity():
++    frame = quadrant_frame(4)
++    clip = static_clip(frame)
++    out = clip.with_effects([KeyframeMotion()])
++    assert out.size == (4, 4)
++    assert np.array_equal(out.get_frame(0.0), frame)
++    assert np.array_equal(out.get_frame(1.3), frame)
++
++
++def test_output_size_duration_and_fps():
++    clip = static_clip(quadrant_frame(4), duration=3.0).with_fps(12)
++    out = clip.with_effects([KeyframeMotion(canvas_size=(10, 6))])
++    assert out.size == (10, 6)
++    assert out.duration == 3.0
++    assert out.fps == 12
++    assert out.get_frame(1.0).shape == (6, 10, 3)
++
++
++def test_original_clip_is_not_modified():
++    clip = static_clip(quadrant_frame(4))
++    clip.with_effects([KeyframeMotion(rotation=90.0)])
++    assert clip.size == (4, 4)
++    assert np.array_equal(clip.get_frame(0.0), quadrant_frame(4))
++
++
++def test_audio_is_preserved():
++    from moviepy import AudioClip
++
++    audio = AudioClip(
++        frame_function=lambda t: 0 * t, duration=2.0, fps=22050
++    )
++    clip = static_clip(quadrant_frame(4)).with_audio(audio)
++    out = clip.with_effects([KeyframeMotion(scale=2.0)])
++    assert out.audio is not None
++
++
++def test_mask_clips_are_rejected():
++    mask = VideoClip(
++        frame_function=lambda t: np.ones((4, 4)), is_mask=True, duration=1.0
++    )
++    with pytest.raises(ValueError):
++        mask.with_effects([KeyframeMotion()])
++
++
++# ------------------------------------------------------------- validation
++
++
++def test_bad_canvas_size():
++    clip = static_clip(quadrant_frame(4))
++    with pytest.raises(ValueError):
++        clip.with_effects([KeyframeMotion(canvas_size=(0, 4))])
++    with pytest.raises(ValueError):
++        clip.with_effects([KeyframeMotion(canvas_size=(4, -2))])
++    with pytest.raises(TypeError):
++        clip.with_effects([KeyframeMotion(canvas_size="big")])
++    with pytest.raises(TypeError):
++        clip.with_effects([KeyframeMotion(canvas_size=(4, "4"))])
++
++
++def test_bad_opacity_values():
++    clip = static_clip(quadrant_frame(4))
++    with pytest.raises(ValueError):
++        clip.with_effects([KeyframeMotion(opacity=1.5)])
++    with pytest.raises(ValueError):
++        clip.with_effects([KeyframeMotion(opacity=-0.1)])
++    with pytest.raises(ValueError):
++        clip.with_effects(
++            [KeyframeMotion(opacity=KeyframeTrack([(0.0, 0.5), (1.0, 2.0)]))]
++        )
++    with pytest.raises(TypeError):
++        clip.with_effects([KeyframeMotion(opacity="opaque")])
++    with pytest.raises(ValueError):
++        clip.with_effects(
++            [
++                KeyframeMotion(
++                    opacity=KeyframeTrack([(0.0, (0.5, 0.5)), (1.0, (1.0, 1.0))])
++                )
++            ]
++        )
++
++
++def test_bad_scale_values():
++    clip = static_clip(quadrant_frame(4))
++    with pytest.raises(ValueError):
++        clip.with_effects([KeyframeMotion(scale=0.0)])
++    with pytest.raises(ValueError):
++        clip.with_effects([KeyframeMotion(scale=-1.0)])
++    with pytest.raises(ValueError):
++        clip.with_effects([KeyframeMotion(scale=(1.0, 0.0))])
++    with pytest.raises(ValueError):
++        clip.with_effects(
++            [KeyframeMotion(scale=KeyframeTrack([(0.0, 1.0), (1.0, -2.0)]))]
++        )
++    with pytest.raises(TypeError):
++        clip.with_effects([KeyframeMotion(scale="zoom")])
++
++
++def test_bad_position_values():
++    clip = static_clip(quadrant_frame(4))
++    with pytest.raises(TypeError):
++        clip.with_effects([KeyframeMotion(position=5.0)])
++    with pytest.raises(TypeError):
++        clip.with_effects([KeyframeMotion(position=(1.0, "x"))])
++    with pytest.raises(ValueError):
++        clip.with_effects(
++            [KeyframeMotion(position=KeyframeTrack([(0.0, 1.0), (1.0, 2.0)]))]
++        )
++
++
++def test_bad_rotation_values():
++    clip = static_clip(quadrant_frame(4))
++    with pytest.raises(TypeError):
++        clip.with_effects([KeyframeMotion(rotation=(0.0, 1.0))])
++    with pytest.raises(ValueError):
++        clip.with_effects(
++            [
++                KeyframeMotion(
++                    rotation=KeyframeTrack([(0.0, (0.0, 1.0)), (1.0, (2.0, 3.0))])
++                )
++            ]
++        )
++
++
++# ------------------------------------------------------------- opacity
++
++
++def test_static_opacity_multiplies_pixels():
++    clip = ColorClip(size=(4, 2), color=(200, 100, 48), duration=2.0)
++    out = clip.with_effects([KeyframeMotion(opacity=0.5)])
++    pixel = out.get_frame(0.0)[0, 0]
++    assert list(pixel) == [100, 50, 24]
++
++
++def test_animated_opacity():
++    clip = ColorClip(size=(4, 2), color=(200, 100, 48), duration=2.0)
++    track = KeyframeTrack([(0.0, 1.0), (2.0, 0.5)])
++    out = clip.with_effects([KeyframeMotion(opacity=track)])
++    assert list(out.get_frame(0.0)[0, 0]) == [200, 100, 48]
++    # t = 1.0 -> opacity 0.75
++    assert list(out.get_frame(1.0)[0, 0]) == [150, 75, 36]
++    assert list(out.get_frame(2.0)[0, 0]) == [100, 50, 24]
++
++
++def test_zero_opacity_is_black():
++    clip = ColorClip(size=(2, 2), color=(200, 100, 48), duration=1.0)
++    out = clip.with_effects([KeyframeMotion(opacity=0.0)])
++    assert not out.get_frame(0.0).any()
++
++
++# ------------------------------------------------------------- rotation
++
++
++def test_rotation_90_degrees_is_counterclockwise():
++    frame = quadrant_frame(4)
++    out = static_clip(frame).with_effects([KeyframeMotion(rotation=90.0)])
++    assert np.array_equal(out.get_frame(0.0), np.rot90(frame))
++
++
++def test_rotation_180_degrees():
++    frame = quadrant_frame(4)
++    out = static_clip(frame).with_effects([KeyframeMotion(rotation=180.0)])
++    assert np.array_equal(out.get_frame(0.0), np.rot90(frame, 2))
++
++
++def test_rotation_360_is_identity():
++    frame = quadrant_frame(4)
++    out = static_clip(frame).with_effects([KeyframeMotion(rotation=360.0)])
++    assert np.array_equal(out.get_frame(0.0), frame)
++
++
++def test_rotation_negative_90_equals_positive_270():
++    frame = quadrant_frame(4)
++    out = static_clip(frame).with_effects([KeyframeMotion(rotation=-90.0)])
++    assert np.array_equal(out.get_frame(0.0), np.rot90(frame, 3))
++
++
++def test_animated_rotation():
++    frame = quadrant_frame(4)
++    track = KeyframeTrack([(0.0, 0.0), (1.0, 90.0)], easing="hold")
++    out = static_clip(frame, duration=1.0).with_effects(
++        [KeyframeMotion(rotation=track)]
++    )
++    assert np.array_equal(out.get_frame(0.0), frame)
++    assert np.array_equal(out.get_frame(1.0), np.rot90(frame))
++
++
++# ------------------------------------------------------------- scale
++
++
++def test_scale_up_uniform_region():
++    # solid red frame stays solid red under any scale
++    clip = ColorClip(size=(4, 4), color=(200, 30, 60), duration=1.0)
++    out = clip.with_effects([KeyframeMotion(scale=2.0)])
++    frame = out.get_frame(0.0)
++    assert frame.shape == (4, 4, 3)
++    assert np.all(frame == (200, 30, 60))
++
++
++def test_scale_down_reveals_black_canvas():
++    # a 4x4 solid frame scaled by 0.5 becomes a 2x2 block centered on a
++    # black 4x4 canvas
++    clip = ColorClip(size=(4, 4), color=(200, 30, 60), duration=1.0)
++    out = clip.with_effects([KeyframeMotion(scale=0.5)])
++    frame = out.get_frame(0.0)
++    assert np.all(frame[1:3, 1:3] == (200, 30, 60))
++    assert not frame[0, :].any()
++    assert not frame[3, :].any()
++    assert not frame[:, 0].any()
++    assert not frame[:, 3].any()
++
++
++def test_animated_scale():
++    clip = ColorClip(size=(4, 4), color=(200, 30, 60), duration=2.0)
++    track = KeyframeTrack([(0.0, 0.5), (2.0, 1.0)])
++    out = clip.with_effects([KeyframeMotion(scale=track)])
++    frame0 = out.get_frame(0.0)
++    assert np.all(frame0[1:3, 1:3] == (200, 30, 60))
++    assert not frame0[0, :].any()
++    frame2 = out.get_frame(2.0)
++    assert np.all(frame2 == (200, 30, 60))
++
++
++def test_non_uniform_scale():
++    # 4x4 frame scaled (2.0, 1.0): 8 wide, 4 high, centered -> cropped to
++    # the middle 4 columns of the widened image
++    frame = np.zeros((4, 4, 3), dtype=np.uint8)
++    frame[:, :2] = (0, 0, 255)  # left half blue
++    frame[:, 2:] = (255, 0, 0)  # right half red
++    out = static_clip(frame).with_effects([KeyframeMotion(scale=(2.0, 1.0))])
++    result = out.get_frame(0.0)
++    # scaled image is 8x4; canvas 4x4 crops columns 2..5 of the scaled
++    # image, i.e. one column blue, boundary, then red columns
++    assert np.all(result[:, 0] == (0, 0, 255))
++    assert np.all(result[:, 3] == (255, 0, 0))
++
++
++# ------------------------------------------------------------- position
++
++
++def test_static_position_places_center():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small)
++    out = clip.with_effects(
++        [KeyframeMotion(position=(4, 3), canvas_size=(8, 6))]
++    )
++    frame = out.get_frame(0.0)
++    # center (4, 3), size 2x2 -> top-left (3, 2)
++    expected = np.zeros((6, 8, 3), dtype=np.uint8)
++    expected[2:4, 3:5] = 255
++    assert np.array_equal(frame, expected)
++
++
++def test_animated_position_linear_motion():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small, duration=2.0)
++    track = KeyframeTrack([(0.0, (2.0, 2.0)), (2.0, (6.0, 2.0))])
++    out = clip.with_effects(
++        [KeyframeMotion(position=track, canvas_size=(8, 4))]
++    )
++    frame0 = out.get_frame(0.0)
++    expected0 = np.zeros((4, 8, 3), dtype=np.uint8)
++    expected0[1:3, 1:3] = 255
++    assert np.array_equal(frame0, expected0)
++    # t = 1.0 -> center (4, 2) -> top-left (3, 1)
++    frame1 = out.get_frame(1.0)
++    expected1 = np.zeros((4, 8, 3), dtype=np.uint8)
++    expected1[1:3, 3:5] = 255
++    assert np.array_equal(frame1, expected1)
++
++
++def test_position_clips_at_canvas_edges():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small)
++    out = clip.with_effects(
++        [KeyframeMotion(position=(0, 0), canvas_size=(4, 4))]
++    )
++    frame = out.get_frame(0.0)
++    expected = np.zeros((4, 4, 3), dtype=np.uint8)
++    expected[0, 0] = 255  # only one pixel remains visible
++    assert np.array_equal(frame, expected)
++
++
++def test_position_fully_off_canvas_is_black():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small)
++    out = clip.with_effects(
++        [KeyframeMotion(position=(-10, -10), canvas_size=(4, 4))]
++    )
++    assert not out.get_frame(0.0).any()
++
++
++# ------------------------------------------------------------- composition
++
++
++def test_transform_order_scale_then_rotation():
++    # A wide 4x2 (w x h) solid red frame, scaled (2.0, 1.0) then rotated
++    # 90 degrees CCW: the content becomes a vertical red strip on the
++    # 4x2 canvas. Rotating first and scaling afterwards would produce a
++    # different (horizontal) footprint, so this pins down the order.
++    frame = np.zeros((2, 4, 3), dtype=np.uint8)
++    frame[:] = (255, 0, 0)
++    clip = static_clip(frame)
++    out = clip.with_effects([KeyframeMotion(scale=(2.0, 1.0), rotation=90.0)])
++    result = out.get_frame(0.0)
++    expected = np.zeros((2, 4, 3), dtype=np.uint8)
++    expected[:, 1:3] = (255, 0, 0)
++    assert np.array_equal(result, expected)
++
++
++def test_combined_motion_at_keyframe_time():
++    clip = ColorClip(size=(2, 2), color=(255, 255, 255), duration=2.0)
++    effect = KeyframeMotion(
++        position=KeyframeTrack([(0.0, (2.0, 2.0)), (2.0, (4.0, 2.0))]),
++        opacity=KeyframeTrack([(0.0, 1.0), (2.0, 0.5)]),
++        canvas_size=(6, 4),
++    )
++    out = clip.with_effects([effect])
++    frame = out.get_frame(2.0)
++    expected = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected[1:3, 3:5] = 128  # round(255 * 0.5)
++    assert np.array_equal(frame, expected)
++
++
++def test_colorclip_roundtrip_dtype():
++    # ColorClip frames are not uint8; the effect must still handle them
++    clip = ColorClip(size=(3, 3), color=(10, 20, 30), duration=1.0)
++    out = clip.with_effects([KeyframeMotion(rotation=45.0)])
++    frame = out.get_frame(0.0)
++    assert frame.dtype == np.uint8
++    assert frame.shape == (3, 3, 3)
++
++
++# ------------------------------------------------------------- more geometry
++
++
++def test_rotation_270_degrees():
++    frame = quadrant_frame(4)
++    out = static_clip(frame).with_effects([KeyframeMotion(rotation=270.0)])
++    assert np.array_equal(out.get_frame(0.0), np.rot90(frame, 3))
++
++
++def test_animated_rotation_with_easing():
++    # with the hold easing the rotation jumps at the keyframe time
++    frame = quadrant_frame(4)
++    track = KeyframeTrack(
++        [(0.0, 0.0), (1.0, 90.0), (2.0, 180.0)], easing="hold"
++    )
++    out = static_clip(frame, duration=2.0).with_effects(
++        [KeyframeMotion(rotation=track)]
++    )
++    assert np.array_equal(out.get_frame(0.5), frame)
++    assert np.array_equal(out.get_frame(1.0), np.rot90(frame))
++    assert np.array_equal(out.get_frame(1.5), np.rot90(frame))
++    assert np.array_equal(out.get_frame(2.0), np.rot90(frame, 2))
++
++
++def test_scale_track_tuple_values():
++    clip = ColorClip(size=(4, 4), color=(200, 30, 60), duration=2.0)
++    track = KeyframeTrack([(0.0, (0.5, 0.5)), (2.0, (1.0, 1.0))])
++    out = clip.with_effects([KeyframeMotion(scale=track)])
++    frame0 = out.get_frame(0.0)
++    assert np.all(frame0[1:3, 1:3] == (200, 30, 60))
++    assert not frame0[0, :].any()
++    assert np.all(out.get_frame(2.0) == (200, 30, 60))
++
++
++def test_scale_scalar_track_expands_uniformly():
++    clip = ColorClip(size=(4, 4), color=(200, 30, 60), duration=2.0)
++    track = KeyframeTrack([(0.0, 0.5), (2.0, 1.0)])
++    out = clip.with_effects([KeyframeMotion(scale=track)])
++    frame0 = out.get_frame(0.0)
++    assert np.all(frame0[1:3, 1:3] == (200, 30, 60))
++    assert not frame0[0, :].any()
++
++
++def test_scale_up_crops_to_canvas():
++    # a 4x4 quadrant frame scaled by 2 becomes an 8x8 quadrant frame;
++    # the 4x4 canvas keeps only the central region. The four corner
++    # pixels of the canvas sample the solid interior of each scaled
++    # quadrant, away from any interpolation boundary.
++    frame = quadrant_frame(4)
++    out = static_clip(frame).with_effects([KeyframeMotion(scale=2.0)])
++    result = out.get_frame(0.0)
++    assert result.shape == (4, 4, 3)
++    assert list(result[0, 0]) == [255, 0, 0]
++    assert list(result[0, 3]) == [0, 255, 0]
++    assert list(result[3, 0]) == [0, 0, 255]
++    assert list(result[3, 3]) == [255, 255, 0]
++
++
++def test_position_clipping_on_each_side():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small)
++
++    def expected_for(position):
++        expected = np.zeros((4, 4, 3), dtype=np.uint8)
++        cx, cy = position
++        left = int(round(cx - 1.0))
++        top = int(round(cy - 1.0))
++        for y in range(max(0, top), min(4, top + 2)):
++            for x in range(max(0, left), min(4, left + 2)):
++                expected[y, x] = 255
++        return expected
++
++    for position in [(0.0, 2.0), (4.0, 2.0), (2.0, 0.0), (2.0, 4.0)]:
++        out = clip.with_effects(
++            [KeyframeMotion(position=position, canvas_size=(4, 4))]
++        )
++        frame = out.get_frame(0.0)
++        assert np.array_equal(frame, expected_for(position)), (
++            f"position={position}"
++        )
++    # sanity: each edge case leaves exactly one row or column visible
++    assert expected_for((0.0, 2.0))[:, 0].sum() > 0
++    assert not expected_for((0.0, 2.0))[:, 1:].any()
++    assert not expected_for((4.0, 2.0))[:, :3].any()
++    assert not expected_for((2.0, 0.0))[1:, :].any()
++    assert not expected_for((2.0, 4.0))[:3, :].any()
++
++
++def test_fractional_position_rounds_to_nearest_pixel():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small)
++    # center (2.4, 2.0): left = round(2.4 - 1.0) = 1, top = round(1.0) = 1
++    out = clip.with_effects(
++        [KeyframeMotion(position=(2.4, 2.0), canvas_size=(4, 4))]
++    )
++    frame = out.get_frame(0.0)
++    expected = np.zeros((4, 4, 3), dtype=np.uint8)
++    expected[1:3, 1:3] = 255
++    assert np.array_equal(frame, expected)
++
++
++def test_animated_position_with_easing():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small, duration=2.0)
++    track = KeyframeTrack(
++        [(0.0, (2.0, 2.0)), (2.0, (6.0, 2.0))], easing="ease_in_out_quad"
++    )
++    out = clip.with_effects(
++        [KeyframeMotion(position=track, canvas_size=(8, 4))]
++    )
++    # t = 0.5: progress 0.25, eased 0.125 -> center (2.5, 2.0)
++    # left = round(2.5 - 1) = 2 (banker's rounding of 1.5), top = 1
++    frame = out.get_frame(0.5)
++    expected = np.zeros((4, 8, 3), dtype=np.uint8)
++    expected[1:3, 2:4] = 255
++    assert np.array_equal(frame, expected)
++
++
++def test_opacity_animated_with_hold_easing():
++    clip = ColorClip(size=(2, 2), color=(200, 100, 48), duration=2.0)
++    track = KeyframeTrack([(0.0, 1.0), (1.0, 0.5)], easing="hold")
++    out = clip.with_effects([KeyframeMotion(opacity=track)])
++    assert list(out.get_frame(0.999)[0, 0]) == [200, 100, 48]
++    assert list(out.get_frame(1.0)[0, 0]) == [100, 50, 24]
++
++
++def test_canvas_smaller_than_clip_crops():
++    clip = ColorClip(size=(6, 6), color=(10, 20, 30), duration=1.0)
++    out = clip.with_effects([KeyframeMotion(canvas_size=(2, 2))])
++    frame = out.get_frame(0.0)
++    assert frame.shape == (2, 2, 3)
++    assert np.all(frame == (10, 20, 30))
++
++
++def test_all_parameters_animated_together():
++    frame = quadrant_frame(4)
++    clip = static_clip(frame, duration=2.0)
++    effect = KeyframeMotion(
++        position=KeyframeTrack([(0.0, (2.0, 2.0)), (2.0, (4.0, 2.0))]),
++        scale=KeyframeTrack([(0.0, 1.0), (2.0, 1.0)]),
++        rotation=KeyframeTrack([(0.0, 0.0), (2.0, 90.0)]),
++        opacity=KeyframeTrack([(0.0, 1.0), (2.0, 1.0)]),
++        canvas_size=(6, 4),
++    )
++    out = clip.with_effects([effect])
++    # at t=2: rotated 90 CCW, center (4, 2) -> top-left (2, 0)
++    expected = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected[0:4, 2:6] = np.rot90(frame)
++    assert np.array_equal(out.get_frame(2.0), expected)
++    # at t=0: identity at center (2, 2) -> top-left (0, 0)
++    expected0 = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected0[0:4, 0:4] = frame
++    assert np.array_equal(out.get_frame(0.0), expected0)
++
++
++def test_effect_copy_semantics():
++    # the same effect instance can be applied to two different clips
++    effect = KeyframeMotion(opacity=0.5)
++    clip_a = ColorClip(size=(2, 2), color=(200, 0, 0), duration=1.0)
++    clip_b = ColorClip(size=(2, 2), color=(100, 0, 0), duration=1.0)
++    out_a = clip_a.with_effects([effect])
++    out_b = clip_b.with_effects([effect])
++    assert list(out_a.get_frame(0.0)[0, 0]) == [100, 0, 0]
++    assert list(out_b.get_frame(0.0)[0, 0]) == [50, 0, 0]
++
++
++def test_rotation_of_nonsquare_frame_keeps_canvas_size():
++    clip = ColorClip(size=(6, 2), color=(250, 0, 0), duration=1.0)
++    out = clip.with_effects([KeyframeMotion(rotation=90.0)])
++    frame = out.get_frame(0.0)
++    assert frame.shape == (2, 6, 3)
++    # the 6x2 bar rotated 90 degrees becomes a 2x6 vertical strip,
++    # cropped to the 6x2 canvas: only the middle columns survive
++    assert np.all(frame[:, 2:4] == (250, 0, 0))
++    assert not frame[:, 0:2].any()
++    assert not frame[:, 4:6].any()
++
++
++def test_mid_animation_bilinear_blend_is_between_neighbors():
++    # at a fractional rotation the edge pixels are blends of the quadrant
++    # colors and black; we only assert they stay within bounds
++    frame = quadrant_frame(4)
++    track = KeyframeTrack([(0.0, 0.0), (2.0, 90.0)])
++    out = static_clip(frame, duration=2.0).with_effects(
++        [KeyframeMotion(rotation=track)]
++    )
++    mid = out.get_frame(1.0)
++    assert mid.shape == (4, 4, 3)
++    assert mid.dtype == np.uint8
++
++
++# ------------------------------------------------- integration-style checks
++
++
++def test_deterministic_frames():
++    # rendering the same time twice yields identical frames
++    clip = ColorClip(size=(4, 4), color=(200, 30, 60), duration=2.0)
++    effect = KeyframeMotion(
++        position=KeyframeTrack([(0.0, (1.0, 1.0)), (2.0, (3.0, 3.0))]),
++        rotation=KeyframeTrack([(0.0, 0.0), (2.0, 45.0)]),
++        opacity=KeyframeTrack([(0.0, 1.0), (2.0, 0.5)]),
++    )
++    out = clip.with_effects([effect])
++    assert np.array_equal(out.get_frame(1.0), out.get_frame(1.0))
++    assert np.array_equal(out.get_frame(0.37), out.get_frame(0.37))
++
++
++def test_frame_shape_and_dtype_are_constant_over_time():
++    clip = ColorClip(size=(4, 4), color=(200, 30, 60), duration=3.0)
++    effect = KeyframeMotion(
++        position=KeyframeTrack([(0.0, (0.0, 0.0)), (3.0, (4.0, 4.0))]),
++        scale=KeyframeTrack([(0.0, 0.5), (3.0, 2.0)]),
++        rotation=KeyframeTrack([(0.0, 0.0), (3.0, 180.0)]),
++        opacity=KeyframeTrack([(0.0, 1.0), (3.0, 0.25)]),
++        canvas_size=(6, 5),
++    )
++    out = clip.with_effects([effect])
++    for t in (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0):
++        frame = out.get_frame(t)
++        assert frame.shape == (5, 6, 3)
++        assert frame.dtype == np.uint8
++
++
++def test_rotation_full_turn_animated():
++    # a full 0 -> 360 rotation passes through the 90-degree state exactly
++    # at the quarter time when the easing is linear
++    frame = quadrant_frame(4)
++    track = KeyframeTrack([(0.0, 0.0), (4.0, 360.0)])
++    out = static_clip(frame, duration=4.0).with_effects(
++        [KeyframeMotion(rotation=track)]
++    )
++    assert np.array_equal(out.get_frame(0.0), frame)
++    assert np.array_equal(out.get_frame(1.0), np.rot90(frame))
++    assert np.array_equal(out.get_frame(2.0), np.rot90(frame, 2))
++    assert np.array_equal(out.get_frame(3.0), np.rot90(frame, 3))
++    assert np.array_equal(out.get_frame(4.0), frame)
++
++
++def test_position_diagonal_motion():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small, duration=2.0)
++    track = KeyframeTrack([(0.0, (1.0, 1.0)), (2.0, (5.0, 3.0))])
++    out = clip.with_effects(
++        [KeyframeMotion(position=track, canvas_size=(6, 4))]
++    )
++    # t=1.0 -> center (3, 2) -> top-left (2, 1)
++    frame = out.get_frame(1.0)
++    expected = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected[1:3, 2:4] = 255
++    assert np.array_equal(frame, expected)
++
++
++def test_shifted_track_delays_motion():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small, duration=4.0)
++    base = KeyframeTrack([(0.0, (1.0, 1.0)), (2.0, (5.0, 1.0))])
++    delayed = base.shifted(1.0)
++    out = clip.with_effects(
++        [KeyframeMotion(position=delayed, canvas_size=(6, 4))]
++    )
++    # before the first keyframe the position is clamped to the start
++    expected_start = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected_start[0:2, 0:2] = 255
++    assert np.array_equal(out.get_frame(0.5), expected_start)
++    assert np.array_equal(out.get_frame(1.0), expected_start)
++    # t=2.0 -> progress 0.5 -> center (3, 1) -> top-left (2, 0)
++    expected_mid = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected_mid[0:2, 2:4] = 255
++    assert np.array_equal(out.get_frame(2.0), expected_mid)
++
++
++def test_reversed_track_plays_motion_backwards():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small, duration=2.0)
++    forward = KeyframeTrack([(0.0, (1.0, 1.0)), (2.0, (5.0, 1.0))])
++    out = clip.with_effects(
++        [KeyframeMotion(position=forward.reversed(), canvas_size=(6, 4))]
++    )
++    # t=0 -> the original end position
++    expected_start = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected_start[0:2, 4:6] = 255
++    assert np.array_equal(out.get_frame(0.0), expected_start)
++    # t=2 -> the original start position
++    expected_end = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected_end[0:2, 0:2] = 255
++    assert np.array_equal(out.get_frame(2.0), expected_end)
++
++
++def test_rescaled_track_grows_motion_range():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small, duration=2.0)
++    base = KeyframeTrack([(0.0, (1.0, 1.0)), (2.0, (2.0, 1.0))])
++    out = clip.with_effects(
++        [KeyframeMotion(position=base.rescaled(2.0), canvas_size=(8, 4))]
++    )
++    # t=2 -> center (4, 2) -> top-left (3, 1)
++    expected = np.zeros((4, 8, 3), dtype=np.uint8)
++    expected[1:3, 3:5] = 255
++    assert np.array_equal(out.get_frame(2.0), expected)
++
++
++def test_subclip_after_effect():
++    # the effect composes with the standard clip machinery: subclipping
++    # the animated clip shifts the sampled keyframe times
++    clip = ColorClip(size=(2, 2), color=(255, 255, 255), duration=4.0)
++    effect = KeyframeMotion(
++        position=KeyframeTrack([(0.0, (1.0, 1.0)), (4.0, (5.0, 1.0))]),
++        canvas_size=(6, 4),
++    )
++    out = clip.with_effects([effect]).subclipped(2.0, 4.0)
++    assert out.duration == 2.0
++    # subclip t=0 maps to original t=2 -> center (3, 1) -> top-left (2, 0)
++    frame = out.get_frame(0.0)
++    expected = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected[0:2, 2:4] = 255
++    assert np.array_equal(frame, expected)
++
++
++def test_opacity_exact_multiplication_table():
++    # frozen multiplication cases, all exactly representable
++    cases = [
++        ((200, 100, 48), 1.0, (200, 100, 48)),
++        ((200, 100, 48), 0.5, (100, 50, 24)),
++        ((200, 100, 48), 0.25, (50, 25, 12)),
++        ((128, 64, 32), 0.5, (64, 32, 16)),
++        ((255, 255, 255), 0.2, (51, 51, 51)),
++        ((255, 255, 255), 0.0, (0, 0, 0)),
++    ]
++    for color, opacity, expected in cases:
++        clip = ColorClip(size=(2, 2), color=color, duration=1.0)
++        out = clip.with_effects([KeyframeMotion(opacity=opacity)])
++        pixel = tuple(int(v) for v in out.get_frame(0.0)[0, 0])
++        assert pixel == expected, f"color={color} opacity={opacity}"
++
++
++def test_scale_down_animated_intermediate_size():
++    clip = ColorClip(size=(8, 8), color=(200, 30, 60), duration=2.0)
++    track = KeyframeTrack([(0.0, 1.0), (2.0, 0.5)])
++    out = clip.with_effects([KeyframeMotion(scale=track)])
++    # t=1 -> scale 0.75 -> 6x6 block centered on the 8x8 canvas
++    frame = out.get_frame(1.0)
++    assert np.all(frame[1:7, 1:7] == (200, 30, 60))
++    assert not frame[0, :].any()
++    assert not frame[7, :].any()
++    assert not frame[:, 0].any()
++    assert not frame[:, 7].any()
++
++
++def test_default_position_is_canvas_center():
++    # a clip placed on a canvas larger than itself is centered by default
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small)
++    out = clip.with_effects([KeyframeMotion(canvas_size=(6, 4))])
++    frame = out.get_frame(0.0)
++    expected = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected[1:3, 2:4] = 255
++    assert np.array_equal(frame, expected)
++
++
++def test_rotation_90_of_nonsquare_quadrant_frame():
++    # 2x4 (h x w) frame: left half red, right half green
++    frame = np.zeros((2, 4, 3), dtype=np.uint8)
++    frame[:, :2] = (255, 0, 0)
++    frame[:, 2:] = (0, 255, 0)
++    clip = static_clip(frame)
++    out = clip.with_effects([KeyframeMotion(rotation=90.0)])
++    result = out.get_frame(0.0)
++    # rotating the wide bar 90 degrees CCW turns it into a vertical bar
++    # on the 4x2 canvas: the top column comes from the old right half
++    expected = np.zeros((2, 4, 3), dtype=np.uint8)
++    expected[0, 1:3] = (0, 255, 0)
++    expected[1, 1:3] = (255, 0, 0)
++    assert np.array_equal(result, expected)
++
++
++def test_three_tuple_tracks_are_rejected_for_all_parameters():
++    clip = static_clip(quadrant_frame(4))
++    three = KeyframeTrack([(0.0, (1.0, 2.0, 3.0)), (1.0, (4.0, 5.0, 6.0))])
++    with pytest.raises(ValueError):
++        clip.with_effects([KeyframeMotion(position=three)])
++    with pytest.raises(ValueError):
++        clip.with_effects([KeyframeMotion(scale=three)])
++    with pytest.raises(ValueError):
++        clip.with_effects([KeyframeMotion(rotation=three)])
++    with pytest.raises(ValueError):
++        clip.with_effects([KeyframeMotion(opacity=three)])
++
++
++def test_static_arguments_accept_lists_as_pairs():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small)
++    out = clip.with_effects(
++        [KeyframeMotion(position=[3, 2], scale=[1.0, 1.0], canvas_size=[6, 4])]
++    )
++    frame = out.get_frame(0.0)
++    expected = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected[1:3, 2:4] = 255
++    assert np.array_equal(frame, expected)
++    assert out.size == (6, 4)
++
++
++def test_rotation_track_values_are_unbounded():
++    # rotation angles are not clamped: 450 degrees is the same as 90
++    frame = quadrant_frame(4)
++    out = static_clip(frame).with_effects([KeyframeMotion(rotation=450.0)])
++    assert np.array_equal(out.get_frame(0.0), np.rot90(frame))
++
++
++def test_scale_static_tuple():
++    clip = ColorClip(size=(4, 4), color=(200, 30, 60), duration=1.0)
++    out = clip.with_effects([KeyframeMotion(scale=(0.5, 0.25))])
++    frame = out.get_frame(0.0)
++    # 4x4 -> 2 wide, 1 high, centered on the 4x4 canvas
++    expected = np.zeros((4, 4, 3), dtype=np.uint8)
++    expected[2, 1:3] = (200, 30, 60)
++    assert np.array_equal(frame, expected)
++
++
++def test_mask_and_audio_pass_through_untouched():
++    from moviepy import AudioClip
++
++    clip = static_clip(quadrant_frame(4), duration=2.0)
++    audio = AudioClip(frame_function=lambda t: 0 * t, duration=2.0, fps=8000)
++    mask = VideoClip(
++        frame_function=lambda t: np.ones((4, 4)), is_mask=True, duration=2.0
++    )
++    clip = clip.with_audio(audio).with_mask(mask)
++    out = clip.with_effects([KeyframeMotion(rotation=90.0, opacity=0.5)])
++    assert out.audio is not None
++    assert out.mask is not None
++    assert np.array_equal(out.mask.get_frame(0.0), np.ones((4, 4)))
++
++
++def test_effect_can_be_chained_with_other_effects():
++    clip = ColorClip(size=(4, 4), color=(200, 100, 48), duration=2.0)
++    out = clip.with_effects(
++        [
++            KeyframeMotion(opacity=0.5),
++            vfx.MultiplyColor(0.5),
++        ]
++    )
++    # 200 * 0.5 -> 100, then * 0.5 -> 50
++    assert list(out.get_frame(0.0)[0, 0]) == [50, 25, 12]
++
++
++def test_imageclip_with_duration_is_animatable():
++    from moviepy import ImageClip
++
++    image = ImageClip(quadrant_frame(4), duration=2.0)
++    out = image.with_effects(
++        [KeyframeMotion(rotation=KeyframeTrack([(0.0, 0.0), (2.0, 90.0)]))]
++    )
++    assert np.array_equal(out.get_frame(2.0), np.rot90(quadrant_frame(4)))
++
++
++def test_opacity_with_rescaled_and_reversed_tracks():
++    clip = ColorClip(size=(2, 2), color=(200, 100, 48), duration=2.0)
++    fade_in = KeyframeTrack.ramp(0.5, 1.0, 2.0)
++    fade_out = fade_in.reversed()
++    out = clip.with_effects([KeyframeMotion(opacity=fade_out)])
++    assert list(out.get_frame(0.0)[0, 0]) == [200, 100, 48]
++    assert list(out.get_frame(2.0)[0, 0]) == [100, 50, 24]
++    dimmer = KeyframeMotion(opacity=fade_in.rescaled(0.5))
++    out2 = clip.with_effects([dimmer])
++    assert list(out2.get_frame(0.0)[0, 0]) == [50, 25, 12]
++    assert list(out2.get_frame(2.0)[0, 0]) == [100, 50, 24]
++
++
++def test_position_track_constant_factory():
++    small = np.full((2, 2, 3), 255, dtype=np.uint8)
++    clip = static_clip(small)
++    out = clip.with_effects(
++        [KeyframeMotion(position=KeyframeTrack.constant((3, 2)), canvas_size=(6, 4))]
++    )
++    expected = np.zeros((4, 6, 3), dtype=np.uint8)
++    expected[1:3, 2:4] = 255
++    assert np.array_equal(out.get_frame(0.0), expected)
++    assert np.array_equal(out.get_frame(1.9), expected)
++
++
++def test_rotation_with_ramp_factory():
++    frame = quadrant_frame(4)
++    track = KeyframeTrack.ramp(0.0, 90.0, 1.0)
++    out = static_clip(frame, duration=1.0).with_effects(
++        [KeyframeMotion(rotation=track)]
++    )
++    assert np.array_equal(out.get_frame(1.0), np.rot90(frame))
+diff --git a/tests/test_keyframe_track.py b/tests/test_keyframe_track.py
+new file mode 100644
+index 0000000..19d491c
+--- /dev/null
++++ b/tests/test_keyframe_track.py
+@@ -0,0 +1,488 @@
++"""Tests for :class:`moviepy.keyframe.KeyframeTrack`."""
++
++import pytest
++
++from moviepy import KeyframeTrack
++from moviepy.easing import linear
++
++
++# ------------------------------------------------------------- construction
++
++
++def test_basic_scalar_track():
++    track = KeyframeTrack([(0.0, 0.0), (2.0, 100.0)])
++    assert track.times == (0.0, 2.0)
++    assert track.values == (0.0, 100.0)
++    assert len(track) == 2
++    assert track.duration == 2.0
++    assert track.is_tuple is False
++    assert track.easing is linear
++
++
++def test_values_are_converted_to_floats():
++    track = KeyframeTrack([(0, 1), (1, 2)])
++    assert track.values == (1.0, 2.0)
++    assert all(isinstance(v, float) for v in track.values)
++
++
++def test_tuple_track():
++    track = KeyframeTrack([(0.0, (0, 0)), (1.0, (10, 20))])
++    assert track.is_tuple is True
++    assert track.values == ((0.0, 0.0), (10.0, 20.0))
++
++
++def test_single_keyframe_is_constant():
++    track = KeyframeTrack([(1.5, 42.0)])
++    assert track.duration == 1.5
++    assert track.value_at(0.0) == 42.0
++    assert track.value_at(1.5) == 42.0
++    assert track.value_at(100.0) == 42.0
++
++
++def test_keyframes_accept_generators():
++    track = KeyframeTrack((t, t * 2) for t in (0.0, 1.0, 2.0))
++    assert track.times == (0.0, 1.0, 2.0)
++    assert track.values == (0.0, 2.0, 4.0)
++
++
++def test_repr_mentions_class_name():
++    track = KeyframeTrack([(0.0, 1.0)])
++    assert "KeyframeTrack" in repr(track)
++
++
++# -------------------------------------------------------- construction errors
++
++
++def test_empty_keyframes_raise_value_error():
++    with pytest.raises(ValueError):
++        KeyframeTrack([])
++
++
++def test_non_iterable_keyframes_raise_type_error():
++    with pytest.raises(TypeError):
++        KeyframeTrack(42)
++    with pytest.raises(TypeError):
++        KeyframeTrack("not-a-track")
++
++
++def test_malformed_keyframe_pairs_raise_type_error():
++    with pytest.raises(TypeError):
++        KeyframeTrack([(0.0, 1.0, 2.0)])
++    with pytest.raises(TypeError):
++        KeyframeTrack([0.0, 1.0])
++
++
++def test_non_numeric_time_raises_type_error():
++    with pytest.raises(TypeError):
++        KeyframeTrack([("0", 1.0)])
++    with pytest.raises(TypeError):
++        KeyframeTrack([(None, 1.0)])
++    with pytest.raises(TypeError):
++        KeyframeTrack([(True, 1.0)])
++
++
++def test_negative_time_raises_value_error():
++    with pytest.raises(ValueError):
++        KeyframeTrack([(-1.0, 0.0), (1.0, 1.0)])
++
++
++def test_non_increasing_times_raise_value_error():
++    with pytest.raises(ValueError):
++        KeyframeTrack([(1.0, 0.0), (0.5, 1.0)])
++    with pytest.raises(ValueError):
++        KeyframeTrack([(1.0, 0.0), (1.0, 1.0)])
++
++
++def test_non_numeric_value_raises_type_error():
++    with pytest.raises(TypeError):
++        KeyframeTrack([(0.0, "fast")])
++    with pytest.raises(TypeError):
++        KeyframeTrack([(0.0, True)])
++    with pytest.raises(TypeError):
++        KeyframeTrack([(0.0, (1.0, "x"))])
++
++
++def test_mixed_scalar_and_tuple_values_raise_value_error():
++    with pytest.raises(ValueError):
++        KeyframeTrack([(0.0, 1.0), (1.0, (1.0, 2.0))])
++
++
++def test_inconsistent_tuple_lengths_raise_value_error():
++    with pytest.raises(ValueError):
++        KeyframeTrack([(0.0, (1.0, 2.0)), (1.0, (1.0, 2.0, 3.0))])
++
++
++def test_too_short_tuples_raise_value_error():
++    with pytest.raises(ValueError):
++        KeyframeTrack([(0.0, (1.0,))])
++
++
++def test_unknown_easing_name_raises_value_error():
++    with pytest.raises(ValueError):
++        KeyframeTrack([(0.0, 0.0), (1.0, 1.0)], easing="ease_sideways")
++
++
++def test_non_callable_easing_raises_type_error():
++    with pytest.raises(TypeError):
++        KeyframeTrack([(0.0, 0.0), (1.0, 1.0)], easing=42)
++
++
++# ------------------------------------------------------------- evaluation
++
++
++def test_value_at_keyframes_exact():
++    track = KeyframeTrack([(0.0, 10.0), (1.0, 20.0), (3.0, 60.0)])
++    assert track.value_at(0.0) == 10.0
++    assert track.value_at(1.0) == 20.0
++    assert track.value_at(3.0) == 60.0
++
++
++def test_linear_interpolation():
++    track = KeyframeTrack([(0.0, 0.0), (2.0, 100.0)])
++    assert track.value_at(0.5) == pytest.approx(25.0)
++    assert track.value_at(1.0) == pytest.approx(50.0)
++    assert track.value_at(1.5) == pytest.approx(75.0)
++
++
++def test_interpolation_is_per_segment():
++    track = KeyframeTrack([(0.0, 0.0), (1.0, 10.0), (3.0, 50.0)])
++    # second segment: 10 -> 50 over [1, 3]
++    assert track.value_at(2.0) == pytest.approx(30.0)
++
++
++def test_clamping_outside_range():
++    track = KeyframeTrack([(1.0, 5.0), (2.0, 15.0)])
++    assert track.value_at(0.0) == 5.0
++    assert track.value_at(0.999) == 5.0
++    assert track.value_at(2.0) == 15.0
++    assert track.value_at(100.0) == 15.0
++
++
++def test_easing_is_applied_to_progress():
++    track = KeyframeTrack([(0.0, 0.0), (2.0, 100.0)], easing="ease_in_quad")
++    # progress 0.5 -> eased 0.25
++    assert track.value_at(1.0) == pytest.approx(25.0)
++    # progress 0.25 -> eased 0.0625
++    assert track.value_at(0.5) == pytest.approx(6.25)
++
++
++def test_hold_easing_steps_at_segment_end():
++    track = KeyframeTrack(
++        [(0.0, 0.0), (1.0, 10.0), (2.0, 20.0)], easing="hold"
++    )
++    assert track.value_at(0.0) == 0.0
++    assert track.value_at(0.999) == 0.0
++    assert track.value_at(1.0) == 10.0
++    assert track.value_at(1.5) == 10.0
++    assert track.value_at(2.0) == 20.0
++
++
++def test_custom_callable_easing():
++    track = KeyframeTrack(
++        [(0.0, 0.0), (1.0, 10.0)], easing=lambda p: p * p * p
++    )
++    assert track.value_at(0.5) == pytest.approx(1.25)
++
++
++def test_tuple_interpolation_componentwise():
++    track = KeyframeTrack([(0.0, (0.0, 100.0)), (2.0, (10.0, 200.0))])
++    assert track.value_at(1.0) == pytest.approx((5.0, 150.0))
++    x, y = track.value_at(1.0)
++    assert isinstance(x, float) and isinstance(y, float)
++
++
++def test_tuple_clamping():
++    track = KeyframeTrack([(1.0, (0.0, 0.0)), (2.0, (4.0, 8.0))])
++    assert track.value_at(0.0) == (0.0, 0.0)
++    assert track.value_at(5.0) == (4.0, 8.0)
++
++
++def test_tuple_track_with_easing():
++    track = KeyframeTrack(
++        [(0.0, (0.0, 0.0)), (1.0, (10.0, 20.0))], easing="ease_in_cubic"
++    )
++    # progress 0.5 -> eased 0.125
++    assert track.value_at(0.5) == pytest.approx((1.25, 2.5))
++
++
++def test_value_at_rejects_non_numeric_time():
++    track = KeyframeTrack([(0.0, 0.0), (1.0, 1.0)])
++    with pytest.raises(TypeError):
++        track.value_at("0.5")
++    with pytest.raises(TypeError):
++        track.value_at(None)
++
++
++def test_three_component_tuples():
++    track = KeyframeTrack([(0.0, (0.0, 0.0, 0.0)), (1.0, (3.0, 6.0, 9.0))])
++    assert track.value_at(0.5) == pytest.approx((1.5, 3.0, 4.5))
++
++
++# ------------------------------------------------------------- transforms
++
++
++def test_rescaled_scalar_track():
++    track = KeyframeTrack([(0.0, 1.0), (2.0, 5.0)])
++    scaled = track.rescaled(3.0)
++    assert scaled.times == track.times
++    assert scaled.values == (3.0, 15.0)
++    assert scaled.value_at(1.0) == pytest.approx(9.0)
++    # the original track is unchanged
++    assert track.values == (1.0, 5.0)
++
++
++def test_rescaled_tuple_track():
++    track = KeyframeTrack([(0.0, (1.0, -2.0)), (1.0, (3.0, 4.0))])
++    scaled = track.rescaled(0.5)
++    assert scaled.values == ((0.5, -1.0), (1.5, 2.0))
++    assert scaled.value_at(0.5) == pytest.approx((1.0, 0.5))
++
++
++def test_rescaled_preserves_easing():
++    track = KeyframeTrack([(0.0, 0.0), (1.0, 10.0)], easing="ease_in_quad")
++    scaled = track.rescaled(2.0)
++    assert scaled.easing is track.easing
++    assert scaled.value_at(0.5) == pytest.approx(2.0 * 10.0 * 0.25)
++
++
++def test_rescaled_rejects_non_numeric_factor():
++    track = KeyframeTrack([(0.0, 1.0)])
++    with pytest.raises(TypeError):
++        track.rescaled("double")
++    with pytest.raises(TypeError):
++        track.rescaled((2.0, 2.0))
++
++
++def test_shifted_moves_times():
++    track = KeyframeTrack([(1.0, 10.0), (3.0, 30.0)])
++    shifted = track.shifted(2.0)
++    assert shifted.times == (3.0, 5.0)
++    assert shifted.values == track.values
++    assert shifted.value_at(3.0) == 10.0
++    assert shifted.value_at(4.0) == 20.0
++    # shifting also moves the clamping window
++    assert shifted.value_at(0.0) == 10.0
++    # the original track is unchanged
++    assert track.times == (1.0, 3.0)
++
++
++def test_shifted_negative_offset():
++    track = KeyframeTrack([(2.0, 1.0), (4.0, 2.0)])
++    shifted = track.shifted(-2.0)
++    assert shifted.times == (0.0, 2.0)
++
++
++def test_shifted_below_zero_raises_value_error():
++    track = KeyframeTrack([(1.0, 1.0), (2.0, 2.0)])
++    with pytest.raises(ValueError):
++        track.shifted(-1.5)
++
++
++def test_shifted_rejects_non_numeric_offset():
++    track = KeyframeTrack([(0.0, 1.0)])
++    with pytest.raises(TypeError):
++        track.shifted("later")
++
++
++def test_shifted_preserves_easing():
++    track = KeyframeTrack([(0.0, 0.0), (1.0, 1.0)], easing="hold")
++    assert track.shifted(1.0).easing is track.easing
++
++
++def test_reversed_track():
++    track = KeyframeTrack([(0.0, 0.0), (1.0, 10.0), (3.0, 50.0)])
++    reversed_track = track.reversed()
++    assert reversed_track.times == (0.0, 2.0, 3.0)
++    assert reversed_track.values == (50.0, 10.0, 0.0)
++    assert reversed_track.duration == track.duration
++    # with linear easing, reversed.value_at(t) == track.value_at(end - t)
++    for t in (0.0, 0.5, 1.0, 2.5, 3.0):
++        assert reversed_track.value_at(t) == pytest.approx(
++            track.value_at(3.0 - t)
++        )
++    # the original track is unchanged
++    assert track.values == (0.0, 10.0, 50.0)
++
++
++def test_reversed_tuple_track():
++    track = KeyframeTrack([(1.0, (0.0, 0.0)), (3.0, (4.0, 8.0))])
++    reversed_track = track.reversed()
++    assert reversed_track.times == (0.0, 2.0)
++    assert reversed_track.values == ((4.0, 8.0), (0.0, 0.0))
++    assert reversed_track.value_at(1.0) == pytest.approx((2.0, 4.0))
++
++
++def test_reversed_single_keyframe():
++    track = KeyframeTrack([(2.0, 7.0)])
++    reversed_track = track.reversed()
++    assert reversed_track.times == (0.0,)
++    assert reversed_track.values == (7.0,)
++
++
++def test_transforms_compose():
++    track = KeyframeTrack([(0.0, 1.0), (2.0, 3.0)])
++    result = track.rescaled(2.0).shifted(1.0).reversed()
++    assert result.times == (0.0, 2.0)
++    assert result.values == (6.0, 2.0)
++    assert track.times == (0.0, 2.0)
++    assert track.values == (1.0, 3.0)
++
++
++# ------------------------------------------------------------- factories
++
++
++def test_constant_scalar_factory():
++    track = KeyframeTrack.constant(3.5)
++    assert track.times == (0.0,)
++    assert track.values == (3.5,)
++    assert track.value_at(0.0) == 3.5
++    assert track.value_at(10.0) == 3.5
++
++
++def test_constant_tuple_factory():
++    track = KeyframeTrack.constant((1, 2))
++    assert track.is_tuple
++    assert track.value_at(5.0) == (1.0, 2.0)
++
++
++def test_constant_factory_validates_value():
++    with pytest.raises(TypeError):
++        KeyframeTrack.constant("still")
++    with pytest.raises(ValueError):
++        KeyframeTrack.constant((1.0,))
++
++
++def test_ramp_factory():
++    track = KeyframeTrack.ramp(0.0, 100.0, 2.0)
++    assert track.times == (0.0, 2.0)
++    assert track.values == (0.0, 100.0)
++    assert track.value_at(1.0) == pytest.approx(50.0)
++    assert track.value_at(99.0) == 100.0
++
++
++def test_ramp_factory_with_easing():
++    track = KeyframeTrack.ramp(0.0, 1.0, 1.0, easing="ease_in_quad")
++    assert track.value_at(0.5) == pytest.approx(0.25)
++
++
++def test_ramp_factory_tuple_values():
++    track = KeyframeTrack.ramp((0, 0), (10, 20), 1.0)
++    assert track.value_at(0.5) == pytest.approx((5.0, 10.0))
++
++
++def test_ramp_factory_rejects_bad_duration():
++    with pytest.raises(ValueError):
++        KeyframeTrack.ramp(0.0, 1.0, 0.0)
++    with pytest.raises(ValueError):
++        KeyframeTrack.ramp(0.0, 1.0, -1.0)
++    with pytest.raises(TypeError):
++        KeyframeTrack.ramp(0.0, 1.0, "a while")
++
++
++def test_ramp_factory_rejects_mismatched_values():
++    with pytest.raises(ValueError):
++        KeyframeTrack.ramp(0.0, (1.0, 2.0), 1.0)
++    with pytest.raises(ValueError):
++        KeyframeTrack.ramp((0.0, 0.0), (1.0, 2.0, 3.0), 1.0)
++
++
++# --------------------------------------------- easing coverage through tracks
++
++
++@pytest.mark.parametrize(
++    "easing_name",
++    sorted(__import__("moviepy.easing", fromlist=["EASINGS"]).EASINGS),
++)
++def test_unit_ramp_matches_easing_at_sample_points(easing_name):
++    """A 0 -> 1 ramp over [0, 1] must sample its easing exactly."""
++    from moviepy.easing import EASINGS
++
++    track = KeyframeTrack([(0.0, 0.0), (1.0, 1.0)], easing=easing_name)
++    func = EASINGS[easing_name]
++    for i in range(11):
++        p = i / 10.0
++        assert track.value_at(p) == pytest.approx(func(p), abs=1e-12)
++
++
++@pytest.mark.parametrize(
++    "easing_name", ["linear", "ease_in_quad", "ease_out_expo", "ease_in_out_back"]
++)
++def test_easing_scales_and_offsets_linearly(easing_name):
++    """a + (b - a) * easing(p) for arbitrary a, b and segment bounds."""
++    from moviepy.easing import EASINGS
++
++    track = KeyframeTrack([(1.0, -4.0), (3.0, 6.0)], easing=easing_name)
++    func = EASINGS[easing_name]
++    for i in range(11):
++        p = i / 10.0
++        assert track.value_at(1.0 + 2.0 * p) == pytest.approx(
++            -4.0 + 10.0 * func(p), abs=1e-9
++        )
++
++
++# ------------------------------------------------------------- numeric types
++
++
++def test_integer_times_and_values_are_accepted():
++    track = KeyframeTrack([(0, 0), (2, 4)])
++    assert track.times == (0.0, 2.0)
++    assert track.value_at(1) == 2.0
++
++
++def test_numpy_scalar_types_are_accepted():
++    np = pytest.importorskip("numpy")
++    track = KeyframeTrack(
++        [(np.float64(0.0), np.int64(1)), (np.float64(1.0), np.float32(2.0))]
++    )
++    assert track.value_at(0.5) == pytest.approx(1.5)
++
++
++def test_numpy_scalar_time_argument():
++    np = pytest.importorskip("numpy")
++    track = KeyframeTrack([(0.0, 0.0), (1.0, 10.0)])
++    assert track.value_at(np.float64(0.5)) == pytest.approx(5.0)
++
++
++def test_value_at_returns_float_not_int():
++    track = KeyframeTrack([(0, 0), (2, 4)])
++    assert isinstance(track.value_at(1), float)
++    assert isinstance(track.times[0], float)
++
++
++def test_tracks_with_many_keyframes():
++    keyframes = [(float(i), float(i * i)) for i in range(20)]
++    track = KeyframeTrack(keyframes)
++    assert len(track) == 20
++    assert track.duration == 19.0
++    assert track.value_at(10.5) == pytest.approx((100.0 + 121.0) / 2.0)
++    for i in range(20):
++        assert track.value_at(float(i)) == float(i * i)
++
++
++def test_track_immutability_of_input_list():
++    keyframes = [[0.0, 1.0], [1.0, 2.0]]
++    track = KeyframeTrack(keyframes)
++    keyframes[0][1] = 999.0
++    keyframes.append((2.0, 3.0))
++    assert track.values == (1.0, 2.0)
++    assert len(track) == 2
++
++
++@pytest.mark.parametrize(
++    "easing_name",
++    sorted(__import__("moviepy.easing", fromlist=["EASINGS"]).EASINGS),
++)
++def test_tuple_ramp_matches_easing_componentwise(easing_name):
++    """Tuple tracks ease every component with the same eased progress."""
++    from moviepy.easing import EASINGS
++
++    track = KeyframeTrack(
++        [(0.0, (0.0, 10.0)), (1.0, (4.0, 50.0))], easing=easing_name
++    )
++    func = EASINGS[easing_name]
++    for i in range(11):
++        p = i / 10.0
++        eased = func(p)
++        assert track.value_at(p) == pytest.approx(
++            (4.0 * eased, 10.0 + 40.0 * eased), abs=1e-9
++        )

@@ -1,0 +1,866 @@
+diff --git a/fs/opener/__init__.py b/fs/opener/__init__.py
+index 651a630..7b432fd 100644
+--- a/fs/opener/__init__.py
++++ b/fs/opener/__init__.py
+@@ -6,7 +6,7 @@
+ __import__("pkg_resources").declare_namespace(__name__)  # type: ignore
+ 
+ # Import opener modules so that `registry.install` if called on each opener
+-from . import appfs, ftpfs, memoryfs, osfs, tarfs, tempfs, zipfs
++from . import appfs, ftpfs, memoryfs, osfs, overlayfs, tarfs, tempfs, zipfs
+ 
+ # Import objects into fs.opener namespace
+ from .base import Opener
+diff --git a/fs/opener/overlayfs.py b/fs/opener/overlayfs.py
+new file mode 100644
+index 0000000..9e622b2
+--- /dev/null
++++ b/fs/opener/overlayfs.py
+@@ -0,0 +1,59 @@
++# coding: utf-8
++"""`OverlayFS` opener definition.
++"""
++
++from __future__ import absolute_import, print_function, unicode_literals
++
++import typing
++
++from .base import Opener
++from .errors import OpenerError
++from .registry import registry
++
++if typing.TYPE_CHECKING:
++    from typing import Text
++
++    from ..overlayfs import OverlayFS  # noqa: F401
++    from .parse import ParseResult
++
++
++@registry.install
++class OverlayOpener(Opener):
++    """`OverlayFS` opener.
++
++    Opens a copy-on-write overlay.  The URL resource names the *lower*
++    (read-only) filesystem as a nested FS URL; the upper (writable) layer
++    is always a fresh in-memory scratch layer.  A bare ``overlay://``
++    yields an empty scratch overlay.
++
++    Examples:
++        ``overlay://``                  -- empty scratch overlay
++        ``overlay://mem://``            -- overlay over an empty memory FS
++        ``overlay://osfs:///data``      -- writable scratch over /data
++    """
++
++    protocols = ["overlay"]
++
++    def open_fs(
++        self,
++        fs_url,  # type: Text
++        parse_result,  # type: ParseResult
++        writeable,  # type: bool
++        create,  # type: bool
++        cwd,  # type: Text
++    ):
++        # type: (...) -> OverlayFS
++        from ..memoryfs import MemoryFS
++        from ..overlayfs import OverlayFS
++
++        lower_url = parse_result.resource
++        if lower_url:
++            try:
++                lower_fs = registry.open_fs(lower_url, writeable=False, cwd=cwd)
++            except Exception as error:
++                raise OpenerError(
++                    "failed to open lower filesystem {!r}: {}".format(lower_url, error)
++                )
++        else:
++            lower_fs = MemoryFS()
++        return OverlayFS(lower_fs, MemoryFS())
+diff --git a/fs/overlayfs.py b/fs/overlayfs.py
+new file mode 100644
+index 0000000..392a874
+--- /dev/null
++++ b/fs/overlayfs.py
+@@ -0,0 +1,644 @@
++# coding: utf-8
++"""A copy-on-write overlay of two filesystems.
++
++`OverlayFS` presents a single merged view of two filesystems: a
++read-only *lower* filesystem and a writable *upper* filesystem.  Reads
++are served from the upper layer when a resource exists there and fall
++back to the lower layer otherwise; every mutation is directed at the
++upper layer, leaving the lower layer untouched.  This mirrors the
++semantics of a union mount such as Linux ``overlayfs`` and is useful
++whenever a pristine base image must stay immutable while callers make
++changes on top of it -- container root filesystems, reproducible build
++sandboxes, or "scratch" edits over a shipped dataset.
++
++The three operations that make an overlay more than a simple search
++path are handled explicitly:
++
++* **copy-up** -- writing to (or otherwise modifying) a resource that
++  only exists in the lower layer first copies it into the upper layer,
++  so the lower layer is never mutated.
++* **whiteouts** -- deleting a resource that exists in the lower layer
++  records a *whiteout* marker in the upper layer, hiding the lower
++  resource from the merged view without touching the lower layer.
++* **opaque directories** -- recreating a directory that was deleted
++  marks it *opaque*, so stale lower-layer children do not reappear.
++"""
++
++from __future__ import absolute_import, unicode_literals
++
++import typing
++
++import io
++
++import six
++
++from . import errors
++from .base import FS
++from .enums import ResourceType, Seek
++from .info import Info
++from .mode import Mode
++from .path import abspath, dirname, iteratepath, join, normpath, recursepath, split
++
++if typing.TYPE_CHECKING:
++    from typing import (
++        Any,
++        BinaryIO,
++        Collection,
++        Dict,
++        Iterator,
++        List,
++        Optional,
++        Set,
++        Text,
++        Tuple,
++    )
++
++    from .info import RawInfo
++    from .permissions import Permissions
++    from .subfs import SubFS
++
++    _O = typing.TypeVar("_O", bound="OverlayFS")
++
++
++# Whiteout and opacity are recorded inside the upper filesystem using
++# reserved names, following the convention used by ``overlayfs``.  A
++# whiteout marker ``<dir>/.wh.<name>`` hides ``<dir>/<name>`` from the
++# lower layer; the marker ``<dir>/.wh..wh..opq`` marks ``<dir>`` opaque,
++# hiding *every* lower-layer child of that directory.
++_WH_PREFIX = ".wh."
++_OPAQUE_NAME = ".wh..wh..opq"
++
++
++def _whiteout_name(name):
++    # type: (Text) -> Text
++    return _WH_PREFIX + name
++
++
++def _is_whiteout(name):
++    # type: (Text) -> bool
++    return name.startswith(_WH_PREFIX) and name != _OPAQUE_NAME and name != _WH_PREFIX
++
++
++def _whitedout_target(name):
++    # type: (Text) -> Text
++    return name[len(_WH_PREFIX):]
++
++
++@six.python_2_unicode_compatible
++class _OverlayFile(io.RawIOBase):
++    """A writable handle that keeps the merged view consistent.
++
++    The overlay always opens the *upper*-layer copy of a file (creating
++    it via copy-up when necessary).  This thin wrapper simply forwards to
++    that underlying handle; it exists so the overlay can present handles
++    whose ``repr`` and lifecycle are its own rather than the backing
++    filesystem's.
++    """
++
++    def __init__(self, wrapped, path, mode):
++        # type: (BinaryIO, Text, Text) -> None
++        super(_OverlayFile, self).__init__()
++        self._wrapped = wrapped
++        self._path = path
++        self._mode = Mode(mode)
++
++    def __str__(self):
++        # type: () -> str
++        return "<overlayfile '{}' '{}'>".format(self._path, self._mode)
++
++    @property
++    def mode(self):
++        # type: () -> Text
++        return self._mode.to_platform_bin()
++
++    def close(self):
++        # type: () -> None
++        if not self.closed:
++            try:
++                self._wrapped.close()
++            finally:
++                super(_OverlayFile, self).close()
++
++    def flush(self):
++        # type: () -> None
++        self._wrapped.flush()
++
++    def readable(self):
++        # type: () -> bool
++        return self._mode.reading
++
++    def writable(self):
++        # type: () -> bool
++        return self._mode.writing
++
++    def seekable(self):
++        # type: () -> bool
++        return True
++
++    def tell(self):
++        # type: () -> int
++        return self._wrapped.tell()
++
++    def seek(self, pos, whence=Seek.set):
++        # type: (int, int) -> int
++        return self._wrapped.seek(pos, int(whence))
++
++    def read(self, size=-1):
++        # type: (int) -> bytes
++        if not self._mode.reading:
++            raise IOError("File not open for reading")
++        return self._wrapped.read(size if size is not None and size >= 0 else None)
++
++    def readinto(self, buffer):
++        # type: (bytearray) -> Optional[int]
++        if not self._mode.reading:
++            raise IOError("File not open for reading")
++        data = self._wrapped.read(len(buffer))
++        if not data:
++            return 0
++        buffer[: len(data)] = data
++        return len(data)
++
++    def readline(self, size=-1):
++        # type: (int) -> bytes
++        if not self._mode.reading:
++            raise IOError("File not open for reading")
++        return self._wrapped.readline(size)
++
++    def readlines(self, hint=-1):
++        # type: (int) -> List[bytes]
++        if not self._mode.reading:
++            raise IOError("File not open for reading")
++        return self._wrapped.readlines(hint)
++
++    def __iter__(self):
++        # type: () -> Iterator[bytes]
++        return iter(self._wrapped)
++
++    def write(self, data):
++        # type: (bytes) -> int
++        if not self._mode.writing:
++            raise IOError("File not open for writing")
++        return self._wrapped.write(data)
++
++    def writelines(self, lines):
++        # type: (Any) -> None
++        for line in lines:
++            self.write(line)
++
++    def truncate(self, size=None):
++        # type: (Optional[int]) -> int
++        return self._wrapped.truncate(size)
++
++
++@six.python_2_unicode_compatible
++class OverlayFS(FS):
++    """A copy-on-write union of a read-only lower and writable upper FS.
++
++    Arguments:
++        lower_fs (FS): The read-only base filesystem.  It is never
++            modified through the overlay.
++        upper_fs (FS): The writable filesystem that receives all
++            changes.  If omitted, an in-memory filesystem is used, in
++            which case the overlay behaves like a scratch layer whose
++            edits vanish when it is closed.
++        auto_close (bool): If `True` (the default), the lower and upper
++            filesystems are closed when the overlay is closed.
++
++    """
++
++    _meta = {
++        "case_insensitive": False,
++        "invalid_path_chars": "\0",
++        "network": False,
++        "read_only": False,
++        "supports_rename": False,
++        "thread_safe": True,
++        "unicode_paths": True,
++        "virtual": True,
++    }  # type: Dict[Text, object]
++
++    def __init__(self, lower_fs, upper_fs=None, auto_close=True):
++        # type: (FS, Optional[FS], bool) -> None
++        super(OverlayFS, self).__init__()
++        from .memoryfs import MemoryFS
++
++        self._lower = lower_fs
++        self._upper = upper_fs if upper_fs is not None else MemoryFS()
++        self._auto_close = auto_close
++
++    def __repr__(self):
++        # type: () -> str
++        return "OverlayFS({!r}, {!r})".format(self._lower, self._upper)
++
++    def __str__(self):
++        # type: () -> str
++        return "<overlayfs {} over {}>".format(self._upper, self._lower)
++
++    # -- Whiteout / opacity bookkeeping -----------------------------------
++
++    def _wh_path(self, path):
++        # type: (Text) -> Text
++        """The upper-layer path of the whiteout marker for ``path``."""
++        head, tail = split(normpath(path))
++        return join(head, _whiteout_name(tail))
++
++    def _opaque_path(self, path):
++        # type: (Text) -> Text
++        return join(normpath(path), _OPAQUE_NAME)
++
++    def _is_whiteout_present(self, path):
++        # type: (Text) -> bool
++        """Is ``path`` hidden by a whiteout marker in the upper layer?"""
++        _path = normpath(path)
++        if _path == "/":
++            return False
++        return self._upper.isfile(self._wh_path(_path))
++
++    def _is_hidden_by_opaque(self, path):
++        # type: (Text) -> bool
++        """Is ``path`` a lower-only child of an opaque upper directory?"""
++        _path = normpath(path)
++        if _path == "/":
++            return False
++        parent = dirname(_path)
++        # Any opaque ancestor whose subtree is not re-established in the
++        # upper layer hides the lower resource.
++        for ancestor in recursepath(parent):
++            if self._upper.isfile(self._opaque_path(ancestor)):
++                # The directory is opaque; a lower resource beneath it is
++                # only visible if the upper layer re-creates the chain.
++                if not self._upper_has(_path):
++                    return True
++        return False
++
++    def _upper_has(self, path):
++        # type: (Text) -> bool
++        try:
++            return self._upper.exists(path)
++        except errors.ResourceError:
++            return False
++
++    def _hidden(self, path):
++        # type: (Text) -> bool
++        """Should the lower-layer view of ``path`` be suppressed?"""
++        return self._is_whiteout_present(path) or self._is_hidden_by_opaque(path)
++
++    # -- Resolution --------------------------------------------------------
++
++    def _which(self, path):
++        # type: (Text) -> Tuple[Optional[FS], Text]
++        """Return the layer that should serve ``path`` (or ``None``).
++
++        The upper layer wins when the resource exists there.  Otherwise
++        the lower layer serves it, unless it is hidden by a whiteout or
++        an opaque ancestor.
++        """
++        _path = normpath(path)
++        if self._upper_has(_path):
++            return self._upper, _path
++        if self._hidden(_path):
++            return None, _path
++        if self._lower.exists(_path):
++            return self._lower, _path
++        return None, _path
++
++    def _exists(self, path):
++        # type: (Text) -> bool
++        layer, _ = self._which(path)
++        return layer is not None
++
++    # -- Copy-up -----------------------------------------------------------
++
++    def _ensure_upper_dir(self, path):
++        # type: (Text) -> None
++        """Recreate the directory chain ``path`` in the upper layer.
++
++        Directories present only in the lower layer are materialised in
++        the upper layer (without their children) so that a child can be
++        written.  A previously whited-out directory has its marker
++        removed as it is re-established.
++        """
++        _path = normpath(path)
++        for ancestor in recursepath(_path):
++            if ancestor == "/":
++                continue
++            wh = self._wh_path(ancestor)
++            if self._upper.isfile(wh):
++                self._upper.remove(wh)
++            if not self._upper.isdir(ancestor):
++                if self._upper.exists(ancestor):
++                    raise errors.DirectoryExpected(ancestor)
++                self._upper.makedir(ancestor)
++
++    def _copy_up_file(self, path):
++        # type: (Text) -> None
++        """Copy a lower-layer file into the upper layer, if needed."""
++        _path = normpath(path)
++        if self._upper_has(_path):
++            return
++        if not self._lower.isfile(_path):
++            return
++        self._ensure_upper_dir(dirname(_path))
++        data = self._lower.readbytes(_path)
++        self._upper.writebytes(_path, data)
++        # Carry over the timestamps we can read from the lower layer.
++        try:
++            info = self._lower.getinfo(_path, namespaces=["details"])
++            self._upper.setinfo(
++                _path,
++                {
++                    "details": {
++                        "accessed": info.get("details", "accessed"),
++                        "modified": info.get("details", "modified"),
++                    }
++                },
++            )
++        except errors.ResourceError:
++            pass
++
++    def _clear_whiteout(self, path):
++        # type: (Text) -> None
++        wh = self._wh_path(path)
++        if self._upper.isfile(wh):
++            self._upper.remove(wh)
++
++    # -- Required FS methods ----------------------------------------------
++
++    def getinfo(self, path, namespaces=None):
++        # type: (Text, Optional[Collection[Text]]) -> Info
++        self.check()
++        _path = self.validatepath(path)
++        layer, target = self._which(_path)
++        if layer is None:
++            raise errors.ResourceNotFound(path)
++        return layer.getinfo(target, namespaces=namespaces)
++
++    def listdir(self, path):
++        # type: (Text) -> List[Text]
++        self.check()
++        _path = self.validatepath(path)
++        if not self._exists(_path):
++            raise errors.ResourceNotFound(path)
++        # The merged listing is the union of both layers, minus whiteouts
++        # and reserved markers; an opaque directory drops the lower layer
++        # entirely.
++        names = []  # type: List[Text]
++        seen = set()  # type: Set[Text]
++
++        upper_is_dir = self._upper.isdir(_path)
++        if not upper_is_dir and self._upper.exists(_path):
++            raise errors.DirectoryExpected(path)
++
++        opaque = upper_is_dir and self._upper.isfile(self._opaque_path(_path))
++        whiteouts = set()  # type: Set[Text]
++
++        if upper_is_dir:
++            for name in self._upper.listdir(_path):
++                if name == _OPAQUE_NAME:
++                    continue
++                if _is_whiteout(name):
++                    whiteouts.add(_whitedout_target(name))
++                    continue
++                if name.startswith(_WH_PREFIX):
++                    # Reserved marker that is neither a plain whiteout nor
++                    # the opacity flag -- never surfaced to callers.
++                    continue
++                if name not in seen:
++                    names.append(name)
++                    seen.add(name)
++
++        if not opaque and self._lower.isdir(_path):
++            for name in self._lower.listdir(_path):
++                if name in seen or name in whiteouts:
++                    continue
++                names.append(name)
++                seen.add(name)
++
++        return names
++
++    def makedir(self, path, permissions=None, recreate=False):
++        # type: (Text, Optional[Permissions], bool) -> SubFS[OverlayFS]
++        self.check()
++        _path = self.validatepath(path)
++        if _path == "/":
++            if recreate:
++                return self.opendir(path)
++            raise errors.DirectoryExists(path)
++        dir_path, dir_name = split(_path)
++        if not self._exists(dir_path):
++            raise errors.ResourceNotFound(path)
++        if not self.isdir(dir_path):
++            raise errors.DirectoryExpected(dir_path)
++        if self._exists(_path):
++            if recreate and self.isdir(_path):
++                return self.opendir(path)
++            raise errors.DirectoryExists(path)
++        self._ensure_upper_dir(dir_path)
++        self._clear_whiteout(_path)
++        # If the lower layer has children at this path, mark the new upper
++        # directory opaque so those stale children stay hidden.
++        self._upper.makedir(_path, permissions=permissions)
++        if self._lower.isdir(_path):
++            self._upper.touch(self._opaque_path(_path))
++        return self.opendir(path)
++
++    def openbin(self, path, mode="r", buffering=-1, **options):
++        # type: (Text, Text, int, **Any) -> BinaryIO
++        self.check()
++        _mode = Mode(mode)
++        _mode.validate_bin()
++        _path = self.validatepath(path)
++        dir_path, file_name = split(_path)
++        if not file_name:
++            raise errors.FileExpected(path)
++
++        exists = self._exists(_path)
++        if self.isdir(_path) if exists else False:
++            raise errors.FileExpected(path)
++
++        if not _mode.create and not exists:
++            raise errors.ResourceNotFound(path)
++        if _mode.exclusive and exists:
++            raise errors.FileExists(path)
++
++        # The parent directory must exist in the merged view.
++        if not self._exists(dir_path):
++            raise errors.ResourceNotFound(path)
++        if not self.isdir(dir_path):
++            raise errors.DirectoryExpected(dir_path)
++
++        # All writes land in the upper layer, so make sure the parent
++        # chain is present there first.
++        if _mode.writing:
++            self._ensure_upper_dir(dir_path)
++            self._clear_whiteout(_path)
++            if not self._upper_has(_path):
++                if exists and self._lower.isfile(_path) and not _mode.truncate:
++                    # Copy the lower file up so appends/updates see content.
++                    self._copy_up_file(_path)
++                else:
++                    self._upper.create(_path)
++            # The exclusive check is enforced above; the upper copy now
++            # exists, so open it with a non-exclusive equivalent mode.
++            open_mode = mode.replace("x", "w") if _mode.exclusive else mode
++            handle = self._upper.openbin(_path, open_mode, buffering, **options)
++            return _OverlayFile(handle, _path, mode)
++
++        # Read-only open: serve from whichever layer owns the path.
++        layer, target = self._which(_path)
++        if layer is None:
++            raise errors.ResourceNotFound(path)
++        if layer.isdir(target):
++            raise errors.FileExpected(path)
++        handle = layer.openbin(target, mode, buffering, **options)
++        return _OverlayFile(handle, _path, mode)
++
++    def remove(self, path):
++        # type: (Text) -> None
++        self.check()
++        _path = self.validatepath(path)
++        layer, target = self._which(_path)
++        if layer is None:
++            raise errors.ResourceNotFound(path)
++        if layer.isdir(target):
++            raise errors.FileExpected(path)
++        # Remove the upper copy if present...
++        if self._upper_has(_path):
++            self._upper.remove(_path)
++        # ...and hide any lower copy behind a whiteout.
++        if self._lower.isfile(_path) and not self._is_whiteout_present(_path):
++            self._ensure_upper_dir(dirname(_path))
++            self._upper.touch(self._wh_path(_path))
++
++    def removedir(self, path):
++        # type: (Text) -> None
++        self.check()
++        _path = self.validatepath(path)
++        if _path == "/":
++            raise errors.RemoveRootError()
++        layer, target = self._which(_path)
++        if layer is None:
++            raise errors.ResourceNotFound(path)
++        if not layer.isdir(target):
++            raise errors.DirectoryExpected(path)
++        if self.listdir(_path):
++            raise errors.DirectoryNotEmpty(path)
++        # Drop the upper directory if present.  Although the merged view
++        # is empty, the physical upper directory may still hold reserved
++        # markers (whiteouts for now-removed lower children, an opacity
++        # flag); those are moot once the directory itself is whited out,
++        # so clear the whole subtree.
++        if self._upper.isdir(_path):
++            self._upper.removetree(_path)
++        # Hide any lower directory behind a whiteout.
++        if self._lower.isdir(_path) and not self._is_whiteout_present(_path):
++            self._ensure_upper_dir(dirname(_path))
++            self._upper.touch(self._wh_path(_path))
++
++    def setinfo(self, path, info):
++        # type: (Text, RawInfo) -> None
++        self.check()
++        _path = self.validatepath(path)
++        layer, target = self._which(_path)
++        if layer is None:
++            raise errors.ResourceNotFound(path)
++        # Mutating metadata is a modification: copy the resource up first
++        # so the lower layer stays pristine.
++        if layer is self._lower:
++            if self._lower.isdir(_path):
++                self._ensure_upper_dir(_path)
++            else:
++                self._copy_up_file(_path)
++        self._upper.setinfo(_path, info)
++
++    # -- Overlay introspection --------------------------------------------
++
++    def is_modified(self, path):
++        # type: (Text) -> bool
++        """Return `True` if ``path`` has been changed in the upper layer.
++
++        A resource is *modified* when the upper layer holds a copy of it
++        (added outright, or copied up from the lower layer); a whited-out
++        lower resource also counts as modified.  A resource served purely
++        from the pristine lower layer is not modified.
++        """
++        self.check()
++        _path = self.validatepath(path)
++        if _path == "/":
++            return False
++        return self._upper_has(_path) or self._is_whiteout_present(_path)
++
++    def changes(self):
++        # type: () -> Dict[Text, List[Text]]
++        """Summarise the changes recorded in the upper layer.
++
++        Returns a mapping with three keys -- ``"added"``, ``"removed"``
++        and ``"modified"`` -- each holding a sorted list of paths, in the
++        spirit of ``docker diff``:
++
++        * **added** -- resources that exist in the merged view but not in
++          the lower layer.
++        * **removed** -- lower-layer resources hidden by a whiteout.
++        * **modified** -- lower-layer resources that were copied up and
++          then changed (present in both layers).
++
++        The lower layer is only read, never written, so this is safe to
++        call at any time.
++        """
++        self.check()
++        added = []  # type: List[Text]
++        removed = []  # type: List[Text]
++        modified = []  # type: List[Text]
++
++        # Walk the raw upper layer, translating markers into removals and
++        # classifying real resources as added or modified.
++        for step in self._upper.walk.info(namespaces=[]):
++            up_path, info = step
++            name = info.name
++            if _is_whiteout(name):
++                target = join(dirname(up_path), _whitedout_target(name))
++                removed.append(target)
++                continue
++            if name == _OPAQUE_NAME or name.startswith(_WH_PREFIX):
++                continue
++            if self._lower.exists(up_path):
++                modified.append(up_path)
++            else:
++                added.append(up_path)
++
++        return {
++            "added": sorted(added),
++            "removed": sorted(removed),
++            "modified": sorted(modified),
++        }
++
++    def flatten_to(self, dst_fs):
++        # type: (FS) -> None
++        """Materialise the merged view into ``dst_fs``.
++
++        Every resource visible through the overlay is copied into
++        ``dst_fs`` (directories first, then files), collapsing the two
++        layers and all copy-up/whiteout bookkeeping into a single plain
++        filesystem.  ``dst_fs`` receives only the resolved view; the
++        overlay's reserved markers are never leaked.
++        """
++        self.check()
++        for dir_path, dirs, files in self.walk():
++            for info in dirs:
++                dst_fs.makedirs(join(dir_path, info.name), recreate=True)
++            for info in files:
++                file_path = join(dir_path, info.name)
++                dst_fs.writebytes(file_path, self.readbytes(file_path))
++
++    # -- Overrides for correctness ----------------------------------------
++
++    def close(self):
++        # type: () -> None
++        if not self._closed:
++            if self._auto_close:
++                try:
++                    self._upper.close()
++                finally:
++                    self._lower.close()
++        super(OverlayFS, self).close()
+diff --git a/tests/test_overlayfs.py b/tests/test_overlayfs.py
+new file mode 100644
+index 0000000..abb04a6
+--- /dev/null
++++ b/tests/test_overlayfs.py
+@@ -0,0 +1,132 @@
++# coding: utf-8
++"""Tests for the copy-on-write OverlayFS backend."""
++
++from __future__ import unicode_literals
++
++import unittest
++
++from fs.memoryfs import MemoryFS
++from fs.overlayfs import OverlayFS
++from fs.test import FSTestCases
++
++
++class TestOverlayFSConformance(FSTestCases, unittest.TestCase):
++    """Full conformance: an empty upper over an empty lower must behave
++    exactly like a plain writable filesystem."""
++
++    def make_fs(self):
++        return OverlayFS(MemoryFS(), MemoryFS())
++
++
++class TestOverlayCOW(unittest.TestCase):
++    """Targeted copy-on-write / whiteout behaviour."""
++
++    def setUp(self):
++        self.lower = MemoryFS()
++        self.lower.writetext("keep.txt", "base")
++        self.lower.makedirs("docs/sub")
++        self.lower.writetext("docs/readme.txt", "hello")
++        self.lower.writetext("docs/sub/note.txt", "note")
++        self.upper = MemoryFS()
++        self.fs = OverlayFS(self.lower, self.upper)
++
++    def test_reads_fall_through(self):
++        self.assertEqual(self.fs.readtext("keep.txt"), "base")
++        self.assertEqual(self.fs.readtext("docs/readme.txt"), "hello")
++        self.assertTrue(self.fs.isdir("docs/sub"))
++
++    def test_write_does_not_touch_lower(self):
++        self.fs.writetext("docs/readme.txt", "changed")
++        self.assertEqual(self.fs.readtext("docs/readme.txt"), "changed")
++        # Lower layer stays pristine.
++        self.assertEqual(self.lower.readtext("docs/readme.txt"), "hello")
++        # The change was materialised in the upper layer (copy-up).
++        self.assertTrue(self.upper.isfile("docs/readme.txt"))
++
++    def test_append_copies_up_content(self):
++        with self.fs.open("keep.txt", "a") as f:
++            f.write("+more")
++        self.assertEqual(self.fs.readtext("keep.txt"), "base+more")
++        self.assertEqual(self.lower.readtext("keep.txt"), "base")
++
++    def test_delete_lower_file_via_whiteout(self):
++        self.fs.remove("keep.txt")
++        self.assertFalse(self.fs.exists("keep.txt"))
++        # Lower still has it, but it is hidden.
++        self.assertTrue(self.lower.exists("keep.txt"))
++        self.assertNotIn("keep.txt", self.fs.listdir("/"))
++
++    def test_delete_then_recreate(self):
++        self.fs.remove("keep.txt")
++        self.assertFalse(self.fs.exists("keep.txt"))
++        self.fs.writetext("keep.txt", "fresh")
++        self.assertEqual(self.fs.readtext("keep.txt"), "fresh")
++        self.assertEqual(self.lower.readtext("keep.txt"), "base")
++
++    def test_removedir_lower_hidden(self):
++        self.fs.removetree("docs")
++        self.assertFalse(self.fs.exists("docs"))
++        self.assertTrue(self.lower.isdir("docs"))
++        self.assertNotIn("docs", self.fs.listdir("/"))
++
++    def test_recreated_dir_is_opaque(self):
++        # Delete a populated lower directory then recreate it: the stale
++        # lower children must not reappear.
++        self.fs.removetree("docs")
++        self.fs.makedir("docs")
++        self.assertEqual(self.fs.listdir("docs"), [])
++        self.fs.writetext("docs/new.txt", "n")
++        self.assertEqual(sorted(self.fs.listdir("docs")), ["new.txt"])
++
++    def test_listdir_merges_layers(self):
++        self.fs.writetext("upper_only.txt", "u")
++        self.assertEqual(
++            sorted(self.fs.listdir("/")), ["docs", "keep.txt", "upper_only.txt"]
++        )
++
++    def test_whiteout_marker_not_visible(self):
++        self.fs.remove("keep.txt")
++        for name in self.fs.listdir("/"):
++            self.assertFalse(name.startswith(".wh."))
++
++    def test_setinfo_copies_up(self):
++        import time
++
++        self.fs.setinfo("keep.txt", {"details": {"modified": time.time()}})
++        self.assertTrue(self.upper.isfile("keep.txt"))
++        self.assertEqual(self.lower.readtext("keep.txt"), "base")
++
++    def test_is_modified(self):
++        self.assertFalse(self.fs.is_modified("keep.txt"))
++        self.fs.writetext("keep.txt", "changed")
++        self.assertTrue(self.fs.is_modified("keep.txt"))
++
++    def test_changes_added_removed_modified(self):
++        self.fs.writetext("new.txt", "n")            # added
++        self.fs.writetext("docs/readme.txt", "chg")  # modified (copy-up)
++        self.fs.remove("keep.txt")                   # removed
++        changes = self.fs.changes()
++        self.assertIn("/new.txt", changes["added"])
++        self.assertIn("/docs/readme.txt", changes["modified"])
++        self.assertIn("/keep.txt", changes["removed"])
++        # Reserved markers never leak into the change set.
++        for group in changes.values():
++            for p in group:
++                self.assertNotIn(".wh.", p)
++
++    def test_flatten_to_collapses_layers(self):
++        self.fs.writetext("docs/readme.txt", "chg")
++        self.fs.remove("keep.txt")
++        self.fs.writetext("added.txt", "a")
++        flat = MemoryFS()
++        self.fs.flatten_to(flat)
++        self.assertEqual(flat.readtext("docs/readme.txt"), "chg")
++        self.assertEqual(flat.readtext("added.txt"), "a")
++        self.assertFalse(flat.exists("keep.txt"))
++        # No reserved markers leaked.
++        for path in flat.walk.files():
++            self.assertNotIn(".wh.", path)
++
++
++if __name__ == "__main__":
++    unittest.main()

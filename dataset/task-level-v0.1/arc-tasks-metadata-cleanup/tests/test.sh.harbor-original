@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+resolve_task_root() {
+  for candidate in "${TASK_ROOT:-}" /app /workspace "$(cd "$SCRIPT_DIR/.." && pwd)" "$(pwd)"; do
+    [ -n "$candidate" ] || continue
+    if [ -d "$candidate/inputs" ] || [ -d "$candidate/outputs" ] || [ -d "$candidate/output" ] || [ -f "$candidate/task.toml" ] || [ -d "$candidate/rootfs" ] || [ -f "$candidate/Makefile" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  cd "$SCRIPT_DIR/.." && pwd
+}
+TASK_ROOT="$(resolve_task_root)"
+cd "$TASK_ROOT"
+ROOT="$TASK_ROOT"
+ROOT_DIR="$TASK_ROOT"
+task_root="$TASK_ROOT"
+HERE="$SCRIPT_DIR"
+script_dir="$SCRIPT_DIR"
+
+
+python3 <<'PY'
+import csv, json, os, sys
+from pathlib import Path
+
+root = Path(os.getcwd())
+out = root / "outputs"
+
+tc = out / "tasks_clean.csv"
+cr = out / "cleaning_report.json"
+ss = out / "subset_summary.csv"
+rh = out / "report.html"
+
+for p in (tc, cr, ss, rh):
+    assert p.exists(), f"missing {p}"
+
+# tasks_clean.csv
+with open(tc, newline="") as f:
+    reader = csv.reader(f)
+    rows = list(reader)
+assert len(rows) >= 2, "tasks_clean.csv empty"
+header = rows[0]
+expected = ["task_id","subset","n_train","n_test","max_input_h","max_input_w","max_output_h","max_output_w","n_colors"]
+assert header == expected, f"header mismatch: {header}"
+
+data_rows = rows[1:]
+task_ids = [r[0] for r in data_rows]
+assert len(set(task_ids)) == len(task_ids), "task_id not unique"
+
+valid_subsets = {"training","evaluation","test"}
+for r in data_rows:
+    assert r[1] in valid_subsets, f"bad subset {r[1]}"
+    n_train = int(r[2]); n_test = int(r[3])
+    assert n_train >= 0 and n_test >= 0
+
+n_valid_rows = len(data_rows)
+
+# cleaning_report.json
+with open(cr) as f:
+    rep = json.load(f)
+for k in ("files_scanned","files_valid","files_dropped","dropped_reasons"):
+    assert k in rep, f"cleaning_report missing {k}"
+assert rep["files_scanned"] == rep["files_valid"] + rep["files_dropped"], "scanned != valid+dropped"
+assert rep["files_valid"] == n_valid_rows, f"files_valid {rep['files_valid']} != rows {n_valid_rows}"
+
+# subset_summary.csv
+with open(ss, newline="") as f:
+    reader = csv.DictReader(f)
+    srows = list(reader)
+    fields = reader.fieldnames
+for col in ("subset","task_count","avg_n_train","avg_n_colors"):
+    assert col in fields, f"subset_summary missing {col}"
+total = sum(int(r["task_count"]) for r in srows)
+assert total == n_valid_rows, f"task_count sum {total} != {n_valid_rows}"
+
+txt = rh.read_text(encoding="utf-8")
+assert "<html" in txt.lower()
+assert "subset_summary" in txt or any(s in txt for s in ("training","evaluation","test"))
+assert ("<img" in txt.lower()) or ("<svg" in txt.lower()), "no chart"
+# no external network refs
+low = txt.lower()
+for bad in ("http://","https://","//cdn."):
+    assert bad not in low, f"external ref {bad}"
+
+print("ALL TESTS PASSED")
+PY

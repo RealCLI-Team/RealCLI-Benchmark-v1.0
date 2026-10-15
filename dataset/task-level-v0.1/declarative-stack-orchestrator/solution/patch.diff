@@ -1,0 +1,1915 @@
+diff --git a/docker/orchestration/__init__.py b/docker/orchestration/__init__.py
+new file mode 100644
+index 00000000..b0aff643
+--- /dev/null
++++ b/docker/orchestration/__init__.py
+@@ -0,0 +1,103 @@
++"""Declarative multi-container stack orchestration for docker-py.
++
++This package sits on top of :class:`docker.api.APIClient` and lets you describe
++a set of related containers -- with their networks, volumes and start-up
++dependencies -- as a single declarative document, then reconcile the running
++world towards that description.
++
++The design mirrors the way infrastructure tools work in the large: a *pure*
++planning phase that decides what needs to change, and a separate apply phase
++that carries the plan out.  Because planning never mutates anything, you can
++inspect exactly what a deployment would do before committing to it, and because
++the orchestrator recognises its own resources purely by label, applying the
++same spec twice is a no-op the second time.
++
++Typical use::
++
++    import docker
++    from docker.orchestration import StackDeployer, StackSpec
++
++    api = docker.APIClient()
++    spec = StackSpec.from_dict({
++        "services": {
++            "db": {"image": "postgres:16"},
++            "web": {
++                "image": "nginx:latest",
++                "depends_on": {"db": {"condition": "service_healthy"}},
++                "ports": ["80:8080"],
++            },
++        },
++    })
++    deployer = StackDeployer(api, project_name="demo")
++    plan = deployer.plan(spec)      # inspect first...
++    if not plan.is_noop:
++        deployer.up(spec)           # ...then apply
++"""
++
++from __future__ import annotations
++
++from .deployer import StackDeployer
++from .errors import (
++    CyclicDependencyError,
++    DeploymentError,
++    HealthCheckTimeout,
++    OrchestrationError,
++    SpecError,
++    UnknownDependencyError,
++)
++from .interpolation import (
++    InterpolationError,
++    interpolate,
++    parse_env_file,
++)
++from .loader import (
++    deep_merge,
++    load_stack,
++    merge_documents,
++    select_profiles,
++)
++from .plan import (
++    Action,
++    ActionKind,
++    ApplyResult,
++    Plan,
++    ResourceType,
++    ServiceStatus,
++)
++from .spec import (
++    HealthcheckSpec,
++    MountSpec,
++    NetworkSpec,
++    ServiceSpec,
++    StackSpec,
++    VolumeSpec,
++)
++
++__all__ = [
++    "StackDeployer",
++    "StackSpec",
++    "ServiceSpec",
++    "NetworkSpec",
++    "VolumeSpec",
++    "MountSpec",
++    "HealthcheckSpec",
++    "Plan",
++    "Action",
++    "ActionKind",
++    "ResourceType",
++    "ApplyResult",
++    "ServiceStatus",
++    "OrchestrationError",
++    "SpecError",
++    "UnknownDependencyError",
++    "CyclicDependencyError",
++    "DeploymentError",
++    "HealthCheckTimeout",
++    "InterpolationError",
++    "interpolate",
++    "parse_env_file",
++    "load_stack",
++    "merge_documents",
++    "deep_merge",
++    "select_profiles",
++]
+diff --git a/docker/orchestration/deployer.py b/docker/orchestration/deployer.py
+new file mode 100644
+index 00000000..28bb7940
+--- /dev/null
++++ b/docker/orchestration/deployer.py
+@@ -0,0 +1,507 @@
++"""Turn a declarative stack spec into Docker Engine API calls.
++
++:class:`StackDeployer` is the heart of the package.  It follows a strict
++plan/apply split:
++
++* :meth:`plan` is a *pure* function -- it reads the current state once and
++  returns a :class:`~docker.orchestration.plan.Plan` describing what it would
++  do, without making a single change.
++* :meth:`up` calls :meth:`plan` and then executes the resulting actions in
++  order, translating each into the appropriate ``APIClient`` calls.
++* :meth:`down` removes everything the project owns, in the reverse of creation
++  order, and :meth:`ps` reports what is currently running.
++
++The class never stores state between calls; the source of truth is always the
++Docker Engine, queried through the managed labels.  That is what makes ``up``
++idempotent: running it twice over an unchanged spec produces an all-NOOP plan
++on the second run.
++"""
++
++from __future__ import annotations
++
++import time
++
++from . import naming
++from .errors import DeploymentError, HealthCheckTimeout
++from .plan import (
++    Action,
++    ActionKind,
++    ApplyResult,
++    Plan,
++    ResourceType,
++    ServiceStatus,
++)
++from .spec import StackSpec
++from .state import CurrentState
++
++
++class StackDeployer:
++    """Deploy and reconcile a declarative stack against a Docker Engine."""
++
++    def __init__(self, api_client, project_name, sleeper=None,
++                 health_attempts=30):
++        self.api = api_client
++        self.project = project_name
++        # Injected so tests (and the health gate) do not sleep in real time.
++        self._sleep = sleeper if sleeper is not None else time.sleep
++        self.health_attempts = health_attempts
++
++    # ------------------------------------------------------------------
++    # Planning (pure)
++    # ------------------------------------------------------------------
++
++    def plan(self, spec):
++        """Return the :class:`Plan` that would reconcile *spec*.
++
++        Reads current state exactly once; performs no mutations.  The action
++        order is: networks to create, volumes to create, containers in
++        dependency order (create/recreate/noop), then orphan containers,
++        networks and volumes to remove.
++        """
++        if not isinstance(spec, StackSpec):
++            spec = StackSpec.from_dict(spec)
++
++        state = CurrentState.observe(self.api, self.project)
++        order = spec.topological_order()
++
++        actions = []
++
++        # 1. Networks that do not yet exist.
++        for net_name in sorted(spec.networks):
++            if net_name not in state.networks:
++                actions.append(Action(
++                    kind=ActionKind.CREATE,
++                    resource_type=ResourceType.NETWORK,
++                    resource_name=naming.network_name(self.project, net_name),
++                    reason="network not present",
++                    detail={"logical": net_name},
++                ))
++
++        # 2. Volumes that do not yet exist.
++        for vol_name in sorted(spec.volumes):
++            if vol_name not in state.volumes:
++                actions.append(Action(
++                    kind=ActionKind.CREATE,
++                    resource_type=ResourceType.VOLUME,
++                    resource_name=naming.volume_name(self.project, vol_name),
++                    reason="volume not present",
++                    detail={"logical": vol_name},
++                ))
++
++        # 3. Containers, in dependency order.
++        desired_keys = set()
++        for service_name in order:
++            service = spec.services[service_name]
++            cfg_hash = service.config_hash()
++            for index in range(1, service.replicas + 1):
++                key = (service_name, index)
++                desired_keys.add(key)
++                cname = naming.container_name(self.project, service_name, index)
++                existing = state.containers.get(key)
++                detail = {
++                    "service": service_name,
++                    "index": index,
++                    "config_hash": cfg_hash,
++                }
++                if existing is None:
++                    actions.append(Action(
++                        kind=ActionKind.CREATE,
++                        resource_type=ResourceType.CONTAINER,
++                        resource_name=cname,
++                        reason="container not present",
++                        detail=detail,
++                    ))
++                elif existing.config_hash != cfg_hash:
++                    actions.append(Action(
++                        kind=ActionKind.RECREATE,
++                        resource_type=ResourceType.CONTAINER,
++                        resource_name=cname,
++                        reason="configuration changed",
++                        detail=dict(detail, old_id=existing.id),
++                    ))
++                else:
++                    actions.append(Action(
++                        kind=ActionKind.NOOP,
++                        resource_type=ResourceType.CONTAINER,
++                        resource_name=cname,
++                        reason="up to date",
++                        detail=dict(detail, id=existing.id),
++                    ))
++
++        # 4. Orphan containers -- managed by us, no longer desired.
++        #    Removed in reverse dependency order so dependents die first.
++        orphan_containers = [
++            mc for key, mc in state.containers.items()
++            if key not in desired_keys
++        ]
++        orphan_containers.sort(
++            key=lambda mc: (order.index(mc.service)
++                            if mc.service in order else -1, mc.index),
++            reverse=True,
++        )
++        for mc in orphan_containers:
++            actions.append(Action(
++                kind=ActionKind.REMOVE,
++                resource_type=ResourceType.CONTAINER,
++                resource_name=mc.name,
++                reason="not in spec",
++                detail={"id": mc.id, "service": mc.service, "index": mc.index},
++            ))
++
++        # 5. Orphan networks and volumes.
++        for logical, mr in sorted(state.networks.items()):
++            if logical not in spec.networks:
++                actions.append(Action(
++                    kind=ActionKind.REMOVE,
++                    resource_type=ResourceType.NETWORK,
++                    resource_name=mr.name,
++                    reason="not in spec",
++                    detail={"id": mr.id, "logical": logical},
++                ))
++        for logical, mr in sorted(state.volumes.items()):
++            if logical not in spec.volumes:
++                actions.append(Action(
++                    kind=ActionKind.REMOVE,
++                    resource_type=ResourceType.VOLUME,
++                    resource_name=mr.name,
++                    reason="not in spec",
++                    detail={"id": mr.id, "logical": logical},
++                ))
++
++        return Plan(actions=actions)
++
++    # ------------------------------------------------------------------
++    # Applying
++    # ------------------------------------------------------------------
++
++    def up(self, spec, wait=False):
++        """Plan and then apply, returning an :class:`ApplyResult`."""
++        if not isinstance(spec, StackSpec):
++            spec = StackSpec.from_dict(spec)
++
++        plan = self.plan(spec)
++        result = ApplyResult()
++
++        for action in plan.actions:
++            if action.kind == ActionKind.NOOP:
++                result.add_skipped(action)
++                continue
++            try:
++                self._apply_action(action, spec, result, wait=wait)
++            except DeploymentError:
++                raise
++            except Exception as exc:  # pragma: no cover - defensive
++                raise DeploymentError(
++                    "failed to apply {}: {}".format(action.describe(), exc),
++                    action=action,
++                    cause=exc,
++                ) from exc
++            result.add_executed(action)
++
++        return result
++
++    def _apply_action(self, action, spec, result, wait):
++        if action.resource_type == ResourceType.NETWORK:
++            if action.kind == ActionKind.CREATE:
++                self._create_network(spec, action.detail["logical"])
++            elif action.kind == ActionKind.REMOVE:
++                self.api.remove_network(action.detail["id"])
++        elif action.resource_type == ResourceType.VOLUME:
++            if action.kind == ActionKind.CREATE:
++                self._create_volume(spec, action.detail["logical"])
++            elif action.kind == ActionKind.REMOVE:
++                self.api.remove_volume(action.detail["id"], force=True)
++        elif action.resource_type == ResourceType.CONTAINER:
++            if action.kind in (ActionKind.CREATE, ActionKind.RECREATE):
++                if action.kind == ActionKind.RECREATE:
++                    old_id = action.detail.get("old_id")
++                    if old_id:
++                        self.api.stop(old_id)
++                        self.api.remove_container(old_id, force=True)
++                cid = self._create_container(spec, action)
++                result.created_ids[action.resource_name] = cid
++                self.api.start(cid)
++                self._gate_on_dependencies(spec, action)
++            elif action.kind == ActionKind.REMOVE:
++                self.api.stop(action.detail["id"])
++                self.api.remove_container(action.detail["id"], force=True)
++
++    def _create_network(self, spec, logical):
++        net = spec.networks[logical]
++        self.api.create_network(
++            name=naming.network_name(self.project, logical),
++            driver=net.driver,
++            options=net.options or None,
++            internal=net.internal,
++            attachable=net.attachable,
++            labels=naming.network_labels(self.project, logical, net.labels),
++        )
++
++    def _create_volume(self, spec, logical):
++        vol = spec.volumes[logical]
++        self.api.create_volume(
++            name=naming.volume_name(self.project, logical),
++            driver=vol.driver,
++            driver_opts=vol.driver_opts or None,
++            labels=naming.volume_labels(self.project, logical, vol.labels),
++        )
++
++    def _create_container(self, spec, action):
++        service = spec.services[action.detail["service"]]
++        index = action.detail["index"]
++        cfg_hash = action.detail["config_hash"]
++        name = action.resource_name
++
++        host_config = self._build_host_config(spec, service)
++        networking_config = self._build_networking_config(spec, service, index)
++
++        labels = naming.container_labels(
++            self.project, service.name, index, cfg_hash, service.labels
++        )
++
++        kwargs = dict(
++            image=service.image,
++            name=name,
++            command=service.command,
++            entrypoint=service.entrypoint,
++            environment=(
++                dict(sorted(service.environment.items()))
++                if service.environment else None
++            ),
++            labels=labels,
++            host_config=host_config,
++            networking_config=networking_config,
++        )
++        if service.user is not None:
++            kwargs["user"] = service.user
++        if service.working_dir is not None:
++            kwargs["working_dir"] = service.working_dir
++        if service.healthcheck is not None:
++            kwargs["healthcheck"] = service.healthcheck.to_payload()
++        if service.ports:
++            kwargs["ports"] = [
++                (p[0], p[2]) for p in service.ports
++            ]
++
++        created = self.api.create_container(**kwargs)
++        # ``create_container`` returns {'Id': ...}; be forgiving about shape.
++        if isinstance(created, dict):
++            return created.get("Id") or created.get("id") or name
++        return created or name
++
++    def _build_host_config(self, spec, service):
++        binds = []
++        for mount in service.mounts:
++            if mount.is_volume and mount.volume is not None:
++                source = naming.volume_name(self.project, mount.volume)
++            else:
++                source = mount.source
++            if source is None:
++                continue
++            suffix = ":ro" if mount.read_only else ":rw"
++            binds.append("{}:{}{}".format(source, mount.target, suffix))
++
++        port_bindings = {}
++        for container_port, host, proto in service.ports:
++            if host is None:
++                continue
++            key = "{}/{}".format(container_port, proto)
++            port_bindings[key] = host
++
++        hc_kwargs = {}
++        if binds:
++            hc_kwargs["binds"] = binds
++        if port_bindings:
++            hc_kwargs["port_bindings"] = port_bindings
++        if service.restart and service.restart != "no":
++            hc_kwargs["restart_policy"] = {"Name": service.restart}
++
++        return self.api.create_host_config(**hc_kwargs)
++
++    def _build_networking_config(self, spec, service, index):
++        endpoints = {}
++        for net_logical in sorted(service.networks):
++            full = naming.network_name(self.project, net_logical)
++            aliases = [service.name]
++            endpoints[full] = self.api.create_endpoint_config(
++                aliases=aliases,
++            )
++        if not endpoints:
++            return None
++        return self.api.create_networking_config(endpoints)
++
++    def _gate_on_dependencies(self, spec, action):
++        """Block until this container's healthy-gated dependencies are up.
++
++        Only dependencies declared with ``condition: service_healthy`` gate;
++        ``service_started`` is satisfied as soon as the dependency's container
++        has been started, which -- because we apply in dependency order -- has
++        already happened by the time we get here.
++        """
++        service = spec.services[action.detail["service"]]
++        for dep, condition in sorted(service.depends_on.items()):
++            if condition != "service_healthy":
++                continue
++            dep_service = spec.services[dep]
++            for dep_index in range(1, dep_service.replicas + 1):
++                dep_name = naming.container_name(self.project, dep, dep_index)
++                self._wait_healthy(dep_name)
++
++    def _wait_healthy(self, container):
++        for attempt in range(self.health_attempts):
++            info = self.api.inspect_container(container)
++            state = (info or {}).get("State", {}) or {}
++            health = state.get("Health", {}) or {}
++            status = health.get("Status")
++            if status == "healthy":
++                return
++            if status is None and state.get("Running"):
++                # No healthcheck defined but the container is running: treat
++                # "running" as good enough rather than spinning forever.
++                return
++            self._sleep(1)
++        raise HealthCheckTimeout(container, self.health_attempts)
++
++    # ------------------------------------------------------------------
++    # Teardown & status
++    # ------------------------------------------------------------------
++
++    def down(self, spec=None):
++        """Remove every resource owned by this project.
++
++        Containers are stopped and removed first (reverse dependency order
++        when a spec is supplied so dependents die before their dependencies),
++        then networks, then volumes.
++        """
++        state = CurrentState.observe(self.api, self.project)
++        result = ApplyResult()
++
++        containers = list(state.containers.values())
++        if spec is not None:
++            if not isinstance(spec, StackSpec):
++                spec = StackSpec.from_dict(spec)
++            order = spec.topological_order()
++            containers.sort(
++                key=lambda mc: (order.index(mc.service)
++                                if mc.service in order else -1, mc.index),
++                reverse=True,
++            )
++        else:
++            containers.sort(key=lambda mc: (mc.service, mc.index), reverse=True)
++
++        for mc in containers:
++            self.api.stop(mc.id)
++            self.api.remove_container(mc.id, force=True)
++            result.add_executed(Action(
++                kind=ActionKind.REMOVE,
++                resource_type=ResourceType.CONTAINER,
++                resource_name=mc.name,
++                reason="down",
++                detail={"id": mc.id},
++            ))
++
++        for logical, mr in sorted(state.networks.items()):
++            self.api.remove_network(mr.id)
++            result.add_executed(Action(
++                kind=ActionKind.REMOVE,
++                resource_type=ResourceType.NETWORK,
++                resource_name=mr.name,
++                reason="down",
++                detail={"id": mr.id},
++            ))
++
++        for logical, mr in sorted(state.volumes.items()):
++            self.api.remove_volume(mr.id, force=True)
++            result.add_executed(Action(
++                kind=ActionKind.REMOVE,
++                resource_type=ResourceType.VOLUME,
++                resource_name=mr.name,
++                reason="down",
++                detail={"id": mr.id},
++            ))
++
++        return result
++
++    def ps(self, spec=None):
++        """Return a :class:`ServiceStatus` per managed container.
++
++        When *spec* is supplied, each status's ``up_to_date`` flag reflects
++        whether the running container's recorded config-hash still matches the
++        hash the spec would produce -- i.e. whether a subsequent ``up`` would
++        leave it alone (``True``) or recreate it (``False``).  Without a spec
++        there is nothing to compare against, so everything is reported
++        up to date.
++        """
++        state = CurrentState.observe(self.api, self.project)
++
++        desired_hashes = {}
++        if spec is not None:
++            if not isinstance(spec, StackSpec):
++                spec = StackSpec.from_dict(spec)
++            for name, service in spec.services.items():
++                desired_hashes[name] = service.config_hash()
++
++        statuses = []
++        for (service, index), mc in sorted(state.containers.items()):
++            if spec is not None:
++                wanted = desired_hashes.get(service)
++                up_to_date = wanted is not None and wanted == mc.config_hash
++            else:
++                up_to_date = True
++            statuses.append(ServiceStatus(
++                service=service,
++                index=index,
++                name=mc.name,
++                container_id=mc.id,
++                state=mc.status,
++                config_hash=mc.config_hash,
++                up_to_date=up_to_date,
++            ))
++        return statuses
++
++    def config(self, spec):
++        """Return the fully-resolved, canonical view of *spec*.
++
++        This is the moral equivalent of ``docker compose config``: it does not
++        touch the Engine at all, it simply reports -- in a stable, ordering
++        independent form -- exactly what the orchestrator understands the
++        stack to be, including the managed names each service's containers
++        would receive and the config-hash that governs recreation.  It is
++        useful both as a debugging aid and as a way to diff two stack
++        documents without deploying either.
++        """
++        if not isinstance(spec, StackSpec):
++            spec = StackSpec.from_dict(spec)
++
++        order = spec.topological_order()
++        services = {}
++        for name in order:
++            service = spec.services[name]
++            cfg_hash = service.config_hash()
++            containers = [
++                naming.container_name(self.project, name, index)
++                for index in range(1, service.replicas + 1)
++            ]
++            services[name] = {
++                "config": service.canonical(),
++                "config_hash": cfg_hash,
++                "containers": containers,
++                "depends_on": dict(sorted(service.depends_on.items())),
++            }
++
++        networks = {
++            name: naming.network_name(self.project, name)
++            for name in sorted(spec.networks)
++        }
++        volumes = {
++            name: naming.volume_name(self.project, name)
++            for name in sorted(spec.volumes)
++        }
++
++        return {
++            "project": self.project,
++            "order": order,
++            "services": services,
++            "networks": networks,
++            "volumes": volumes,
++        }
+diff --git a/docker/orchestration/errors.py b/docker/orchestration/errors.py
+new file mode 100644
+index 00000000..1f327cb7
+--- /dev/null
++++ b/docker/orchestration/errors.py
+@@ -0,0 +1,83 @@
++"""Exceptions raised by the declarative stack orchestrator.
++
++All orchestration errors derive from :class:`OrchestrationError` so that a
++caller can catch the whole family with a single ``except`` clause while still
++being able to distinguish the individual failure modes when it matters.
++
++The hierarchy is intentionally shallow and explicit -- every distinct thing
++that can go wrong while turning a declarative stack description into a set of
++Docker Engine API calls has its own class, because the difference between (for
++example) "your spec refers to a service that does not exist" and "your spec has
++a dependency cycle" is exactly the sort of thing a user needs to be told
++precisely.
++"""
++
++from __future__ import annotations
++
++
++class OrchestrationError(Exception):
++    """Base class for every error raised by :mod:`docker.orchestration`."""
++
++
++class SpecError(OrchestrationError):
++    """The declarative stack description is malformed or self-inconsistent.
++
++    Raised while parsing/validating a stack mapping into the typed
++    :class:`~docker.orchestration.spec.StackSpec` -- for instance when a
++    service is missing its ``image``, when a port mapping cannot be parsed, or
++    when a mount points at a volume that the stack never declares.
++    """
++
++
++class UnknownDependencyError(SpecError):
++    """A service's ``depends_on`` names a service the stack does not define."""
++
++    def __init__(self, service, dependency):
++        self.service = service
++        self.dependency = dependency
++        super().__init__(
++            "service {!r} depends on unknown service {!r}".format(
++                service, dependency
++            )
++        )
++
++
++class CyclicDependencyError(SpecError):
++    """The ``depends_on`` graph contains a cycle and cannot be ordered."""
++
++    def __init__(self, cycle):
++        # ``cycle`` is a list of service names forming the loop, e.g.
++        # ["web", "api", "web"].
++        self.cycle = list(cycle)
++        super().__init__(
++            "service dependency cycle detected: {}".format(
++                " -> ".join(self.cycle)
++            )
++        )
++
++
++class DeploymentError(OrchestrationError):
++    """Applying a plan against the Docker Engine failed.
++
++    Carries the offending :class:`~docker.orchestration.plan.Action` (when the
++    failure can be attributed to one) and the underlying exception so callers
++    can inspect or re-raise as they see fit.
++    """
++
++    def __init__(self, message, action=None, cause=None):
++        self.action = action
++        self.cause = cause
++        super().__init__(message)
++
++
++class HealthCheckTimeout(DeploymentError):
++    """A dependency never reached the ``healthy`` state within the budget."""
++
++    def __init__(self, container, attempts):
++        self.container = container
++        self.attempts = attempts
++        super().__init__(
++            "container {!r} did not become healthy after {} checks".format(
++                container, attempts
++            )
++        )
+diff --git a/docker/orchestration/interpolation.py b/docker/orchestration/interpolation.py
+new file mode 100644
+index 00000000..900f0c37
+--- /dev/null
++++ b/docker/orchestration/interpolation.py
+@@ -0,0 +1,157 @@
++"""Variable interpolation for stack documents.
++
++Real-world declarative stacks are rarely fully static: they carry
++``${VARIABLE}`` references that are resolved against the environment at load
++time, so the same document can describe a dev and a prod deployment.  This
++module implements that substitution with the shell-like semantics people
++expect from compose files, before the document is ever handed to
++:class:`~docker.orchestration.spec.StackSpec`.
++
++Supported forms (mirroring the POSIX ``${...}`` family):
++
++* ``${VAR}`` / ``$VAR``        -- value, or "" (and a warning) if unset
++* ``${VAR:-default}``          -- value if set *and non-empty*, else default
++* ``${VAR-default}``           -- value if set (even if empty), else default
++* ``${VAR:?message}``          -- value if set and non-empty, else raise
++* ``${VAR?message}``           -- value if set, else raise
++* ``$$``                       -- a literal ``$`` (escape)
++
++Interpolation is applied recursively to every string leaf of the mapping;
++keys, numbers, booleans and ``None`` are passed through untouched.
++"""
++
++from __future__ import annotations
++
++import re
++
++from .errors import SpecError
++
++# Matches either an escaped ``$$`` or a ``$NAME`` / ``${...}`` reference.  We
++# capture the two cases separately so the substitution callback can tell an
++# escape from a real reference.
++_PATTERN = re.compile(
++    r"""
++    \$(?:
++        (?P<escaped>\$)                       # $$  -> literal $
++      | (?P<braced>\{                          # ${ ... }
++            (?P<bname>[A-Za-z_][A-Za-z0-9_]*)
++            (?:
++                (?P<op>:?[-?])
++                (?P<arg>[^}]*)
++            )?
++        \})
++      | (?P<named>[A-Za-z_][A-Za-z0-9_]*)      # $NAME
++    )
++    """,
++    re.VERBOSE,
++)
++
++
++class InterpolationError(SpecError):
++    """A ``${VAR:?message}`` reference was required but unset."""
++
++
++def interpolate(value, mapping, path="<stack>"):
++    """Recursively interpolate ``${VAR}`` references in *value*.
++
++    *mapping* is the source of variable values (typically ``os.environ`` or a
++    dict loaded from an env file).  *path* is used only to make error messages
++    point at the offending location.
++    """
++    if isinstance(value, str):
++        return _interpolate_string(value, mapping, path)
++    if isinstance(value, dict):
++        result = {}
++        for key, item in value.items():
++            child = "{}.{}".format(path, key)
++            result[key] = interpolate(item, mapping, child)
++        return result
++    if isinstance(value, (list, tuple)):
++        return [
++            interpolate(item, mapping, "{}[{}]".format(path, i))
++            for i, item in enumerate(value)
++        ]
++    # numbers / bools / None are returned unchanged.
++    return value
++
++
++def _interpolate_string(text, mapping, path):
++    def replace(match):
++        if match.group("escaped"):
++            return "$"
++        if match.group("named"):
++            name = match.group("named")
++            return _lookup(name, None, None, mapping, path)
++        # braced
++        name = match.group("bname")
++        op = match.group("op")
++        arg = match.group("arg")
++        return _lookup(name, op, arg, mapping, path)
++
++    return _PATTERN.sub(replace, text)
++
++
++def _lookup(name, op, arg, mapping, path):
++    present = name in mapping
++    raw = mapping.get(name)
++    value = "" if raw is None else str(raw)
++    non_empty = present and value != ""
++
++    if op is None:
++        if not present:
++            # Unset variables become the empty string, matching compose.
++            return ""
++        return value
++
++    if op == ":-":
++        return value if non_empty else (arg or "")
++    if op == "-":
++        return value if present else (arg or "")
++    if op == ":?":
++        if not non_empty:
++            raise InterpolationError(
++                "{}: required variable {!r} is unset or empty{}".format(
++                    path, name, ": " + arg if arg else ""
++                )
++            )
++        return value
++    if op == "?":
++        if not present:
++            raise InterpolationError(
++                "{}: required variable {!r} is unset{}".format(
++                    path, name, ": " + arg if arg else ""
++                )
++            )
++        return value
++    # Unknown operator: leave the reference verbatim rather than guessing.
++    return "${{{}{}{}}}".format(name, op or "", arg or "")
++
++
++def parse_env_file(text):
++    """Parse ``KEY=value`` lines (an env file) into a dict.
++
++    Blank lines and ``#`` comments are ignored; surrounding single or double
++    quotes on the value are stripped; ``export KEY=value`` is accepted.  This
++    is intentionally small -- it is not a shell -- but it covers the common
++    shape of the ``.env`` files people keep next to their stacks.
++    """
++    result = {}
++    for lineno, raw in enumerate(text.splitlines(), start=1):
++        line = raw.strip()
++        if not line or line.startswith("#"):
++            continue
++        if line.startswith("export "):
++            line = line[len("export "):].lstrip()
++        if "=" not in line:
++            raise SpecError(
++                "env file line {}: expected KEY=value, got {!r}".format(
++                    lineno, raw
++                )
++            )
++        key, value = line.split("=", 1)
++        key = key.strip()
++        value = value.strip()
++        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
++            value = value[1:-1]
++        result[key] = value
++    return result
+diff --git a/docker/orchestration/loader.py b/docker/orchestration/loader.py
+new file mode 100644
+index 00000000..d7468f12
+--- /dev/null
++++ b/docker/orchestration/loader.py
+@@ -0,0 +1,162 @@
++"""Assemble a single stack document from layered sources.
++
++Deployments in practice are described not by one document but by a base plus
++overrides -- a common ``stack.yml`` plus an environment-specific
++``stack.prod.yml`` -- and by *profiles* that switch optional services on and
++off.  This module turns those layered inputs into the single, fully-resolved
++mapping that :class:`~docker.orchestration.spec.StackSpec` consumes, applying
++three transformations in order:
++
++1. **interpolation** of ``${VAR}`` references (delegated to
++   :mod:`docker.orchestration.interpolation`),
++2. **deep merge** of successive documents, with well-defined rules for how
++   mappings, lists and scalars combine, and
++3. **profile selection**, dropping services whose ``profiles`` are not active.
++
++Keeping this separate from parsing means the merge rules -- which are fiddly
++and easy to get subtly wrong -- live in one auditable place.
++"""
++
++from __future__ import annotations
++
++from .errors import SpecError
++from .interpolation import interpolate
++
++# Keys whose list values are merged by *appending* (with de-duplication)
++# rather than replaced wholesale, because that is what users mean by an
++# override that adds another port or environment entry.
++_APPEND_LIST_KEYS = frozenset(
++    {"ports", "volumes", "environment", "networks", "labels", "expose",
++     "depends_on", "command", "entrypoint"}
++)
++
++# ``command``/``entrypoint`` are conceptually scalars-or-lists; an override
++# should *replace* them, not append.  Keep them out of the append set.
++_REPLACE_LIST_KEYS = frozenset({"command", "entrypoint"})
++
++
++def deep_merge(base, override, path="<stack>"):
++    """Return a new mapping formed by merging *override* onto *base*.
++
++    * two mappings merge key-by-key, recursively;
++    * a list under one of the append-keys extends the base list (order
++      preserved, duplicates dropped); any other list is replaced;
++    * scalars replace;
++    * a ``None`` in the override deletes the key.
++    """
++    if not isinstance(base, dict) or not isinstance(override, dict):
++        return _merge_leaf(base, override, path, key=None)
++
++    result = dict(base)
++    for key, ovr in override.items():
++        child = "{}.{}".format(path, key)
++        if ovr is None:
++            result.pop(key, None)
++            continue
++        if key in result:
++            result[key] = _merge_value(result[key], ovr, child, key)
++        else:
++            result[key] = ovr
++    return result
++
++
++def _merge_value(base, override, path, key):
++    if isinstance(base, dict) and isinstance(override, dict):
++        return deep_merge(base, override, path)
++    if isinstance(base, list) and isinstance(override, list):
++        return _merge_leaf(base, override, path, key)
++    return _merge_leaf(base, override, path, key)
++
++
++def _merge_leaf(base, override, path, key):
++    if (
++        isinstance(base, list)
++        and isinstance(override, list)
++        and key in _APPEND_LIST_KEYS
++        and key not in _REPLACE_LIST_KEYS
++    ):
++        merged = list(base)
++        for item in override:
++            if item not in merged:
++                merged.append(item)
++        return merged
++    # Anything else: the override wins outright.
++    return override
++
++
++def merge_documents(documents):
++    """Deep-merge a sequence of stack mappings left-to-right."""
++    if not documents:
++        raise SpecError("no documents to merge")
++    result = {}
++    for index, doc in enumerate(documents):
++        if not isinstance(doc, dict):
++            raise SpecError(
++                "document {} is not a mapping".format(index)
++            )
++        result = deep_merge(result, doc, "<doc{}>".format(index))
++    return result
++
++
++def select_profiles(document, active_profiles):
++    """Drop services whose profiles are not among *active_profiles*.
++
++    A service with no ``profiles`` key is always kept (it belongs to the
++    implicit "always on" set).  A service listing one or more profiles is kept
++    only if at least one of them is active.  The ``profiles`` key is stripped
++    from the surviving services so it never reaches the spec parser.  Services
++    removed this way are also scrubbed from the remaining services'
++    ``depends_on`` so the result stays internally consistent.
++    """
++    active = set(active_profiles or ())
++    services = document.get("services") or {}
++    kept = {}
++    dropped = set()
++
++    for name, cfg in services.items():
++        cfg = cfg or {}
++        profiles = cfg.get("profiles")
++        if not profiles:
++            keep = True
++        else:
++            keep = bool(active & set(profiles))
++        if keep:
++            trimmed = {k: v for k, v in cfg.items() if k != "profiles"}
++            kept[name] = trimmed
++        else:
++            dropped.add(name)
++
++    if dropped:
++        for cfg in kept.values():
++            deps = cfg.get("depends_on")
++            if isinstance(deps, dict):
++                cfg["depends_on"] = {
++                    d: v for d, v in deps.items() if d not in dropped
++                }
++            elif isinstance(deps, (list, tuple)):
++                cfg["depends_on"] = [d for d in deps if d not in dropped]
++
++    result = dict(document)
++    result["services"] = kept
++    return result
++
++
++def load_stack(documents, environment=None, active_profiles=None):
++    """Full pipeline: interpolate -> merge -> select profiles.
++
++    *documents* is one mapping or a list of mappings (base + overrides).
++    *environment* supplies values for ``${VAR}`` interpolation.  Returns a
++    single fully-resolved mapping ready for ``StackSpec.from_dict``.
++    """
++    if isinstance(documents, dict):
++        documents = [documents]
++
++    env = dict(environment or {})
++    interpolated = [
++        interpolate(doc, env, "<doc{}>".format(i))
++        for i, doc in enumerate(documents)
++    ]
++    merged = merge_documents(interpolated)
++    if active_profiles is not None:
++        merged = select_profiles(merged, active_profiles)
++    return merged
+diff --git a/docker/orchestration/naming.py b/docker/orchestration/naming.py
+new file mode 100644
+index 00000000..ca9f11fa
+--- /dev/null
++++ b/docker/orchestration/naming.py
+@@ -0,0 +1,60 @@
++"""Deterministic resource names and managed labels.
++
++The orchestrator needs to be able to recognise, on a later run, the resources
++it created on an earlier one.  It does that purely from names and labels -- it
++keeps no state of its own -- so those names and labels have to be derived by a
++single, well-defined convention.  Centralising that convention here keeps the
++planner, the applier and the grader honest: there is exactly one place that
++decides what a managed container is called.
++"""
++
++from __future__ import annotations
++
++LABEL_PREFIX = "com.orchestra"
++
++LABEL_PROJECT = LABEL_PREFIX + ".project"
++LABEL_SERVICE = LABEL_PREFIX + ".service"
++LABEL_NUMBER = LABEL_PREFIX + ".number"
++LABEL_CONFIG_HASH = LABEL_PREFIX + ".config-hash"
++LABEL_NETWORK = LABEL_PREFIX + ".network"
++LABEL_VOLUME = LABEL_PREFIX + ".volume"
++
++
++def container_name(project, service, index):
++    return "{}_{}_{}".format(project, service, index)
++
++
++def network_name(project, network):
++    return "{}_{}".format(project, network)
++
++
++def volume_name(project, volume):
++    return "{}_{}".format(project, volume)
++
++
++def container_labels(project, service, index, config_hash, user_labels=None):
++    labels = dict(user_labels or {})
++    labels[LABEL_PROJECT] = project
++    labels[LABEL_SERVICE] = service
++    labels[LABEL_NUMBER] = str(index)
++    labels[LABEL_CONFIG_HASH] = config_hash
++    return labels
++
++
++def network_labels(project, network, user_labels=None):
++    labels = dict(user_labels or {})
++    labels[LABEL_PROJECT] = project
++    labels[LABEL_NETWORK] = network
++    return labels
++
++
++def volume_labels(project, volume, user_labels=None):
++    labels = dict(user_labels or {})
++    labels[LABEL_PROJECT] = project
++    labels[LABEL_VOLUME] = volume
++    return labels
++
++
++def project_filter(project):
++    """A ``filters`` dict selecting a project's managed resources."""
++    return {"label": "{}={}".format(LABEL_PROJECT, project)}
+diff --git a/docker/orchestration/plan.py b/docker/orchestration/plan.py
+new file mode 100644
+index 00000000..ed1f577e
+--- /dev/null
++++ b/docker/orchestration/plan.py
+@@ -0,0 +1,128 @@
++"""The immutable description of *what would change* -- a deployment plan.
++
++A plan is produced by :meth:`StackDeployer.plan` without touching the Docker
++Engine at all: it is a pure function of the desired stack spec and the observed
++current state.  Keeping it as plain, comparable data (rather than, say, a list
++of callbacks) is what makes the orchestrator testable and its behaviour
++predictable -- you can look at exactly what it intends to do before it does
++anything, and two runs over the same inputs produce identical plans.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from enum import Enum
++
++
++class ActionKind(str, Enum):
++    CREATE = "create"
++    RECREATE = "recreate"
++    REMOVE = "remove"
++    NOOP = "noop"
++    START = "start"
++    STOP = "stop"
++
++
++class ResourceType(str, Enum):
++    CONTAINER = "container"
++    NETWORK = "network"
++    VOLUME = "volume"
++
++
++@dataclass(frozen=True)
++class Action:
++    """A single intended change to one resource."""
++
++    kind: ActionKind
++    resource_type: ResourceType
++    resource_name: str
++    reason: str = ""
++    # Free-form data the applier needs (e.g. the service name, index, the
++    # container id to remove).  Not part of equality-relevant identity below
++    # beyond what the fields already capture, but handy for the applier.
++    detail: dict = field(default_factory=dict, compare=False)
++
++    def describe(self):
++        return "{} {} {}{}".format(
++            self.kind.value,
++            self.resource_type.value,
++            self.resource_name,
++            " ({})".format(self.reason) if self.reason else "",
++        )
++
++
++@dataclass
++class Plan:
++    """An ordered list of actions plus convenience queries over them."""
++
++    actions: list = field(default_factory=list)
++
++    @property
++    def is_noop(self):
++        """True when the plan would not change anything.
++
++        A plan consisting only of NOOP actions (or no actions at all) leaves
++        the world untouched; this is the property the idempotency guarantee is
++        expressed in terms of.
++        """
++        return all(a.kind == ActionKind.NOOP for a in self.actions)
++
++    def of_kind(self, kind):
++        return [a for a in self.actions if a.kind == kind]
++
++    def of_type(self, resource_type):
++        return [a for a in self.actions if a.resource_type == resource_type]
++
++    def changes(self):
++        """Every action that is not a NOOP."""
++        return [a for a in self.actions if a.kind != ActionKind.NOOP]
++
++    def summary(self):
++        """A stable multi-line human-readable rendering of the plan."""
++        if not self.actions:
++            return "empty plan"
++        lines = []
++        counts = {}
++        for action in self.actions:
++            counts[action.kind] = counts.get(action.kind, 0) + 1
++            lines.append("  " + action.describe())
++        header = ", ".join(
++            "{} {}".format(counts[k], k.value)
++            for k in ActionKind
++            if k in counts
++        )
++        return header + "\n" + "\n".join(lines)
++
++    def __iter__(self):
++        return iter(self.actions)
++
++    def __len__(self):
++        return len(self.actions)
++
++
++@dataclass
++class ApplyResult:
++    """What actually happened when a plan was applied."""
++
++    executed: list = field(default_factory=list)   # [Action]
++    skipped: list = field(default_factory=list)     # [Action] (NOOPs)
++    created_ids: dict = field(default_factory=dict)  # container name -> id
++
++    def add_executed(self, action):
++        self.executed.append(action)
++
++    def add_skipped(self, action):
++        self.skipped.append(action)
++
++
++@dataclass
++class ServiceStatus:
++    """A snapshot of one managed container, as reported by ``ps``."""
++
++    service: str
++    index: int
++    name: str
++    container_id: str
++    state: str
++    config_hash: str
++    up_to_date: bool
+diff --git a/docker/orchestration/spec.py b/docker/orchestration/spec.py
+new file mode 100644
+index 00000000..fccb1ad4
+--- /dev/null
++++ b/docker/orchestration/spec.py
+@@ -0,0 +1,561 @@
++"""Typed, validated description of a declarative container stack.
++
++The orchestrator accepts a plain mapping -- the sort of thing you would get
++from parsing a compose-style YAML/JSON document -- and turns it into the
++dataclasses defined here.  Doing the parsing and validation once, up front,
++means the rest of the package can assume it is working with well-formed data
++and never has to second-guess the shape of a dict.
++
++Nothing in this module talks to Docker; it is pure data manipulation, which is
++also what makes the resulting objects trivial to reason about and to hash.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass, field
++
++from .errors import SpecError, UnknownDependencyError
++
++# ``depends_on`` may be given either as a bare list of service names or as a
++# mapping of ``service -> {condition: ...}``.  These are the conditions we
++# understand; anything else is rejected so a typo cannot silently disable the
++# health gate a user was relying on.
++VALID_CONDITIONS = ("service_started", "service_healthy")
++
++
++def _as_str(value, what):
++    if not isinstance(value, str):
++        raise SpecError("{} must be a string, got {!r}".format(what, value))
++    return value
++
++
++def _parse_ports(raw, service):
++    """Normalise a list of port mappings into ``[(container, host, proto)]``.
++
++    Accepts the common compose spellings:
++
++    * ``"8080"``                 -> container 8080, host auto (None), tcp
++    * ``"8080/udp"``             -> container 8080, host auto, udp
++    * ``"80:8080"``              -> container 8080, host 80, tcp
++    * ``"127.0.0.1:80:8080"``    -> container 8080, host ("127.0.0.1", 80), tcp
++    * ``{"target": 8080, "published": 80, "protocol": "udp"}``
++    """
++    if raw is None:
++        return []
++    if not isinstance(raw, (list, tuple)):
++        raise SpecError(
++            "service {!r}: 'ports' must be a list".format(service)
++        )
++
++    ports = []
++    for entry in raw:
++        if isinstance(entry, dict):
++            if "target" not in entry:
++                raise SpecError(
++                    "service {!r}: port mapping {!r} is missing 'target'".format(
++                        service, entry
++                    )
++                )
++            container_port = int(entry["target"])
++            published = entry.get("published")
++            host = int(published) if published is not None else None
++            proto = str(entry.get("protocol", "tcp")).lower()
++            ports.append((container_port, host, proto))
++            continue
++
++        text = str(entry)
++        proto = "tcp"
++        if "/" in text:
++            text, proto = text.rsplit("/", 1)
++            proto = proto.lower()
++
++        bits = text.split(":")
++        try:
++            if len(bits) == 1:
++                ports.append((int(bits[0]), None, proto))
++            elif len(bits) == 2:
++                ports.append((int(bits[1]), int(bits[0]), proto))
++            elif len(bits) == 3:
++                ports.append((int(bits[2]), (bits[0], int(bits[1])), proto))
++            else:
++                raise ValueError(text)
++        except ValueError as exc:
++            raise SpecError(
++                "service {!r}: cannot parse port mapping {!r}".format(
++                    service, entry
++                )
++            ) from exc
++    return ports
++
++
++def _parse_environment(raw, service):
++    """Normalise environment into a sorted ``{name: value}`` dict.
++
++    Accepts either a list of ``"NAME=value"`` strings or a mapping.  The result
++    is an ordinary dict; callers that need determinism sort by key.
++    """
++    if raw is None:
++        return {}
++    env = {}
++    if isinstance(raw, dict):
++        for key, value in raw.items():
++            env[_as_str(key, "environment key")] = (
++                "" if value is None else str(value)
++            )
++    elif isinstance(raw, (list, tuple)):
++        for item in raw:
++            text = _as_str(item, "environment entry")
++            if "=" in text:
++                name, value = text.split("=", 1)
++            else:
++                name, value = text, ""
++            env[name] = value
++    else:
++        raise SpecError(
++            "service {!r}: 'environment' must be a list or mapping".format(
++                service
++            )
++        )
++    return env
++
++
++def _parse_mounts(raw, service):
++    """Normalise ``volumes`` entries into typed :class:`MountSpec` objects.
++
++    Supports both the short string form ``"name:/path[:ro]"`` and the long
++    mapping form ``{"type": "volume", "source": "name", "target": "/path"}``.
++    A bind mount (host path source, or ``type: bind``) has ``volume=None``;
++    a named-volume mount records the *stack-local* volume name in ``volume``.
++    """
++    if raw is None:
++        return []
++    if not isinstance(raw, (list, tuple)):
++        raise SpecError(
++            "service {!r}: 'volumes' must be a list".format(service)
++        )
++
++    mounts = []
++    for entry in raw:
++        if isinstance(entry, dict):
++            target = entry.get("target")
++            if not target:
++                raise SpecError(
++                    "service {!r}: mount {!r} missing 'target'".format(
++                        service, entry
++                    )
++                )
++            mtype = str(entry.get("type", "volume"))
++            source = entry.get("source")
++            read_only = bool(entry.get("read_only", False))
++            volume = source if mtype == "volume" else None
++            mounts.append(
++                MountSpec(
++                    target=str(target),
++                    source=source,
++                    read_only=read_only,
++                    is_volume=(mtype == "volume"),
++                    volume=volume,
++                )
++            )
++            continue
++
++        text = str(entry)
++        bits = text.split(":")
++        if len(bits) == 1:
++            # An anonymous volume at a path: no source.
++            mounts.append(
++                MountSpec(
++                    target=bits[0],
++                    source=None,
++                    read_only=False,
++                    is_volume=True,
++                    volume=None,
++                )
++            )
++        elif len(bits) in (2, 3):
++            source, target = bits[0], bits[1]
++            read_only = len(bits) == 3 and bits[2] == "ro"
++            # A source that looks like a path is a bind mount; otherwise it is
++            # a named volume that must be declared by the stack.
++            is_volume = not source.startswith(("/", "."))
++            mounts.append(
++                MountSpec(
++                    target=target,
++                    source=source,
++                    read_only=read_only,
++                    is_volume=is_volume,
++                    volume=source if is_volume else None,
++                )
++            )
++        else:
++            raise SpecError(
++                "service {!r}: cannot parse mount {!r}".format(service, entry)
++            )
++    return mounts
++
++
++def _parse_depends_on(raw, service):
++    """Return ``{dependency: condition}`` for a service's ``depends_on``."""
++    if raw is None:
++        return {}
++    result = {}
++    if isinstance(raw, (list, tuple)):
++        for dep in raw:
++            result[_as_str(dep, "depends_on entry")] = "service_started"
++    elif isinstance(raw, dict):
++        for dep, cfg in raw.items():
++            dep = _as_str(dep, "depends_on key")
++            if isinstance(cfg, dict):
++                condition = str(cfg.get("condition", "service_started"))
++            else:
++                condition = "service_started"
++            if condition not in VALID_CONDITIONS:
++                raise SpecError(
++                    "service {!r}: unknown depends_on condition {!r}".format(
++                        service, condition
++                    )
++                )
++            result[dep] = condition
++    else:
++        raise SpecError(
++            "service {!r}: 'depends_on' must be a list or mapping".format(
++                service
++            )
++        )
++    return result
++
++
++@dataclass(frozen=True)
++class MountSpec:
++    """A single mount attached to a service container."""
++
++    target: str
++    source: object  # str | None
++    read_only: bool
++    is_volume: bool
++    volume: object  # str | None  (stack-local volume name)
++
++    def canonical(self):
++        return {
++            "target": self.target,
++            "source": self.source,
++            "read_only": self.read_only,
++            "is_volume": self.is_volume,
++            "volume": self.volume,
++        }
++
++
++@dataclass
++class HealthcheckSpec:
++    """A container healthcheck, mirrored onto the create payload."""
++
++    test: object = None            # list[str] | str | None
++    interval: object = None        # nanoseconds
++    timeout: object = None
++    retries: object = None
++    start_period: object = None
++
++    def to_payload(self):
++        if self.test is None:
++            return None
++        payload = {"Test": self.test}
++        if self.interval is not None:
++            payload["Interval"] = self.interval
++        if self.timeout is not None:
++            payload["Timeout"] = self.timeout
++        if self.retries is not None:
++            payload["Retries"] = self.retries
++        if self.start_period is not None:
++            payload["StartPeriod"] = self.start_period
++        return payload
++
++    def canonical(self):
++        return {
++            "test": self.test,
++            "interval": self.interval,
++            "timeout": self.timeout,
++            "retries": self.retries,
++            "start_period": self.start_period,
++        }
++
++
++@dataclass
++class ServiceSpec:
++    """A single service: what container(s) to run and how."""
++
++    name: str
++    image: str
++    command: object = None                       # list | str | None
++    entrypoint: object = None
++    environment: dict = field(default_factory=dict)
++    ports: list = field(default_factory=list)    # [(container, host, proto)]
++    mounts: list = field(default_factory=list)   # [MountSpec]
++    networks: list = field(default_factory=list) # [network name]
++    depends_on: dict = field(default_factory=dict)
++    labels: dict = field(default_factory=dict)   # user labels only
++    restart: str = "no"
++    replicas: int = 1
++    user: object = None
++    working_dir: object = None
++    healthcheck: object = None                   # HealthcheckSpec | None
++
++    def canonical(self):
++        """Return an ordering-independent, JSON-serialisable view.
++
++        This is the input to the config hash.  It deliberately excludes the
++        service *name* and any orchestrator-managed labels, so that renaming a
++        project or re-deriving managed labels does not, on its own, look like a
++        configuration change.
++        """
++        return {
++            "image": self.image,
++            "command": self.command,
++            "entrypoint": self.entrypoint,
++            "environment": dict(sorted(self.environment.items())),
++            "ports": sorted(
++                [list(p[:2]) + [p[2]] for p in self.ports]
++            ),
++            "mounts": sorted(
++                (m.canonical() for m in self.mounts),
++                key=lambda d: d["target"],
++            ),
++            "networks": sorted(self.networks),
++            "labels": dict(sorted(self.labels.items())),
++            "restart": self.restart,
++            "replicas": self.replicas,
++            "user": self.user,
++            "working_dir": self.working_dir,
++            "healthcheck": (
++                self.healthcheck.canonical() if self.healthcheck else None
++            ),
++        }
++
++    def config_hash(self):
++        """Stable hex digest of the service configuration.
++
++        Two specs that describe the same desired state hash identically
++        regardless of the order keys were written in the source document.
++        """
++        blob = json.dumps(
++            self.canonical(), sort_keys=True, separators=(",", ":")
++        )
++        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
++
++
++@dataclass
++class NetworkSpec:
++    name: str
++    driver: object = None
++    options: dict = field(default_factory=dict)
++    internal: bool = False
++    attachable: object = None
++    labels: dict = field(default_factory=dict)
++
++
++@dataclass
++class VolumeSpec:
++    name: str
++    driver: object = None
++    driver_opts: dict = field(default_factory=dict)
++    labels: dict = field(default_factory=dict)
++
++
++@dataclass
++class StackSpec:
++    """A whole stack: services plus the networks and volumes they use."""
++
++    services: dict = field(default_factory=dict)   # name -> ServiceSpec
++    networks: dict = field(default_factory=dict)    # name -> NetworkSpec
++    volumes: dict = field(default_factory=dict)     # name -> VolumeSpec
++
++    # -- construction ----------------------------------------------------
++
++    @classmethod
++    def from_dict(cls, data):
++        if not isinstance(data, dict):
++            raise SpecError("stack description must be a mapping")
++
++        raw_services = data.get("services")
++        if not raw_services or not isinstance(raw_services, dict):
++            raise SpecError("stack must define at least one service")
++
++        networks = {}
++        for name, cfg in (data.get("networks") or {}).items():
++            cfg = cfg or {}
++            networks[name] = NetworkSpec(
++                name=name,
++                driver=cfg.get("driver"),
++                options=dict(cfg.get("options") or {}),
++                internal=bool(cfg.get("internal", False)),
++                attachable=cfg.get("attachable"),
++                labels=dict(cfg.get("labels") or {}),
++            )
++
++        volumes = {}
++        for name, cfg in (data.get("volumes") or {}).items():
++            cfg = cfg or {}
++            volumes[name] = VolumeSpec(
++                name=name,
++                driver=cfg.get("driver"),
++                driver_opts=dict(cfg.get("driver_opts") or {}),
++                labels=dict(cfg.get("labels") or {}),
++            )
++
++        services = {}
++        for name, cfg in raw_services.items():
++            services[name] = cls._parse_service(name, cfg or {})
++
++        spec = cls(services=services, networks=networks, volumes=volumes)
++        spec.validate()
++        return spec
++
++    @staticmethod
++    def _parse_service(name, cfg):
++        if "image" not in cfg:
++            raise SpecError("service {!r} is missing 'image'".format(name))
++
++        replicas = cfg.get("replicas", cfg.get("scale", 1))
++        try:
++            replicas = int(replicas)
++        except (TypeError, ValueError) as exc:
++            raise SpecError(
++                "service {!r}: 'replicas' must be an integer".format(name)
++            ) from exc
++        if replicas < 1:
++            raise SpecError(
++                "service {!r}: 'replicas' must be >= 1".format(name)
++            )
++
++        health = None
++        raw_health = cfg.get("healthcheck")
++        if isinstance(raw_health, dict):
++            health = HealthcheckSpec(
++                test=raw_health.get("test"),
++                interval=raw_health.get("interval"),
++                timeout=raw_health.get("timeout"),
++                retries=raw_health.get("retries"),
++                start_period=raw_health.get("start_period"),
++            )
++
++        return ServiceSpec(
++            name=name,
++            image=_as_str(cfg["image"], "image"),
++            command=cfg.get("command"),
++            entrypoint=cfg.get("entrypoint"),
++            environment=_parse_environment(cfg.get("environment"), name),
++            ports=_parse_ports(cfg.get("ports"), name),
++            mounts=_parse_mounts(cfg.get("volumes"), name),
++            networks=list(cfg.get("networks") or []),
++            depends_on=_parse_depends_on(cfg.get("depends_on"), name),
++            labels=dict(cfg.get("labels") or {}),
++            restart=str(cfg.get("restart", "no")),
++            replicas=replicas,
++            user=cfg.get("user"),
++            working_dir=cfg.get("working_dir"),
++            healthcheck=health,
++        )
++
++    # -- validation ------------------------------------------------------
++
++    def validate(self):
++        """Check cross-references between services, networks and volumes."""
++        for service in self.services.values():
++            for dep in service.depends_on:
++                if dep not in self.services:
++                    raise UnknownDependencyError(service.name, dep)
++            for net in service.networks:
++                if net not in self.networks:
++                    raise SpecError(
++                        "service {!r} attaches to undeclared network "
++                        "{!r}".format(service.name, net)
++                    )
++            for mount in service.mounts:
++                if mount.is_volume and mount.volume is not None:
++                    if mount.volume not in self.volumes:
++                        raise SpecError(
++                            "service {!r} mounts undeclared volume {!r}".format(
++                                service.name, mount.volume
++                            )
++                        )
++        # A service with no explicit network is implicitly attached to the
++        # stack's default network; make sure that default exists so planning
++        # can treat every service uniformly.
++        if any(not s.networks for s in self.services.values()):
++            self.networks.setdefault(
++                "default", NetworkSpec(name="default")
++            )
++            for service in self.services.values():
++                if not service.networks:
++                    service.networks = ["default"]
++
++    # -- dependency ordering --------------------------------------------
++
++    def topological_order(self):
++        """Return service names ordered so dependencies come first.
++
++        Ties (services at the same dependency depth) are broken
++        alphabetically, so the ordering -- and therefore every plan built from
++        it -- is deterministic.
++        """
++        from .errors import CyclicDependencyError
++
++        graph = {name: set(s.depends_on) for name, s in self.services.items()}
++        order = []
++        # Kahn's algorithm with a sorted frontier for determinism.
++        indegree = {n: 0 for n in graph}
++        for deps in graph.values():
++            for dep in deps:
++                indegree[dep] += 1
++        # We want dependencies first, so process nodes whose deps are all
++        # already emitted.  Track satisfied set.
++        emitted = set()
++        remaining = set(graph)
++        while remaining:
++            ready = sorted(
++                n for n in remaining if graph[n] <= emitted
++            )
++            if not ready:
++                # Whatever remains forms at least one cycle; surface a concrete
++                # path through it for the error message.
++                cycle = self._find_cycle(graph, remaining)
++                raise CyclicDependencyError(cycle)
++            for n in ready:
++                order.append(n)
++                emitted.add(n)
++                remaining.discard(n)
++        return order
++
++    @staticmethod
++    def _find_cycle(graph, nodes):
++        """Return one concrete cycle among ``nodes`` for error reporting."""
++        visited = set()
++        stack = []
++        stack_set = set()
++
++        def dfs(node):
++            visited.add(node)
++            stack.append(node)
++            stack_set.add(node)
++            for nxt in sorted(graph.get(node, ())):
++                if nxt not in nodes:
++                    continue
++                if nxt in stack_set:
++                    idx = stack.index(nxt)
++                    return stack[idx:] + [nxt]
++                if nxt not in visited:
++                    found = dfs(nxt)
++                    if found:
++                        return found
++            stack.pop()
++            stack_set.discard(node)
++            return None
++
++        for start in sorted(nodes):
++            if start not in visited:
++                found = dfs(start)
++                if found:
++                    return found
++        # Fallback: should not happen, but never return None to the caller.
++        return sorted(nodes) + [sorted(nodes)[0]]
+diff --git a/docker/orchestration/state.py b/docker/orchestration/state.py
+new file mode 100644
+index 00000000..3ca361cd
+--- /dev/null
++++ b/docker/orchestration/state.py
+@@ -0,0 +1,100 @@
++"""Observe the *current* state of a project's managed resources.
++
++The planner needs to know what already exists before it can decide what to
++create, recreate or remove.  This module is the only part of the planning path
++that reads from the Docker Engine, and it does so exclusively through the
++public :class:`docker.api.APIClient` surface -- ``containers``, ``networks``
++and ``volumes`` with a label filter -- so it works against a real daemon and
++against a mocked client in exactly the same way.
++
++Everything is keyed by the managed labels defined in
++:mod:`docker.orchestration.naming`; a resource without the project label is
++simply invisible to the orchestrator, which is what stops it from trampling
++containers it did not create.
++"""
++
++from __future__ import annotations
++
++from . import naming
++
++
++class ManagedContainer:
++    """A lightweight view over one ``docker ps`` entry we manage."""
++
++    __slots__ = ("id", "name", "service", "index", "config_hash", "status",
++                 "labels", "raw")
++
++    def __init__(self, raw):
++        self.raw = raw
++        self.id = raw.get("Id") or raw.get("ID") or ""
++        names = raw.get("Names") or []
++        # The Engine prefixes container names with '/'; strip it so the value
++        # matches what we asked to be created.
++        self.name = (names[0].lstrip("/") if names else raw.get("Name", ""))
++        labels = raw.get("Labels") or {}
++        self.labels = labels
++        self.service = labels.get(naming.LABEL_SERVICE, "")
++        try:
++            self.index = int(labels.get(naming.LABEL_NUMBER, "0"))
++        except (TypeError, ValueError):
++            self.index = 0
++        self.config_hash = labels.get(naming.LABEL_CONFIG_HASH, "")
++        self.status = raw.get("State") or raw.get("Status") or ""
++
++    @property
++    def key(self):
++        return (self.service, self.index)
++
++
++class ManagedResource:
++    """A managed network or volume."""
++
++    __slots__ = ("id", "name", "labels", "logical", "raw")
++
++    def __init__(self, raw, logical_label):
++        self.raw = raw
++        self.id = raw.get("Id") or raw.get("ID") or raw.get("Name", "")
++        self.name = raw.get("Name", "")
++        self.labels = raw.get("Labels") or {}
++        self.logical = self.labels.get(logical_label, "")
++
++
++class CurrentState:
++    """Everything the orchestrator can currently see for one project."""
++
++    def __init__(self, containers, networks, volumes):
++        # containers: {(service, index): ManagedContainer}
++        self.containers = containers
++        # networks/volumes: {logical_name: ManagedResource}
++        self.networks = networks
++        self.volumes = volumes
++
++    @classmethod
++    def observe(cls, api, project):
++        flt = naming.project_filter(project)
++
++        containers = {}
++        for raw in api.containers(all=True, filters=flt):
++            mc = ManagedContainer(raw)
++            if mc.service:
++                containers[mc.key] = mc
++
++        networks = {}
++        for raw in api.networks(filters=flt):
++            mr = ManagedResource(raw, naming.LABEL_NETWORK)
++            if mr.logical:
++                networks[mr.logical] = mr
++
++        volumes = {}
++        raw_volumes = api.volumes(filters=flt)
++        # ``APIClient.volumes`` returns {'Volumes': [...], 'Warnings': ...}.
++        if isinstance(raw_volumes, dict):
++            raw_volume_list = raw_volumes.get("Volumes") or []
++        else:
++            raw_volume_list = raw_volumes or []
++        for raw in raw_volume_list:
++            mr = ManagedResource(raw, naming.LABEL_VOLUME)
++            if mr.logical:
++                volumes[mr.logical] = mr
++
++        return cls(containers, networks, volumes)

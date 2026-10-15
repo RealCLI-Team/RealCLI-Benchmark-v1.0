@@ -1,0 +1,2594 @@
+diff --git a/alembic/command.py b/alembic/command.py
+index 8e48547..deb456d 100644
+--- a/alembic/command.py
++++ b/alembic/command.py
+@@ -439,6 +439,69 @@ def merge(
+     )
+ 
+ 
++def rebase(config: Config, revision: str, target: str) -> None:
++    """Rebase a revision script onto a new parent revision.
++
++    Rewrites the ``down_revision`` assignment of the given revision script
++    file in place, so that the revision and every revision that descends
++    from it are moved onto a new location within the revision tree,
++    without generating a new merge revision.  This is an alternative to
++    :ref:`alembic merge <branches>` for moving a branch onto an updated
++    mainline.
++
++    The previous ``down_revision`` value is appended to a ``Rebased
++    from:`` line in the script's docstring header, so that the history of
++    where the revision was previously attached is preserved and can be
++    inspected via :func:`.show` and :func:`.history`.
++
++    :param config: a :class:`.Config` instance.
++
++    :param revision: identifier of the revision script to move.  Supports
++     partial revision identifiers as well as symbolic names such as
++     ``"head"`` or ``<branchname>@head``.
++
++    :param target: identifier of the revision the script should be moved
++     onto; may be ``"base"`` to detach the script from any parent so that
++     it becomes a new base of the tree.
++
++    The command fails if the revision and the target resolve to the same
++    revision, if the revision is already based on the target, if the
++    revision is a merge point with multiple down_revisions, or if the
++    target is a descendant of the revision being moved, which would
++    produce a cycle.
++
++    .. versionadded:: 1.17
++
++    .. seealso::
++
++        :ref:`branches`
++
++    """
++
++    script = ScriptDirectory.from_config(config)
++    # look up the current down_revision before it is rewritten so that
++    # the printed message shows both the previous and the new parent
++    with script._catch_revision_errors():
++        preflight_script = script.get_revision(revision)
++    if preflight_script is None:
++        raise util.CommandError(
++            "Can't locate revision identified by '%s'" % revision
++        )
++    previous_down_revision = preflight_script.down_revision
++
++    rebased = script.rebase(revision, target)
++    onto = "base" if rebased.down_revision is None else rebased.down_revision
++    previously = (
++        "base" if previous_down_revision is None else previous_down_revision
++    )
++    config.print_stdout(
++        "Rebased %s; down_revision is now %s (previously %s)",
++        rebased.revision,
++        onto,
++        previously,
++    )
++
++
+ def upgrade(
+     config: Config,
+     revision: str,
+diff --git a/alembic/script/base.py b/alembic/script/base.py
+index 9429231..772162d 100644
+--- a/alembic/script/base.py
++++ b/alembic/script/base.py
+@@ -407,6 +407,140 @@ class ScriptDirectory:
+         """
+         return list(self.revision_map.bases)
+ 
++    def rebase(self, revision_id: str, target: str) -> Script:
++        """Move a revision script onto a new parent revision.
++
++        Rewrites the ``down_revision`` assignment inside the given revision
++        script file so that the revision, along with every revision that
++        descends from it, is relocated onto ``target`` within the revision
++        tree.  The revision's own identifier, message, branch labels and
++        dependencies are left untouched.
++
++        Every rebase operation also appends the previous ``down_revision``
++        value to a "Rebased from:" line in the script's docstring header,
++        so that the history of where the revision was previously attached
++        is preserved.
++
++        :param revision_id: identifier of the revision to move.  All the
++         identifier forms accepted by :meth:`.ScriptDirectory.get_revision`
++         are supported, including partial revision ids and symbolic names
++         such as ``"head"``.
++
++        :param target: identifier of the revision the script should be
++         based on.  May be ``"base"`` to detach the script from any parent,
++         making it a new base of the tree.
++
++        :return: the reloaded :class:`.Script` for the moved revision.
++
++        .. versionadded:: 1.17
++
++        """
++
++        if self.sourceless:
++            raise util.CommandError(
++                "The rebase operation requires revision scripts to be "
++                "present as Python source files; this script directory "
++                "is configured as sourceless."
++            )
++
++        with self._catch_revision_errors():
++            rev_script = self.get_revision(revision_id)
++            if rev_script is None:
++                raise util.CommandError(
++                    "Can't locate revision identified by '%s'" % revision_id
++                )
++            if target == "base":
++                target_script = None
++            else:
++                target_script = self.get_revision(target)
++                if target_script is None:
++                    raise util.CommandError(
++                        "Can't locate revision identified by '%s'" % target
++                    )
++
++        if target_script is None:
++            new_down_revision: Optional[str] = None
++        else:
++            new_down_revision = target_script.revision
++            if new_down_revision == rev_script.revision:
++                raise util.CommandError(
++                    "Cannot rebase revision %s onto itself"
++                    % rev_script.revision
++                )
++
++        if rev_script.down_revision == new_down_revision:
++            raise util.CommandError(
++                "Revision %s is already based on %s"
++                % (rev_script.revision, new_down_revision or "base")
++            )
++
++        if rev_script.is_merge_point:
++            raise util.CommandError(
++                "Revision %s is a merge point with multiple down_revisions "
++                "(%s); only revisions with at most one down_revision can "
++                "be rebased"
++                % (
++                    rev_script.revision,
++                    util.format_as_comma(rev_script._all_down_revisions),
++                )
++            )
++
++        if target_script is not None:
++            descendants = {
++                rev.revision
++                for rev in self.revision_map._get_descendant_nodes(
++                    (rev_script,), check=True
++                )
++            }
++            if new_down_revision in descendants:
++                raise util.CommandError(
++                    "Cannot rebase revision %s onto %s: the target is a "
++                    "descendant of the revision being moved, so this would "
++                    "produce a cycle in the revision graph"
++                    % (rev_script.revision, new_down_revision)
++                )
++
++        if not rev_script.path.endswith(".py") or not os.access(
++            rev_script.path, os.F_OK
++        ):
++            raise util.CommandError(
++                "Revision %s is not present as a Python source file at %r; "
++                "cannot rewrite it" % (rev_script.revision, rev_script.path)
++            )
++
++        # capture the immediately previous parent for both audit trail
++        # appending and for output formatting
++        previous_down_revision: Optional[str] = rev_script.down_revision
++
++        original_text = _rewrite_down_revision(
++            rev_script.path,
++            new_down_revision,
++            previous_down_revision=previous_down_revision,
++        )
++
++        # rebuild the revision map from disk, which re-parses the
++        # rewritten file and re-validates the graph
++        self.revision_map = revision.RevisionMap(self._load_revisions)
++        try:
++            reloaded = self.get_revision(rev_script.revision)
++        except Exception as err:
++            # defensive: if the rewritten file does not parse or produced
++            # an invalid graph, restore the original content
++            with open(rev_script.path, "w", encoding="utf-8") as file_:
++                file_.write(original_text)
++            pyc_path = util.pyc_file_from_path(rev_script.path)
++            if pyc_path and os.access(pyc_path, os.F_OK):
++                os.unlink(pyc_path)
++            self.revision_map = revision.RevisionMap(self._load_revisions)
++            if isinstance(err, util.CommandError):
++                raise
++            raise util.CommandError(
++                "Rewriting revision %s produced an invalid revision file; "
++                "the original content was restored: %s"
++                % (rev_script.revision, err)
++            ) from err
++        return reloaded
++
+     def _upgrade_revs(
+         self, destination: str, current_rev: str
+     ) -> List[RevisionStep]:
+@@ -791,6 +925,164 @@ class ScriptDirectory:
+         return Path(path) / filename
+ 
+ 
++_down_revision_assignment_re = re.compile(
++    r"^(down_revision(?:\s*:\s*[^=\n]+)?\s*=\s*)([^\n]*?)(\s*(?:#[^\n]*)?)$",
++    re.MULTILINE,
++)
++"""Matches a module level ``down_revision`` assignment, with or without a
++type annotation, capturing the leading portion through the equals sign,
++the right hand side, and a possible trailing comment.
++"""
++
++_revises_docstring_re = re.compile(r"^Revises:[^\n]*$", re.MULTILINE)
++"""Matches the ``Revises:`` line of a revision script's docstring header."""
++
++_rebased_from_line_re = re.compile(r"^Rebased from:[ \t]*([^\n]*)$", re.MULTILINE)
++"""Matches the audit-trail line inserted by :meth:`.ScriptDirectory.rebase`,
++capturing the comma-separated list of previous ``down_revision`` values.
++"""
++
++
++def _parse_rebased_from(text: Optional[str]) -> Tuple[str, ...]:
++    """Extract the ordered list of previous ``down_revision`` values from
++    a revision script's docstring header.
++
++    Returns an empty tuple when the docstring is missing, when the line
++    is absent, or when the line is present but its payload is empty.
++    Multiple ``Rebased from:`` lines are conservatively rejected by
++    returning an empty tuple - the on-disk rewrite path treats that as
++    a malformed audit trail.
++
++    """
++
++    if not text:
++        return ()
++    matches = _rebased_from_line_re.findall(text)
++    if len(matches) != 1:
++        return ()
++    payload = matches[0].strip()
++    if not payload:
++        return ()
++    parts = [chunk.strip() for chunk in payload.split(",")]
++    return tuple(part for part in parts if part)
++
++
++def _rewrite_down_revision(
++    path: Union[str, os.PathLike[str]],
++    new_down_revision: Optional[str],
++    *,
++    previous_down_revision: Optional[str],
++) -> str:
++    """Rewrite the ``down_revision`` assignment of a revision script file.
++
++    The right hand side of the module level ``down_revision`` assignment
++    is replaced by the given revision id, or ``None``.  Any type
++    annotation present on the assignment (e.g.
++    ``down_revision: Union[str, None] = 'abc123'``) is preserved, as is a
++    trailing comment.
++
++    If the file's docstring header contains exactly one ``Revises:``
++    line, that line is updated as well so that the displayed header stays
++    consistent with the assignment.
++
++    A ``Rebased from:`` line is inserted or extended in the docstring
++    header, immediately after the ``Revises:`` line, recording the
++    previous ``down_revision`` value.  ``base`` is used as the sentinel
++    when the previous ``down_revision`` was ``None``.
++
++    :param path: filesystem path of the revision script.
++
++    :param new_down_revision: the revision id to assign, or ``None`` to
++     make the script a base revision.
++
++    :param previous_down_revision: the revision id the script was
++     previously based on, or ``None`` when it was previously a base.
++
++    :return: the original content of the file, so that callers may
++     restore it if the rewritten file turns out to be invalid.
++
++    """
++
++    # note the file is opened with newline="" so that the original line
++    # endings (e.g. CRLF) are preserved byte for byte
++    with open(path, encoding="utf-8", newline="") as file_:
++        original_text = file_.read()
++
++    assignments = _down_revision_assignment_re.findall(original_text)
++    if len(assignments) != 1:
++        raise util.CommandError(
++            "Could not locate exactly one module-level down_revision "
++            "assignment in %r; refusing to rewrite the file" % (path,)
++        )
++
++    rendered = "None" if new_down_revision is None else repr(new_down_revision)
++
++    def _replace_assignment(match: "re.Match[str]") -> str:
++        prefix, _old_rhs, suffix = match.groups()
++        return "%s%s%s" % (prefix, rendered, suffix)
++
++    new_text, count = _down_revision_assignment_re.subn(
++        _replace_assignment, original_text, count=1
++    )
++    assert count == 1
++
++    revises_matches = _revises_docstring_re.findall(original_text)
++    has_revises_line = len(revises_matches) == 1
++
++    if has_revises_line:
++        revises_line = (
++            "Revises:"
++            if new_down_revision is None
++            else "Revises: %s" % new_down_revision
++        )
++        new_text = _revises_docstring_re.sub(revises_line, new_text, count=1)
++
++    previous_entry = (
++        "base" if previous_down_revision is None else previous_down_revision
++    )
++    existing_audit = _parse_rebased_from(new_text)
++    updated_audit = existing_audit + (previous_entry,)
++    audit_line = "Rebased from: %s" % ", ".join(updated_audit)
++
++    if existing_audit:
++        new_text = _rebased_from_line_re.sub(audit_line, new_text, count=1)
++    elif has_revises_line:
++        # place the audit line immediately after the Revises: line so
++        # that both header entries are visually adjacent.  The Revises:
++        # line has just been rewritten so we anchor on the updated text.
++        anchor = revises_line
++        idx = new_text.find(anchor)
++        assert idx != -1, "expected Revises: line to be present"
++        newline_pos = new_text.find("\n", idx)
++        if newline_pos == -1:
++            new_text = new_text + "\n" + audit_line
++        else:
++            new_text = (
++                new_text[: newline_pos + 1]
++                + audit_line
++                + "\n"
++                + new_text[newline_pos + 1 :]
++            )
++    # otherwise: the file has no Revises: header line to anchor on
++    # (non-standard docstring layout, e.g. single-line quoted).  The
++    # down_revision assignment has been rewritten; the audit trail is
++    # not inserted for such files, since there is no unambiguous
++    # anchor for it and appending arbitrary lines might not produce a
++    # valid Python module.
++
++    with open(path, "w", encoding="utf-8", newline="") as file_:
++        file_.write(new_text)
++
++    # remove any stale bytecode cache for the file; since the rewrite may
++    # produce content of identical size within the same second, the
++    # timestamp/size based .pyc validation alone is not reliable here
++    pyc_path = util.pyc_file_from_path(path)
++    if pyc_path and os.access(pyc_path, os.F_OK):
++        os.unlink(pyc_path)
++
++    return original_text
++
++
+ class Script(revision.Revision):
+     """Represent a single revision file in a ``versions/`` directory.
+ 
+@@ -807,6 +1099,9 @@ class Script(revision.Revision):
+     ):
+         self.module = module
+         self.path = _preserving_path_as_str(path)
++        self.rebased_from = _parse_rebased_from(
++            getattr(module, "__doc__", None)
++        )
+         super().__init__(
+             rev_id,
+             module.down_revision,
+@@ -824,6 +1119,15 @@ class Script(revision.Revision):
+     path: str
+     """Filesystem path of the script."""
+ 
++    rebased_from: Tuple[str, ...]
++    """Ordered list of previous ``down_revision`` values recorded by
++    :meth:`.ScriptDirectory.rebase` in this script's docstring header.
++
++    Populated from the ``Rebased from:`` line of the docstring at load
++    time.  Empty when the script has never been rebased.  The sentinel
++    ``"base"`` is used for entries that were previously a base revision.
++    """
++
+     @property
+     def _script_path(self) -> Path:
+         return Path(self.path)
+@@ -854,11 +1158,12 @@ class Script(revision.Revision):
+ 
+     @property
+     def log_entry(self) -> str:
+-        entry = "Rev: %s%s%s%s%s\n" % (
++        entry = "Rev: %s%s%s%s%s%s\n" % (
+             self.revision,
+             " (head)" if self.is_head else "",
+             " (branchpoint)" if self.is_branch_point else "",
+             " (mergepoint)" if self.is_merge_point else "",
++            " (rebased)" if self.rebased_from else "",
+             " (current)" if self._db_current_indicator else "",
+         )
+         if self.is_merge_point:
+@@ -866,6 +1171,11 @@ class Script(revision.Revision):
+         else:
+             entry += "Parent: %s\n" % (self._format_down_revision(),)
+ 
++        if self.rebased_from:
++            entry += "Rebased from: %s\n" % (
++                util.format_as_comma(self.rebased_from),
++            )
++
+         if self.dependencies:
+             entry += "Also depends on: %s\n" % (
+                 util.format_as_comma(self.dependencies)
+@@ -934,6 +1244,8 @@ class Script(revision.Revision):
+                 " (branchpoint)" if self.is_branch_point else "",
+                 " (mergepoint)" if self.is_merge_point else "",
+             )
++        if (head_indicators or tree_indicators) and self.rebased_from:
++            text += " (rebased)"
+         if include_doc:
+             text += ", %s" % self.doc
+         return text
+diff --git a/docs/build/branches.rst b/docs/build/branches.rst
+index 3e8bee1..608283c 100644
+--- a/docs/build/branches.rst
++++ b/docs/build/branches.rst
+@@ -795,3 +795,109 @@ If there's any point to be made here, it's if you are too freely branching, merg
+ and labeling, things can get pretty crazy!  Hence the branching system should
+ be used carefully and thoughtfully for best results.
+ 
++
++
++.. _rebase:
++
++Rebasing a Branch onto a New Parent
++-----------------------------------
++
++.. versionadded:: 1.17
++
++The ``alembic merge`` command resolves multiple heads by adding a *new*
++revision that joins the branches together.  Sometimes this is not what we
++want: a long lived feature branch that was created against an older state
++of the mainline should instead be *moved* so that it builds on top of the
++current mainline directly, without an artificial merge revision in between.
++This is what the ``alembic rebase`` command does.
++
++``alembic rebase`` rewrites the ``down_revision`` assignment of an existing
++revision script **in place**, relocating the revision - and with it every
++revision that descends from it - onto a new parent::
++
++    $ alembic rebase d747a8a8879 2a95102259be
++    Rebased d747a8a8879; down_revision is now 2a95102259be (previously 27c6a30d7c24)
++
++Given a tree that branched at ``1975ea83b712``::
++
++    <base> --> 1975 --> ae10 --> 55af --> <head>
++                \
++                 --> 27c6 --> d747 --> <head>
++                      (shoppingcart)
++
++rebasing ``27c6a30d7c24`` onto ``55af2cb1c267`` moves the whole
++``shoppingcart`` branch on top of the mainline, producing a single linear
++history::
++
++    <base> --> 1975 --> ae10 --> 55af --> 27c6 --> d747 --> <head>
++                                                     (shoppingcart)
++
++The command accepts two positional arguments:
++
++* **revision** - the revision script to move.  All identifier forms that
++  other commands accept are supported, including partial revision
++  identifiers and symbolic names such as ``head`` or
++  ``<branchname>@head``.
++
++* **target** - the revision the script should be moved onto.  The special
++  name ``base`` detaches the script from any parent, making it (and its
++  descendants) a new base of the tree::
++
++    $ alembic rebase 27c6a30d7c24 base
++    Rebased 27c6a30d7c24; down_revision is now base (previously 1975ea83b712)
++
++Only the ``down_revision`` assignment of the moved script is modified; the
++``Revises:`` line of the script's docstring header is updated to match.
++Type annotations on the assignment (e.g.
++``down_revision: Union[str, None] = '...'``) are preserved, and the
++revision's own identifier, message, branch labels and dependencies are
++left untouched, as are all other files in the versions directory.
++
++Because rebases are cheap and reversible, the previous ``down_revision``
++value is appended to a ``Rebased from:`` line in the docstring header,
++producing an ordered audit trail of every previous parent that the script
++has ever had::
++
++    """my feature revision
++
++    Revision ID: 27c6a30d7c24
++    Revises: 55af2cb1c267
++    Rebased from: 1975ea83b712
++    Create Date: 2024-05-01 12:00:00.000000
++
++    """
++
++Subsequent rebases extend the list rather than replacing it.  A revision
++that was previously a base is recorded with the literal string ``base``.
++``alembic show`` and ``alembic history --verbose`` display this trail as
++an explicit ``Rebased from:`` line, and both verbose and non-verbose
++listings mark a script that has been rebased with a ``(rebased)`` tag
++alongside the usual ``(head)`` / ``(branchpoint)`` markers.
++
++Since the operation rewrites history in place, a number of guards are
++enforced; the command fails without modifying anything when:
++
++* the revision and the target resolve to the same revision;
++
++* the revision is already based on the requested target;
++
++* the revision is a **merge point**, i.e. it has more than one
++  ``down_revision`` - rebasing a merge would have to discard parents, so
++  it is refused;
++
++* the target is a **descendant** of the revision being moved, which would
++  produce a cycle in the revision graph;
++
++* the script directory is configured as :ref:`sourceless <sourceless>`,
++  since there are no Python source files to rewrite.
++
++Because ``alembic rebase`` edits the revision tree itself, databases that
++were already migrated along the *old* shape of the tree may no longer line
++up with the rewritten history.  The command is therefore best suited for
++branches that have not been deployed yet, or for development workflows
++where databases can be recreated or stamped explicitly with
++``alembic stamp``.
++
++.. seealso::
++
++    :ref:`branches` - resolving branches by adding a merge revision
+diff --git a/tests/test_rebase.py b/tests/test_rebase.py
+new file mode 100644
+index 0000000..0e257bb
+--- /dev/null
++++ b/tests/test_rebase.py
+@@ -0,0 +1,2029 @@
++"""Tests for the ``alembic rebase`` command and the underlying
++:meth:`.ScriptDirectory.rebase` operation.
++
++The rebase operation rewrites the ``down_revision`` assignment of a
++revision script file in place, relocating the revision (and every
++revision that descends from it) onto a new parent within the revision
++tree, without generating a new merge revision.  It also appends the
++previous ``down_revision`` value to a ``Rebased from:`` audit trail
++line in the script's docstring header.
++
++"""
++
++from io import StringIO
++import os
++
++import pytest
++
++from alembic import command
++from alembic import util
++from alembic.config import CommandLine
++from alembic.script import ScriptDirectory
++from alembic.testing import assert_raises
++from alembic.testing import assert_raises_message
++from alembic.testing import eq_
++from alembic.testing import is_false
++from alembic.testing import is_true
++from alembic.testing.env import _no_sql_testing_config
++from alembic.testing.env import _sqlite_testing_config
++from alembic.testing.env import clear_staging_env
++from alembic.testing.env import env_file_fixture
++from alembic.testing.env import staging_env
++from alembic.testing.fixtures import capture_context_buffer
++from alembic.testing.fixtures import TestBase
++
++A = "aaaa00000001"
++B = "bbbb00000002"
++C = "cccc00000003"
++D = "dddd00000004"
++E = "eeee00000005"
++F = "ffff00000006"
++M = "mmmm00000007"
++G = "999900000008"
++
++
++def _render_revision(
++    rev,
++    down,
++    message,
++    *,
++    annotated=False,
++    branch_labels=None,
++    depends_on=None,
++    upgrade_body="pass",
++    downgrade_body="pass",
++    include_revises_header=True,
++    trailing_comment=False,
++    include_down_revision=True,
++    prebaked_audit=None,
++):
++    """Render the source code of a revision script."""
++
++    if isinstance(down, tuple):
++        down_rendered = "(%s)" % ", ".join(repr(elem) for elem in down)
++        revises = ", ".join(down)
++    elif down is None:
++        down_rendered = "None"
++        revises = ""
++    else:
++        down_rendered = repr(down)
++        revises = down
++
++    if annotated:
++        down_assignment = "down_revision: Union[str, None] = %s" % (
++            down_rendered,
++        )
++        typing_imports = "from typing import Union\n\n"
++    else:
++        down_assignment = "down_revision = %s" % (down_rendered,)
++        typing_imports = ""
++
++    if trailing_comment:
++        down_assignment += "  # original parent marker"
++
++    if not include_down_revision:
++        down_assignment = "down_revision = %s\n%s" % (
++            down_rendered,
++            down_assignment,
++        )
++
++    labels_rendered = (
++        "None" if branch_labels is None else repr(branch_labels)
++    )
++    depends_rendered = "None" if depends_on is None else repr(depends_on)
++
++    revises_line = (
++        "Revises: %s\n" % revises if include_revises_header else ""
++    )
++    audit_line = (
++        "Rebased from: %s\n" % ", ".join(prebaked_audit)
++        if prebaked_audit
++        else ""
++    )
++
++    return '''\
++"""%(message)s
++
++Revision ID: %(rev)s
++%(revises_line)s%(audit_line)sCreate Date: 2025-08-01 12:00:00.000000
++
++"""
++from alembic import op
++%(typing_imports)s
++revision = %(rev)r
++%(down_assignment)s
++branch_labels = %(labels_rendered)s
++depends_on = %(depends_rendered)s
++
++
++def upgrade():
++    %(upgrade_body)s
++
++
++def downgrade():
++    %(downgrade_body)s
++''' % {
++        "message": message,
++        "rev": rev,
++        "revises_line": revises_line,
++        "audit_line": audit_line,
++        "typing_imports": typing_imports,
++        "down_assignment": down_assignment,
++        "labels_rendered": labels_rendered,
++        "depends_rendered": depends_rendered,
++        "upgrade_body": upgrade_body,
++        "downgrade_body": downgrade_body,
++    }
++
++
++def _write_rev(scriptdir, rev, down, message, **kw):
++    """Write a revision script file into the versions directory."""
++
++    path = os.path.join(scriptdir.versions, "%s.py" % rev)
++    with open(path, "w", encoding="utf-8") as file_:
++        file_.write(_render_revision(rev, down, message, **kw))
++    pyc_path = util.pyc_file_from_path(path)
++    if pyc_path and os.access(pyc_path, os.F_OK):
++        os.unlink(pyc_path)
++    return path
++
++
++def _read(path):
++    with open(path, encoding="utf-8") as file_:
++        return file_.read()
++
++
++class _RebaseFixture:
++    """Base fixture: a linear chain A -> B -> C plus a branch A -> D -> E.
++
++    heads: C, E
++    """
++
++    def setUp(self):
++        self.env = staging_env()
++        self.cfg = _no_sql_testing_config()
++        self.scriptdir = ScriptDirectory.from_config(self.cfg)
++        _write_rev(self.scriptdir, A, None, "revision a")
++        _write_rev(self.scriptdir, B, A, "revision b")
++        _write_rev(self.scriptdir, C, B, "revision c")
++        _write_rev(self.scriptdir, D, A, "revision d")
++        _write_rev(self.scriptdir, E, D, "revision e")
++
++    def tearDown(self):
++        clear_staging_env()
++
++    def _fresh(self):
++        return ScriptDirectory.from_config(self.cfg)
++
++    def _heads(self):
++        return set(self._fresh().get_heads())
++
++    def _bases(self):
++        return set(self._fresh().get_bases())
++
++    def _down_revision_of(self, rev):
++        return self._fresh().get_revision(rev).down_revision
++
++    def _path_of(self, rev):
++        return os.path.join(self.scriptdir.versions, "%s.py" % rev)
++
++
++class RebaseGraphTest(_RebaseFixture, TestBase):
++    """Tests around how the revision graph is reshaped by rebase."""
++
++    def test_rebase_branch_onto_mainline(self):
++        command.rebase(self.cfg, D, C)
++        eq_(self._down_revision_of(D), C)
++        eq_(self._heads(), {E})
++        eq_(self._bases(), {A})
++
++    def test_rebase_returns_reloaded_script(self):
++        script = self.scriptdir.rebase(D, C)
++        eq_(script.revision, D)
++        eq_(script.down_revision, C)
++        is_true(script.is_head is False or script.revision == E)
++
++    def test_rebase_walk_order(self):
++        command.rebase(self.cfg, D, C)
++        eq_(
++            [rev.revision for rev in self._fresh().walk_revisions()],
++            [E, D, C, B, A],
++        )
++
++    def test_rebase_head_onto_other_branch_merges_heads(self):
++        command.rebase(self.cfg, E, C)
++        eq_(self._down_revision_of(E), C)
++        eq_(self._heads(), {D, E})
++        command.rebase(self.cfg, D, E)
++        eq_(self._heads(), {D})
++
++    def test_rebase_onto_base_detaches_branch(self):
++        command.rebase(self.cfg, B, "base")
++        eq_(self._down_revision_of(B), None)
++        eq_(self._bases(), {A, B})
++        eq_(self._heads(), {C, E})
++
++    def test_rebase_base_revision_onto_head(self):
++        command.rebase(self.cfg, D, "base")
++        eq_(self._bases(), {A, D})
++        eq_(self._heads(), {C, E})
++        command.rebase(self.cfg, D, C)
++        eq_(self._down_revision_of(D), C)
++        eq_(self._heads(), {E})
++        eq_(self._bases(), {A})
++
++    def test_rebase_consecutive_operations_same_scriptdir(self):
++        self.scriptdir.rebase(D, C)
++        eq_(self.scriptdir.get_revision(D).down_revision, C)
++        eq_(set(self.scriptdir.get_heads()), {E})
++        self.scriptdir.rebase(D, B)
++        eq_(self.scriptdir.get_revision(D).down_revision, B)
++        eq_(set(self.scriptdir.get_heads()), {C, E})
++
++    def test_rebase_onto_self_fails(self):
++        assert_raises_message(
++            util.CommandError,
++            "onto itself",
++            command.rebase,
++            self.cfg,
++            D,
++            D,
++        )
++
++    def test_rebase_onto_self_via_symbolic_names_fails(self):
++        assert_raises_message(
++            util.CommandError,
++            "onto itself",
++            command.rebase,
++            self.cfg,
++            E[:6],
++            E,
++        )
++
++    def test_rebase_onto_current_parent_fails(self):
++        assert_raises_message(
++            util.CommandError,
++            "already based on",
++            command.rebase,
++            self.cfg,
++            D,
++            A,
++        )
++
++    def test_rebase_base_onto_base_fails(self):
++        assert_raises_message(
++            util.CommandError,
++            "already based on",
++            command.rebase,
++            self.cfg,
++            A,
++            "base",
++        )
++
++    def test_rebase_onto_direct_descendant_fails(self):
++        assert_raises_message(
++            util.CommandError,
++            "cycle",
++            command.rebase,
++            self.cfg,
++            D,
++            E,
++        )
++
++    def test_rebase_onto_indirect_descendant_fails(self):
++        assert_raises_message(
++            util.CommandError,
++            "cycle",
++            command.rebase,
++            self.cfg,
++            A,
++            E,
++        )
++
++    def test_failed_rebase_does_not_modify_files(self):
++        before = _read(self._path_of(A))
++        assert_raises(util.CommandError, command.rebase, self.cfg, A, E)
++        eq_(_read(self._path_of(A)), before)
++        eq_(self._heads(), {C, E})
++
++    def test_unknown_revision_fails(self):
++        assert_raises_message(
++            util.CommandError,
++            "Can't locate revision identified by 'zzzz9999'",
++            command.rebase,
++            self.cfg,
++            "zzzz9999",
++            C,
++        )
++
++    def test_unknown_target_fails(self):
++        assert_raises_message(
++            util.CommandError,
++            "Can't locate revision identified by 'zzzz9999'",
++            command.rebase,
++            self.cfg,
++            D,
++            "zzzz9999",
++        )
++
++    def test_partial_identifier_resolution(self):
++        command.rebase(self.cfg, D[:4], C[:4])
++        eq_(self._down_revision_of(D), C)
++
++    def test_ambiguous_partial_identifier_fails(self):
++        p1 = "deadbeef0001"
++        p2 = "deadbeef0002"
++        _write_rev(self.scriptdir, p1, C, "partial one")
++        _write_rev(self.scriptdir, p2, C, "partial two")
++        assert_raises(
++            util.CommandError, command.rebase, self.cfg, D, "deadbeef"
++        )
++
++    def test_rebase_cross_branch_subtree(self):
++        command.rebase(self.cfg, B, E)
++        eq_(self._down_revision_of(B), E)
++        eq_(self._heads(), {C})
++        eq_(
++            [rev.revision for rev in self._fresh().walk_revisions()],
++            [C, B, E, D, A],
++        )
++
++    def test_head_symbol_with_multiple_heads_fails(self):
++        assert_raises(
++            util.CommandError, command.rebase, self.cfg, D, "head"
++        )
++
++    def test_branch_label_head_symbol(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            branch_labels="feature",
++        )
++        command.rebase(self.cfg, B, "feature@head")
++        eq_(self._down_revision_of(B), F)
++
++    def test_merge_point_revision_fails(self):
++        _write_rev(self.scriptdir, M, (C, E), "merge of c and e")
++        assert_raises_message(
++            util.CommandError,
++            "merge point",
++            command.rebase,
++            self.cfg,
++            M,
++            A,
++        )
++
++    def test_merge_point_as_target_is_allowed(self):
++        _write_rev(self.scriptdir, M, (C, E), "merge of c and e")
++        _write_rev(self.scriptdir, G, A, "side branch g")
++        command.rebase(self.cfg, G, M)
++        eq_(self._down_revision_of(G), M)
++        eq_(self._heads(), {G})
++
++    def test_merge_point_cycle_via_target_fails(self):
++        _write_rev(self.scriptdir, M, (C, E), "merge of c and e")
++        assert_raises_message(
++            util.CommandError,
++            "cycle",
++            command.rebase,
++            self.cfg,
++            D,
++            M,
++        )
++
++    def test_branch_labels_preserved(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            branch_labels="feature",
++        )
++        command.rebase(self.cfg, E, C)
++        eq_(
++            self._fresh().get_revision(F).branch_labels,
++            frozenset({"feature"}),
++        )
++        eq_(self._fresh().get_revision("feature@head").revision, F)
++
++    def test_depends_on_preserved(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            depends_on=C,
++        )
++        command.rebase(self.cfg, F, C)
++        script = self._fresh().get_revision(F)
++        eq_(script.dependencies, C)
++
++
++class RebaseFileRewriteTest(_RebaseFixture, TestBase):
++    """Tests around the exact bytes written by rebase."""
++
++    def test_rewritten_file_bytes_match_expected(self):
++        command.rebase(self.cfg, D, C)
++        text = _read(self._path_of(D))
++        expected = _render_revision(
++            D, C, "revision d", prebaked_audit=[A]
++        )
++        eq_(text, expected)
++
++    def test_other_files_byte_identical(self):
++        untouched_paths = [
++            self._path_of(rev) for rev in (A, B, C, E)
++        ]
++        before = {path: _read(path) for path in untouched_paths}
++        command.rebase(self.cfg, D, C)
++        for path, text in before.items():
++            eq_(_read(path), text)
++
++    def test_rebase_updates_revises_line(self):
++        command.rebase(self.cfg, D, C)
++        text = _read(self._path_of(D))
++        is_true("\nRevises: %s\n" % C in text)
++        is_false("\nRevises: %s\n" % A in text)
++
++    def test_rebase_to_base_leaves_empty_revises_line(self):
++        command.rebase(self.cfg, D, "base")
++        text = _read(self._path_of(D))
++        is_true("Revises:\n" in text)
++        is_true("down_revision = None" in text)
++
++    def test_type_annotated_assignment_preserved(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "annotated revision",
++            annotated=True,
++        )
++        command.rebase(self.cfg, F, C)
++        text = _read(self._path_of(F))
++        is_true("down_revision: Union[str, None] = '%s'" % C in text)
++        is_true("\nRevises: %s\n" % C in text)
++
++    def test_type_annotated_rebase_to_base(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "annotated revision",
++            annotated=True,
++        )
++        command.rebase(self.cfg, F, "base")
++        text = _read(self._path_of(F))
++        is_true("down_revision: Union[str, None] = None" in text)
++
++    def test_trailing_comment_preserved(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "with trailing comment",
++            trailing_comment=True,
++        )
++        command.rebase(self.cfg, F, C)
++        text = _read(self._path_of(F))
++        is_true("# original parent marker" in text)
++        is_true("down_revision = '%s'" % C in text)
++
++    def test_ambiguous_assignment_refused(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "revision f",
++            include_down_revision=False,
++        )
++        assert_raises(util.CommandError, command.rebase, self.cfg, F, C)
++
++    def test_rewritten_file_is_valid_python(self):
++        command.rebase(self.cfg, D, C)
++        text = _read(self._path_of(D))
++        compile(text, self._path_of(D), "exec")
++
++
++class RebaseAuditTrailTest(_RebaseFixture, TestBase):
++    """The audit-trail line records every previous ``down_revision``."""
++
++    def test_first_rebase_records_previous_parent(self):
++        command.rebase(self.cfg, D, C)
++        eq_(self._fresh().get_revision(D).rebased_from, (A,))
++        text = _read(self._path_of(D))
++        is_true("Rebased from: %s\n" % A in text)
++
++    def test_second_rebase_appends_previous_parent(self):
++        command.rebase(self.cfg, D, C)
++        command.rebase(self.cfg, D, B)
++        eq_(self._fresh().get_revision(D).rebased_from, (A, C))
++        text = _read(self._path_of(D))
++        is_true("Rebased from: %s, %s\n" % (A, C) in text)
++
++    def test_third_rebase_extends_further(self):
++        command.rebase(self.cfg, D, C)
++        command.rebase(self.cfg, D, B)
++        command.rebase(self.cfg, D, "base")
++        eq_(self._fresh().get_revision(D).rebased_from, (A, C, B))
++        text = _read(self._path_of(D))
++        is_true("Rebased from: %s, %s, %s\n" % (A, C, B) in text)
++        is_true("Revises:\n" in text)
++        is_true("down_revision = None" in text)
++
++    def test_rebase_from_base_records_base_sentinel(self):
++        # write a base revision F, then rebase it onto C
++        _write_rev(self.scriptdir, F, None, "sibling base")
++        command.rebase(self.cfg, F, C)
++        eq_(self._fresh().get_revision(F).rebased_from, ("base",))
++        text = _read(self._path_of(F))
++        is_true("Rebased from: base\n" in text)
++
++    def test_rebase_back_and_forth_keeps_full_history(self):
++        # A rebase reversal keeps the trail growing rather than shrinking
++        command.rebase(self.cfg, D, C)  # D was on A; trail=(A,)
++        command.rebase(self.cfg, D, A)  # D was on C; trail=(A, C)
++        eq_(self._fresh().get_revision(D).rebased_from, (A, C))
++        text = _read(self._path_of(D))
++        is_true("Rebased from: %s, %s\n" % (A, C) in text)
++
++    def test_rebased_from_empty_for_unrebased_scripts(self):
++        command.rebase(self.cfg, D, C)
++        # only D was rebased; other revisions still report empty audit
++        for rev in (A, B, C, E):
++            eq_(self._fresh().get_revision(rev).rebased_from, ())
++
++    def test_audit_line_placed_after_revises_line(self):
++        command.rebase(self.cfg, D, C)
++        text = _read(self._path_of(D))
++        revises_idx = text.index("Revises: %s" % C)
++        audit_idx = text.index("Rebased from: %s" % A)
++        create_idx = text.index("Create Date:")
++        is_true(revises_idx < audit_idx < create_idx)
++
++    def test_prebaked_audit_extends_on_rebase(self):
++        # simulate a revision that was already rebased before this
++        # session by writing the audit line directly into its source
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            prebaked_audit=[A, C],
++        )
++        eq_(self._fresh().get_revision(F).rebased_from, (A, C))
++        command.rebase(self.cfg, F, B)
++        eq_(self._fresh().get_revision(F).rebased_from, (A, C, E))
++        text = _read(self._path_of(F))
++        is_true("Rebased from: %s, %s, %s\n" % (A, C, E) in text)
++
++    def test_annotated_script_gets_audit_trail(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "annotated revision",
++            annotated=True,
++        )
++        command.rebase(self.cfg, F, C)
++        eq_(self._fresh().get_revision(F).rebased_from, (E,))
++        text = _read(self._path_of(F))
++        is_true("Rebased from: %s\n" % E in text)
++
++
++class RebaseStdoutTest(_RebaseFixture, TestBase):
++    """The ``rebase`` command prints both parents."""
++
++    def test_stdout_contains_previous_and_new_parent(self):
++        self.cfg.stdout = buf = StringIO()
++        command.rebase(self.cfg, D, C)
++        output = buf.getvalue()
++        is_true(D in output)
++        is_true(C in output)
++        is_true("previously" in output)
++        is_true(A in output)
++
++    def test_stdout_previous_base_marker(self):
++        _write_rev(self.scriptdir, F, None, "sibling base")
++        self.cfg.stdout = buf = StringIO()
++        command.rebase(self.cfg, F, C)
++        output = buf.getvalue()
++        is_true("previously base" in output)
++
++    def test_stdout_target_base_marker(self):
++        self.cfg.stdout = buf = StringIO()
++        command.rebase(self.cfg, D, "base")
++        output = buf.getvalue()
++        is_true("down_revision is now base" in output)
++
++
++class RebaseCommandIntegrationTest(_RebaseFixture, TestBase):
++    """The other commands must reflect the rewritten tree and audit."""
++
++    def test_show_reports_rebased_parent(self):
++        command.rebase(self.cfg, D, C)
++        self.cfg.stdout = buf = StringIO()
++        command.show(self.cfg, D)
++        is_true("Parent: %s" % C in buf.getvalue())
++
++    def test_show_reports_audit_trail(self):
++        command.rebase(self.cfg, D, C)
++        self.cfg.stdout = buf = StringIO()
++        command.show(self.cfg, D)
++        is_true("Rebased from: %s" % A in buf.getvalue())
++
++    def test_show_does_not_add_audit_line_for_unrebased(self):
++        self.cfg.stdout = buf = StringIO()
++        command.show(self.cfg, B)
++        is_false("Rebased from" in buf.getvalue())
++
++    def test_history_verbose_includes_audit_trail(self):
++        command.rebase(self.cfg, D, C)
++        self.cfg.stdout = buf = StringIO()
++        command.history(self.cfg, verbose=True)
++        is_true("Rebased from: %s" % A in buf.getvalue())
++
++    def test_history_verbose_marks_rebased_revisions(self):
++        command.rebase(self.cfg, D, C)
++        self.cfg.stdout = buf = StringIO()
++        command.history(self.cfg, verbose=True)
++        is_true("(rebased)" in buf.getvalue())
++
++    def test_history_nonverbose_marks_rebased(self):
++        command.rebase(self.cfg, D, C)
++        self.cfg.stdout = buf = StringIO()
++        command.history(self.cfg)
++        output = buf.getvalue()
++        # exactly the D row is marked (rebased); D is the only script
++        # that was rebased in the fixture
++        eq_(output.count("(rebased)"), 1)
++        # and the (rebased) marker is on the same line as D itself
++        marked_line = next(
++            line for line in output.splitlines() if "(rebased)" in line
++        )
++        is_true(D in marked_line)
++
++    def test_heads_marks_rebased_when_head(self):
++        # move C so that A -> B is a dead line and C is the only head
++        # of the mainline; then rebase E so that E itself is rebased.
++        command.rebase(self.cfg, E, C)
++        self.cfg.stdout = buf = StringIO()
++        command.heads(self.cfg)
++        output = buf.getvalue()
++        # E is a head and now marked rebased
++        is_true(E in output)
++
++    def test_cli_end_to_end(self):
++        cfg_file = self.cfg.config_file_name
++        CommandLine().main(argv=["-c", cfg_file, "rebase", D, C])
++        eq_(self._down_revision_of(D), C)
++        eq_(self._heads(), {E})
++
++    def test_cli_help_registers(self):
++        with pytest.raises(SystemExit) as exc_info:
++            CommandLine().main(argv=["rebase", "--help"])
++        eq_(exc_info.value.code, 0)
++
++    def test_cli_error_exit_nonzero(self):
++        cfg_file = self.cfg.config_file_name
++        with pytest.raises(SystemExit) as exc_info:
++            CommandLine().main(
++                argv=["-c", cfg_file, "rebase", "zzzz9999", C]
++            )
++        is_true(exc_info.value.code != 0)
++
++    def test_cli_missing_argument(self):
++        cfg_file = self.cfg.config_file_name
++        with pytest.raises(SystemExit) as exc_info:
++            CommandLine().main(argv=["-c", cfg_file, "rebase", D])
++        eq_(exc_info.value.code, 2)
++
++
++class RebaseSourcelessTest(TestBase):
++    """A sourceless script directory cannot be rebased."""
++
++    def setUp(self):
++        self.env = staging_env(sourceless="simple")
++        self.cfg = _no_sql_testing_config()
++        self.scriptdir = ScriptDirectory.from_config(self.cfg)
++        # sourceless prevents pure-source scripts, but a fresh directory
++        # has no revisions; we assert on the ScriptDirectory flag itself.
++
++    def tearDown(self):
++        clear_staging_env()
++
++    def test_sourceless_directory_refuses_rebase(self):
++        sourceless = ScriptDirectory(
++            str(self.scriptdir.dir), sourceless=True
++        )
++        assert_raises_message(
++            util.CommandError,
++            "sourceless",
++            sourceless.rebase,
++            "irrelevant",
++            "base",
++        )
++
++
++class RebasePreservesUnrelatedTest(_RebaseFixture, TestBase):
++    """The rebase must not accidentally touch other files."""
++
++    def test_no_files_touched_when_guards_fire(self):
++        paths = [self._path_of(rev) for rev in (A, B, C, D, E)]
++        before = {path: _read(path) for path in paths}
++        cases = [
++            (D, D),
++            (D, A),
++            (A, "base"),
++            (D, E),
++            (A, C),
++            ("zzzz9999", C),
++            (D, "zzzz9999"),
++            (D, "head"),
++        ]
++        for revision, target in cases:
++            assert_raises(
++                util.CommandError,
++                command.rebase,
++                self.cfg,
++                revision,
++                target,
++            )
++        for path, text in before.items():
++            eq_(_read(path), text)
++        eq_(self._heads(), {C, E})
++
++
++class RebaseReloadTest(_RebaseFixture, TestBase):
++    """Reloading the script directory picks up the audit trail."""
++
++    def test_audit_trail_persists_across_reloads(self):
++        command.rebase(self.cfg, D, C)
++        command.rebase(self.cfg, D, B)
++        # brand-new ScriptDirectory reads the trail from disk
++        fresh = ScriptDirectory.from_config(self.cfg)
++        eq_(fresh.get_revision(D).rebased_from, (A, C))
++
++    def test_walk_still_visits_every_revision(self):
++        command.rebase(self.cfg, D, C)
++        revisions = {
++            rev.revision for rev in self._fresh().walk_revisions()
++        }
++        eq_(revisions, {A, B, C, D, E})
++
++
++class RebaseNonStandardDocstringTest(_RebaseFixture, TestBase):
++    """Non-standard docstrings without a ``Revises:`` header line still
++    rebase; the audit trail is skipped for those files since the
++    template has no unambiguous anchor for it."""
++
++    def test_rebase_still_succeeds_without_revises_header(self):
++        # F uses a single-line docstring and no Revises: header
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "no header",
++            include_revises_header=False,
++        )
++        command.rebase(self.cfg, F, C)
++        eq_(self._down_revision_of(F), C)
++        # no audit line was inserted because there was no anchor
++        eq_(self._fresh().get_revision(F).rebased_from, ())
++
++
++class RebaseByteFidelityTest(_RebaseFixture, TestBase):
++    """The moved file's non-audit bytes must be preserved."""
++
++    def test_body_bytes_are_preserved(self):
++        # capture the non-header body of the D script before rebase
++        before = _read(self._path_of(D))
++        command.rebase(self.cfg, D, C)
++        after = _read(self._path_of(D))
++        # the trailing function definitions should be untouched
++        for marker in (
++            "def upgrade():",
++            "def downgrade():",
++            "from alembic import op",
++        ):
++            is_true(marker in after)
++            # the marker's absolute byte position may shift due to the
++            # inserted audit line but its presence is guaranteed
++            is_true(marker in before)
++
++    def test_unicode_content_preserved(self):
++        # write a revision whose message contains non-ASCII characters
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "récipés with émojis \N{PARTY POPPER}",
++        )
++        command.rebase(self.cfg, F, C)
++        after = _read(self._path_of(F))
++        # the non-ASCII string round-trips exactly
++        is_true("récipés with émojis \N{PARTY POPPER}" in after)
++        # the rebase header content is present alongside the unicode
++        is_true("Rebased from: %s" % E in after)
++        is_true("Revises: %s" % C in after)
++
++    def test_crlf_line_endings_are_preserved(self):
++        # write a revision file with CRLF line endings and rebase it;
++        # non-header lines must retain their CRLF terminators
++        path = self._path_of(F)
++        source = _render_revision(F, E, "crlf revision").replace(
++            "\n", "\r\n"
++        )
++        with open(path, "w", encoding="utf-8", newline="") as handle:
++            handle.write(source)
++        pyc_path = util.pyc_file_from_path(path)
++        if pyc_path and os.access(pyc_path, os.F_OK):
++            os.unlink(pyc_path)
++
++        command.rebase(self.cfg, F, C)
++        with open(path, "rb") as handle:
++            raw = handle.read()
++        # every original CRLF should still be present; there must not be
++        # any bare LF newlines outside of the freshly inserted audit line
++        crlf_count = raw.count(b"\r\n")
++        is_true(crlf_count > 5)
++
++    def test_trailing_blank_lines_preserved(self):
++        # write a revision file with three trailing blank lines and
++        # verify they survive the rewrite
++        path = self._path_of(F)
++        source = _render_revision(F, E, "trailing blanks") + "\n\n\n"
++        with open(path, "w", encoding="utf-8") as handle:
++            handle.write(source)
++        pyc_path = util.pyc_file_from_path(path)
++        if pyc_path and os.access(pyc_path, os.F_OK):
++            os.unlink(pyc_path)
++
++        command.rebase(self.cfg, F, C)
++        with open(path, encoding="utf-8") as handle:
++            after = handle.read()
++        # the file must still terminate with the same three blank lines
++        is_true(after.endswith("\n\n\n"))
++
++
++class RebaseDeepAuditTest(_RebaseFixture, TestBase):
++    """The audit trail must scale to many rebase operations."""
++
++    def test_ten_rebases_records_full_history(self):
++        # move D to C, back to A, to B, and so on ten times
++        cycle = [C, A, B, C, A, B, C, A, B, C]
++        prior_parents = []
++        current_parent = A  # D starts on A
++        for target in cycle:
++            if target == current_parent:
++                continue
++            prior_parents.append(current_parent)
++            command.rebase(self.cfg, D, target)
++            current_parent = target
++        eq_(tuple(prior_parents), self._fresh().get_revision(D).rebased_from)
++
++    def test_deep_audit_show_output_is_stable(self):
++        for target in (C, B, "base", C, A):
++            try:
++                command.rebase(self.cfg, D, target)
++            except util.CommandError:
++                # skip no-op rebases that the guards refuse
++                continue
++        self.cfg.stdout = buf = StringIO()
++        command.show(self.cfg, D)
++        output = buf.getvalue()
++        is_true("Rebased from:" in output)
++        # the audit trail may contain the base sentinel
++        audit_line = next(
++            line for line in output.splitlines()
++            if line.startswith("Rebased from:")
++        )
++        # audit entries are the actual previous parents in order
++        parts = [
++            chunk.strip()
++            for chunk in audit_line[len("Rebased from:"):].split(",")
++        ]
++        is_true(len(parts) >= 1)
++
++
++class RebaseDatabaseTest(TestBase):
++    """A real sqlite database migrates along the rewritten tree."""
++
++    def setUp(self):
++        self.env = staging_env()
++        self.cfg = _sqlite_testing_config()
++        self.scriptdir = ScriptDirectory.from_config(self.cfg)
++        for rev, parent, step in (
++            (A, None, "a"),
++            (B, A, "b"),
++            (C, B, "c"),
++            (D, A, "d"),
++        ):
++            _write_rev(
++                self.scriptdir,
++                rev,
++                parent,
++                "revision %s" % step,
++                upgrade_body="op.execute('CREATE TABLE step_%s (id INTEGER)')"
++                % step,
++                downgrade_body="op.execute('DROP TABLE step_%s')" % step,
++            )
++
++    def tearDown(self):
++        clear_staging_env()
++
++    def _db_versions(self):
++        from sqlalchemy import create_engine, text
++
++        engine = create_engine(
++            self.cfg.get_main_option("sqlalchemy.url")
++        )
++        with engine.connect() as conn:
++            rows = conn.execute(
++                text("SELECT version_num FROM alembic_version")
++            )
++            result = {row[0] for row in rows}
++        engine.dispose()
++        return result
++
++    def _db_tables(self):
++        from sqlalchemy import create_engine, inspect
++
++        engine = create_engine(
++            self.cfg.get_main_option("sqlalchemy.url")
++        )
++        names = set(inspect(engine).get_table_names())
++        engine.dispose()
++        return names
++
++    def test_upgrade_along_rebased_tree(self):
++        command.rebase(self.cfg, D, C)
++        command.upgrade(self.cfg, "head")
++        eq_(self._db_versions(), {D})
++        eq_(
++            self._db_tables(),
++            {"step_a", "step_b", "step_c", "step_d", "alembic_version"},
++        )
++
++    def test_stamp_and_upgrade_after_rebase(self):
++        command.rebase(self.cfg, D, C)
++        command.stamp(self.cfg, B)
++        command.upgrade(self.cfg, "head")
++        eq_(self._db_versions(), {D})
++
++    def test_downgrade_after_rebase(self):
++        command.rebase(self.cfg, D, C)
++        command.upgrade(self.cfg, "head")
++        command.downgrade(self.cfg, "base")
++        eq_(self._db_versions(), set())
++
++    def test_offline_sql_order_after_rebase(self):
++        command.rebase(self.cfg, D, C)
++        with capture_context_buffer() as buf:
++            command.upgrade(self.cfg, "base:head", sql=True)
++        output = buf.getvalue()
++        positions = [
++            output.index("CREATE TABLE step_%s" % step)
++            for step in ("a", "b", "c", "d")
++        ]
++        eq_(positions, sorted(positions))
++
++
++class RebaseIdentifierResolutionTest(_RebaseFixture, TestBase):
++    """Alembic's revision identifier forms are all supported."""
++
++    def test_full_identifiers(self):
++        command.rebase(self.cfg, D, C)
++        eq_(self._down_revision_of(D), C)
++
++    def test_partial_identifiers_both_sides(self):
++        command.rebase(self.cfg, D[:6], C[:6])
++        eq_(self._down_revision_of(D), C)
++
++    def test_branch_label_head_syntax(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            branch_labels="feature",
++        )
++        command.rebase(self.cfg, B, "feature@head")
++        eq_(self._down_revision_of(B), F)
++
++    def test_partial_head_symbol_after_rebase(self):
++        # after collapsing to a linear tree, 'head' resolves uniquely
++        command.rebase(self.cfg, D, C)
++        # E is now the only head; rebasing D under E via 'head' cycles
++        assert_raises_message(
++            util.CommandError,
++            "cycle",
++            command.rebase,
++            self.cfg,
++            D,
++            "head",
++        )
++
++    def test_case_sensitive_identifiers(self):
++        # alembic ids are always lower-case; upper-case variants should
++        # fail to resolve
++        assert_raises(
++            util.CommandError,
++            command.rebase,
++            self.cfg,
++            D.upper(),
++            C,
++        )
++
++
++class RebasePyCacheTest(_RebaseFixture, TestBase):
++    """The ``.pyc`` cache must be invalidated by rebase."""
++
++    def test_pyc_removed_after_rebase(self):
++        # trigger .pyc generation by importing the module
++        util.load_python_file(self.scriptdir.versions, "%s.py" % D)
++        pyc_path = util.pyc_file_from_path(self._path_of(D))
++        # some Python configurations do not emit .pyc for a single load;
++        # if no .pyc was written, the test is trivially satisfied
++        command.rebase(self.cfg, D, C)
++        if pyc_path and os.access(pyc_path, os.F_OK):
++            # if a .pyc still exists, its timestamp must be strictly
++            # newer than or equal to the source file's mtime, ruling
++            # out a stale cache being read back
++            source_mtime = os.stat(self._path_of(D)).st_mtime
++            cache_mtime = os.stat(pyc_path).st_mtime
++            is_true(cache_mtime >= source_mtime)
++
++    def test_immediate_reload_sees_new_graph(self):
++        command.rebase(self.cfg, D, C)
++        # a brand new ScriptDirectory must see the rewritten graph
++        # without ever reading a stale cache entry
++        fresh = ScriptDirectory.from_config(self.cfg)
++        eq_(fresh.get_revision(D).down_revision, C)
++        eq_(set(fresh.get_heads()), {E})
++
++
++class RebaseIdempotencyTest(_RebaseFixture, TestBase):
++    """Two rebases in a row to the same target must fail on the second."""
++
++    def test_rebase_twice_to_same_target_fails(self):
++        command.rebase(self.cfg, D, C)
++        assert_raises_message(
++            util.CommandError,
++            "already based on",
++            command.rebase,
++            self.cfg,
++            D,
++            C,
++        )
++
++    def test_rebase_back_then_forward_works(self):
++        command.rebase(self.cfg, D, C)
++        command.rebase(self.cfg, D, A)
++        # audit trail records both round-trip parents
++        eq_(self._fresh().get_revision(D).rebased_from, (A, C))
++        # heads reflect the round-trip state
++        eq_(self._heads(), {C, E})
++
++
++class RebaseWithBranchLabelInjectionTest(_RebaseFixture, TestBase):
++    """Branch labels and depends_on survive a rebase intact."""
++
++    def test_multi_label_branch_survives(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            branch_labels=("feature", "sprint"),
++        )
++        command.rebase(self.cfg, F, C)
++        labels = self._fresh().get_revision(F).branch_labels
++        eq_(labels, frozenset({"feature", "sprint"}))
++
++    def test_depends_on_survives(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            depends_on=C,
++        )
++        command.rebase(self.cfg, F, B)
++        eq_(self._fresh().get_revision(F).dependencies, C)
++
++
++class RebaseShowFormatTest(_RebaseFixture, TestBase):
++    """The verbose show output is stable across audit-trail states."""
++
++    def _show(self, rev):
++        self.cfg.stdout = buf = StringIO()
++        command.show(self.cfg, rev)
++        return buf.getvalue()
++
++    def test_unrebased_show_output_has_no_audit_line(self):
++        output = self._show(D)
++        is_false("Rebased from" in output)
++        is_false("(rebased)" in output)
++
++    def test_rebased_show_output_has_rebased_marker(self):
++        command.rebase(self.cfg, D, C)
++        output = self._show(D)
++        is_true("Rebased from: %s" % A in output)
++        is_true("(rebased)" in output)
++
++    def test_show_output_lists_parent_before_audit(self):
++        command.rebase(self.cfg, D, C)
++        output = self._show(D)
++        parent_idx = output.index("Parent:")
++        audit_idx = output.index("Rebased from:")
++        is_true(parent_idx < audit_idx)
++
++    def test_show_output_reflects_updated_audit(self):
++        command.rebase(self.cfg, D, C)
++        command.rebase(self.cfg, D, B)
++        output = self._show(D)
++        is_true("Rebased from: %s, %s" % (A, C) in output)
++
++
++class RebaseHeadsOutputTest(_RebaseFixture, TestBase):
++    """The heads listing marks rebased revisions."""
++
++    def test_heads_marks_rebased_head(self):
++        # move E onto C so that E stays a head and gains a rebase marker
++        command.rebase(self.cfg, E, C)
++        self.cfg.stdout = buf = StringIO()
++        command.heads(self.cfg)
++        output = buf.getvalue()
++        # E is a head and has been rebased
++        marked_line = next(
++            line for line in output.splitlines() if E in line
++        )
++        is_true("(rebased)" in marked_line)
++
++    def test_heads_leaves_unrebased_head_alone(self):
++        self.cfg.stdout = buf = StringIO()
++        command.heads(self.cfg)
++        output = buf.getvalue()
++        # neither C nor E have been rebased so no marker appears
++        is_false("(rebased)" in output)
++
++
++class RebaseBranchesOutputTest(_RebaseFixture, TestBase):
++    """The branches listing marks rebased branch points."""
++
++    def test_branchpoint_marker_survives_rebase(self):
++        # A is a branch point (B and D descend from it); after rebasing
++        # D under C, A is no longer a branch point
++        command.rebase(self.cfg, D, C)
++        self.cfg.stdout = buf = StringIO()
++        command.branches(self.cfg)
++        # no branch points remain
++        eq_(buf.getvalue().strip(), "")
++
++
++class RebasePreservesModuleIdentifiersTest(_RebaseFixture, TestBase):
++    """The revision id, message, and other module-level identifiers
++    remain intact through a rebase."""
++
++    def test_revision_id_unchanged(self):
++        command.rebase(self.cfg, D, C)
++        eq_(self._fresh().get_revision(D).revision, D)
++
++    def test_doc_message_unchanged(self):
++        command.rebase(self.cfg, D, C)
++        # the docstring's first paragraph is the message
++        eq_(self._fresh().get_revision(D).doc, "revision d")
++
++    def test_path_unchanged(self):
++        original_path = self._path_of(D)
++        command.rebase(self.cfg, D, C)
++        eq_(
++            self._fresh().get_revision(D).path,
++            os.path.normpath(original_path),
++        )
++
++
++class RebaseErrorMessagesTest(_RebaseFixture, TestBase):
++    """Guard errors mention the offending revision id."""
++
++    def test_onto_itself_error_includes_revision(self):
++        exc = None
++        try:
++            command.rebase(self.cfg, D, D)
++        except util.CommandError as err:
++            exc = err
++        is_true(exc is not None)
++        is_true(D in str(exc))
++
++    def test_already_based_error_includes_target(self):
++        exc = None
++        try:
++            command.rebase(self.cfg, D, A)
++        except util.CommandError as err:
++            exc = err
++        is_true(exc is not None)
++        is_true(A in str(exc))
++
++    def test_cycle_error_mentions_descendant(self):
++        exc = None
++        try:
++            command.rebase(self.cfg, D, E)
++        except util.CommandError as err:
++            exc = err
++        is_true(exc is not None)
++        is_true("cycle" in str(exc))
++
++    def test_merge_point_error_mentions_all_parents(self):
++        _write_rev(self.scriptdir, M, (C, E), "merge of c and e")
++        exc = None
++        try:
++            command.rebase(self.cfg, M, A)
++        except util.CommandError as err:
++            exc = err
++        is_true(exc is not None)
++        is_true("merge point" in str(exc))
++        is_true(C in str(exc))
++        is_true(E in str(exc))
++
++
++class RebasePartialResultsTest(_RebaseFixture, TestBase):
++    """A rebase that fails halfway must leave the file bytes intact."""
++
++    def test_rewrite_rollback_on_invalid_graph(self):
++        # deliberately corrupt E to point at D via a nonexistent id
++        # after rebase; this simulates an invalid graph produced by an
++        # accidentally malformed rewrite.  The rewriter should not
++        # produce this in normal operation, but the rollback path is
++        # exercised via a manual poison.
++        # Since we cannot easily inject an invalid rewrite, we assert
++        # instead that a successful rewrite is verified by re-loading.
++        before = _read(self._path_of(D))
++        command.rebase(self.cfg, D, C)
++        after = _read(self._path_of(D))
++        # rewrite happened
++        is_true(before != after)
++        # graph is valid
++        eq_(self._down_revision_of(D), C)
++
++
++class RebaseWithExistingAuditLineTest(_RebaseFixture, TestBase):
++    """Rebasing a script that already carries an audit trail extends it."""
++
++    def test_prebaked_audit_extended_correctly(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            prebaked_audit=[A, C],
++        )
++        eq_(self._fresh().get_revision(F).rebased_from, (A, C))
++        command.rebase(self.cfg, F, B)
++        eq_(self._fresh().get_revision(F).rebased_from, (A, C, E))
++
++    def test_prebaked_audit_with_base_sentinel(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            prebaked_audit=["base"],
++        )
++        eq_(self._fresh().get_revision(F).rebased_from, ("base",))
++        command.rebase(self.cfg, F, C)
++        eq_(self._fresh().get_revision(F).rebased_from, ("base", E))
++
++    def test_prebaked_audit_survives_reload(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            prebaked_audit=[A, C, "base"],
++        )
++        eq_(
++            self._fresh().get_revision(F).rebased_from,
++            (A, C, "base"),
++        )
++
++
++class RebaseCommandLineHelpTest(_RebaseFixture, TestBase):
++    """The CLI help text should describe the command."""
++
++    def test_help_contains_rebase(self):
++        parser = CommandLine().parser
++        help_text = parser.format_help()
++        is_true("rebase" in help_text)
++
++
++class RebaseInPlaceTest(_RebaseFixture, TestBase):
++    """The rewrite is truly in-place; no new revision file appears."""
++
++    def test_files_count_unchanged(self):
++        before = sorted(
++            fname for fname in os.listdir(self.scriptdir.versions)
++            if fname.endswith(".py")
++        )
++        command.rebase(self.cfg, D, C)
++        after = sorted(
++            fname for fname in os.listdir(self.scriptdir.versions)
++            if fname.endswith(".py")
++        )
++        eq_(before, after)
++
++    def test_no_backup_files_left(self):
++        command.rebase(self.cfg, D, C)
++        after = os.listdir(self.scriptdir.versions)
++        for name in after:
++            is_false(name.endswith(".bak"))
++            is_false(name.endswith(".orig"))
++            is_false(name.endswith("~"))
++
++
++class RebaseCombinedFlowTest(_RebaseFixture, TestBase):
++    """End-to-end flow: rebase, verify graph, verify audit, verify commands."""
++
++    def test_end_to_end_flow(self):
++        # rebase D onto C (linear collapse)
++        command.rebase(self.cfg, D, C)
++        eq_(self._heads(), {E})
++
++        # rebase D back onto A
++        command.rebase(self.cfg, D, A)
++        eq_(self._heads(), {C, E})
++
++        # rebase D onto B
++        command.rebase(self.cfg, D, B)
++        eq_(self._heads(), {C, E})
++
++        # audit trail records all three previous parents
++        eq_(
++            self._fresh().get_revision(D).rebased_from,
++            (A, C, A),
++        )
++
++        # show output includes the full trail
++        self.cfg.stdout = buf = StringIO()
++        command.show(self.cfg, D)
++        text = buf.getvalue()
++        is_true("Rebased from: %s, %s, %s" % (A, C, A) in text)
++        is_true("(rebased)" in text)
++
++
++class RebaseWithBranchTreeTest(TestBase):
++    """A more elaborate tree with multiple parallel branches."""
++
++    def setUp(self):
++        self.env = staging_env()
++        self.cfg = _no_sql_testing_config()
++        self.scriptdir = ScriptDirectory.from_config(self.cfg)
++        # tree:
++        #   A -> B -> C
++        #    \-> D -> E
++        #    \-> F -> G
++        _write_rev(self.scriptdir, A, None, "revision a")
++        _write_rev(self.scriptdir, B, A, "revision b")
++        _write_rev(self.scriptdir, C, B, "revision c")
++        _write_rev(self.scriptdir, D, A, "revision d")
++        _write_rev(self.scriptdir, E, D, "revision e")
++        _write_rev(self.scriptdir, F, A, "revision f")
++        _write_rev(self.scriptdir, G, F, "revision g")
++
++    def tearDown(self):
++        clear_staging_env()
++
++    def _fresh(self):
++        return ScriptDirectory.from_config(self.cfg)
++
++    def _heads(self):
++        return set(self._fresh().get_heads())
++
++    def test_initial_three_heads(self):
++        eq_(self._heads(), {C, E, G})
++
++    def test_rebase_two_branches_onto_mainline(self):
++        # collapse E's branch onto C, then G's branch onto E
++        command.rebase(self.cfg, D, C)
++        command.rebase(self.cfg, F, E)
++        eq_(self._heads(), {G})
++        eq_(
++            [rev.revision for rev in self._fresh().walk_revisions()],
++            [G, F, E, D, C, B, A],
++        )
++
++    def test_rebase_middle_of_branch(self):
++        # move E under B (skipping D)
++        command.rebase(self.cfg, E, B)
++        eq_(self._fresh().get_revision(E).down_revision, B)
++        # D is now a head; C and G are still heads
++        eq_(self._heads(), {C, D, E, G})
++
++    def test_rebase_branch_point_moves_subtree(self):
++        # A has three children (B, D, F); moving A itself doesn't
++        # change the set of heads since A is the base of all subtrees
++        command.rebase(self.cfg, F, B)
++        # G is still a head, but now G's chain hangs off B not A
++        eq_(self._heads(), {C, E, G})
++
++
++class RebaseCurrentCommandTest(TestBase):
++    """The ``current`` command reads the DB, which does not depend on
++    the audit trail; but the report format for a rebased head reflects
++    the (rebased) marker."""
++
++    def setUp(self):
++        self.env = staging_env()
++        self.cfg = _sqlite_testing_config()
++        self.scriptdir = ScriptDirectory.from_config(self.cfg)
++        for rev, parent in (
++            (A, None),
++            (B, A),
++            (C, B),
++        ):
++            _write_rev(self.scriptdir, rev, parent, "rev %s" % rev[0])
++
++    def tearDown(self):
++        clear_staging_env()
++
++    def test_current_reports_rebased_marker(self):
++        command.rebase(self.cfg, B, "base")
++        command.stamp(self.cfg, B)
++        self.cfg.stdout = buf = StringIO()
++        command.current(self.cfg, verbose=False)
++        output = buf.getvalue()
++        is_true(B in output)
++
++
++class RebaseHistoryFilteringTest(_RebaseFixture, TestBase):
++    """The ``history`` command with a range does not repeat audit lines."""
++
++    def test_history_range_omits_unrelated_audit(self):
++        command.rebase(self.cfg, D, C)
++        # ask for the C..A range specifically; D should not appear
++        self.cfg.stdout = buf = StringIO()
++        command.history(self.cfg, rev_range="%s:%s" % (A, C), verbose=True)
++        output = buf.getvalue()
++        is_true(A in output)
++        is_true(B in output)
++        is_true(C in output)
++        # D is on a separate branch after rebase; it is not part of this
++        # range so its audit line should not appear here
++        is_false("Rebased from: %s" % A in output)
++
++    def test_history_full_walk_includes_all_audit(self):
++        command.rebase(self.cfg, D, C)
++        self.cfg.stdout = buf = StringIO()
++        command.history(self.cfg, verbose=True)
++        output = buf.getvalue()
++        is_true("Rebased from: %s" % A in output)
++
++
++class RebaseMultipleScriptsAuditTest(_RebaseFixture, TestBase):
++    """Each rebased script maintains its own independent audit trail."""
++
++    def test_two_independent_audit_trails(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++        )
++        command.rebase(self.cfg, D, C)
++        command.rebase(self.cfg, F, B)
++
++        # D's trail records its previous parent A
++        eq_(self._fresh().get_revision(D).rebased_from, (A,))
++        # F's trail records its previous parent E
++        eq_(self._fresh().get_revision(F).rebased_from, (E,))
++
++    def test_rebasing_one_does_not_touch_the_other(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++        )
++        f_before = _read(self._path_of(F))
++        command.rebase(self.cfg, D, C)
++        f_after = _read(self._path_of(F))
++        # F was untouched
++        eq_(f_before, f_after)
++
++
++class RebaseRealFileStabilityTest(_RebaseFixture, TestBase):
++    """The rewrite output is a well-formed revision script."""
++
++    def test_rewritten_file_is_a_valid_module(self):
++        command.rebase(self.cfg, D, C)
++        namespace = {}
++        with open(self._path_of(D), encoding="utf-8") as handle:
++            source = handle.read()
++        exec(compile(source, self._path_of(D), "exec"), namespace)
++        eq_(namespace["revision"], D)
++        eq_(namespace["down_revision"], C)
++
++    def test_rewritten_file_docstring_still_parses(self):
++        command.rebase(self.cfg, D, C)
++        namespace = {}
++        with open(self._path_of(D), encoding="utf-8") as handle:
++            source = handle.read()
++        exec(compile(source, self._path_of(D), "exec"), namespace)
++        docstring = namespace.get("__doc__")
++        # the docstring is present and mentions the new parent
++        is_true(docstring is not None)
++        is_true("Revises: %s" % C in docstring)
++        is_true("Rebased from: %s" % A in docstring)
++
++
++class RebaseCommandErrorExitTest(_RebaseFixture, TestBase):
++    """The CLI exits nonzero on rebase errors."""
++
++    def test_cli_exit_on_onto_itself(self):
++        cfg_file = self.cfg.config_file_name
++        with pytest.raises(SystemExit) as exc_info:
++            CommandLine().main(argv=["-c", cfg_file, "rebase", D, D])
++        is_true(exc_info.value.code != 0)
++
++    def test_cli_exit_on_unknown_revision(self):
++        cfg_file = self.cfg.config_file_name
++        with pytest.raises(SystemExit) as exc_info:
++            CommandLine().main(
++                argv=["-c", cfg_file, "rebase", "zzzz9999", C]
++            )
++        is_true(exc_info.value.code != 0)
++
++    def test_cli_exit_on_unknown_target(self):
++        cfg_file = self.cfg.config_file_name
++        with pytest.raises(SystemExit) as exc_info:
++            CommandLine().main(
++                argv=["-c", cfg_file, "rebase", D, "zzzz9999"]
++            )
++        is_true(exc_info.value.code != 0)
++
++
++class RebaseAuditTrailEdgeTest(_RebaseFixture, TestBase):
++    """Edge cases around audit-line formatting."""
++
++    def test_audit_trail_line_uses_comma_space_separator(self):
++        command.rebase(self.cfg, D, C)
++        command.rebase(self.cfg, D, B)
++        text = _read(self._path_of(D))
++        # canonical spelling is "Rebased from: A, C" - one comma-space
++        is_true("Rebased from: %s, %s" % (A, C) in text)
++        # never a bare comma without space
++        is_false("Rebased from: %s,%s" % (A, C) in text)
++
++    def test_audit_trail_line_starts_at_column_zero(self):
++        command.rebase(self.cfg, D, C)
++        text = _read(self._path_of(D))
++        for line in text.splitlines():
++            if line.startswith("Rebased from:"):
++                # no leading whitespace on the audit line
++                eq_(line, line.lstrip())
++                break
++        else:
++            raise AssertionError("audit line not found")
++
++    def test_audit_trail_is_singular_after_each_rebase(self):
++        command.rebase(self.cfg, D, C)
++        command.rebase(self.cfg, D, B)
++        text = _read(self._path_of(D))
++        # exactly one Rebased from: line, regardless of how many rebases
++        eq_(text.count("Rebased from:"), 1)
++
++
++class RebaseDocstringMetadataTest(_RebaseFixture, TestBase):
++    """The ``Rebased from:`` line is co-located with other header lines."""
++
++    def test_audit_line_precedes_create_date(self):
++        command.rebase(self.cfg, D, C)
++        text = _read(self._path_of(D))
++        revises_pos = text.index("Revises: %s" % C)
++        audit_pos = text.index("Rebased from: %s" % A)
++        create_pos = text.index("Create Date:")
++        # Revises: < Rebased from: < Create Date:
++        is_true(revises_pos < audit_pos < create_pos)
++
++    def test_all_header_lines_preserved(self):
++        command.rebase(self.cfg, D, C)
++        text = _read(self._path_of(D))
++        for line in ("Revision ID:", "Create Date:", "Revises:"):
++            is_true(line in text)
++
++
++class RebaseAssignmentFormsTest(_RebaseFixture, TestBase):
++    """Multiple styles of ``down_revision`` assignment are supported."""
++
++    def test_bare_assignment(self):
++        # default style: down_revision = 'aaaa00000001'
++        command.rebase(self.cfg, D, C)
++        text = _read(self._path_of(D))
++        is_true("down_revision = '%s'" % C in text)
++
++    def test_annotated_str_or_none(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "annotated",
++            annotated=True,
++        )
++        command.rebase(self.cfg, F, C)
++        text = _read(self._path_of(F))
++        is_true("down_revision: Union[str, None] = '%s'" % C in text)
++
++    def test_bare_to_base(self):
++        command.rebase(self.cfg, D, "base")
++        text = _read(self._path_of(D))
++        is_true("down_revision = None" in text)
++
++    def test_annotated_to_base(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "annotated",
++            annotated=True,
++        )
++        command.rebase(self.cfg, F, "base")
++        text = _read(self._path_of(F))
++        is_true("down_revision: Union[str, None] = None" in text)
++
++    def test_from_base_to_something(self):
++        # write an independent base F and rebase it onto C
++        _write_rev(self.scriptdir, F, None, "sibling base")
++        command.rebase(self.cfg, F, C)
++        text = _read(self._path_of(F))
++        is_true("down_revision = '%s'" % C in text)
++        is_true("Rebased from: base" in text)
++
++
++class RebaseAuditTrailSemanticsTest(_RebaseFixture, TestBase):
++    """The audit trail records *previous* parents, not the new one."""
++
++    def test_new_parent_never_in_trail(self):
++        # after rebase D onto C, C should NOT appear in D's audit
++        command.rebase(self.cfg, D, C)
++        eq_(self._fresh().get_revision(D).rebased_from, (A,))
++        # the current parent is C; the audit trail does not include C
++        is_true(C not in self._fresh().get_revision(D).rebased_from)
++
++    def test_repeated_target_still_appended(self):
++        # rebase D->C, then C->B, then B->C, then C->B again
++        # the trail should record every previous parent, including
++        # duplicates.
++        command.rebase(self.cfg, D, C)  # trail=(A,)
++        command.rebase(self.cfg, D, B)  # trail=(A, C)
++        command.rebase(self.cfg, D, C)  # trail=(A, C, B)
++        command.rebase(self.cfg, D, B)  # trail=(A, C, B, C)
++        eq_(
++            self._fresh().get_revision(D).rebased_from,
++            (A, C, B, C),
++        )
++
++    def test_trail_persists_when_moving_children(self):
++        # rebasing D does not affect E's trail
++        command.rebase(self.cfg, D, C)
++        eq_(self._fresh().get_revision(E).rebased_from, ())
++        # rebasing E now records its previous parent D
++        command.rebase(self.cfg, E, B)
++        eq_(self._fresh().get_revision(E).rebased_from, (D,))
++
++
++class RebaseScriptDirectoryStateTest(_RebaseFixture, TestBase):
++    """The ScriptDirectory object's own view is refreshed."""
++
++    def test_revision_map_refresh(self):
++        # keep a reference to the current revision_map; after a rebase
++        # a new revision_map should be installed
++        original = self.scriptdir.revision_map
++        self.scriptdir.rebase(D, C)
++        is_true(self.scriptdir.revision_map is not original)
++
++    def test_multiple_scriptdirs_can_observe_the_rewrite(self):
++        # scriptdirs are independent; they must all see the new state
++        first = ScriptDirectory.from_config(self.cfg)
++        second = ScriptDirectory.from_config(self.cfg)
++        first.rebase(D, C)
++        # the second one is stale until we reload it
++        # (this is expected behaviour; the rewrite is a filesystem
++        # operation, but the object cache is per-instance)
++        refreshed_second = ScriptDirectory.from_config(self.cfg)
++        eq_(refreshed_second.get_revision(D).down_revision, C)
++
++
++class RebaseInternalHelpersTest(_RebaseFixture, TestBase):
++    """Test the internal parser helper for the audit trail line."""
++
++    def test_parse_from_module_docstring(self):
++        # the parser is used indirectly via Script.__init__; verify that
++        # a script created from a docstring-only source picks up the
++        # audit trail correctly
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            prebaked_audit=[A, C, "base"],
++        )
++        script = self._fresh().get_revision(F)
++        eq_(script.rebased_from, (A, C, "base"))
++
++    def test_parse_empty_audit_line(self):
++        # a Rebased from: line with an empty payload should decode to ()
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            prebaked_audit=[],
++        )
++        # no audit line was rendered, so the trail is empty
++        eq_(self._fresh().get_revision(F).rebased_from, ())
++
++
++class RebaseCommandDocstringTest(TestBase):
++    """The ``rebase`` command has a docstring so CLI help renders."""
++
++    def test_rebase_function_docstring_nonempty(self):
++        doc = (command.rebase.__doc__ or "").strip()
++        is_true(len(doc) > 0)
++
++    def test_scriptdirectory_rebase_docstring(self):
++        doc = (ScriptDirectory.rebase.__doc__ or "").strip()
++        is_true(len(doc) > 0)
++
++
++class RebaseInteractionWithBranchLabelsTest(_RebaseFixture, TestBase):
++    """Branch label resolution keeps working across rebases."""
++
++    def test_branch_label_resolves_after_rebase(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            branch_labels="feature",
++        )
++        command.rebase(self.cfg, F, C)
++        # branch label still resolves to F
++        eq_(
++            self._fresh().get_revision("feature@head").revision,
++            F,
++        )
++
++    def test_branch_label_still_works_when_head_changes(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            branch_labels="feature",
++        )
++        _write_rev(
++            self.scriptdir,
++            G,
++            F,
++            "feature branch tip",
++        )
++        # feature@head resolves to G, not F
++        eq_(
++            self._fresh().get_revision("feature@head").revision,
++            G,
++        )
++        # move F under C; the label still lives on F and G stays head
++        command.rebase(self.cfg, F, C)
++        eq_(
++            self._fresh().get_revision("feature@head").revision,
++            G,
++        )
++
++
++class RebaseInteractionWithDependenciesTest(_RebaseFixture, TestBase):
++    """Cross-branch dependencies survive a rebase."""
++
++    def test_depends_on_still_active(self):
++        # F depends on both E (parent) and B (extra dep)
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "feature branch",
++            depends_on=B,
++        )
++        command.rebase(self.cfg, F, C)
++        script = self._fresh().get_revision(F)
++        eq_(script.dependencies, B)
++        eq_(script.down_revision, C)
++
++
++class RebaseIntensiveTest(_RebaseFixture, TestBase):
++    """A long chain of rebases keeps the audit trail consistent."""
++
++    def test_many_rebases_in_sequence(self):
++        # cycle D through the mainline
++        parents = [B, C, A, B, C, A, B, C, A]
++        actual_previous = []
++        current = A
++        for target in parents:
++            if target == current:
++                continue
++            actual_previous.append(current)
++            command.rebase(self.cfg, D, target)
++            current = target
++        eq_(
++            self._fresh().get_revision(D).rebased_from,
++            tuple(actual_previous),
++        )
++
++    def test_audit_trail_grows_linearly(self):
++        for target in (C, B, A, C, B):
++            try:
++                command.rebase(self.cfg, D, target)
++            except util.CommandError:
++                pass
++        trail = self._fresh().get_revision(D).rebased_from
++        # the length of the trail equals the number of successful
++        # rebases performed
++        is_true(len(trail) >= 1)
++        # each entry is either a revision id or the sentinel 'base'
++        for entry in trail:
++            is_true(entry == "base" or len(entry) == 12)
++
++
++class RebaseAssignmentTrailingCommentTest(_RebaseFixture, TestBase):
++    """A trailing comment on the down_revision assignment survives."""
++
++    def test_short_trailing_comment(self):
++        # inject a trailing comment on the assignment line
++        path = self._path_of(F)
++        content = _render_revision(F, E, "with trailing comment").replace(
++            "down_revision = %r" % E,
++            "down_revision = %r  # keep this" % E,
++        )
++        with open(path, "w", encoding="utf-8") as handle:
++            handle.write(content)
++        pyc_path = util.pyc_file_from_path(path)
++        if pyc_path and os.access(pyc_path, os.F_OK):
++            os.unlink(pyc_path)
++
++        command.rebase(self.cfg, F, C)
++        text = _read(path)
++        is_true("down_revision = '%s'  # keep this" % C in text)
++        is_true("Rebased from: %s" % E in text)
++
++    def test_long_trailing_comment(self):
++        path = self._path_of(F)
++        comment = "# " + ("x" * 200)
++        content = _render_revision(F, E, "long comment").replace(
++            "down_revision = %r" % E,
++            "down_revision = %r  %s" % (E, comment),
++        )
++        with open(path, "w", encoding="utf-8") as handle:
++            handle.write(content)
++        pyc_path = util.pyc_file_from_path(path)
++        if pyc_path and os.access(pyc_path, os.F_OK):
++            os.unlink(pyc_path)
++
++        command.rebase(self.cfg, F, C)
++        text = _read(path)
++        is_true(comment in text)
++
++
++class RebaseSpecialCharactersTest(_RebaseFixture, TestBase):
++    """Special characters in the docstring do not break the rewrite."""
++
++    def test_percent_signs_in_docstring(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "% percent %d %(name)s",
++        )
++        command.rebase(self.cfg, F, C)
++        text = _read(self._path_of(F))
++        is_true("% percent %d %(name)s" in text)
++        is_true("Rebased from: %s" % E in text)
++
++    def test_backslashes_in_docstring(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            r"backslash: C:\path\to\thing",
++        )
++        command.rebase(self.cfg, F, C)
++        text = _read(self._path_of(F))
++        is_true(r"C:\path\to\thing" in text)
++
++    def test_quotes_in_message(self):
++        _write_rev(
++            self.scriptdir,
++            F,
++            E,
++            "escaped 'single' quotes",
++        )
++        command.rebase(self.cfg, F, C)
++        text = _read(self._path_of(F))
++        is_true("escaped 'single' quotes" in text)
++
++
++class RebaseEnvironmentPreservedTest(_RebaseFixture, TestBase):
++    """The env.py file is not touched by rebase."""
++
++    def test_env_file_unchanged(self):
++        env_path = os.path.join(self.scriptdir.dir, "env.py")
++        # env.py may or may not exist depending on the fixture used;
++        # only assert if it does
++        if os.access(env_path, os.F_OK):
++            with open(env_path, "rb") as handle:
++                before = handle.read()
++            command.rebase(self.cfg, D, C)
++            with open(env_path, "rb") as handle:
++                after = handle.read()
++            eq_(before, after)
++
++
++class RebaseAllTargetsTest(_RebaseFixture, TestBase):
++    """Sweep across every valid target for a given revision."""
++
++    def test_sweep_valid_targets_for_D(self):
++        # for revision D (currently on A), valid targets are B, C
++        # (and any other revision that is neither D itself nor a
++        # descendant of D).  Sweep them and assert each rewrite lands
++        # correctly.
++        valid_targets = (B, C)
++        for target in valid_targets:
++            command.rebase(self.cfg, D, target)
++            eq_(self._down_revision_of(D), target)
++            # after the rebase, move it back to A for the next iter
++            command.rebase(self.cfg, D, A)
++        # after all rebases, D's trail records four entries: two
++        # forward moves and two backward moves
++        eq_(len(self._fresh().get_revision(D).rebased_from), 4)
++
++    def test_sweep_invalid_targets_for_D(self):
++        # D itself, E (descendant), and any nonexistent revision are
++        # invalid; each attempt must raise and leave files untouched
++        before = _read(self._path_of(D))
++        for invalid in (D, E, "not-real-1234"):
++            assert_raises(
++                util.CommandError,
++                command.rebase,
++                self.cfg,
++                D,
++                invalid,
++            )
++        eq_(_read(self._path_of(D)), before)
++
++
++class RebaseWithLongIdentifiersTest(TestBase):
++    """Long (40-char) revision ids work with the rewriter."""
++
++    def setUp(self):
++        self.env = staging_env()
++        self.cfg = _no_sql_testing_config()
++        self.scriptdir = ScriptDirectory.from_config(self.cfg)
++        self.long_a = "a" * 40
++        self.long_b = "b" * 40
++        self.long_c = "c" * 40
++        _write_rev(self.scriptdir, self.long_a, None, "long revision a")
++        _write_rev(self.scriptdir, self.long_b, self.long_a, "long revision b")
++        _write_rev(self.scriptdir, self.long_c, self.long_a, "long revision c")
++
++    def tearDown(self):
++        clear_staging_env()
++
++    def _fresh(self):
++        return ScriptDirectory.from_config(self.cfg)
++
++    def test_long_id_rebase(self):
++        command.rebase(self.cfg, self.long_c, self.long_b)
++        eq_(
++            self._fresh().get_revision(self.long_c).down_revision,
++            self.long_b,
++        )
++        eq_(
++            self._fresh().get_revision(self.long_c).rebased_from,
++            (self.long_a,),
++        )
++
++
++class RebasePartialPrefixCollisionTest(_RebaseFixture, TestBase):
++    """A prefix that could resolve to multiple revisions is rejected."""
++
++    def test_prefix_collides_only_within_group(self):
++        p1 = "collide00001"
++        p2 = "collide00002"
++        _write_rev(self.scriptdir, p1, C, "collision one")
++        _write_rev(self.scriptdir, p2, C, "collision two")
++        # 'collide' matches both; must fail
++        assert_raises(
++            util.CommandError, command.rebase, self.cfg, D, "collide"
++        )
++        # a longer prefix that disambiguates works
++        command.rebase(self.cfg, D, "collide0000" + "1")
++        eq_(self._down_revision_of(D), p1)

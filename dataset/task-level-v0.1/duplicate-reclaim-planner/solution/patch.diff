@@ -1,0 +1,1996 @@
+diff --git a/core/reclaim/__init__.py b/core/reclaim/__init__.py
+new file mode 100644
+index 00000000..f1c8955e
+--- /dev/null
++++ b/core/reclaim/__init__.py
+@@ -0,0 +1,150 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Duplicate-file reclaim planner.
++
++A small, testable layer on top of dupeGuru's :mod:`core.fs` /
++:mod:`core.directories` primitives that finds byte-identical files, decides
++which copy to keep, produces an inspectable *plan* for reclaiming the rest, and
++then carries that plan out safely (delete / trash / hardlink / symlink) with
++dry-run, staleness and protection guards.
++
++The pipeline is deliberately staged and mostly pure:
++
++    scan (folders -> candidates)      core.reclaim.scanner
++      -> group (candidates -> groups) core.reclaim.grouper + identity
++        -> plan (groups -> actions)   core.reclaim.plan + strategies
++          -> execute (actions -> fs)  core.reclaim.executor
++
++:class:`ReclaimSession` (and the layered :func:`load_session`) wire these
++together for the common case.
++"""
++
++from core.reclaim.errors import (
++    ReclaimError,
++    ReclaimConfigError,
++    UnknownStrategyError,
++    InvalidScanRootError,
++    ReclaimExecutionError,
++    ProtectedPathError,
++    StalePlanError,
++)
++from core.reclaim.identity import (
++    ContentIdentity,
++    identity_of,
++    same_content,
++    SIZE_ONLY,
++    PARTIAL,
++    FULL,
++    DEFAULT_BIG_FILE_SIZE,
++)
++from core.reclaim.candidate import (
++    Candidate,
++    candidate_from_path,
++    candidates_from_files,
++)
++from core.reclaim.strategies import (
++    KeeperStrategy,
++    OldestKeeper,
++    NewestKeeper,
++    ShortestPathKeeper,
++    LongestPathKeeper,
++    PreferredDirKeeper,
++    CleanestNameKeeper,
++    BiggestKeeper,
++    CompositeStrategy,
++    make_strategy,
++    STRATEGY_NAMES,
++)
++from core.reclaim.grouper import (
++    DuplicateGroup,
++    GroupingResult,
++    group_identical,
++    DEFAULT_MIN_SIZE,
++)
++from core.reclaim.plan import (
++    ReclaimAction,
++    ReclaimPlan,
++    ReclaimPlanner,
++    DELETE,
++    TRASH,
++    HARDLINK,
++    SYMLINK,
++    ACTION_KINDS,
++)
++from core.reclaim.executor import ReclaimReport, ReclaimExecutor
++from core.reclaim.scanner import ScanSpec, CandidateScanner
++from core.reclaim.session import AnalysisResult, ReclaimSession
++from core.reclaim.loader import (
++    merge_documents,
++    load_settings,
++    load_session,
++    DEFAULT_SETTINGS,
++)
++from core.reclaim import report
++
++__all__ = [
++    # errors
++    "ReclaimError",
++    "ReclaimConfigError",
++    "UnknownStrategyError",
++    "InvalidScanRootError",
++    "ReclaimExecutionError",
++    "ProtectedPathError",
++    "StalePlanError",
++    # identity
++    "ContentIdentity",
++    "identity_of",
++    "same_content",
++    "SIZE_ONLY",
++    "PARTIAL",
++    "FULL",
++    "DEFAULT_BIG_FILE_SIZE",
++    # candidates
++    "Candidate",
++    "candidate_from_path",
++    "candidates_from_files",
++    # strategies
++    "KeeperStrategy",
++    "OldestKeeper",
++    "NewestKeeper",
++    "ShortestPathKeeper",
++    "LongestPathKeeper",
++    "PreferredDirKeeper",
++    "CleanestNameKeeper",
++    "BiggestKeeper",
++    "CompositeStrategy",
++    "make_strategy",
++    "STRATEGY_NAMES",
++    # grouping
++    "DuplicateGroup",
++    "GroupingResult",
++    "group_identical",
++    "DEFAULT_MIN_SIZE",
++    # plan
++    "ReclaimAction",
++    "ReclaimPlan",
++    "ReclaimPlanner",
++    "DELETE",
++    "TRASH",
++    "HARDLINK",
++    "SYMLINK",
++    "ACTION_KINDS",
++    # execution
++    "ReclaimReport",
++    "ReclaimExecutor",
++    # scan
++    "ScanSpec",
++    "CandidateScanner",
++    # session + loader
++    "AnalysisResult",
++    "ReclaimSession",
++    "merge_documents",
++    "load_settings",
++    "load_session",
++    "DEFAULT_SETTINGS",
++    "report",
++]
+diff --git a/core/reclaim/candidate.py b/core/reclaim/candidate.py
+new file mode 100644
+index 00000000..a1c763f5
+--- /dev/null
++++ b/core/reclaim/candidate.py
+@@ -0,0 +1,137 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Candidates -- the files the planner reasons about.
++
++A :class:`Candidate` is a thin, self-describing snapshot around a
++:class:`core.fs.File`. It exists for three reasons:
++
++* it captures the file's *observed* size and mtime at planning time so the
++  executor can later notice if the file changed underneath us (staleness);
++* it carries the ``is_ref`` / ``protected`` flag out of the directory layer so
++  the keeper logic and the executor both agree a reference file may never be a
++  victim;
++* it exposes the handful of attributes the strategies sort on (path depth,
++  name, extension, mtime, size) without every strategy having to reach back
++  into :mod:`core.fs`.
++
++Candidates are value-ish: two candidates for the same path are equal, so a run
++never accidentally lists one file twice.
++"""
++
++from pathlib import Path
++
++from core import fs
++from core.reclaim import identity as identity_mod
++
++__all__ = ["Candidate", "candidate_from_path", "candidates_from_files"]
++
++
++class Candidate:
++    """One file under consideration, with a planning-time snapshot."""
++
++    __slots__ = ("file", "path", "size", "mtime", "protected", "_identity_cache")
++
++    def __init__(self, file, protected=False):
++        self.file = file
++        self.path = Path(file.path)
++        # Snapshot the volatile stat fields now. core.fs.File caches these on
++        # first access, so reading them here is what "freezes" the observation.
++        self.size = file.size
++        self.mtime = file.mtime
++        # A reference/protected file is scanned and may anchor a group, but is
++        # never eligible for removal.
++        self.protected = bool(protected) or bool(getattr(file, "is_ref", False))
++        self._identity_cache = {}
++
++    # --- Sorting helpers used by keeper strategies -------------------------
++    @property
++    def name(self):
++        return self.path.name
++
++    @property
++    def stem(self):
++        return self.path.stem
++
++    @property
++    def extension(self):
++        return self.path.suffix.lower().lstrip(".")
++
++    @property
++    def depth(self):
++        """Number of path components -- deeper files are 'more buried'."""
++        return len(self.path.parts)
++
++    @property
++    def parent(self):
++        return self.path.parent
++
++    def identity(self, strength=identity_mod.FULL, big_file_size=identity_mod.DEFAULT_BIG_FILE_SIZE):
++        """Content identity at ``strength``, memoised per candidate."""
++        cached = self._identity_cache.get(strength)
++        if cached is None:
++            cached = identity_mod.identity_of(self.file, strength, big_file_size)
++            self._identity_cache[strength] = cached
++        return cached
++
++    def is_stale(self):
++        """Return whether the file on disk no longer matches our snapshot.
++
++        A vanished file, or one whose size/mtime changed, is stale: acting on it
++        based on the old plan would be unsafe.
++        """
++        try:
++            stat = self.path.stat()
++        except OSError:
++            return True
++        if stat.st_size != self.size:
++            return True
++        # mtime is compared with a small tolerance because some filesystems have
++        # coarse timestamp resolution; an exact-equal test would spuriously flag
++        # files on those systems.
++        return abs(stat.st_mtime - self.mtime) > 1e-6
++
++    def exists(self):
++        return self.file.exists()
++
++    def __eq__(self, other):
++        return isinstance(other, Candidate) and self.path == other.path
++
++    def __hash__(self):
++        return hash(self.path)
++
++    def __repr__(self):
++        flag = " ref" if self.protected else ""
++        return f"<Candidate {self.path} size={self.size}{flag}>"
++
++
++def candidate_from_path(path, protected=False, fileclasses=None):
++    """Build a :class:`Candidate` from a filesystem ``path``.
++
++    Returns ``None`` if the path can't be wrapped as a file (e.g. it's a
++    directory or a broken symlink), mirroring :func:`core.fs.get_file`.
++    """
++    path = Path(path)
++    file = fs.get_file(path, fileclasses=fileclasses or [fs.File])
++    if file is None:
++        return None
++    return Candidate(file, protected=protected)
++
++
++def candidates_from_files(files, protected_paths=None):
++    """Wrap an iterable of :class:`core.fs.File` as candidates.
++
++    ``protected_paths`` is an optional set of paths (or path strings) whose
++    candidates should be flagged protected even if their ``is_ref`` wasn't set.
++    """
++    protected = set()
++    if protected_paths:
++        protected = {str(Path(p)) for p in protected_paths}
++    result = []
++    for file in files:
++        is_protected = str(Path(file.path)) in protected
++        result.append(Candidate(file, protected=is_protected))
++    return result
+diff --git a/core/reclaim/errors.py b/core/reclaim/errors.py
+new file mode 100644
+index 00000000..0182a22c
+--- /dev/null
++++ b/core/reclaim/errors.py
+@@ -0,0 +1,64 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Exception hierarchy for the duplicate reclaim planner.
++
++The hierarchy deliberately separates *configuration* problems (bad input that
++can be caught before we ever touch the filesystem) from *execution* problems
++(something went wrong while actually reclaiming space). Callers that only want
++to validate a plan can therefore catch :class:`ReclaimConfigError` and be sure
++that no destructive work has happened yet.
++"""
++
++
++class ReclaimError(Exception):
++    """Root of every error raised by :mod:`core.reclaim`."""
++
++
++class ReclaimConfigError(ReclaimError):
++    """The reclaim run was misconfigured.
++
++    Raised for problems that are detectable *before* any file is touched: an
++    unknown strategy name, a scan root that does not exist, contradictory
++    options, and so on. Catching this guarantees the filesystem is untouched.
++    """
++
++
++class UnknownStrategyError(ReclaimConfigError):
++    """A keeper-selection strategy was requested by a name we don't know."""
++
++
++class InvalidScanRootError(ReclaimConfigError):
++    """A directory handed to the scanner is missing or not a directory."""
++
++
++class ReclaimExecutionError(ReclaimError):
++    """A reclaim action failed while it was being carried out."""
++
++    def __init__(self, message, action=None, cause=None):
++        super().__init__(message)
++        self.action = action
++        self.cause = cause
++
++
++class ProtectedPathError(ReclaimExecutionError):
++    """An action tried to remove a file that was marked protected/reference.
++
++    This should never happen for a plan produced by this package -- reference
++    files are never chosen as victims -- so hitting it means the plan was
++    tampered with, or the executor was fed a hand-built action list that points
++    at a protected file.
++    """
++
++
++class StalePlanError(ReclaimExecutionError):
++    """The plan no longer matches what is on disk.
++
++    A plan is computed against an observed snapshot. If a victim file has been
++    modified (different size/mtime) or has vanished between planning and
++    execution, carrying the action out blindly would be unsafe, so the executor
++    refuses unless explicitly told to ignore staleness.
++    """
+diff --git a/core/reclaim/executor.py b/core/reclaim/executor.py
+new file mode 100644
+index 00000000..bb6bf157
+--- /dev/null
++++ b/core/reclaim/executor.py
+@@ -0,0 +1,243 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Carrying out a reclaim plan against the real filesystem.
++
++The executor is the only place in :mod:`core.reclaim` that mutates the disk.
++Everything upstream (grouping, keeper selection, planning) is pure, which means
++a caller can preview and audit exactly what will happen before a single byte is
++touched.
++
++Design points that matter for safety:
++
++* **dry-run** performs every check an apply does -- staleness, protection,
++  keeper-still-present -- and reports the same result object, but skips the
++  mutation. So a green dry-run is a strong signal a real run will succeed.
++* **staleness guard**: before removing a victim we re-check that it still
++  matches the snapshot taken at planning time. If it changed or vanished we
++  refuse (raising :class:`StalePlanError`) unless ``ignore_stale`` is set, in
++  which case we record it as skipped rather than blowing up the whole run.
++* **protection guard**: a protected/reference victim is a contradiction (the
++  planner never emits one) so it is always a hard error -- it means someone
++  hand-built a bad action list.
++* **idempotency**: re-running an already-applied plan is a no-op. A victim that
++  is already gone (because we deleted it last time) is treated as
++  already-reclaimed, not as an error.
++
++Trash support is optional and lazy: we only import Send2Trash when a trash
++action is actually executed, so environments without it can still use
++delete/link actions.
++"""
++
++import os
++from pathlib import Path
++
++from core.reclaim.errors import (
++    ProtectedPathError,
++    ReclaimExecutionError,
++    StalePlanError,
++)
++from core.reclaim.plan import DELETE, TRASH, HARDLINK, SYMLINK
++
++__all__ = ["ReclaimReport", "ReclaimExecutor"]
++
++
++class ReclaimReport:
++    """What actually happened when a plan was executed (or dry-run)."""
++
++    __slots__ = ("done", "skipped", "failed", "dry_run", "reclaimed_bytes")
++
++    def __init__(self, dry_run=False):
++        self.dry_run = dry_run
++        self.done = []       # (action, reason) that were carried out
++        self.skipped = []    # (action, reason) intentionally not done
++        self.failed = []     # (action, reason) that errored (only if keep_going)
++        self.reclaimed_bytes = 0
++
++    def _record_done(self, action):
++        self.done.append(action)
++        self.reclaimed_bytes += action.reclaimed_bytes
++
++    def _record_skipped(self, action, reason):
++        self.skipped.append((action, reason))
++
++    def _record_failed(self, action, reason):
++        self.failed.append((action, reason))
++
++    @property
++    def done_count(self):
++        return len(self.done)
++
++    @property
++    def skipped_count(self):
++        return len(self.skipped)
++
++    @property
++    def failed_count(self):
++        return len(self.failed)
++
++    @property
++    def ok(self):
++        return not self.failed
++
++    def summary(self):
++        return {
++            "dry_run": self.dry_run,
++            "done": self.done_count,
++            "skipped": self.skipped_count,
++            "failed": self.failed_count,
++            "reclaimed_bytes": self.reclaimed_bytes,
++        }
++
++    def __repr__(self):
++        return (
++            f"<ReclaimReport done={self.done_count} skipped={self.skipped_count} "
++            f"failed={self.failed_count} reclaimed={self.reclaimed_bytes}"
++            f"{' dry-run' if self.dry_run else ''}>"
++        )
++
++
++class ReclaimExecutor:
++    """Execute :class:`~core.reclaim.plan.ReclaimAction` objects.
++
++    :param dry_run: if true, check everything but perform no mutation.
++    :param ignore_stale: if true, a victim that changed/vanished is skipped
++        rather than raising :class:`StalePlanError`.
++    :param keep_going: if true, an action that errors is recorded in
++        ``report.failed`` and execution continues; otherwise the error
++        propagates.
++    :param trash_func: injectable callable ``(path)`` used for trash actions;
++        defaults to Send2Trash. Tests pass a fake so no real trashing happens.
++    """
++
++    def __init__(self, dry_run=False, ignore_stale=False, keep_going=False, trash_func=None):
++        self.dry_run = dry_run
++        self.ignore_stale = ignore_stale
++        self.keep_going = keep_going
++        self._trash_func = trash_func
++
++    # --- individual mutations ---------------------------------------------
++    def _unlink(self, path):
++        os.unlink(path)
++
++    def _trash(self, path):
++        func = self._trash_func
++        if func is None:
++            try:
++                from send2trash import send2trash as func
++            except ImportError as ex:  # pragma: no cover - env dependent
++                raise ReclaimExecutionError(
++                    "trash action requested but Send2Trash is not available",
++                    cause=ex,
++                )
++        func(str(path))
++
++    def _hardlink(self, victim_path, keeper_path):
++        # Remove the redundant copy, then recreate its directory entry as a hard
++        # link to the keeper's inode. Space is reclaimed because both entries now
++        # share the keeper's blocks.
++        os.unlink(victim_path)
++        try:
++            os.link(keeper_path, victim_path)
++        except OSError as ex:
++            raise ReclaimExecutionError(
++                f"failed to hardlink {victim_path} -> {keeper_path}", cause=ex
++            )
++
++    def _symlink(self, victim_path, keeper_path):
++        os.unlink(victim_path)
++        try:
++            os.symlink(keeper_path, victim_path)
++        except OSError as ex:
++            raise ReclaimExecutionError(
++                f"failed to symlink {victim_path} -> {keeper_path}", cause=ex
++            )
++
++    # --- guards ------------------------------------------------------------
++    def _check_action(self, action):
++        """Validate an action; return a "skip reason" string, or None if go.
++
++        Raises for hard errors (protected victim). Returns a reason string when
++        the action should be skipped (already reclaimed, or stale-and-ignored).
++        """
++        victim = action.victim
++        if victim.protected:
++            raise ProtectedPathError(
++                f"refusing to reclaim protected file {victim.path}", action=action
++            )
++        # Idempotency: a victim already gone is considered already reclaimed,
++        # unless it's a linking action (which needs the entry to be replaceable
++        # -- but a missing entry there also just means "already done").
++        if not victim.path.exists():
++            return "already-reclaimed"
++        # A linking action needs a live keeper to point at.
++        if action.is_linking and not action.keeper.path.exists():
++            raise ReclaimExecutionError(
++                f"keeper {action.keeper.path} is missing; cannot link to it",
++                action=action,
++            )
++        # Staleness: the file must still be what we planned against.
++        if victim.is_stale():
++            if self.ignore_stale:
++                return "stale"
++            raise StalePlanError(
++                f"file changed since planning: {victim.path}", action=action
++            )
++        return None
++
++    # --- driving -----------------------------------------------------------
++    def _apply_one(self, action):
++        if action.kind == DELETE:
++            self._unlink(action.victim.path)
++        elif action.kind == TRASH:
++            self._trash(action.victim.path)
++        elif action.kind == HARDLINK:
++            self._hardlink(action.victim.path, action.keeper.path)
++        elif action.kind == SYMLINK:
++            self._symlink(action.victim.path, action.keeper.path)
++        else:  # pragma: no cover - guarded at construction
++            raise ReclaimExecutionError(f"unknown action kind: {action.kind}")
++
++    def execute(self, plan):
++        """Execute every action in ``plan``; return a :class:`ReclaimReport`."""
++        report = ReclaimReport(dry_run=self.dry_run)
++        for action in plan:
++            try:
++                skip_reason = self._check_action(action)
++            except ReclaimExecutionError:
++                if self.keep_going:
++                    report._record_failed(action, "check-failed")
++                    continue
++                raise
++            if skip_reason is not None:
++                report._record_skipped(action, skip_reason)
++                continue
++            if self.dry_run:
++                # Everything checked out; we simply don't mutate.
++                report._record_done(action)
++                continue
++            try:
++                self._apply_one(action)
++            except Exception as ex:
++                if self.keep_going:
++                    report._record_failed(action, str(ex))
++                    continue
++                if isinstance(ex, ReclaimExecutionError):
++                    raise
++                raise ReclaimExecutionError(
++                    f"action failed: {action.describe()}", action=action, cause=ex
++                )
++            report._record_done(action)
++        return report
++
++    def dry_run_plan(self, plan):
++        """Convenience: run ``plan`` with mutation disabled."""
++        saved = self.dry_run
++        self.dry_run = True
++        try:
++            return self.execute(plan)
++        finally:
++            self.dry_run = saved
+diff --git a/core/reclaim/grouper.py b/core/reclaim/grouper.py
+new file mode 100644
+index 00000000..08ca49d1
+--- /dev/null
++++ b/core/reclaim/grouper.py
+@@ -0,0 +1,192 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Grouping identical files.
++
++Given a flat list of :class:`~core.reclaim.candidate.Candidate`, produce
++:class:`DuplicateGroup` objects, each holding two-or-more files that share a
++content identity. The grouping mirrors dupeguru's own content scan
++(:func:`core.engine.getmatches_by_contents`) in spirit -- bucket by size, then
++by digest -- but returns explicit groups rather than pairwise matches, because
++the reclaim planner reasons per-group ("keep one, drop the others").
++
++The staged comparison keeps I/O to the minimum:
++
++1. bucket by ``size`` (free -- ``stat`` only);
++2. within a size bucket, sub-bucket by the **partial** digest (a cheap prefix
++   read); singletons fall out here without a full read;
++3. within a partial bucket, sub-bucket by the **full** (or sampled) digest.
++
++A group is only emitted when it has at least two members. Zero-length files are
++handled explicitly: they are all identical to each other, so they form one group
++per run without any hashing.
++"""
++
++from collections import defaultdict
++
++from hscommon.jobprogress import job
++
++from core.reclaim import identity as identity_mod
++
++__all__ = ["DuplicateGroup", "GroupingResult", "group_identical", "DEFAULT_MIN_SIZE"]
++
++# Files at or below this size are ignored by default: reclaiming a handful of
++# bytes is never worth the risk, and tiny files collide on content constantly
++# (think empty ``__init__.py``). Callers can lower it to 0 to consider
++# everything.
++DEFAULT_MIN_SIZE = 1
++
++
++class DuplicateGroup:
++    """A set of candidates that share identical content.
++
++    The group does not itself decide which file to keep; that is the strategy's
++    job (see :meth:`core.reclaim.plan.ReclaimPlanner`). It does expose the
++    accounting the planner needs: the per-file size and how much space is
++    *reclaimable* (everything but one copy).
++    """
++
++    __slots__ = ("candidates", "identity")
++
++    def __init__(self, candidates, identity):
++        # Store deterministically ordered so downstream planning is reproducible
++        # regardless of scan order.
++        self.candidates = sorted(candidates, key=lambda c: str(c.path))
++        self.identity = identity
++
++    @property
++    def size(self):
++        """Size of a single copy (all members are byte-identical)."""
++        return self.candidates[0].size
++
++    def __len__(self):
++        return len(self.candidates)
++
++    def __iter__(self):
++        return iter(self.candidates)
++
++    @property
++    def protected_members(self):
++        return [c for c in self.candidates if c.protected]
++
++    @property
++    def removable_members(self):
++        return [c for c in self.candidates if not c.protected]
++
++    @property
++    def total_size(self):
++        """Bytes currently occupied by every copy in the group."""
++        return self.size * len(self.candidates)
++
++    @property
++    def reclaimable_size(self):
++        """Bytes that could be freed by collapsing the group to one keeper.
++
++        If the whole group is protected nothing is reclaimable.
++        """
++        if not self.removable_members:
++            return 0
++        return self.size * (len(self.candidates) - 1)
++
++    def __repr__(self):
++        return f"<DuplicateGroup n={len(self.candidates)} size={self.size} {self.identity!r}>"
++
++
++class GroupingResult:
++    """The outcome of a grouping pass, plus a little bookkeeping."""
++
++    __slots__ = ("groups", "scanned_count", "ignored_small", "ignored_unique")
++
++    def __init__(self, groups, scanned_count, ignored_small, ignored_unique):
++        self.groups = groups
++        self.scanned_count = scanned_count
++        self.ignored_small = ignored_small
++        self.ignored_unique = ignored_unique
++
++    @property
++    def duplicate_count(self):
++        """Number of files that are a redundant copy (group size minus one each)."""
++        return sum(len(g) - 1 for g in self.groups)
++
++    @property
++    def reclaimable_size(self):
++        return sum(g.reclaimable_size for g in self.groups)
++
++    def __iter__(self):
++        return iter(self.groups)
++
++    def __len__(self):
++        return len(self.groups)
++
++
++def _subdivide(candidates, strength, big_file_size, j):
++    """Split ``candidates`` (already same-size) into same-content buckets."""
++    buckets = defaultdict(list)
++    for c in candidates:
++        ident = c.identity(strength, big_file_size)
++        buckets[ident._key()].append((c, ident))
++    return buckets
++
++
++def group_identical(
++    candidates,
++    min_size=DEFAULT_MIN_SIZE,
++    strength=identity_mod.FULL,
++    big_file_size=identity_mod.DEFAULT_BIG_FILE_SIZE,
++    j=job.nulljob,
++):
++    """Group ``candidates`` by identical content.
++
++    :param candidates: iterable of :class:`~core.reclaim.candidate.Candidate`.
++    :param min_size: files with ``size <= min_size`` are skipped (but see the
++        zero-length special case: files of size 0 are only skipped if
++        ``min_size >= 0`` excludes them, which the default does).
++    :param strength: comparison strength (see :mod:`core.reclaim.identity`).
++    :param big_file_size: size above which the sampled digest is used.
++    :returns: a :class:`GroupingResult`.
++    """
++    candidates = list(candidates)
++    scanned = len(candidates)
++    ignored_small = 0
++    kept = []
++    for c in candidates:
++        if c.size <= min_size:
++            ignored_small += 1
++            continue
++        kept.append(c)
++
++    # Stage 1: bucket by size. Different sizes cannot be identical.
++    by_size = defaultdict(list)
++    for c in kept:
++        by_size[c.size].append(c)
++
++    groups = []
++    ignored_unique = 0
++    size_buckets = [group for group in by_size.values() if len(group) > 1]
++    ignored_unique += sum(1 for group in by_size.values() if len(group) == 1)
++
++    j.start_job(len(size_buckets))
++    for same_size in size_buckets:
++        if strength == identity_mod.SIZE_ONLY:
++            ident = same_size[0].identity(identity_mod.SIZE_ONLY)
++            groups.append(DuplicateGroup(same_size, ident))
++            j.add_progress()
++            continue
++        # Stage 2/3: subdivide by digest at the requested strength.
++        buckets = _subdivide(same_size, strength, big_file_size, j)
++        for members in buckets.values():
++            if len(members) > 1:
++                cands = [m[0] for m in members]
++                ident = members[0][1]
++                groups.append(DuplicateGroup(cands, ident))
++            else:
++                ignored_unique += 1
++        j.add_progress()
++
++    # Deterministic order: biggest reclaim first, then by identity size, then
++    # by the lexically-first member path so ties never wobble.
++    groups.sort(key=lambda g: (-g.reclaimable_size, -g.size, str(g.candidates[0].path)))
++    return GroupingResult(groups, scanned, ignored_small, ignored_unique)
+diff --git a/core/reclaim/identity.py b/core/reclaim/identity.py
+new file mode 100644
+index 00000000..f65c6c53
+--- /dev/null
++++ b/core/reclaim/identity.py
+@@ -0,0 +1,162 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Content identity for files.
++
++The reclaim planner decides that two files are interchangeable when they have
++the same *content identity*. We reuse :mod:`core.fs`'s digest machinery (which
++already knows how to hash whole files, hash a cheap partial prefix, and take
++three samples for very large files) but layer a small, explicit protocol on top
++so the rest of the package never has to think about how a digest is computed.
++
++The staged comparison is the whole point of being cheap:
++
++* files are first bucketed by **size** -- two files of different sizes can never
++  be byte-identical, and reading them is free (``stat`` only);
++* within a size bucket we compare a **partial** digest (a small prefix); files
++  that differ early drop out without a full read;
++* only the survivors get a **full** digest (or, for very large files, the
++  three-sample digest, matching dupeguru's own big-file shortcut).
++
++Everything here is pure computation over :class:`core.fs.File`; nothing is
++deleted or written.
++"""
++
++from core import fs
++
++__all__ = [
++    "ContentIdentity",
++    "identity_of",
++    "same_content",
++    "SIZE_ONLY",
++    "PARTIAL",
++    "FULL",
++    "DEFAULT_BIG_FILE_SIZE",
++]
++
++# Comparison strength -- how hard we are willing to work before declaring two
++# files identical. They are ordered, and a stronger level implies every weaker
++# one.
++SIZE_ONLY = "size"
++PARTIAL = "partial"
++FULL = "full"
++
++_STRENGTH_ORDER = {SIZE_ONLY: 0, PARTIAL: 1, FULL: 2}
++
++# Above this size we take three samples rather than reading the whole file, the
++# same trade-off dupeguru makes for its "big file" content scan.
++DEFAULT_BIG_FILE_SIZE = 100 * 1024 * 1024  # 100 MiB
++
++
++class ContentIdentity:
++    """A comparable, hashable stand-in for a file's content.
++
++    Two :class:`ContentIdentity` compare equal (and hash equal) when they were
++    produced at the same strength and agree on every component up to that
++    strength. The object is intentionally small so it can be used as a dict key
++    when bucketing thousands of files.
++    """
++
++    __slots__ = ("size", "strength", "partial_digest", "full_digest")
++
++    def __init__(self, size, strength, partial_digest=None, full_digest=None):
++        self.size = size
++        self.strength = strength
++        self.partial_digest = partial_digest
++        self.full_digest = full_digest
++
++    # --- The key used to bucket / compare identities.
++    def _key(self):
++        if self.strength == SIZE_ONLY:
++            return (self.size,)
++        if self.strength == PARTIAL:
++            return (self.size, self.partial_digest)
++        return (self.size, self.full_digest)
++
++    def __eq__(self, other):
++        if not isinstance(other, ContentIdentity):
++            return NotImplemented
++        # Comparing identities computed at different strengths is a programming
++        # error in this package -- the grouper always uses one strength for a
++        # whole run -- but we still fall back to the weakest common ground
++        # rather than silently claim inequality.
++        if self.strength != other.strength:
++            return self.size == other.size
++        return self._key() == other._key()
++
++    def __hash__(self):
++        # Hash only on size: identities that are equal must hash equal, and two
++        # equal identities always share a size. This keeps hashing cheap while
++        # letting __eq__ do the precise work inside a bucket.
++        return hash(self.size)
++
++    def __repr__(self):
++        if self.strength == SIZE_ONLY:
++            return f"<ContentIdentity size={self.size} (size-only)>"
++        digest = self.full_digest if self.strength == FULL else self.partial_digest
++        shown = digest.hex()[:12] if isinstance(digest, (bytes, bytearray)) else digest
++        return f"<ContentIdentity size={self.size} {self.strength}={shown}>"
++
++    def refine_to(self, strength, file, big_file_size=DEFAULT_BIG_FILE_SIZE):
++        """Return a copy of this identity strengthened to ``strength``.
++
++        Digests already computed are reused; only the extra work required by the
++        higher strength is done. ``file`` must be the :class:`core.fs.File` this
++        identity describes.
++        """
++        if _STRENGTH_ORDER[strength] <= _STRENGTH_ORDER[self.strength]:
++            return self
++        return identity_of(file, strength, big_file_size=big_file_size, base=self)
++
++
++def _full_digest_for(file, big_file_size):
++    # For big files dupeguru compares the three-sample digest instead of reading
++    # the whole thing; we honour the same cut-off so identity matches the
++    # library's own notion of "same contents" for large media.
++    if big_file_size and file.size > big_file_size:
++        return file.digest_samples
++    return file.digest
++
++
++def identity_of(file, strength=FULL, big_file_size=DEFAULT_BIG_FILE_SIZE, base=None):
++    """Compute the :class:`ContentIdentity` of ``file`` at ``strength``.
++
++    ``file`` is a :class:`core.fs.File`. Reading its ``size`` / ``digest_partial``
++    / ``digest`` attributes triggers dupeguru's lazy, cached hashing, so calling
++    this repeatedly on the same file is cheap after the first time.
++
++    ``base`` lets a weaker identity be reused so we don't recompute what we
++    already know.
++    """
++    if strength not in _STRENGTH_ORDER:
++        raise ValueError(f"unknown comparison strength: {strength!r}")
++    size = file.size
++    partial = base.partial_digest if base is not None else None
++    full = base.full_digest if base is not None else None
++    if strength == SIZE_ONLY:
++        return ContentIdentity(size, SIZE_ONLY)
++    if strength == PARTIAL:
++        if partial is None:
++            partial = file.digest_partial
++        return ContentIdentity(size, PARTIAL, partial_digest=partial)
++    # FULL
++    if partial is None:
++        partial = file.digest_partial
++    if full is None:
++        full = _full_digest_for(file, big_file_size)
++    return ContentIdentity(size, FULL, partial_digest=partial, full_digest=full)
++
++
++def same_content(a, b, strength=FULL, big_file_size=DEFAULT_BIG_FILE_SIZE):
++    """Return whether two :class:`core.fs.File` share content at ``strength``.
++
++    A fast size check happens first so that mismatched files never get hashed.
++    """
++    if a.size != b.size:
++        return False
++    if strength == SIZE_ONLY:
++        return True
++    return identity_of(a, strength, big_file_size) == identity_of(b, strength, big_file_size)
+diff --git a/core/reclaim/loader.py b/core/reclaim/loader.py
+new file mode 100644
+index 00000000..af7ead9c
+--- /dev/null
++++ b/core/reclaim/loader.py
+@@ -0,0 +1,127 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Layered configuration for reclaim runs.
++
++Real cleanup jobs are described in config, and that config is usually layered: a
++shared ``base`` (the folders and rules everyone agrees on) plus per-machine or
++per-user overlays. This module deep-merges a list of such documents into a
++single settings dict and then materialises a ready-to-run
++:class:`~core.reclaim.session.ReclaimSession`.
++
++Merge rules (mirroring the reconcile loader used elsewhere in the codebase so
++the behaviour is familiar):
++
++* later documents override earlier ones for **scalar** values;
++* **list** fields (``roots``, ``reference_roots``, ``include_ext`` ...) are
++  **appended**, not replaced, so overlays extend rather than clobber;
++* a key explicitly set to ``None`` **deletes** whatever earlier layers set;
++* a ``strategy`` given as a list is treated as a composite (ordered) and is
++  therefore *replaced* wholesale by a later layer's list rather than appended --
++  otherwise you could never simplify a strategy in an overlay.
++"""
++
++import copy
++
++from core.reclaim.errors import ReclaimConfigError
++from core.reclaim.plan import ACTION_KINDS, DELETE
++from core.reclaim import identity as identity_mod
++from core.reclaim.scanner import ScanSpec
++from core.reclaim.session import ReclaimSession
++
++__all__ = ["merge_documents", "load_settings", "load_session", "DEFAULT_SETTINGS"]
++
++# List-valued keys are append-merged across layers.
++_APPEND_LIST_KEYS = {
++    "roots",
++    "paths",
++    "reference_roots",
++    "references",
++    "excluded_roots",
++    "excludes",
++    "include_ext",
++    "exclude_ext",
++    "include_globs",
++    "exclude_globs",
++}
++
++DEFAULT_SETTINGS = {
++    "strategy": "oldest",
++    "action": DELETE,
++    "strength": identity_mod.FULL,
++}
++
++
++def _merge_into(base, overlay):
++    """Deep-merge ``overlay`` into ``base`` in place, following the rules."""
++    for key, value in overlay.items():
++        if value is None:
++            # Explicit delete.
++            base.pop(key, None)
++            continue
++        if key in _APPEND_LIST_KEYS and isinstance(value, list):
++            existing = base.get(key)
++            if isinstance(existing, list):
++                # Append while de-duplicating, preserving order.
++                merged = list(existing)
++                for item in value:
++                    if item not in merged:
++                        merged.append(item)
++                base[key] = merged
++            else:
++                base[key] = list(value)
++            continue
++        if isinstance(value, dict) and isinstance(base.get(key), dict):
++            _merge_into(base[key], value)
++            continue
++        # Scalars and non-append lists (e.g. a composite strategy list) replace.
++        base[key] = copy.deepcopy(value)
++
++
++def merge_documents(documents):
++    """Deep-merge a sequence of config dicts into one settings dict."""
++    result = {}
++    for doc in documents:
++        if doc is None:
++            continue
++        if not isinstance(doc, dict):
++            raise ReclaimConfigError(f"config document must be a dict, got {type(doc).__name__}")
++        _merge_into(result, doc)
++    return result
++
++
++def load_settings(documents):
++    """Merge ``documents`` on top of the defaults; return the settings dict."""
++    merged = merge_documents([DEFAULT_SETTINGS] + list(documents))
++    return merged
++
++
++def _spec_from_settings(settings):
++    # ScanSpec.from_dict already understands both roots/paths spellings.
++    return ScanSpec.from_dict(settings)
++
++
++def load_session(documents):
++    """Build a :class:`ReclaimSession` from layered config documents."""
++    settings = load_settings(documents)
++    spec = _spec_from_settings(settings)
++
++    action = settings.get("action", DELETE)
++    if action not in ACTION_KINDS:
++        raise ReclaimConfigError(f"unknown action in config: {action!r}")
++
++    strategy = settings.get("strategy", "oldest")
++    strength = settings.get("strength", identity_mod.FULL)
++    if strength not in (identity_mod.SIZE_ONLY, identity_mod.PARTIAL, identity_mod.FULL):
++        raise ReclaimConfigError(f"unknown comparison strength: {strength!r}")
++
++    kwargs = {}
++    if "min_size" in settings:
++        kwargs["min_size"] = settings["min_size"]
++    if "big_file_size" in settings:
++        kwargs["big_file_size"] = settings["big_file_size"]
++
++    return ReclaimSession(spec, strategy=strategy, action=action, strength=strength, **kwargs)
+diff --git a/core/reclaim/plan.py b/core/reclaim/plan.py
+new file mode 100644
+index 00000000..9286274c
+--- /dev/null
++++ b/core/reclaim/plan.py
+@@ -0,0 +1,225 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""The reclaim plan -- a pure, inspectable description of what to do.
++
++A :class:`ReclaimPlan` is produced by :class:`ReclaimPlanner` from a set of
++duplicate groups and a keeper strategy. Producing a plan is a **pure** operation:
++it observes and computes but never touches the filesystem. Only handing the plan
++to an :class:`~core.reclaim.executor.ReclaimExecutor` actually reclaims space.
++
++Each group of identical files collapses to:
++
++* exactly one **keeper** (chosen by the strategy, or forced to a protected
++  member if the group has one);
++* one :class:`ReclaimAction` per other member describing how that copy is
++  reclaimed (deleted, sent to trash, or replaced by a link to the keeper).
++
++Keeping the plan as data -- rather than acting immediately -- is what lets the
++caller preview it ("you'll free 3.2 GB across 812 files"), diff two runs, or
++apply a subset.
++"""
++
++from core.reclaim.errors import ReclaimConfigError
++from core.reclaim.strategies import make_strategy
++
++__all__ = [
++    "ReclaimAction",
++    "ReclaimPlan",
++    "ReclaimPlanner",
++    "DELETE",
++    "TRASH",
++    "HARDLINK",
++    "SYMLINK",
++    "ACTION_KINDS",
++]
++
++# What to do with a redundant copy.
++DELETE = "delete"        # unlink it outright
++TRASH = "trash"          # move it to the OS trash (recoverable)
++HARDLINK = "hardlink"    # unlink it, then hard-link it to the keeper
++SYMLINK = "symlink"      # unlink it, then symlink it to the keeper
++
++ACTION_KINDS = (DELETE, TRASH, HARDLINK, SYMLINK)
++
++# Linking actions reclaim the copy's blocks but leave a directory entry that
++# still resolves to the keeper's content; delete/trash remove the entry too.
++_LINKING = (HARDLINK, SYMLINK)
++
++
++class ReclaimAction:
++    """One thing to do to one redundant file.
++
++    Attributes:
++        kind: one of :data:`ACTION_KINDS`.
++        victim: the :class:`~core.reclaim.candidate.Candidate` being reclaimed.
++        keeper: the candidate being kept (the link target for link actions;
++            recorded for delete/trash too so a report can show the survivor).
++        reclaimed_bytes: how many bytes this action frees.
++    """
++
++    __slots__ = ("kind", "victim", "keeper", "reclaimed_bytes")
++
++    def __init__(self, kind, victim, keeper):
++        if kind not in ACTION_KINDS:
++            raise ReclaimConfigError(f"unknown action kind: {kind!r}")
++        self.kind = kind
++        self.victim = victim
++        self.keeper = keeper
++        # For every kind we free the victim's blocks. A symlink leaves a tiny
++        # entry behind, but its cost is negligible and filesystem-dependent, so
++        # we don't try to model it -- the reclaimed figure is the copy's size.
++        self.reclaimed_bytes = victim.size
++
++    @property
++    def victim_path(self):
++        return self.victim.path
++
++    @property
++    def keeper_path(self):
++        return self.keeper.path
++
++    @property
++    def is_linking(self):
++        return self.kind in _LINKING
++
++    def describe(self):
++        """One-line, human-readable summary of the action."""
++        verb = {
++            DELETE: "delete",
++            TRASH: "trash",
++            HARDLINK: "hardlink -> ",
++            SYMLINK: "symlink -> ",
++        }[self.kind]
++        if self.is_linking:
++            return f"{verb}{self.keeper_path} :: {self.victim_path}"
++        return f"{verb} {self.victim_path} (keep {self.keeper_path})"
++
++    def __repr__(self):
++        return f"<ReclaimAction {self.kind} {self.victim_path}>"
++
++
++class ReclaimPlan:
++    """An ordered, inspectable set of actions plus the keepers they preserve."""
++
++    __slots__ = ("actions", "keepers", "strategy_name")
++
++    def __init__(self, actions, keepers, strategy_name=""):
++        self.actions = actions
++        self.keepers = keepers
++        self.strategy_name = strategy_name
++
++    def __len__(self):
++        return len(self.actions)
++
++    def __iter__(self):
++        return iter(self.actions)
++
++    def __bool__(self):
++        return bool(self.actions)
++
++    @property
++    def is_empty(self):
++        return not self.actions
++
++    @property
++    def victim_count(self):
++        return len(self.actions)
++
++    @property
++    def keeper_count(self):
++        return len(self.keepers)
++
++    @property
++    def reclaimable_bytes(self):
++        """Total bytes freed if the whole plan is applied."""
++        return sum(a.reclaimed_bytes for a in self.actions)
++
++    def actions_of_kind(self, kind):
++        return [a for a in self.actions if a.kind == kind]
++
++    def victims(self):
++        return [a.victim for a in self.actions]
++
++    def summary(self):
++        """A small dict summarising the plan, handy for reports and tests."""
++        by_kind = {kind: 0 for kind in ACTION_KINDS}
++        for a in self.actions:
++            by_kind[a.kind] += 1
++        return {
++            "strategy": self.strategy_name,
++            "groups": self.keeper_count,
++            "victims": self.victim_count,
++            "reclaimable_bytes": self.reclaimable_bytes,
++            "by_kind": {k: v for k, v in by_kind.items() if v},
++        }
++
++    def __repr__(self):
++        return (
++            f"<ReclaimPlan victims={self.victim_count} "
++            f"reclaimable={self.reclaimable_bytes} strategy={self.strategy_name!r}>"
++        )
++
++
++class ReclaimPlanner:
++    """Turn duplicate groups into a :class:`ReclaimPlan` under a strategy.
++
++    :param strategy: anything :func:`core.reclaim.strategies.make_strategy`
++        understands. Defaults to keeping the oldest copy.
++    :param action: the default :data:`ACTION_KINDS` verb to apply to victims.
++    """
++
++    def __init__(self, strategy="oldest", action=DELETE):
++        self.strategy = make_strategy(strategy)
++        if action not in ACTION_KINDS:
++            raise ReclaimConfigError(f"unknown action kind: {action!r}")
++        self.action = action
++
++    def _choose_keeper(self, group):
++        """Pick the keeper for a group, honouring protected members.
++
++        If the group contains one or more protected (reference) members, one of
++        *them* is kept -- a protected file may never be reclaimed. The strategy
++        only ranks among protected members in that case, so the user's ordering
++        still applies where it can. If the group is entirely non-protected the
++        strategy ranks freely.
++        """
++        protected = group.protected_members
++        pool = protected if protected else list(group.candidates)
++        return self.strategy.choose_keeper(pool)
++
++    def plan_group(self, group, action=None):
++        """Return ``(keeper, [actions])`` for a single group."""
++        action = action or self.action
++        keeper = self._choose_keeper(group)
++        actions = []
++        for candidate in group.candidates:
++            if candidate is keeper:
++                continue
++            # A protected file that isn't the keeper still must not be removed.
++            # This happens when a group has several protected members: we keep
++            # one and leave the rest strictly alone (no action emitted).
++            if candidate.protected:
++                continue
++            actions.append(ReclaimAction(action, candidate, keeper))
++        return keeper, actions
++
++    def build(self, groups, action=None):
++        """Build a :class:`ReclaimPlan` from an iterable of groups.
++
++        Groups are consumed in the order given (the grouper already sorts them
++        biggest-reclaim-first), which becomes the plan's action order.
++        """
++        all_actions = []
++        keepers = []
++        for group in groups:
++            keeper, actions = self.plan_group(group, action=action)
++            keepers.append(keeper)
++            all_actions.extend(actions)
++        return ReclaimPlan(all_actions, keepers, strategy_name=self._strategy_name())
++
++    def _strategy_name(self):
++        return getattr(self.strategy, "name", "custom")
+diff --git a/core/reclaim/report.py b/core/reclaim/report.py
+new file mode 100644
+index 00000000..7862d3e3
+--- /dev/null
++++ b/core/reclaim/report.py
+@@ -0,0 +1,91 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Human- and machine-readable reporting of a reclaim run.
++
++The planner and executor already expose ``summary()`` dicts; this module turns a
++whole analysis into something you can print in a terminal or serialise to JSON
++for a dashboard, without any of the lower layers having to care about
++presentation. Nothing here mutates state.
++"""
++
++import json
++
++from hscommon.util import format_size
++
++from core.reclaim.plan import ACTION_KINDS
++
++__all__ = ["group_rows", "as_dict", "as_json", "render_text"]
++
++
++def group_rows(grouping):
++    """Return one serialisable row per duplicate group.
++
++    Each row lists the shared size, the member paths, and the reclaimable bytes,
++    which is exactly what a "review before you delete" table wants.
++    """
++    rows = []
++    for group in grouping.groups:
++        rows.append(
++            {
++                "size": group.size,
++                "count": len(group),
++                "reclaimable": group.reclaimable_size,
++                "protected": [str(c.path) for c in group.protected_members],
++                "members": [str(c.path) for c in group.candidates],
++            }
++        )
++    return rows
++
++
++def as_dict(analysis):
++    """Serialise an :class:`~core.reclaim.session.AnalysisResult` to a dict."""
++    plan = analysis.plan
++    actions = []
++    for a in plan.actions:
++        actions.append(
++            {
++                "kind": a.kind,
++                "victim": str(a.victim_path),
++                "keeper": str(a.keeper_path),
++                "bytes": a.reclaimed_bytes,
++            }
++        )
++    return {
++        "scanned": analysis.scanned_count,
++        "groups": group_rows(analysis.grouping),
++        "plan": {
++            "strategy": plan.strategy_name,
++            "reclaimable_bytes": plan.reclaimable_bytes,
++            "victim_count": plan.victim_count,
++            "keeper_count": plan.keeper_count,
++            "actions": actions,
++        },
++    }
++
++
++def as_json(analysis, indent=2):
++    return json.dumps(as_dict(analysis), indent=indent, sort_keys=True)
++
++
++def render_text(analysis):
++    """Render a compact plain-text report."""
++    plan = analysis.plan
++    lines = []
++    lines.append(f"Scanned {analysis.scanned_count} files")
++    lines.append(
++        f"Found {analysis.group_count} duplicate group(s), "
++        f"{analysis.duplicate_count} redundant copies"
++    )
++    lines.append(
++        f"Reclaimable: {format_size(plan.reclaimable_bytes, 2)} "
++        f"({plan.reclaimable_bytes} bytes) across {plan.victim_count} file(s)"
++    )
++    by_kind = {k: len(plan.actions_of_kind(k)) for k in ACTION_KINDS}
++    active = ", ".join(f"{k}={n}" for k, n in by_kind.items() if n)
++    if active:
++        lines.append(f"Actions: {active} (strategy: {plan.strategy_name})")
++    return "\n".join(lines)
+diff --git a/core/reclaim/scanner.py b/core/reclaim/scanner.py
+new file mode 100644
+index 00000000..1813b576
+--- /dev/null
++++ b/core/reclaim/scanner.py
+@@ -0,0 +1,170 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Turning a set of folders into a flat list of candidates.
++
++This wraps :class:`core.directories.Directories` (which already knows how to
++walk trees, honour per-folder *normal / reference / excluded* states, and skip
++dot-folders and excluded names) and produces
++:class:`~core.reclaim.candidate.Candidate` objects for the reclaim planner.
++
++The important pieces it adds on top of :class:`~core.directories.Directories`:
++
++* **reference folders**: a folder marked ``REFERENCE`` yields candidates with
++  ``protected=True``. The planner will never reclaim those -- they anchor their
++  group. This is how a user says "these are my masters, dedupe *against* them
++  but never touch them".
++* **extension / glob filters**: only-these or none-of-these name filters applied
++  as files are collected, so a photo dedupe run doesn't waste time hashing
++  videos.
++* **min / max size gates** at collection time, complementing the grouper's own
++  ``min_size``.
++"""
++
++import fnmatch
++from pathlib import Path
++
++from hscommon.jobprogress import job
++
++from core import fs
++from core.directories import Directories, DirectoryState, InvalidPathError
++from core.reclaim.candidate import Candidate
++from core.reclaim.errors import InvalidScanRootError
++
++__all__ = ["ScanSpec", "CandidateScanner"]
++
++
++class ScanSpec:
++    """Declarative description of *what* to scan.
++
++    :param roots: list of directories to scan (normal state).
++    :param reference_roots: directories whose files are protected.
++    :param excluded_roots: directories to skip entirely.
++    :param include_ext: if given, only files with these extensions
++        (lower-case, no dot) are kept.
++    :param exclude_ext: files with these extensions are dropped.
++    :param include_globs / exclude_globs: fnmatch patterns on the file *name*.
++    :param min_size / max_size: byte gates (``max_size=0`` means no upper bound).
++    """
++
++    __slots__ = (
++        "roots",
++        "reference_roots",
++        "excluded_roots",
++        "include_ext",
++        "exclude_ext",
++        "include_globs",
++        "exclude_globs",
++        "min_size",
++        "max_size",
++    )
++
++    def __init__(
++        self,
++        roots,
++        reference_roots=None,
++        excluded_roots=None,
++        include_ext=None,
++        exclude_ext=None,
++        include_globs=None,
++        exclude_globs=None,
++        min_size=0,
++        max_size=0,
++    ):
++        self.roots = [Path(p) for p in roots]
++        self.reference_roots = [Path(p) for p in (reference_roots or [])]
++        self.excluded_roots = [Path(p) for p in (excluded_roots or [])]
++        self.include_ext = {e.lower().lstrip(".") for e in (include_ext or [])}
++        self.exclude_ext = {e.lower().lstrip(".") for e in (exclude_ext or [])}
++        self.include_globs = list(include_globs or [])
++        self.exclude_globs = list(exclude_globs or [])
++        self.min_size = min_size
++        self.max_size = max_size
++
++    @classmethod
++    def from_dict(cls, data):
++        """Build a :class:`ScanSpec` from a plain dict (e.g. parsed config)."""
++        return cls(
++            roots=data.get("roots", data.get("paths", [])),
++            reference_roots=data.get("reference_roots", data.get("references", [])),
++            excluded_roots=data.get("excluded_roots", data.get("excludes", [])),
++            include_ext=data.get("include_ext"),
++            exclude_ext=data.get("exclude_ext"),
++            include_globs=data.get("include_globs"),
++            exclude_globs=data.get("exclude_globs"),
++            min_size=data.get("min_size", 0),
++            max_size=data.get("max_size", 0),
++        )
++
++    def _name_allowed(self, name):
++        ext = Path(name).suffix.lower().lstrip(".")
++        if self.include_ext and ext not in self.include_ext:
++            return False
++        if self.exclude_ext and ext in self.exclude_ext:
++            return False
++        if self.include_globs and not any(fnmatch.fnmatch(name, g) for g in self.include_globs):
++            return False
++        if self.exclude_globs and any(fnmatch.fnmatch(name, g) for g in self.exclude_globs):
++            return False
++        return True
++
++    def _size_allowed(self, size):
++        if size < self.min_size:
++            return False
++        if self.max_size and size > self.max_size:
++            return False
++        return True
++
++
++class CandidateScanner:
++    """Collects candidates for a :class:`ScanSpec`."""
++
++    def __init__(self, spec):
++        self.spec = spec
++
++    def _build_directories(self):
++        dirs = Directories()
++        for root in self.spec.roots:
++            if not root.exists() or not root.is_dir():
++                raise InvalidScanRootError(f"scan root does not exist or is not a directory: {root}")
++            try:
++                dirs.add_path(root)
++            except InvalidPathError:
++                raise InvalidScanRootError(f"invalid scan root: {root}")
++        # Reference roots must be added too (a root not in the tree is ignored by
++        # Directories) and then marked REFERENCE.
++        for ref in self.spec.reference_roots:
++            if not ref.exists() or not ref.is_dir():
++                raise InvalidScanRootError(f"reference root does not exist: {ref}")
++            if ref not in dirs:
++                try:
++                    dirs.add_path(ref)
++                except InvalidPathError:
++                    raise InvalidScanRootError(f"invalid reference root: {ref}")
++            dirs.set_state(ref, DirectoryState.REFERENCE)
++        for exc in self.spec.excluded_roots:
++            # Excluding a path that isn't under a root is harmless; set the state
++            # regardless so a nested excluded folder is honoured.
++            dirs.set_state(Path(exc), DirectoryState.EXCLUDED)
++        return dirs
++
++    def scan(self, j=job.nulljob):
++        """Return the list of :class:`Candidate` matching the spec.
++
++        Reference-folder files come back with ``protected=True``.
++        """
++        dirs = self._build_directories()
++        candidates = []
++        for file in dirs.get_files(fileclasses=[fs.File], j=j):
++            name = file.path.name
++            if not self.spec._name_allowed(name):
++                continue
++            if not self.spec._size_allowed(file.size):
++                continue
++            candidates.append(Candidate(file, protected=getattr(file, "is_ref", False)))
++        # Deterministic order regardless of directory iteration order.
++        candidates.sort(key=lambda c: str(c.path))
++        return candidates
+diff --git a/core/reclaim/session.py b/core/reclaim/session.py
+new file mode 100644
+index 00000000..ac7c583f
+--- /dev/null
++++ b/core/reclaim/session.py
+@@ -0,0 +1,135 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""A one-stop session tying scan -> group -> plan -> execute together.
++
++Most callers don't want to wire the five stages by hand; they want to say
++"dedupe these folders, keep the oldest, and tell me how much I'd save", preview
++it, and then apply it. :class:`ReclaimSession` is that facade. It keeps the
++stages explicit underneath (so power users can still reach in) but offers a
++smooth default path:
++
++    session = ReclaimSession(spec, strategy="oldest", action="delete")
++    result = session.analyze()          # pure: scan + group + plan
++    print(result.plan.summary())
++    report = session.apply()            # mutates, honouring dry_run
++
++The session caches the analysis so ``apply`` uses exactly what was previewed --
++you never plan against one snapshot and act against another by accident.
++"""
++
++from hscommon.jobprogress import job
++
++from core.reclaim.errors import ReclaimConfigError
++from core.reclaim.executor import ReclaimExecutor
++from core.reclaim.grouper import group_identical
++from core.reclaim import identity as identity_mod
++from core.reclaim.plan import DELETE, ReclaimPlanner
++from core.reclaim.scanner import CandidateScanner, ScanSpec
++
++__all__ = ["AnalysisResult", "ReclaimSession"]
++
++
++class AnalysisResult:
++    """Everything the pure phase produced, bundled for inspection."""
++
++    __slots__ = ("candidates", "grouping", "plan")
++
++    def __init__(self, candidates, grouping, plan):
++        self.candidates = candidates
++        self.grouping = grouping
++        self.plan = plan
++
++    @property
++    def scanned_count(self):
++        return len(self.candidates)
++
++    @property
++    def group_count(self):
++        return len(self.grouping.groups)
++
++    @property
++    def duplicate_count(self):
++        return self.grouping.duplicate_count
++
++    @property
++    def reclaimable_bytes(self):
++        # The plan is the authority: it accounts for protected files that keep a
++        # group from being fully collapsed, which the raw grouping does not.
++        return self.plan.reclaimable_bytes
++
++    def summary(self):
++        return {
++            "scanned": self.scanned_count,
++            "groups": self.group_count,
++            "duplicates": self.duplicate_count,
++            "plan": self.plan.summary(),
++        }
++
++
++class ReclaimSession:
++    """High-level orchestration of a reclaim run."""
++
++    def __init__(
++        self,
++        spec,
++        strategy="oldest",
++        action=DELETE,
++        min_size=None,
++        strength=identity_mod.FULL,
++        big_file_size=identity_mod.DEFAULT_BIG_FILE_SIZE,
++    ):
++        if not isinstance(spec, ScanSpec):
++            raise ReclaimConfigError("ReclaimSession needs a ScanSpec")
++        self.spec = spec
++        self.planner = ReclaimPlanner(strategy=strategy, action=action)
++        self.strength = strength
++        self.big_file_size = big_file_size
++        # If the caller didn't override min_size, let the grouper default apply.
++        self.min_size = min_size
++        self._analysis = None
++
++    def analyze(self, j=job.nulljob, force=False):
++        """Run the pure phase (scan -> group -> plan) and cache the result."""
++        if self._analysis is not None and not force:
++            return self._analysis
++        scanner = CandidateScanner(self.spec)
++        candidates = scanner.scan(j=j)
++        group_kwargs = dict(strength=self.strength, big_file_size=self.big_file_size, j=j)
++        if self.min_size is not None:
++            group_kwargs["min_size"] = self.min_size
++        grouping = group_identical(candidates, **group_kwargs)
++        plan = self.planner.build(grouping.groups)
++        self._analysis = AnalysisResult(candidates, grouping, plan)
++        return self._analysis
++
++    @property
++    def analysis(self):
++        if self._analysis is None:
++            return self.analyze()
++        return self._analysis
++
++    def preview(self, j=job.nulljob):
++        """Dry-run the current plan; does not mutate the filesystem."""
++        plan = self.analyze(j=j).plan
++        executor = ReclaimExecutor(dry_run=True)
++        return executor.execute(plan)
++
++    def apply(self, dry_run=False, ignore_stale=False, keep_going=False, trash_func=None, j=job.nulljob):
++        """Execute the plan produced by :meth:`analyze`.
++
++        The plan is (re)built if it hasn't been yet, so ``apply`` alone works;
++        but if you already called :meth:`analyze`/:meth:`preview`, the very same
++        plan is used.
++        """
++        plan = self.analyze(j=j).plan
++        executor = ReclaimExecutor(
++            dry_run=dry_run,
++            ignore_stale=ignore_stale,
++            keep_going=keep_going,
++            trash_func=trash_func,
++        )
++        return executor.execute(plan)
+diff --git a/core/reclaim/strategies.py b/core/reclaim/strategies.py
+new file mode 100644
+index 00000000..ee9780cd
+--- /dev/null
++++ b/core/reclaim/strategies.py
+@@ -0,0 +1,228 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Keeper-selection strategies.
++
++When a bunch of files are byte-identical, exactly one of them should be kept and
++the rest reclaimed. *Which* one to keep is a policy decision, and different users
++want different policies:
++
++* keep the **oldest** copy (the original), delete the later copies;
++* keep the **newest** copy;
++* keep the one with the **shortest path** (the copy that lives closest to the
++  root is usually the "real" one, deep copies are usually strays);
++* keep the copy under a **preferred directory** (e.g. an ``Originals`` folder);
++* keep the copy whose **name looks least like a duplicate** ("photo.jpg" over
++  "photo (1).jpg" / "photo copy.jpg").
++
++A strategy is expressed as a *sort key*: we sort the group's candidates and the
++first one wins the "keeper" seat. Strategies compose -- you can rank primarily
++by preferred-directory and break ties by oldest -- via :class:`CompositeStrategy`.
++
++Reference/protected candidates are handled outside the strategy: they are always
++kept and never eligible to be a victim. A strategy only ever chooses among the
++*non-protected* members, and only when a group has no protected member at all.
++"""
++
++import re
++
++from core.reclaim.errors import UnknownStrategyError
++
++__all__ = [
++    "KeeperStrategy",
++    "OldestKeeper",
++    "NewestKeeper",
++    "ShortestPathKeeper",
++    "LongestPathKeeper",
++    "PreferredDirKeeper",
++    "CleanestNameKeeper",
++    "BiggestKeeper",
++    "CompositeStrategy",
++    "make_strategy",
++    "STRATEGY_NAMES",
++]
++
++# Marks a filename as looking like a copy: "foo (1).jpg", "foo copy.jpg",
++# "foo - Copy.jpg", "foo_2.txt". Higher score == more copy-like == less
++# desirable to keep.
++_COPY_MARKERS = [
++    re.compile(r"\bcopy\b", re.IGNORECASE),
++    re.compile(r"\(\d+\)\s*$"),
++    re.compile(r"\[\d+\]\s*$"),
++    re.compile(r"[-_ ]\d+\s*$"),
++]
++
++
++def _copy_score(stem):
++    """How 'copy-like' a filename stem is; 0 means pristine."""
++    score = 0
++    for marker in _COPY_MARKERS:
++        if marker.search(stem):
++            score += 1
++    # A trailing digit is a mild signal even without brackets.
++    if stem.strip()[-1:].isdigit():
++        score += 1
++    return score
++
++
++class KeeperStrategy:
++    """Base class: rank the candidates of a group, best keeper first."""
++
++    name = "base"
++
++    def sort_key(self, candidate):
++        """Return a sort key; the candidate with the smallest key is kept."""
++        raise NotImplementedError()
++
++    def rank(self, candidates):
++        """Return ``candidates`` ordered best-keeper-first.
++
++        The sort is stable, so candidates that tie on the strategy key keep the
++        input order (the caller feeds a deterministically ordered group, so the
++        whole thing is deterministic).
++        """
++        return sorted(candidates, key=self.sort_key)
++
++    def choose_keeper(self, candidates):
++        """Return the single candidate to keep out of ``candidates``."""
++        return self.rank(candidates)[0]
++
++    def __repr__(self):
++        return f"<{type(self).__name__}>"
++
++
++class OldestKeeper(KeeperStrategy):
++    """Keep the earliest-modified copy (the presumed original)."""
++
++    name = "oldest"
++
++    def sort_key(self, candidate):
++        return (candidate.mtime, str(candidate.path))
++
++
++class NewestKeeper(KeeperStrategy):
++    name = "newest"
++
++    def sort_key(self, candidate):
++        return (-candidate.mtime, str(candidate.path))
++
++
++class ShortestPathKeeper(KeeperStrategy):
++    """Keep the copy with the fewest path components, then shortest string."""
++
++    name = "shortest_path"
++
++    def sort_key(self, candidate):
++        return (candidate.depth, len(str(candidate.path)), str(candidate.path))
++
++
++class LongestPathKeeper(KeeperStrategy):
++    name = "longest_path"
++
++    def sort_key(self, candidate):
++        return (-candidate.depth, -len(str(candidate.path)), str(candidate.path))
++
++
++class BiggestKeeper(KeeperStrategy):
++    """Keep the largest file. (For byte-identical dupes sizes match, so this is
++    mostly useful as a tie-break component in a composite.)"""
++
++    name = "biggest"
++
++    def sort_key(self, candidate):
++        return (-candidate.size, str(candidate.path))
++
++
++class CleanestNameKeeper(KeeperStrategy):
++    """Keep the copy whose name looks least like a duplicate."""
++
++    name = "cleanest_name"
++
++    def sort_key(self, candidate):
++        return (_copy_score(candidate.stem), len(candidate.name), str(candidate.path))
++
++
++class PreferredDirKeeper(KeeperStrategy):
++    """Keep the copy that lives under one of the ``preferred`` directories.
++
++    Directories earlier in the list are preferred over later ones. A copy under
++    no preferred directory sorts last. Within the same preference rank we fall
++    back to shortest path so the choice is still deterministic.
++    """
++
++    name = "preferred_dir"
++
++    def __init__(self, preferred):
++        from pathlib import Path
++
++        self.preferred = [Path(p) for p in preferred]
++
++    def _rank_of(self, candidate):
++        for i, pref in enumerate(self.preferred):
++            try:
++                candidate.path.relative_to(pref)
++                return i
++            except ValueError:
++                continue
++        return len(self.preferred)
++
++    def sort_key(self, candidate):
++        return (self._rank_of(candidate), candidate.depth, str(candidate.path))
++
++
++class CompositeStrategy(KeeperStrategy):
++    """Chain several strategies: earlier ones dominate, later ones break ties."""
++
++    name = "composite"
++
++    def __init__(self, strategies):
++        self.strategies = list(strategies)
++        if not self.strategies:
++            raise UnknownStrategyError("composite strategy needs at least one component")
++
++    def sort_key(self, candidate):
++        return tuple(s.sort_key(candidate) for s in self.strategies)
++
++
++# Registry of the no-argument strategies, keyed by their public name.
++_SIMPLE = {
++    OldestKeeper.name: OldestKeeper,
++    NewestKeeper.name: NewestKeeper,
++    ShortestPathKeeper.name: ShortestPathKeeper,
++    LongestPathKeeper.name: LongestPathKeeper,
++    BiggestKeeper.name: BiggestKeeper,
++    CleanestNameKeeper.name: CleanestNameKeeper,
++}
++
++STRATEGY_NAMES = sorted(list(_SIMPLE.keys()) + [PreferredDirKeeper.name])
++
++
++def make_strategy(spec):
++    """Build a :class:`KeeperStrategy` from a flexible ``spec``.
++
++    ``spec`` may be:
++
++    * a :class:`KeeperStrategy` instance (returned as-is);
++    * a string naming a simple strategy (``"oldest"``, ``"shortest_path"`` ...);
++    * a ``("preferred_dir", [paths...])`` tuple;
++    * a list/tuple of any of the above, which becomes a :class:`CompositeStrategy`.
++    """
++    if isinstance(spec, KeeperStrategy):
++        return spec
++    if isinstance(spec, str):
++        try:
++            return _SIMPLE[spec]()
++        except KeyError:
++            raise UnknownStrategyError(
++                f"unknown keeper strategy {spec!r}; known: {', '.join(STRATEGY_NAMES)}"
++            )
++    if isinstance(spec, (list, tuple)):
++        # A ("preferred_dir", [...]) pair is a single parametrised strategy, not
++        # a composite -- disambiguate by the first element being that name.
++        if len(spec) == 2 and spec[0] == PreferredDirKeeper.name:
++            return PreferredDirKeeper(spec[1])
++        return CompositeStrategy([make_strategy(s) for s in spec])
++    raise UnknownStrategyError(f"cannot interpret strategy spec: {spec!r}")

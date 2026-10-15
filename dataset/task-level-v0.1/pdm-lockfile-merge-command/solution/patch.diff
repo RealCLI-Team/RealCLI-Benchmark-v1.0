@@ -1,0 +1,2423 @@
+diff --git a/docs/usage/lockfile.md b/docs/usage/lockfile.md
+index 487aa8f..9a17397 100644
+--- a/docs/usage/lockfile.md
++++ b/docs/usage/lockfile.md
+@@ -121,6 +121,86 @@ pdm add --frozen-lockfile flask
+ In this case, the lock file, if existing, will become read-only, no write operation will be performed on it.
+ However, dependency resolution step will still be performed if needed.
+ 
++## Merge lock files
++
++When several people work on the same project, `pdm.lock` is a frequent source of version control
++conflicts: two branches add or upgrade different packages and the merged file no longer reflects
++either resolution. `pdm merge-lock` reconciles two diverged revisions of a lock file against their
++common ancestor, without contacting any package index:
++
++```bash
++pdm merge-lock BASE OURS THEIRS [-o OUTPUT] [--on-conflict STRATEGY]
++```
++
++The three positional arguments are the paths of the lock file at the merge base, at "our" revision
++(the working copy) and at "their" revision (the incoming change). The merged lock file is written
++to `--output`, or overwrites `OURS` when the option is omitted, so the command can be wired as a
++[git merge driver](https://git-scm.com/docs/gitattributes#_defining_a_custom_merge_driver):
++
++```bash
++# .git/config or ~/.gitconfig
++[merge "pdm-lock"]
++    name = PDM lockfile merge driver
++    driver = pdm merge-lock %O %A %B
++```
++
++```gitattributes
++# .gitattributes
++pdm.lock merge=pdm-lock
++```
++
++Packages are matched across the three revisions by requirement identity (name, extras, marker and
++source URL) -- the pinned version itself is *not* part of the identity, so a version bump on one
++branch is merged with an unrelated change on the other. The merge follows the usual three-way
++rules:
++
++- a package added or removed on only one side, or changed identically on both sides, is merged
++  cleanly;
++- when both sides changed the same package, fields are merged individually: `groups`,
++  `dependencies` and file hashes are combined, and single-valued fields such as `version`,
++  `requires_python`, `summary` and `marker` must have at most one side changing them;
++- anything else -- e.g. both sides pinning different versions, or one side removing a package the
++  other side upgraded -- is a conflict.
++
++With the default `--on-conflict=fail`, conflicts are reported on stderr and the command exits with
++a non-zero code without writing anything. The other strategies resolve every conflict
++automatically: `--on-conflict=ours` and `--on-conflict=theirs` keep the entry from the given side,
++and `--on-conflict=newer` keeps the higher pinned version (a modification always wins over a
++removal, and ties are resolved in favor of `theirs`).
++
++Two more options help automation around the merge:
++
++- `--dry-run` only checks whether the lock files can be merged: it prints the summary, writes
++  nothing, and exits non-zero when conflicts remain. It is useful in CI to detect lock file
++  conflicts early.
++- `--json` prints a machine readable report to stdout, with the merge outcome, the list of added,
++  removed and updated packages, and the details of every conflict (unresolved or resolved by the
++  strategy). Human messages go to stderr in this mode so stdout stays parseable.
++
++```bash
++$ pdm merge-lock base.lock ours.lock theirs.lock --dry-run --json
++{
++  "changes": {
++    "added": ["requests 2.32.3"],
++    "removed": [],
++    "updated": ["urllib3 2.2.2"]
++  },
++  "clean": true,
++  "conflicts": [],
++  "packages": 42,
++  ...
++}
++```
++
++The `[metadata]` table is merged as well: `groups` and `targets` are combined, `lock_version` takes
++the highest side, and `content_hash` follows the working copy. The lock strategies
++(`cross_platform`, `static_urls`, ...) must not diverge in both directions -- in that case the
++lock files cannot be merged safely and `pdm merge-lock` refuses with an error; regenerate one of
++them with `pdm lock` so both use the same strategy.
++
++Only the PDM lock file format is supported; `pylock.toml` documents must be converted first, e.g.
++with `pdm lock --format pdm`.
++
+ ## Lock strategies
+ 
+ Currently, we support three flags to control the locking behavior: `cross_platform`, `static_urls` and `direct_minimal_versions`, with the meanings as follows.
+diff --git a/news/3445.feature.md b/news/3445.feature.md
+new file mode 100644
+index 0000000..0c8f486
+--- /dev/null
++++ b/news/3445.feature.md
+@@ -0,0 +1 @@
++Add a `pdm merge-lock` command that performs a three-way structural merge of PDM lockfiles against their common ancestor, with configurable conflict resolution (`--on-conflict=fail|newer|ours|theirs`), suitable as a git merge driver for `pdm.lock`.
+diff --git a/src/pdm/cli/commands/merge_lock.py b/src/pdm/cli/commands/merge_lock.py
+new file mode 100644
+index 0000000..5a1a87d
+--- /dev/null
++++ b/src/pdm/cli/commands/merge_lock.py
+@@ -0,0 +1,112 @@
++import argparse
++import sys
++from pathlib import Path
++
++import tomlkit
++
++from pdm import termui
++from pdm.cli.commands.base import BaseCommand
++from pdm.exceptions import PdmUsageError
++from pdm.project import Project
++from pdm.project.lockfile.merge import (
++    ConflictStrategy,
++    MergeError,
++    format_conflict_report,
++    format_json_report,
++    merge_lockfiles,
++    render_lock_document,
++)
++
++
++class Command(BaseCommand):
++    """Merge two lockfiles against their common ancestor (three-way merge)"""
++
++    name = "merge-lock"
++    description = (
++        "Perform a three-way merge of PDM lockfiles: given the common ancestor and two "
++        "diverged revisions, produce a merged lockfile without re-resolving dependencies. "
++        "It is primarily meant to resolve version control conflicts on the lockfile, and "
++        "can be wired as a git merge driver."
++    )
++
++    def add_arguments(self, parser: argparse.ArgumentParser) -> None:
++        parser.add_argument("base", help="Path to the common ancestor lockfile")
++        parser.add_argument(
++            "ours",
++            help="Path to 'our' revision of the lockfile (the working copy). "
++            "It is overwritten with the merge result unless --output is given.",
++        )
++        parser.add_argument("theirs", help="Path to 'their' revision of the lockfile (the incoming change)")
++        parser.add_argument(
++            "-o",
++            "--output",
++            help="Write the merged lockfile to this path instead of overwriting OURS",
++        )
++        parser.add_argument(
++            "--on-conflict",
++            choices=[s.value for s in ConflictStrategy],
++            default=ConflictStrategy.FAIL.value,
++            help="How to resolve packages that changed on both sides incompatibly: "
++            "'fail' reports the conflicts and writes nothing (default), 'newer' keeps the higher "
++            "pinned version, 'ours'/'theirs' keep the whole entry from the given side.",
++        )
++        parser.add_argument(
++            "--dry-run",
++            action="store_true",
++            help="Only report whether the lockfiles can be merged, without writing anything. "
++            "Exits with a non-zero code when conflicts remain.",
++        )
++        parser.add_argument(
++            "--json",
++            action="store_true",
++            help="Print a machine readable (JSON) merge report to stdout.",
++        )
++
++    def handle(self, project: Project, options: argparse.Namespace) -> None:
++        ui = project.core.ui
++        base = Path(options.base)
++        ours = Path(options.ours)
++        theirs = Path(options.theirs)
++        output = Path(options.output) if options.output else ours
++        strategy = ConflictStrategy.from_string(options.on_conflict)
++        try:
++            result = merge_lockfiles(base, ours, theirs, strategy)
++        except MergeError as e:
++            raise PdmUsageError(str(e)) from None
++        if options.json:
++            # The JSON report must reach stdout regardless of the UI verbosity.
++            print(format_json_report(result))
++        if result.conflicts:
++            if not options.json:
++                ui.echo(format_conflict_report(result.conflicts), err=True)
++            sys.exit(1)
++        for line in result.change_lines():
++            ui.echo(line, verbosity=termui.Verbosity.DETAIL)
++        if result.resolved:
++            ui.echo(
++                f"[warning]{len(result.resolved)}[/] conflict(s) were resolved "
++                f"with [primary]--on-conflict={strategy.value}[/]: "
++                + ", ".join(sorted({c.package_name for c in result.resolved})),
++                verbosity=termui.Verbosity.NORMAL,
++                err=options.json,
++            )
++        summary = (
++            f"[primary]{len(result.packages)}[/] packages "
++            f"([success]{result.added}[/] added, [error]{result.removed}[/] removed, "
++            f"[warning]{result.updated}[/] updated)"
++        )
++        if options.dry_run:
++            ui.echo(
++                f"Lockfiles can be merged cleanly: {summary}.",
++                verbosity=termui.Verbosity.NORMAL,
++                err=options.json,
++            )
++            return
++        document = render_lock_document(result)
++        output.parent.mkdir(parents=True, exist_ok=True)
++        output.write_text(tomlkit.dumps(document), encoding="utf-8")
++        ui.echo(
++            f"Merged lockfile written to [success]{output}[/]: {summary}.",
++            verbosity=termui.Verbosity.NORMAL,
++            err=options.json,
++        )
+diff --git a/src/pdm/project/lockfile/merge.py b/src/pdm/project/lockfile/merge.py
+new file mode 100644
+index 0000000..b82d63c
+--- /dev/null
++++ b/src/pdm/project/lockfile/merge.py
+@@ -0,0 +1,888 @@
++"""Three-way structural merge for PDM lockfiles.
++
++This module implements a git-style three-way merge for ``pdm.lock`` files.
++Given the lockfile at the common ancestor (``base``) and the two diverged
++revisions (``ours`` and ``theirs``), it produces a merged lockfile without
++contacting any package index, by operating purely on the structure of the
++TOML documents.
++
++Merge semantics
++---------------
++Packages are matched across the three revisions by a *merge key* derived
++from the requirement identity: the normalized package name, the extras, the
++environment marker, the source URL (for non-named requirements) and the
++editable flag.  The pinned version is deliberately *not* part of the key, so
++that version bumps on either side are seen as changes to the same entry.
++
++For every key the three entries (any of which may be missing) are reconciled
++with the classic three-way rules:
++
++* if ``ours == theirs`` (including both missing), the result is that entry;
++* else if the key was added on both sides with different content, it is a
++  conflict;
++* else if ``ours == base``, only ``theirs`` changed and its value wins
++  (including deletion);
++* else if ``theirs == base``, only ``ours`` changed and its value wins;
++* else both sides changed the entry differently and the fields are merged
++  individually: set-like fields (``groups``, ``dependencies``, ``extras``,
++  file hashes) are combined with a three-way set merge, scalar fields
++  (``version``, ``requires_python``, ``summary``, ``marker`` and the request
++  attributes) follow the same three-way rules field by field.  Any field
++  that changed on both sides into different values turns the whole entry
++  into a conflict.
++
++Conflicts are resolved according to the chosen strategy:
++
++``fail``
++    No resolution: the conflicts are reported and no output is produced.
++``ours`` / ``theirs``
++    The whole entry from the given side wins (deletion included).
++``newer``
++    The entry with the higher pinned version wins; a modification always
++    wins over a deletion, and ties (or unparseable versions) are resolved in
++    favor of ``theirs`` -- the incoming change.
++
++The ``[metadata]`` table is merged with the same philosophy: ``groups`` and
++``targets`` are three-way set merges, ``lock_version`` picks the highest
++side on disagreement, ``content_hash`` and ``lock_inputs`` prefer the
++working copy (``ours``) when both sides changed, and the lock ``strategy``
++flags must not diverge in both directions -- otherwise the lockfiles cannot
++be merged safely and an error is raised.
++"""
++from __future__ import annotations
++
++import dataclasses
++import enum
++import json
++from collections.abc import Iterable, Mapping
++from pathlib import Path
++from typing import Any
++
++import tomlkit
++
++from pdm.cli.utils import normalize_name
++from pdm.compat import tomllib
++from pdm.exceptions import PdmException, PdmUsageError
++from pdm.project.lockfile.base import GENERATED_COMMENTS
++from pdm.project.lockfile.pdmlock import PDMLock
++from pdm.utils import parse_version
++
++__all__ = [
++    "ConflictStrategy",
++    "MergeConflict",
++    "MergeResult",
++    "PackageEntry",
++    "format_conflict_report",
++    "format_json_report",
++    "load_lockfile_data",
++    "merge_lock_data",
++    "merge_lockfiles",
++    "render_lock_document",
++]
++
++# Scalar fields that are compared value by value during a field-level merge.
++_SCALAR_FIELDS = ("version", "requires_python", "summary", "marker")
++
++# Set-like fields: merged with a three-way set merge and rendered sorted.
++_SET_FIELDS = ("groups", "dependencies", "extras")
++
++# Attributes describing where the package comes from.  They are scalar for
++# merge purposes but are also used to build the merge key.
++_REQUEST_FIELDS = ("url", "path", "editable", "subdirectory", "git", "hg", "svn", "bzr", "ref", "revision")
++
++# Keys of a raw lockfile entry that are not package attributes and therefore
++# ignored by the merger.
++_IGNORED_FIELDS = ("files", "targets")
++
++
++class MergeError(PdmException):
++    """Raised when the lockfiles cannot be merged at all."""
++
++
++class ConflictStrategy(enum.Enum):
++    """How to resolve entries that changed on both sides incompatibly."""
++
++    FAIL = "fail"
++    NEWER = "newer"
++    OURS = "ours"
++    THEIRS = "theirs"
++
++    @classmethod
++    def from_string(cls, value: str) -> ConflictStrategy:
++        try:
++            return cls(value.lower())
++        except ValueError:
++            raise PdmUsageError(
++                f"Invalid conflict strategy: {value!r}, " f"expected one of: {', '.join(s.value for s in cls)}"
++            ) from None
++
++
++def _canon_json(value: Any) -> str:
++    """Serialize a metadata fragment deterministically for comparison."""
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
++
++
++def _canon_file_row(row: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
++    """Canonical form of a ``files`` entry: sorted ``(key, value)`` pairs."""
++    return tuple(sorted((str(k), str(v)) for k, v in row.items()))
++
++
++def _file_row_key(row: tuple[tuple[str, str], ...]) -> str:
++    """The identity of a file row: its filename, or its URL for static URLs."""
++    data = dict(row)
++    return data.get("file") or data.get("url") or ""
++
++
++def three_way_set(
++    base: Iterable[Any], ours: Iterable[Any], theirs: Iterable[Any]
++) -> list[Any]:
++    """Classic three-way set merge.
++
++    An element survives when it is kept (or added) by both sides, or added by
++    exactly one side.  A deletion by one side wins over an unchanged element
++    on the other side.
++    """
++    b, o, t = set(base), set(ours), set(theirs)
++    merged = (o & t) | (o - b) | (t - b)
++    return sorted(merged)
++
++
++@dataclasses.dataclass(frozen=True)
++class PackageEntry:
++    """A canonical ``[[package]]`` entry of a PDM lockfile.
++
++    All collection fields are stored in a normalized (sorted, deduplicated)
++    form so that two entries can be compared semantically regardless of the
++    ordering chosen by the writer.
++    """
++
++    name: str
++    version: str | None = None
++    requires_python: str = ""
++    summary: str = ""
++    marker: str | None = None
++    groups: tuple[str, ...] = ()
++    extras: tuple[str, ...] = ()
++    dependencies: tuple[str, ...] = ()
++    files: tuple[tuple[tuple[str, str], ...], ...] = ()
++    request: tuple[tuple[str, Any], ...] = ()
++
++    @classmethod
++    def from_mapping(cls, data: Mapping[str, Any]) -> PackageEntry:
++        """Build a canonical entry from a raw lockfile package table."""
++        try:
++            name = data["name"]
++        except KeyError:
++            raise MergeError(f"Package entry without a name: {data!r}") from None
++        request = tuple(
++            sorted((k, v) for k, v in data.items() if k in _REQUEST_FIELDS and v not in (None, "", False))
++        )
++        files = tuple(
++            sorted(
++                {_canon_file_row(row) for row in data.get("files", [])},
++                key=_file_row_key,
++            )
++        )
++        return cls(
++            name=normalize_name(str(name)),
++            version=str(data["version"]) if data.get("version") is not None else None,
++            requires_python=str(data.get("requires_python") or ""),
++            summary=str(data.get("summary") or ""),
++            marker=str(data["marker"]) if data.get("marker") is not None else None,
++            groups=tuple(sorted({str(g) for g in data.get("groups", [])})),
++            extras=tuple(sorted({str(e) for e in data.get("extras", [])})),
++            dependencies=tuple(sorted({str(d) for d in data.get("dependencies", [])})),
++            files=files,
++            request=request,
++        )
++
++    @property
++    def key(self) -> tuple[str, tuple[str, ...], str, str, bool]:
++        """The merge key identifying the requirement across revisions."""
++        request = dict(self.request)
++        source = str(request.get("url") or request.get("path") or request.get("git") or "")
++        return (
++            normalize_name(self.name),
++            self.extras,
++            self.marker or "",
++            source,
++            bool(request.get("editable", False)),
++        )
++
++    @property
++    def identity(self) -> tuple[str, tuple[str, ...], str, bool]:
++        """The package identity ignoring the environment marker.
++
++        Entries sharing an identity but carrying different markers (split
++        pins for different Python versions/platforms) form a marker group;
++        the group is merged as a unit when both sides restructured it.
++        """
++        key = self.key
++        return (key[0], key[1], key[3], key[4])
++
++    @property
++    def sort_key(self) -> tuple[str, str, str, str]:
++        """Deterministic ordering key used when rendering the lockfile."""
++        return (
++            normalize_name(self.name),
++            ",".join(self.extras),
++            self.version or "",
++            self.marker or "",
++        )
++
++    def describe(self) -> str:
++        """A short human readable description used in conflict reports."""
++        parts = [self.name]
++        if self.extras:
++            parts.append(f"[{','.join(self.extras)}]")
++        if self.version is not None:
++            parts.append(f" {self.version}")
++        if self.marker:
++            parts.append(f"; {self.marker}")
++        return "".join(parts)
++
++    def _field_value(self, field: str) -> Any:
++        return getattr(self, field)
++
++    def merge_fields(self, base: PackageEntry, other: PackageEntry) -> PackageEntry:
++        """Merge this entry with ``other`` field by field against ``base``.
++
++        Both entries are known to differ from ``base`` and from each other.
++        Returns the merged entry, or raises :class:`_FieldConflict` naming the
++        field that cannot be reconciled.
++        """
++        updates: dict[str, Any] = {}
++        for field in _SCALAR_FIELDS:
++            b, o, t = base._field_value(field), self._field_value(field), other._field_value(field)
++            if o == t:
++                updates[field] = o
++            elif o == b:
++                updates[field] = t
++            elif t == b:
++                updates[field] = o
++            else:
++                raise _FieldConflict(field)
++        for field in _SET_FIELDS:
++            updates[field] = tuple(
++                three_way_set(base._field_value(field), self._field_value(field), other._field_value(field))
++            )
++        updates["files"] = _merge_file_rows(base.files, self.files, other.files)
++        updates["request"] = _merge_request(base.request, self.request, other.request)
++        return dataclasses.replace(self, **updates)
++
++
++class _FieldConflict(Exception):
++    """Internal signal carrying the name of the conflicting field."""
++
++    def __init__(self, field: str) -> None:
++        self.field = field
++        super().__init__(field)
++
++
++def _merge_file_rows(
++    base: tuple[tuple[tuple[str, str], ...], ...],
++    ours: tuple[tuple[tuple[str, str], ...], ...],
++    theirs: tuple[tuple[tuple[str, str], ...], ...],
++) -> tuple[tuple[tuple[str, str], ...], ...]:
++    """Merge file hash rows keyed by filename.
++
++    Rows with the same filename on both sides must agree after the three-way
++    reconciliation, otherwise the hashes belong to different artifacts and the
++    entry is in conflict.
++    """
++    result: dict[str, tuple[tuple[str, str], ...]] = {}
++    b = {_file_row_key(row): row for row in base}
++    o = {_file_row_key(row): row for row in ours}
++    t = {_file_row_key(row): row for row in theirs}
++    for name in b | o | t:  # type: ignore[operator]
++        rb, ro, rt = b.get(name), o.get(name), t.get(name)
++        if ro == rt:
++            if ro is not None:
++                result[name] = ro
++        elif ro == rb:
++            if rt is not None:
++                result[name] = rt
++        elif rt == rb:
++            if ro is not None:
++                result[name] = ro
++        else:
++            raise _FieldConflict("files")
++    return tuple(result[name] for name in sorted(result))
++
++
++def _merge_request(
++    base: tuple[tuple[str, Any], ...],
++    ours: tuple[tuple[str, Any], ...],
++    theirs: tuple[tuple[str, Any], ...],
++) -> tuple[tuple[str, Any], ...]:
++    """Three-way merge of the request attributes (url, ref, revision, ...)."""
++    b, o, t = dict(base), dict(ours), dict(theirs)
++    result: dict[str, Any] = {}
++    for key in b.keys() | o.keys() | t.keys():
++        rb, ro, rt = b.get(key), o.get(key), t.get(key)
++        if ro == rt:
++            if ro is not None:
++                result[key] = ro
++        elif ro == rb:
++            if rt is not None:
++                result[key] = rt
++        elif rt == rb:
++            if ro is not None:
++                result[key] = ro
++        else:
++            raise _FieldConflict(key)
++    return tuple(sorted(result.items()))
++
++
++@dataclasses.dataclass(frozen=True)
++class MergeConflict:
++    """A package entry that could not be merged automatically."""
++
++    key: tuple[str, tuple[str, ...], str, str, bool]
++    reason: str
++    field: str | None
++    base: PackageEntry | None
++    ours: PackageEntry | None
++    theirs: PackageEntry | None
++
++    @property
++    def package_name(self) -> str:
++        return self.key[0]
++
++    def describe_sides(self) -> list[str]:
++        """Render the state of each side for the conflict report."""
++
++        def _side(entry: PackageEntry | None) -> str:
++            return entry.describe() if entry is not None else "<removed>"
++
++        return [
++            f"base:   {_side(self.base)}",
++            f"ours:   {_side(self.ours)}",
++            f"theirs: {_side(self.theirs)}",
++        ]
++
++
++@dataclasses.dataclass
++class LockMetadata:
++    """The ``[metadata]`` table of a PDM lockfile, in mergeable form."""
++
++    groups: tuple[str, ...] = ()
++    strategy: frozenset[str] = frozenset()
++    targets: tuple[str, ...] = ()  # canonical JSON blobs
++    lock_version: str = ""
++    content_hash: str = ""
++    lock_inputs: str | None = None  # canonical JSON blob
++
++    @classmethod
++    def from_mapping(cls, data: Mapping[str, Any]) -> LockMetadata:
++        metadata = data.get("metadata", {})
++        strategy = set(metadata.get("strategy", []))
++        # Legacy boolean flags are folded into the strategy set, mirroring
++        # how ``PDMLock.strategy`` interprets them.
++        if metadata.get("static_urls"):
++            strategy.add("static_urls")
++        if metadata.get("cross_platform") is not False and not metadata.get("strategy"):
++            strategy.add("cross_platform")
++        return cls(
++            groups=tuple(sorted({str(g) for g in metadata.get("groups", [])})),
++            strategy=frozenset(strategy),
++            targets=tuple(sorted({_canon_json(t) for t in metadata.get("targets", [])})),
++            lock_version=str(metadata.get("lock_version", "")),
++            content_hash=str(metadata.get("content_hash", "")),
++            lock_inputs=(
++                _canon_json(metadata["lock_inputs"]) if metadata.get("lock_inputs") is not None else None
++            ),
++        )
++
++
++def load_lockfile_data(path: str | Path) -> dict[str, Any]:
++    """Read and validate a PDM lockfile for merging.
++
++    Only the PDM lockfile format is supported; ``pylock.toml`` documents must
++    be converted first.  The lock version must be compatible with this PDM
++    version, i.e. readable according to the same rules used by ``PDMLock``.
++    """
++    path = Path(path)
++    try:
++        with open(path, "rb") as fp:
++            data = tomllib.load(fp)
++    except FileNotFoundError:
++        raise PdmUsageError(f"Lockfile not found: {path}") from None
++    except tomllib.TOMLDecodeError as e:
++        raise PdmUsageError(f"Cannot parse {path} as TOML: {e}") from None
++    metadata = data.get("metadata", {})
++    if not isinstance(metadata, Mapping) or "lock_version" not in metadata:
++        if "lock-version" in data:
++            raise PdmUsageError(
++                f"{path} is a pylock.toml file, only the PDM lockfile format can be merged."
++            )
++        raise PdmUsageError(f"{path} is not a PDM lockfile: missing [metadata] lock_version.")
++    file_version = parse_version(str(metadata["lock_version"]))
++    spec = PDMLock.spec_version
++    if file_version.major != spec.major or file_version.minor > spec.minor:
++        raise PdmUsageError(
++            f"{path} was written by an incompatible PDM version (lock_version {file_version}, "
++            f"supported: {spec}). Please regenerate it with this PDM first."
++        )
++    if not isinstance(data.get("package", []), list):
++        raise PdmUsageError(f"{path} is malformed: [[package]] must be an array of tables.")
++    return data
++
++
++def _pick_by_strategy(
++    strategy: ConflictStrategy,
++    ours: PackageEntry | None,
++    theirs: PackageEntry | None,
++) -> tuple[PackageEntry | None, bool]:
++    """Resolve a whole-entry conflict with the given strategy.
++
++    Returns the winning entry (``None`` for deletion) and whether the
++    strategy could decide at all -- ``FAIL`` never decides.
++    """
++    if strategy is ConflictStrategy.FAIL:
++        return None, False
++    if strategy is ConflictStrategy.OURS:
++        return ours, True
++    if strategy is ConflictStrategy.THEIRS:
++        return theirs, True
++    # NEWER: a modification always wins over a deletion.
++    if ours is None or theirs is None:
++        return (theirs if ours is None else ours), True
++
++    def _version_key(entry: PackageEntry) -> Any:
++        try:
++            return (1, parse_version(entry.version or ""))
++        except Exception:
++            return (0, entry.version or "")
++
++    if _version_key(ours) > _version_key(theirs):
++        return ours, True
++    # Ties and unparseable versions go to the incoming change.
++    return theirs, True
++
++
++def _merge_entry(
++    key: tuple[str, tuple[str, ...], str, str, bool],
++    base: PackageEntry | None,
++    ours: PackageEntry | None,
++    theirs: PackageEntry | None,
++    strategy: ConflictStrategy,
++    conflicts: list[MergeConflict],
++    resolved: list[MergeConflict],
++) -> PackageEntry | None:
++    """Merge a single package entry three-way, honoring the strategy."""
++    if ours == theirs:
++        return ours
++    reason: str
++    field: str | None = None
++    if base is None:
++        if ours is None:  # added by theirs only
++            return theirs
++        if theirs is None:  # added by ours only
++            return ours
++        reason = "added on both sides with different content"
++    elif ours is None or theirs is None:
++        changed = theirs if ours is None else ours
++        if changed == base:  # one side removed it, the other kept it unchanged
++            return None
++        reason = "removed on one side, modified on the other"
++    elif ours == base:
++        return theirs
++    elif theirs == base:
++        return ours
++    else:
++        assert ours is not None and theirs is not None
++        try:
++            return ours.merge_fields(base, theirs)
++        except _FieldConflict as e:
++            reason = f"both sides changed {e.field!r} differently"
++            field = e.field
++    winner, decided = _pick_by_strategy(strategy, ours, theirs)
++    record = MergeConflict(key, reason, field, base, ours, theirs)
++    (resolved if decided else conflicts).append(record)
++    return winner if decided else None
++
++
++def _version_sort_key(entry: PackageEntry) -> Any:
++    try:
++        return (1, parse_version(entry.version or ""))
++    except Exception:
++        return (0, entry.version or "")
++
++
++def _merge_marker_group(
++    identity: tuple[str, tuple[str, ...], str, bool],
++    base: list[PackageEntry],
++    ours: list[PackageEntry],
++    theirs: list[PackageEntry],
++    strategy: ConflictStrategy,
++    conflicts: list[MergeConflict],
++    resolved: list[MergeConflict],
++) -> list[PackageEntry]:
++    """Merge entries sharing one identity but (possibly) different markers.
++
++    When only one side restructured the marker set (added, removed or changed
++    markers) the entries are reconciled key by key; when *both* sides changed
++    the marker structure in different ways the whole group is a conflict and
++    the strategy picks a side.
++    """
++    base_keys = {e.key for e in base}
++    ours_keys = {e.key for e in ours}
++    theirs_keys = {e.key for e in theirs}
++    if ours_keys == theirs_keys or ours_keys == base_keys or theirs_keys == base_keys:
++        # At most one side restructured the group: plain per-key merge.
++        base_by_key = {e.key: e for e in base}
++        ours_by_key = {e.key: e for e in ours}
++        theirs_by_key = {e.key: e for e in theirs}
++        merged: list[PackageEntry] = []
++        for key in sorted(base_keys | ours_keys | theirs_keys):
++            entry = _merge_entry(
++                key,
++                base_by_key.get(key),
++                ours_by_key.get(key),
++                theirs_by_key.get(key),
++                strategy,
++                conflicts,
++                resolved,
++            )
++            if entry is not None:
++                merged.append(entry)
++        return merged
++    # Both sides changed the marker structure differently.
++    representative_key = sorted(base_keys | ours_keys | theirs_keys)[0]
++
++    def _representative(entries: list[PackageEntry]) -> PackageEntry | None:
++        return max(entries, key=_version_sort_key) if entries else None
++
++    if strategy is ConflictStrategy.FAIL:
++        winner_entries: list[PackageEntry] = []
++        decided = False
++    elif strategy is ConflictStrategy.OURS:
++        winner_entries, decided = ours, True
++    elif strategy is ConflictStrategy.THEIRS:
++        winner_entries, decided = theirs, True
++    else:  # NEWER: the side with the highest pin wins; ties go to theirs.
++        ours_best = _version_sort_key(_representative(ours)) if ours else None
++        theirs_best = _version_sort_key(_representative(theirs)) if theirs else None
++        if ours_best is not None and theirs_best is not None and ours_best > theirs_best:
++            winner_entries, decided = ours, True
++        else:
++            winner_entries, decided = theirs, True
++    record = MergeConflict(
++        representative_key,
++        "marker structure changed on both sides",
++        "marker",
++        _representative(base),
++        _representative(ours),
++        _representative(theirs),
++    )
++    (resolved if decided else conflicts).append(record)
++    return winner_entries
++
++
++def _merge_metadata(
++    base: LockMetadata, ours: LockMetadata, theirs: LockMetadata
++) -> LockMetadata:
++    """Merge the ``[metadata]`` tables of the three revisions."""
++    groups = three_way_set(base.groups, ours.groups, theirs.groups)
++    targets = three_way_set(base.targets, ours.targets, theirs.targets)
++    if ours.strategy == theirs.strategy:
++        strategy = ours.strategy
++    elif ours.strategy == base.strategy:
++        strategy = theirs.strategy
++    elif theirs.strategy == base.strategy:
++        strategy = ours.strategy
++    else:
++        raise MergeError(
++            "The lock strategy flags diverged on both sides "
++            f"(ours: {sorted(ours.strategy)}, theirs: {sorted(theirs.strategy)}); "
++            "the lockfiles cannot be merged safely. Re-run `pdm lock` with a single strategy first."
++        )
++    if ours.lock_version == theirs.lock_version:
++        lock_version = ours.lock_version
++    else:
++        lock_version = str(max(parse_version(ours.lock_version), parse_version(theirs.lock_version)))
++    if ours.content_hash == theirs.content_hash or theirs.content_hash == base.content_hash:
++        content_hash = ours.content_hash
++    elif ours.content_hash == base.content_hash:
++        content_hash = theirs.content_hash
++    else:
++        # Both sides regenerated the hash; the working copy wins because the
++        # merged result is written on top of it.
++        content_hash = ours.content_hash
++    if ours.lock_inputs == theirs.lock_inputs or theirs.lock_inputs == base.lock_inputs:
++        lock_inputs = ours.lock_inputs
++    elif ours.lock_inputs == base.lock_inputs:
++        lock_inputs = theirs.lock_inputs
++    else:
++        lock_inputs = ours.lock_inputs
++    return LockMetadata(
++        groups=tuple(groups),
++        strategy=strategy,
++        targets=tuple(targets),
++        lock_version=lock_version,
++        content_hash=content_hash,
++        lock_inputs=lock_inputs,
++    )
++
++
++@dataclasses.dataclass
++class MergeResult:
++    """The outcome of a three-way lockfile merge."""
++
++    packages: list[PackageEntry]
++    metadata: LockMetadata
++    conflicts: list[MergeConflict] = dataclasses.field(default_factory=list)
++    resolved: list[MergeConflict] = dataclasses.field(default_factory=list)
++    added_packages: list[str] = dataclasses.field(default_factory=list)
++    removed_packages: list[str] = dataclasses.field(default_factory=list)
++    updated_packages: list[str] = dataclasses.field(default_factory=list)
++
++    @property
++    def clean(self) -> bool:
++        """Whether the merge completed without unresolved conflicts."""
++        return not self.conflicts
++
++    @property
++    def added(self) -> int:
++        return len(self.added_packages)
++
++    @property
++    def removed(self) -> int:
++        return len(self.removed_packages)
++
++    @property
++    def updated(self) -> int:
++        return len(self.updated_packages)
++
++    def change_lines(self) -> list[str]:
++        """Human readable lines describing every change against the base."""
++        lines = [f"  add {name}" for name in self.added_packages]
++        lines += [f"  remove {name}" for name in self.removed_packages]
++        lines += [f"  update {name}" for name in self.updated_packages]
++        return lines
++
++
++def merge_lock_data(
++    base: Mapping[str, Any],
++    ours: Mapping[str, Any],
++    theirs: Mapping[str, Any],
++    on_conflict: ConflictStrategy = ConflictStrategy.FAIL,
++) -> MergeResult:
++    """Merge three parsed lockfile documents and return the result.
++
++    The function never touches the filesystem or the network; rendering and
++    writing the document is left to :func:`render_lock_document` and the
++    caller.
++    """
++
++    def _index(data: Mapping[str, Any]) -> dict[tuple, PackageEntry]:
++        indexed: dict[tuple, PackageEntry] = {}
++        for raw in data.get("package", []):
++            entry = PackageEntry.from_mapping(raw)
++            if entry.key in indexed:
++                raise MergeError(
++                    f"Duplicate lockfile entry for {entry.describe()!r}; "
++                    "the lockfile is inconsistent, regenerate it with `pdm lock`."
++                )
++            indexed[entry.key] = entry
++        return indexed
++
++    base_entries = _index(base)
++    ours_entries = _index(ours)
++    theirs_entries = _index(theirs)
++    conflicts: list[MergeConflict] = []
++    resolved: list[MergeConflict] = []
++    packages: list[PackageEntry] = []
++
++    def _group_by_identity(entries: dict[tuple, PackageEntry]) -> dict[tuple, list[PackageEntry]]:
++        grouped: dict[tuple, list[PackageEntry]] = {}
++        for entry in entries.values():
++            grouped.setdefault(entry.identity, []).append(entry)
++        return grouped
++
++    base_groups = _group_by_identity(base_entries)
++    ours_groups = _group_by_identity(ours_entries)
++    theirs_groups = _group_by_identity(theirs_entries)
++    for identity in sorted(base_groups.keys() | ours_groups.keys() | theirs_groups.keys()):
++        packages.extend(
++            _merge_marker_group(
++                identity,
++                base_groups.get(identity, []),
++                ours_groups.get(identity, []),
++                theirs_groups.get(identity, []),
++                on_conflict,
++                conflicts,
++                resolved,
++            )
++        )
++    metadata = _merge_metadata(
++        LockMetadata.from_mapping(base),
++        LockMetadata.from_mapping(ours),
++        LockMetadata.from_mapping(theirs),
++    )
++    base_keys = set(base_entries)
++    merged_by_key = {entry.key: entry for entry in packages}
++    added = sorted(merged_by_key[key].describe() for key in set(merged_by_key) - base_keys)
++    removed = sorted(base_entries[key].describe() for key in base_keys - set(merged_by_key))
++    updated = sorted(
++        merged_by_key[key].describe()
++        for key in set(merged_by_key) & base_keys
++        if merged_by_key[key] != base_entries[key]
++    )
++    return MergeResult(
++        packages=packages,
++        metadata=metadata,
++        conflicts=conflicts,
++        resolved=resolved,
++        added_packages=added,
++        removed_packages=removed,
++        updated_packages=updated,
++    )
++
++
++def merge_lockfiles(
++    base_path: str | Path,
++    ours_path: str | Path,
++    theirs_path: str | Path,
++    on_conflict: ConflictStrategy = ConflictStrategy.FAIL,
++) -> MergeResult:
++    """Load three lockfiles from disk and merge them."""
++    return merge_lock_data(
++        load_lockfile_data(base_path),
++        load_lockfile_data(ours_path),
++        load_lockfile_data(theirs_path),
++        on_conflict,
++    )
++
++
++def _group_sort_key(group: str) -> tuple[bool, str]:
++    return group != "default", group
++
++
++def render_lock_document(result: MergeResult) -> tomlkit.TOMLDocument:
++    """Render the merge result as a PDM lockfile TOML document.
++
++    The layout mirrors ``PDMLock.format_lockfile``: generated-file comments,
++    a ``[metadata]`` table and one ``[[package]]`` table per entry sorted by
++    package identity.
++    """
++    from pdm.formats.base import make_array, make_inline_table
++
++    doc = tomlkit.document()
++    for line in GENERATED_COMMENTS:
++        doc.append(None, tomlkit.comment(line))
++    metadata = tomlkit.table()
++    metadata.update(
++        {
++            "groups": sorted(result.metadata.groups, key=_group_sort_key),
++            "strategy": sorted(result.metadata.strategy),
++            "targets": [json.loads(t) for t in result.metadata.targets],
++            "lock_version": result.metadata.lock_version,
++            "content_hash": result.metadata.content_hash,
++        }
++    )
++    if result.metadata.lock_inputs is not None:
++        metadata["lock_inputs"] = json.loads(result.metadata.lock_inputs)
++    doc.add("metadata", metadata)
++    packages = tomlkit.aot()
++    for entry in sorted(result.packages, key=lambda e: e.sort_key):
++        row = tomlkit.table()
++        row.add("name", entry.name)
++        if entry.version is not None:
++            row.add("version", entry.version)
++        if entry.extras:
++            row.add("extras", list(entry.extras))
++        if entry.requires_python:
++            row.add("requires_python", entry.requires_python)
++        for key, value in entry.request:
++            row.add(key, value)
++        row.add("summary", entry.summary)
++        if entry.groups:
++            row.add("groups", sorted(entry.groups, key=_group_sort_key))
++        if entry.marker is not None:
++            row.add("marker", entry.marker)
++        if entry.dependencies:
++            row.add("dependencies", make_array(sorted(entry.dependencies), True))
++        if entry.files:
++            collected = []
++            for file_row in sorted(entry.files, key=_file_row_key):
++                collected.append(make_inline_table(dict(file_row)))
++            row.add("files", make_array(collected, True))
++        packages.append(row)
++    doc.add("package", packages)
++    return doc
++
++
++_CONFLICT_REASONS = {
++    "added on both sides with different content": "added on both sides",
++    "removed on one side, modified on the other": "removed vs modified",
++    "marker structure changed on both sides": "marker structure diverged",
++}
++
++
++def format_conflict_report(conflicts: Iterable[MergeConflict]) -> str:
++    """Render a human readable report of unresolved conflicts."""
++    lines = ["Lockfile merge conflicts:", ""]
++    for conflict in sorted(conflicts, key=lambda c: c.key):
++        reason = _CONFLICT_REASONS.get(conflict.reason, conflict.reason)
++        lines.append(rf"  \[conflict] {conflict.package_name} ({reason})")
++        lines.extend(f"    {line}" for line in conflict.describe_sides())
++        lines.append("")
++    lines.append(
++        "Resolve the conflicts manually or re-run with --on-conflict=newer|ours|theirs "
++        "to pick a side automatically."
++    )
++    return "\n".join(lines)
++
++
++def _conflict_to_dict(conflict: MergeConflict) -> dict[str, Any]:
++    """Serialize a conflict record for the JSON report."""
++
++    def _side(entry: PackageEntry | None) -> dict[str, Any] | None:
++        if entry is None:
++            return None
++        return {
++            "name": entry.name,
++            "version": entry.version,
++            "marker": entry.marker,
++            "groups": list(entry.groups),
++            "dependencies": list(entry.dependencies),
++        }
++
++    return {
++        "package": conflict.package_name,
++        "reason": conflict.reason,
++        "field": conflict.field,
++        "base": _side(conflict.base),
++        "ours": _side(conflict.ours),
++        "theirs": _side(conflict.theirs),
++    }
++
++
++def format_json_report(result: MergeResult) -> str:
++    """Render a machine readable (JSON) merge report.
++
++    The report contains the merge outcome, the list of changes against the
++    base revision and the unresolved as well as the strategy-resolved
++    conflicts, so automation (merge drivers, CI checks) can react without
++    parsing the human output.
++    """
++    report = {
++        "clean": result.clean,
++        "packages": len(result.packages),
++        "changes": {
++            "added": result.added_packages,
++            "removed": result.removed_packages,
++            "updated": result.updated_packages,
++        },
++        "conflicts": [_conflict_to_dict(c) for c in result.conflicts],
++        "resolved": [_conflict_to_dict(c) for c in result.resolved],
++        "metadata": {
++            "groups": list(result.metadata.groups),
++            "strategy": sorted(result.metadata.strategy),
++            "lock_version": result.metadata.lock_version,
++            "content_hash": result.metadata.content_hash,
++        },
++    }
++    return json.dumps(report, indent=2, sort_keys=True)
+diff --git a/tests/cli/test_merge_lock.py b/tests/cli/test_merge_lock.py
+new file mode 100644
+index 0000000..c545af0
+--- /dev/null
++++ b/tests/cli/test_merge_lock.py
+@@ -0,0 +1,1307 @@
++"""Tests for the ``pdm merge-lock`` three-way lockfile merge command.
++
++The tests build small lockfile documents programmatically, run the CLI
++command against them and assert on the merged result parsed back with
++``tomllib`` -- they never touch the network or a package index.
++"""
++from __future__ import annotations
++
++import pytest
++
++from pdm.compat import tomllib
++from pdm.project.lockfile.merge import (
++    ConflictStrategy,
++    MergeError,
++    PackageEntry,
++    load_lockfile_data,
++    merge_lock_data,
++    render_lock_document,
++)
++
++LOCK_VERSION = "4.5.1"
++
++
++def file_row(file: str, hash: str) -> dict:
++    return {"file": file, "hash": hash}
++
++
++def pkg(
++    name: str,
++    version: str | None = "1.0.0",
++    *,
++    requires_python: str = "",
++    summary: str = "",
++    groups: tuple[str, ...] = ("default",),
++    marker: str | None = None,
++    extras: tuple[str, ...] = (),
++    dependencies: tuple[str, ...] = (),
++    files: tuple[dict, ...] = (),
++    **request,
++) -> dict:
++    """Build a raw lockfile package entry."""
++    entry: dict = {"name": name}
++    if version is not None:
++        entry["version"] = version
++    if extras:
++        entry["extras"] = sorted(extras)
++    if requires_python:
++        entry["requires_python"] = requires_python
++    entry.update({k: v for k, v in request.items() if v not in (None, "", False)})
++    entry["summary"] = summary
++    entry["groups"] = sorted(groups, key=lambda g: (g != "default", g))
++    if marker is not None:
++        entry["marker"] = marker
++    if dependencies:
++        entry["dependencies"] = sorted(dependencies)
++    if files:
++        entry["files"] = list(files)
++    return entry
++
++
++def lock_data(
++    packages: list[dict],
++    *,
++    groups: tuple[str, ...] = ("default",),
++    strategy: tuple[str, ...] = ("inherit_metadata",),
++    targets: tuple[dict, ...] = ({"requires_python": ">=3.9"},),
++    lock_version: str = LOCK_VERSION,
++    content_hash: str = "sha256:base",
++    extra_metadata: dict | None = None,
++) -> dict:
++    """Build a raw lockfile document."""
++    metadata: dict = {
++        "groups": sorted(groups, key=lambda g: (g != "default", g)),
++        "strategy": sorted(strategy),
++        "targets": list(targets),
++        "lock_version": lock_version,
++        "content_hash": content_hash,
++    }
++    if extra_metadata:
++        metadata.update(extra_metadata)
++    return {"metadata": metadata, "package": packages}
++
++
++def write_lock(path, data: dict) -> None:
++    """Serialize a raw lockfile document to disk as TOML."""
++    import tomlkit
++
++    doc = tomlkit.document()
++    doc.append(None, tomlkit.comment("This file is @generated by PDM."))
++    metadata = tomlkit.table()
++    metadata.update(data["metadata"])
++    doc.add("metadata", metadata)
++    aot = tomlkit.aot()
++    for entry in data.get("package", []):
++        table = tomlkit.table()
++        table.update(entry)
++        aot.append(table)
++    doc.add("package", aot)
++    path.write_text(tomlkit.dumps(doc), encoding="utf-8")
++
++
++def read_lock(path) -> dict:
++    with open(path, "rb") as fp:
++        return tomllib.load(fp)
++
++
++def package_map(data: dict) -> dict[str, dict]:
++    return {p["name"]: p for p in data.get("package", [])}
++
++
++def run_merge(pdm, project, base, ours, theirs, *extra, expect=0):
++    out = ours.parent / "merged.lock"
++    result = pdm(
++        ["merge-lock", str(base), str(ours), str(theirs), "-o", str(out), *extra],
++        obj=project,
++    )
++    assert result.exit_code == expect, result.outputs
++    return result, out
++
++
++@pytest.fixture
++def three_locks(tmp_path):
++    """Write base/ours/theirs lockfiles and return their paths."""
++
++    def factory(base_data, ours_data, theirs_data):
++        base = tmp_path / "base.lock"
++        ours = tmp_path / "ours.lock"
++        theirs = tmp_path / "theirs.lock"
++        write_lock(base, base_data)
++        write_lock(ours, ours_data)
++        write_lock(theirs, theirs_data)
++        return base, ours, theirs
++
++    return factory
++
++
++class TestPackageEntry:
++    def test_canonical_equality_ignores_ordering(self):
++        a = PackageEntry.from_mapping(
++            {
++                "name": "Foo",
++                "version": "1.0",
++                "groups": ["dev", "default"],
++                "dependencies": ["b>=1", "a>=2"],
++                "files": [file_row("f1", "h1"), file_row("f2", "h2")],
++            }
++        )
++        b = PackageEntry.from_mapping(
++            {
++                "name": "foo",
++                "version": "1.0",
++                "groups": ["default", "dev"],
++                "dependencies": ["a>=2", "b>=1"],
++                "files": [file_row("f2", "h2"), file_row("f1", "h1")],
++            }
++        )
++        assert a == b
++        assert a.key == b.key
++
++    def test_merge_key_distinguishes_markers(self):
++        plain = PackageEntry.from_mapping({"name": "a", "version": "1.0"})
++        marked = PackageEntry.from_mapping({"name": "a", "version": "1.0", "marker": 'python_version < "3.10"'})
++        assert plain.key != marked.key
++
++    def test_merge_key_distinguishes_extras(self):
++        plain = PackageEntry.from_mapping({"name": "a", "version": "1.0"})
++        with_extras = PackageEntry.from_mapping({"name": "a", "version": "1.0", "extras": ["security"]})
++        assert plain.key != with_extras.key
++
++    def test_merge_key_distinguishes_url_source(self):
++        named = PackageEntry.from_mapping({"name": "a", "version": "1.0"})
++        from_url = PackageEntry.from_mapping(
++            {"name": "a", "url": "https://example.com/a-1.0.tar.gz"}
++        )
++        assert named.key != from_url.key
++
++    def test_describe_includes_version_and_marker(self):
++        entry = PackageEntry.from_mapping(
++            {"name": "a", "version": "1.2", "marker": 'os_name == "posix"'}
++        )
++        assert entry.describe() == 'a 1.2; os_name == "posix"'
++        removed = PackageEntry.from_mapping({"name": "a"})
++        assert removed.describe() == "a"
++
++
++class TestLoadLockfileData:
++    def test_missing_file(self, tmp_path):
++        from pdm.exceptions import PdmUsageError
++
++        with pytest.raises(PdmUsageError, match="not found"):
++            load_lockfile_data(tmp_path / "nope.lock")
++
++    def test_malformed_toml(self, tmp_path):
++        from pdm.exceptions import PdmUsageError
++
++        path = tmp_path / "bad.lock"
++        path.write_text("this is [not toml", encoding="utf-8")
++        with pytest.raises(PdmUsageError, match="TOML"):
++            load_lockfile_data(path)
++
++    def test_pylock_is_rejected(self, tmp_path):
++        from pdm.exceptions import PdmUsageError
++
++        path = tmp_path / "pylock.toml"
++        path.write_text('lock-version = "1.0"\n', encoding="utf-8")
++        with pytest.raises(PdmUsageError, match="pylock"):
++            load_lockfile_data(path)
++
++    def test_not_a_lockfile(self, tmp_path):
++        from pdm.exceptions import PdmUsageError
++
++        path = tmp_path / "random.toml"
++        path.write_text("[project]\nname = 'x'\n", encoding="utf-8")
++        with pytest.raises(PdmUsageError, match="not a PDM lockfile"):
++            load_lockfile_data(path)
++
++    def test_incompatible_lock_version(self, tmp_path):
++        from pdm.exceptions import PdmUsageError
++
++        path = tmp_path / "future.lock"
++        write_lock(path, lock_data([], lock_version="5.0"))
++        with pytest.raises(PdmUsageError, match="incompatible"):
++            load_lockfile_data(path)
++
++    def test_backward_compatible_version_is_accepted(self, tmp_path):
++        path = tmp_path / "old.lock"
++        write_lock(path, lock_data([], lock_version="4.4"))
++        assert load_lockfile_data(path)["metadata"]["lock_version"] == "4.4"
++
++
++class TestMergeData:
++    """Unit level tests for the pure merge function."""
++
++    def test_identical_inputs_produce_no_changes(self):
++        data = lock_data([pkg("a", "1.0", files=(file_row("a.whl", "h1"),))])
++        result = merge_lock_data(data, data, data)
++        assert result.clean
++        assert not result.resolved
++        assert result.added == result.removed == result.updated == 0
++        assert [p.name for p in result.packages] == ["a"]
++
++    def test_single_side_additions_are_kept(self):
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.0"), pkg("b", "2.0")])
++        theirs = lock_data([pkg("a", "1.0"), pkg("c", "3.0")])
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        assert sorted(p.name for p in result.packages) == ["a", "b", "c"]
++        assert result.added == 2
++
++    def test_removal_on_both_sides(self):
++        base = lock_data([pkg("a"), pkg("b")])
++        other = lock_data([pkg("a")])
++        result = merge_lock_data(base, other, other)
++        assert result.clean
++        assert [p.name for p in result.packages] == ["a"]
++        assert result.removed == 1
++
++    def test_removal_beats_untouched(self):
++        base = lock_data([pkg("a"), pkg("b")])
++        ours = lock_data([pkg("a")])  # b removed
++        theirs = lock_data([pkg("a"), pkg("b")])  # b untouched
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        assert [p.name for p in result.packages] == ["a"]
++
++    def test_version_bump_on_one_side(self):
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.1")])
++        theirs = lock_data([pkg("a", "1.0")])
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        assert result.packages[0].version == "1.1"
++        assert result.updated == 1
++
++    def test_same_change_on_both_sides_is_clean(self):
++        base = lock_data([pkg("a", "1.0")])
++        changed = lock_data([pkg("a", "2.0", summary="new")])
++        result = merge_lock_data(base, changed, changed)
++        assert result.clean
++        assert result.packages[0].version == "2.0"
++
++    def test_version_conflict_fails_by_default(self):
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.1")])
++        theirs = lock_data([pkg("a", "1.2")])
++        result = merge_lock_data(base, ours, theirs)
++        assert not result.clean
++        assert len(result.conflicts) == 1
++        conflict = result.conflicts[0]
++        assert conflict.package_name == "a"
++        assert conflict.field == "version"
++
++    def test_version_conflict_newer_picks_higher(self):
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.1")])
++        theirs = lock_data([pkg("a", "1.2")])
++        result = merge_lock_data(base, ours, theirs, ConflictStrategy.NEWER)
++        assert result.clean
++        assert result.packages[0].version == "1.2"
++        assert len(result.resolved) == 1
++
++    def test_version_conflict_tie_prefers_theirs(self):
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.1", summary="from ours")])
++        theirs = lock_data([pkg("a", "1.1", summary="from theirs")])
++        result = merge_lock_data(base, ours, theirs, ConflictStrategy.NEWER)
++        assert result.clean
++        assert result.packages[0].summary == "from theirs"
++
++    @pytest.mark.parametrize(
++        "strategy,expected",
++        [(ConflictStrategy.OURS, "1.1"), (ConflictStrategy.THEIRS, "1.2")],
++    )
++    def test_version_conflict_side_strategies(self, strategy, expected):
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.1")])
++        theirs = lock_data([pkg("a", "1.2")])
++        result = merge_lock_data(base, ours, theirs, strategy)
++        assert result.clean
++        assert result.packages[0].version == expected
++
++    def test_add_add_conflict(self):
++        base = lock_data([])
++        ours = lock_data([pkg("a", "1.0")])
++        theirs = lock_data([pkg("a", "2.0")])
++        result = merge_lock_data(base, ours, theirs)
++        assert not result.clean
++        assert "added on both sides" in result.conflicts[0].reason
++        resolved = merge_lock_data(base, ours, theirs, ConflictStrategy.NEWER)
++        assert resolved.clean
++        assert resolved.packages[0].version == "2.0"
++
++    def test_add_add_identical_is_clean(self):
++        base = lock_data([])
++        both = lock_data([pkg("a", "1.0", files=(file_row("a.whl", "h"),))])
++        result = merge_lock_data(base, both, both)
++        assert result.clean
++        assert [p.name for p in result.packages] == ["a"]
++
++    def test_removal_vs_modification_conflict(self):
++        base = lock_data([pkg("a", "1.0"), pkg("b", "1.0")])
++        ours = lock_data([pkg("a", "1.1"), pkg("b", "1.0")])  # modified a
++        theirs = lock_data([pkg("b", "1.0")])  # removed a
++        result = merge_lock_data(base, ours, theirs)
++        assert not result.clean
++        assert result.conflicts[0].reason == "removed on one side, modified on the other"
++        # newer keeps the modification
++        resolved = merge_lock_data(base, ours, theirs, ConflictStrategy.NEWER)
++        assert resolved.clean
++        assert [p.name for p in resolved.packages] == ["a", "b"]
++        # theirs applies the removal
++        removed = merge_lock_data(base, ours, theirs, ConflictStrategy.THEIRS)
++        assert [p.name for p in removed.packages] == ["b"]
++
++    def test_field_level_merge_of_sets(self):
++        base = lock_data(
++            [
++                pkg(
++                    "a",
++                    "1.0",
++                    groups=("default",),
++                    dependencies=("x>=1",),
++                    files=(file_row("a-1.0.whl", "h1"),),
++                )
++            ]
++        )
++        ours = lock_data(
++            [
++                pkg(
++                    "a",
++                    "1.0",
++                    groups=("default", "dev"),
++                    dependencies=("x>=1", "y>=2"),
++                    files=(file_row("a-1.0.whl", "h1"),),
++                )
++            ]
++        )
++        theirs = lock_data(
++            [
++                pkg(
++                    "a",
++                    "1.0",
++                    groups=("default",),
++                    dependencies=("x>=1",),
++                    files=(file_row("a-1.0.whl", "h1"), file_row("a-1.0.tar.gz", "h2")),
++                )
++            ]
++        )
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        entry = result.packages[0]
++        assert entry.groups == ("default", "dev")
++        assert entry.dependencies == ("x>=1", "y>=2")
++        assert [dict(f) for f in entry.files] == [
++            file_row("a-1.0.tar.gz", "h2"),
++            file_row("a-1.0.whl", "h1"),
++        ]
++
++    def test_file_hash_conflict(self):
++        base = lock_data([pkg("a", "1.0", files=(file_row("a.whl", "h1"),))])
++        ours = lock_data([pkg("a", "1.0", files=(file_row("a.whl", "h2"),))])
++        theirs = lock_data([pkg("a", "1.0", files=(file_row("a.whl", "h3"),))])
++        result = merge_lock_data(base, ours, theirs)
++        assert not result.clean
++        assert result.conflicts[0].field == "files"
++        resolved = merge_lock_data(base, ours, theirs, ConflictStrategy.OURS)
++        assert [dict(f) for f in resolved.packages[0].files] == [file_row("a.whl", "h2")]
++
++    def test_marker_conflict(self):
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.0", marker='python_version < "3.11"')])
++        theirs = lock_data([pkg("a", "1.0", marker='python_version < "3.12"')])
++        result = merge_lock_data(base, ours, theirs)
++        assert not result.clean
++        assert result.conflicts[0].field == "marker"
++        assert "marker structure" in result.conflicts[0].reason
++
++    @pytest.mark.parametrize(
++        "strategy,expected_marker",
++        [
++            (ConflictStrategy.OURS, 'python_version < "3.11"'),
++            (ConflictStrategy.THEIRS, 'python_version < "3.12"'),
++            (ConflictStrategy.NEWER, 'python_version < "3.12"'),  # tie on version -> theirs
++        ],
++    )
++    def test_marker_group_conflict_strategies(self, strategy, expected_marker):
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.0", marker='python_version < "3.11"')])
++        theirs = lock_data([pkg("a", "1.0", marker='python_version < "3.12"')])
++        result = merge_lock_data(base, ours, theirs, strategy)
++        assert result.clean
++        assert len(result.resolved) == 1
++        assert [p.marker for p in result.packages] == [expected_marker]
++
++    def test_marker_group_newer_prefers_higher_pin(self):
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.5", marker='python_version < "3.11"')])
++        theirs = lock_data([pkg("a", "1.2", marker='python_version < "3.12"')])
++        result = merge_lock_data(base, ours, theirs, ConflictStrategy.NEWER)
++        assert result.clean
++        assert [(p.version, p.marker) for p in result.packages] == [("1.5", 'python_version < "3.11"')]
++
++    def test_split_marker_group_extended_on_one_side(self):
++        base = lock_data(
++            [
++                pkg("a", "1.0", marker='python_version < "3.10"'),
++                pkg("a", "2.0", marker='python_version >= "3.10"'),
++            ]
++        )
++        ours = lock_data(
++            [
++                pkg("a", "1.0", marker='python_version < "3.10"'),
++                pkg("a", "2.0", marker='python_version >= "3.10"'),
++                pkg("a", "2.1", marker='python_version >= "3.12"'),
++            ]
++        )
++        theirs = lock_data(
++            [
++                pkg("a", "1.1", marker='python_version < "3.10"'),
++                pkg("a", "2.0", marker='python_version >= "3.10"'),
++            ]
++        )
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        assert sorted((p.version, p.marker) for p in result.packages) == [
++            ("1.1", 'python_version < "3.10"'),
++            ("2.0", 'python_version >= "3.10"'),
++            ("2.1", 'python_version >= "3.12"'),
++        ]
++
++    def test_marker_changed_on_one_side(self):
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.0", marker='python_version < "3.11"')])
++        theirs = lock_data([pkg("a", "1.0")])
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        assert result.packages[0].marker == 'python_version < "3.11"'
++
++    def test_entries_with_different_markers_are_independent(self):
++        base = lock_data([pkg("a", "1.0", marker='python_version < "3.10"')])
++        ours = lock_data(
++            [
++                pkg("a", "1.0", marker='python_version < "3.10"'),
++                pkg("a", "2.0", marker='python_version >= "3.10"'),
++            ]
++        )
++        theirs = lock_data([pkg("a", "1.1", marker='python_version < "3.10"')])
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        versions = sorted(p.version for p in result.packages)
++        assert versions == ["1.1", "2.0"]
++
++    def test_duplicate_entries_rejected(self):
++        data = lock_data([pkg("a", "1.0"), pkg("a", "1.0")])
++        with pytest.raises(MergeError, match="Duplicate"):
++            merge_lock_data(data, data, data)
++
++    def test_static_url_file_rows_merge(self):
++        row1 = {"url": "https://files.example.com/a-1.0.tar.gz", "hash": "sha256:h1"}
++        row2 = {"url": "https://files.example.com/a-1.0.whl", "hash": "sha256:h2"}
++        base = lock_data([pkg("a", "1.0", files=(row1,))])
++        ours = lock_data([pkg("a", "1.0", files=(row1,))])
++        theirs = lock_data([pkg("a", "1.0", files=(row1, row2))])
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        assert len(result.packages[0].files) == 2
++
++    def test_vcs_revision_conflict(self):
++        base = lock_data([pkg("a", None, git="https://github.com/x/a.git", ref="main", revision="aaa")])
++        ours = lock_data([pkg("a", None, git="https://github.com/x/a.git", ref="main", revision="bbb")])
++        theirs = lock_data([pkg("a", None, git="https://github.com/x/a.git", ref="main", revision="ccc")])
++        result = merge_lock_data(base, ours, theirs)
++        assert not result.clean
++        resolved = merge_lock_data(base, ours, theirs, ConflictStrategy.THEIRS)
++        assert dict(resolved.packages[0].request)["revision"] == "ccc"
++
++
++class TestMergeMetadata:
++    def test_groups_three_way_merge(self):
++        base = lock_data([], groups=("default", "dev", "lint"))
++        ours = lock_data([], groups=("default", "dev", "test"))  # drop lint, add test
++        theirs = lock_data([], groups=("default", "dev", "lint", "doc"))  # add doc
++        result = merge_lock_data(base, ours, theirs)
++        assert result.metadata.groups == ("default", "dev", "doc", "test")
++
++    def test_targets_three_way_merge(self):
++        base = lock_data([], targets=({"requires_python": ">=3.9"},))
++        ours = lock_data([], targets=({"requires_python": ">=3.9"},))
++        theirs = lock_data(
++            [],
++            targets=({"requires_python": ">=3.9"}, {"requires_python": ">=3.9", "platform": "windows"}),
++        )
++        result = merge_lock_data(base, ours, theirs)
++        assert len(result.metadata.targets) == 2
++
++    def test_strategy_divergence_is_an_error(self):
++        base = lock_data([], strategy=("inherit_metadata",))
++        ours = lock_data([], strategy=("inherit_metadata", "static_urls"))
++        theirs = lock_data([], strategy=("inherit_metadata", "cross_platform"))
++        with pytest.raises(MergeError, match="strategy"):
++            merge_lock_data(base, ours, theirs)
++
++    def test_strategy_change_on_one_side(self):
++        base = lock_data([], strategy=("inherit_metadata",))
++        ours = lock_data([], strategy=("inherit_metadata", "static_urls"))
++        theirs = lock_data([], strategy=("inherit_metadata",))
++        result = merge_lock_data(base, ours, theirs)
++        assert result.metadata.strategy == frozenset({"inherit_metadata", "static_urls"})
++
++    def test_lock_version_conflict_picks_max(self):
++        base = lock_data([], lock_version="4.5")
++        ours = lock_data([], lock_version="4.4")
++        theirs = lock_data([], lock_version="4.5.1")
++        result = merge_lock_data(base, ours, theirs)
++        assert result.metadata.lock_version == "4.5.1"
++
++    def test_content_hash_prefers_working_copy(self):
++        base = lock_data([], content_hash="sha256:base")
++        ours = lock_data([], content_hash="sha256:ours")
++        theirs = lock_data([], content_hash="sha256:theirs")
++        result = merge_lock_data(base, ours, theirs)
++        assert result.metadata.content_hash == "sha256:ours"
++        # only theirs regenerated -> theirs wins
++        result = merge_lock_data(base, base, theirs)
++        assert result.metadata.content_hash == "sha256:theirs"
++
++    def test_lock_inputs_merged(self):
++        base = lock_data([], extra_metadata={"lock_inputs": {"requirements": ["a>=1"]}})
++        ours = lock_data([], extra_metadata={"lock_inputs": {"requirements": ["a>=1", "b>=2"]}})
++        theirs = lock_data([], extra_metadata={"lock_inputs": {"requirements": ["a>=1"]}})
++        result = merge_lock_data(base, ours, theirs)
++        assert result.metadata.lock_inputs is not None
++        assert "b>=2" in result.metadata.lock_inputs
++
++
++class TestRender:
++    def test_render_round_trip(self):
++        data = lock_data(
++            [
++                pkg(
++                    "b",
++                    "2.0",
++                    requires_python=">=3.9",
++                    summary="B",
++                    groups=("default", "dev"),
++                    dependencies=("a>=1",),
++                    files=(file_row("b-2.0.whl", "h1"), file_row("b-2.0.tar.gz", "h2")),
++                ),
++                pkg("a", "1.0", summary="A"),
++            ],
++            content_hash="sha256:deadbeef",
++        )
++        result = merge_lock_data(data, data, data)
++        doc = render_lock_document(result)
++        import tomlkit
++
++        text = tomlkit.dumps(doc)
++        assert text.startswith("# This file is @generated by PDM.")
++        parsed = tomllib.loads(text)
++        assert parsed["metadata"]["lock_version"] == LOCK_VERSION
++        assert parsed["metadata"]["content_hash"] == "sha256:deadbeef"
++        assert [p["name"] for p in parsed["package"]] == ["a", "b"]
++        b_entry = parsed["package"][1]
++        assert b_entry["groups"] == ["default", "dev"]
++        assert b_entry["dependencies"] == ["a>=1"]
++        assert b_entry["files"] == [
++            {"file": "b-2.0.tar.gz", "hash": "h2"},
++            {"file": "b-2.0.whl", "hash": "h1"},
++        ]
++
++    def test_render_is_deterministic(self):
++        base = lock_data([pkg("a", "1.0"), pkg("b", "1.0")])
++        ours = lock_data([pkg("a", "1.1"), pkg("b", "1.0"), pkg("c", "1.0")])
++        theirs = lock_data([pkg("a", "1.0"), pkg("b", "1.2"), pkg("d", "1.0")])
++        import tomlkit
++
++        first = tomlkit.dumps(render_lock_document(merge_lock_data(base, ours, theirs)))
++        second = tomlkit.dumps(render_lock_document(merge_lock_data(base, ours, theirs)))
++        assert first == second
++
++    def test_render_legacy_boolean_flags_are_dropped(self):
++        data = lock_data(
++            [pkg("a", "1.0")],
++            strategy=(),
++            extra_metadata={"cross_platform": True, "static_urls": False},
++        )
++        result = merge_lock_data(data, data, data)
++        import tomlkit
++
++        parsed = tomllib.loads(tomlkit.dumps(render_lock_document(result)))
++        assert "cross_platform" not in parsed["metadata"]
++        assert "static_urls" not in parsed["metadata"]
++
++
++class TestMergeLockCommand:
++    def test_help(self, pdm, project):
++        result = pdm(["merge-lock", "--help"], obj=project)
++        assert result.exit_code == 0
++        assert "--on-conflict" in result.stdout
++
++    def test_clean_merge_writes_output(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0")]),
++            lock_data([pkg("a", "1.1"), pkg("b", "1.0"), pkg("c", "1.0", groups=("dev",))]),
++            lock_data([pkg("a", "1.0"), pkg("b", "1.2"), pkg("d", "0.1")]),
++        )
++        result, out = run_merge(pdm, project, base, ours, theirs)
++        assert "4 packages" in result.outputs
++        merged = package_map(read_lock(out))
++        assert merged["a"]["version"] == "1.1"
++        assert merged["b"]["version"] == "1.2"
++        assert set(merged) == {"a", "b", "c", "d"}
++        assert merged["c"]["groups"] == ["dev"]
++
++    def test_default_output_overwrites_ours(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0")]),
++            lock_data([pkg("a", "1.1")]),
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0")]),
++        )
++        result = pdm(["merge-lock", str(base), str(ours), str(theirs)], obj=project)
++        assert result.exit_code == 0, result.outputs
++        merged = package_map(read_lock(ours))
++        assert set(merged) == {"a", "b"}
++        assert merged["a"]["version"] == "1.1"
++
++    def test_conflict_exit_code_and_report(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0")]),
++            lock_data([pkg("a", "1.1")]),
++            lock_data([pkg("a", "1.2")]),
++        )
++        out = ours.parent / "merged.lock"
++        result = pdm(
++            ["merge-lock", str(base), str(ours), str(theirs), "-o", str(out)],
++            obj=project,
++        )
++        assert result.exit_code != 0
++        assert "a" in result.stderr
++        assert "version" in result.stderr
++        assert "1.1" in result.stderr and "1.2" in result.stderr
++        assert not out.exists()
++        # ours is left untouched as well
++        assert package_map(read_lock(ours))["a"]["version"] == "1.1"
++
++    def test_conflict_resolved_with_strategy(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0")]),
++            lock_data([pkg("a", "1.1")]),
++            lock_data([pkg("a", "1.2")]),
++        )
++        result, out = run_merge(pdm, project, base, ours, theirs, "--on-conflict=newer")
++        assert "resolved" in result.outputs
++        assert package_map(read_lock(out))["a"]["version"] == "1.2"
++
++    def test_invalid_strategy_rejected(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(lock_data([]), lock_data([]), lock_data([]))
++        result = pdm(
++            ["merge-lock", str(base), str(ours), str(theirs), "--on-conflict=bogus"],
++            obj=project,
++        )
++        assert result.exit_code != 0
++
++    def test_missing_input_file(self, pdm, project, three_locks, tmp_path):
++        base, ours, _ = three_locks(lock_data([]), lock_data([]), lock_data([]))
++        result = pdm(
++            ["merge-lock", str(base), str(ours), str(tmp_path / "absent.lock")],
++            obj=project,
++        )
++        assert result.exit_code != 0
++        assert "not found" in result.outputs
++
++    def test_non_lockfile_input(self, pdm, project, three_locks, tmp_path):
++        base, ours, _ = three_locks(lock_data([]), lock_data([]), lock_data([]))
++        bad = tmp_path / "pylock.toml"
++        bad.write_text('lock-version = "1.0"\n', encoding="utf-8")
++        result = pdm(["merge-lock", str(base), str(ours), str(bad)], obj=project)
++        assert result.exit_code != 0
++        assert "pylock" in result.outputs
++
++    def test_strategy_divergence_reported(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([], strategy=("inherit_metadata",)),
++            lock_data([], strategy=("inherit_metadata", "static_urls")),
++            lock_data([], strategy=("inherit_metadata", "cross_platform")),
++        )
++        result = pdm(["merge-lock", str(base), str(ours), str(theirs)], obj=project)
++        assert result.exit_code != 0
++        assert "strategy" in result.outputs
++
++    def test_merged_lockfile_is_consumable_by_pdm(self, pdm, project, three_locks):
++        """The merged document must load through PDM's own lockfile reader."""
++        base, ours, theirs = three_locks(
++            lock_data(
++                [
++                    pkg(
++                        "a",
++                        "1.0",
++                        requires_python=">=3.9",
++                        dependencies=("b>=1.0",),
++                        files=(file_row("a-1.0.tar.gz", "sha256:aaa"),),
++                    ),
++                    pkg("b", "1.0", files=(file_row("b-1.0.tar.gz", "sha256:bbb"),)),
++                ]
++            ),
++            lock_data(
++                [
++                    pkg(
++                        "a",
++                        "1.1",
++                        requires_python=">=3.9",
++                        dependencies=("b>=1.0",),
++                        files=(file_row("a-1.1.tar.gz", "sha256:ccc"),),
++                    ),
++                    pkg("b", "1.0", files=(file_row("b-1.0.tar.gz", "sha256:bbb"),)),
++                ]
++            ),
++            lock_data(
++                [
++                    pkg(
++                        "a",
++                        "1.0",
++                        requires_python=">=3.9",
++                        dependencies=("b>=1.0",),
++                        files=(file_row("a-1.0.tar.gz", "sha256:aaa"),),
++                    ),
++                    pkg("b", "1.2", files=(file_row("b-1.2.tar.gz", "sha256:ddd"),)),
++                ]
++            ),
++        )
++        _, out = run_merge(pdm, project, base, ours, theirs)
++        from pdm.models.repositories import LockedRepository
++
++        data = read_lock(out)
++        repository = LockedRepository(data, [], project.environment)
++        candidates = repository.all_candidates
++        assert "a" in candidates and "b" in candidates
++        a_candidate = candidates["a"][0]
++        assert a_candidate.version == "1.1"
++        assert a_candidate.hashes == [{"file": "a-1.1.tar.gz", "hash": "sha256:ccc"}]
++        b_candidate = candidates["b"][0]
++        assert b_candidate.version == "1.2"
++
++    def test_merge_is_byte_deterministic(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0")]),
++            lock_data([pkg("a", "1.1"), pkg("b", "1.0"), pkg("c", "1.0")]),
++            lock_data([pkg("a", "1.0"), pkg("b", "1.2"), pkg("d", "1.0")]),
++        )
++        _, out = run_merge(pdm, project, base, ours, theirs)
++        first = out.read_bytes()
++        _, out = run_merge(pdm, project, base, ours, theirs)
++        assert out.read_bytes() == first
++
++
++class TestJsonReport:
++    def test_json_report_clean_merge(self):
++        import json
++
++        from pdm.project.lockfile.merge import format_json_report
++
++        base = lock_data([pkg("a", "1.0"), pkg("b", "1.0")])
++        ours = lock_data([pkg("a", "1.1"), pkg("b", "1.0"), pkg("c", "1.0")])
++        theirs = lock_data([pkg("a", "1.0"), pkg("d", "1.0")])
++        result = merge_lock_data(base, ours, theirs)
++        report = json.loads(format_json_report(result))
++        assert report["clean"] is True
++        assert report["packages"] == 3
++        assert report["changes"]["added"] == ["c 1.0", "d 1.0"]
++        assert report["changes"]["removed"] == ["b 1.0"]
++        assert report["changes"]["updated"] == ["a 1.1"]
++        assert report["conflicts"] == []
++        assert report["metadata"]["lock_version"] == LOCK_VERSION
++
++    def test_json_report_with_conflicts(self):
++        import json
++
++        from pdm.project.lockfile.merge import format_json_report
++
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.1")])
++        theirs = lock_data([pkg("a", "1.2")])
++        result = merge_lock_data(base, ours, theirs)
++        report = json.loads(format_json_report(result))
++        assert report["clean"] is False
++        assert len(report["conflicts"]) == 1
++        conflict = report["conflicts"][0]
++        assert conflict["package"] == "a"
++        assert conflict["field"] == "version"
++        assert conflict["ours"]["version"] == "1.1"
++        assert conflict["theirs"]["version"] == "1.2"
++        assert conflict["base"]["version"] == "1.0"
++
++    def test_json_report_resolved_conflicts(self):
++        import json
++
++        from pdm.project.lockfile.merge import format_json_report
++
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.1")])
++        theirs = lock_data([pkg("a", "1.2")])
++        result = merge_lock_data(base, ours, theirs, ConflictStrategy.NEWER)
++        report = json.loads(format_json_report(result))
++        assert report["clean"] is True
++        assert report["conflicts"] == []
++        assert len(report["resolved"]) == 1
++        assert report["resolved"][0]["package"] == "a"
++
++
++class TestDryRun:
++    def test_dry_run_clean_writes_nothing(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0")]),
++            lock_data([pkg("a", "1.1")]),
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0")]),
++        )
++        before = ours.read_bytes()
++        result = pdm(["merge-lock", str(base), str(ours), str(theirs), "--dry-run"], obj=project)
++        assert result.exit_code == 0, result.outputs
++        assert "can be merged cleanly" in result.outputs
++        assert ours.read_bytes() == before
++
++    def test_dry_run_conflict_exit_code(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0")]),
++            lock_data([pkg("a", "1.1")]),
++            lock_data([pkg("a", "1.2")]),
++        )
++        result = pdm(["merge-lock", str(base), str(ours), str(theirs), "--dry-run"], obj=project)
++        assert result.exit_code != 0
++        assert "conflict" in result.stderr
++
++    def test_dry_run_with_strategy(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0")]),
++            lock_data([pkg("a", "1.1")]),
++            lock_data([pkg("a", "1.2")]),
++        )
++        before = ours.read_bytes()
++        result = pdm(
++            ["merge-lock", str(base), str(ours), str(theirs), "--dry-run", "--on-conflict=newer"],
++            obj=project,
++        )
++        assert result.exit_code == 0, result.outputs
++        assert "resolved" in result.outputs
++        assert ours.read_bytes() == before
++
++
++class TestJsonOption:
++    def test_json_option_prints_report(self, pdm, project, three_locks):
++        import json
++
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0")]),
++            lock_data([pkg("a", "1.1"), pkg("b", "1.0")]),
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0"), pkg("c", "2.0")]),
++        )
++        result, out = run_merge(pdm, project, base, ours, theirs, "--json")
++        report = json.loads(result.stdout)
++        assert report["clean"] is True
++        assert report["changes"]["added"] == ["c 2.0"]
++        assert report["changes"]["updated"] == ["a 1.1"]
++        # the merge was still written
++        assert package_map(read_lock(out))["a"]["version"] == "1.1"
++
++    def test_json_option_with_conflicts(self, pdm, project, three_locks):
++        import json
++
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0")]),
++            lock_data([pkg("a", "1.1")]),
++            lock_data([pkg("a", "1.2")]),
++        )
++        out = ours.parent / "merged.lock"
++        result = pdm(
++            ["merge-lock", str(base), str(ours), str(theirs), "-o", str(out), "--json"],
++            obj=project,
++        )
++        assert result.exit_code != 0
++        report = json.loads(result.stdout)
++        assert report["clean"] is False
++        assert report["conflicts"][0]["package"] == "a"
++        assert not out.exists()
++
++    def test_verbose_lists_changes(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0")]),
++            lock_data([pkg("a", "1.1"), pkg("b", "1.0"), pkg("c", "1.0")]),
++            lock_data([pkg("a", "1.0")]),
++        )
++        result, _ = run_merge(pdm, project, base, ours, theirs, "-v")
++        assert "add c 1.0" in result.outputs
++        assert "remove b 1.0" in result.outputs
++        assert "update a 1.1" in result.outputs
++
++
++class TestCommandEndToEnd:
++    """CLI level scenarios covering whole lockfile shapes."""
++
++    def test_identical_inputs_produce_empty_change_summary(self, pdm, project, three_locks):
++        data = lock_data([pkg("a", "1.0", files=(file_row("a.whl", "h1"),))])
++        base, ours, theirs = three_locks(data, data, data)
++        result, out = run_merge(pdm, project, base, ours, theirs)
++        assert "0 added" in result.outputs
++        assert "0 removed" in result.outputs
++        assert "0 updated" in result.outputs
++        assert package_map(read_lock(out))["a"]["files"] == [file_row("a.whl", "h1")]
++
++    def test_output_parent_directories_are_created(self, pdm, project, three_locks, tmp_path):
++        base, ours, theirs = three_locks(lock_data([]), lock_data([]), lock_data([]))
++        out = tmp_path / "nested" / "dir" / "merged.lock"
++        result = pdm(
++            ["merge-lock", str(base), str(ours), str(theirs), "-o", str(out)],
++            obj=project,
++        )
++        assert result.exit_code == 0, result.outputs
++        assert out.exists()
++
++    def test_removal_merges_against_untouched_side(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0"), pkg("c", "1.0")]),
++            lock_data([pkg("a", "1.0"), pkg("c", "1.0")]),  # removed b
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0"), pkg("c", "1.2")]),  # bumped c
++        )
++        result, out = run_merge(pdm, project, base, ours, theirs)
++        assert "1 removed" in result.outputs
++        merged = package_map(read_lock(out))
++        assert set(merged) == {"a", "c"}
++        assert merged["c"]["version"] == "1.2"
++
++    def test_content_hash_follows_the_working_copy(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0")], content_hash="sha256:base"),
++            lock_data([pkg("a", "1.0")], content_hash="sha256:ours"),
++            lock_data([pkg("a", "1.0")], content_hash="sha256:theirs"),
++        )
++        _, out = run_merge(pdm, project, base, ours, theirs)
++        assert read_lock(out)["metadata"]["content_hash"] == "sha256:ours"
++
++    def test_static_url_rows_survive_the_merge(self, pdm, project, three_locks):
++        row = {"url": "https://files.example.com/a-1.0.tar.gz", "hash": "sha256:h1"}
++        row2 = {"url": "https://files.example.com/a-1.0.whl", "hash": "sha256:h2"}
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0", files=(row,))], strategy=("inherit_metadata", "static_urls")),
++            lock_data([pkg("a", "1.0", files=(row,))], strategy=("inherit_metadata", "static_urls")),
++            lock_data([pkg("a", "1.0", files=(row, row2))], strategy=("inherit_metadata", "static_urls")),
++        )
++        result, out = run_merge(pdm, project, base, ours, theirs)
++        assert result.exit_code == 0, result.outputs
++        merged = read_lock(out)
++        assert merged["metadata"]["strategy"] == ["inherit_metadata", "static_urls"]
++        assert package_map(merged)["a"]["files"] == [row, row2]
++
++    def test_editable_path_entry_merge(self, pdm, project, three_locks):
++        entry = pkg("local-lib", None, path="libs/local-lib", editable=True)
++        base, ours, theirs = three_locks(
++            lock_data([entry, pkg("a", "1.0")]),
++            lock_data([entry, pkg("a", "1.1")]),
++            lock_data([entry, pkg("a", "1.0"), pkg("b", "1.0")]),
++        )
++        result, out = run_merge(pdm, project, base, ours, theirs)
++        assert result.exit_code == 0, result.outputs
++        merged = package_map(read_lock(out))
++        assert merged["local-lib"]["path"] == "libs/local-lib"
++        assert merged["local-lib"]["editable"] is True
++        assert "version" not in merged["local-lib"]
++
++    def test_split_marker_entries_merge_independently(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data(
++                [
++                    pkg("a", "1.0", marker='python_version < "3.10"', files=(file_row("a-1.0.tar.gz", "h1"),)),
++                    pkg("a", "2.0", marker='python_version >= "3.10"', files=(file_row("a-2.0.tar.gz", "h2"),)),
++                ]
++            ),
++            lock_data(
++                [
++                    pkg("a", "1.0", marker='python_version < "3.10"', files=(file_row("a-1.0.tar.gz", "h1"),)),
++                    pkg("a", "2.0", marker='python_version >= "3.10"', files=(file_row("a-2.0.tar.gz", "h2"),)),
++                ]
++            ),
++            lock_data(
++                [
++                    pkg("a", "1.1", marker='python_version < "3.10"', files=(file_row("a-1.1.tar.gz", "h3"),)),
++                    pkg("a", "2.0", marker='python_version >= "3.10"', files=(file_row("a-2.0.tar.gz", "h2"),)),
++                ]
++            ),
++        )
++        result, out = run_merge(pdm, project, base, ours, theirs)
++        assert result.exit_code == 0, result.outputs
++        entries = [p for p in read_lock(out)["package"] if p["name"] == "a"]
++        assert len(entries) == 2
++        by_marker = {p["marker"]: p for p in entries}
++        assert by_marker['python_version < "3.10"']["version"] == "1.1"
++        assert by_marker['python_version >= "3.10"']["version"] == "2.0"
++
++    def test_metadata_targets_union(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([], targets=({"requires_python": ">=3.9"},)),
++            lock_data(
++                [],
++                targets=({"requires_python": ">=3.9"}, {"requires_python": ">=3.9", "platform": "linux"}),
++            ),
++            lock_data(
++                [],
++                targets=({"requires_python": ">=3.9"}, {"requires_python": ">=3.9", "platform": "windows"}),
++            ),
++        )
++        _, out = run_merge(pdm, project, base, ours, theirs)
++        targets = read_lock(out)["metadata"]["targets"]
++        platforms = sorted(t.get("platform", "") for t in targets)
++        assert platforms == ["", "linux", "windows"]
++
++    def test_conflict_report_lists_all_sides(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0")]),
++            lock_data([pkg("a", "1.1")]),
++            lock_data([pkg("a", "1.2")]),
++        )
++        out = ours.parent / "merged.lock"
++        result = pdm(
++            ["merge-lock", str(base), str(ours), str(theirs), "-o", str(out)],
++            obj=project,
++        )
++        assert result.exit_code != 0
++        assert "base:" in result.stderr
++        assert "ours:" in result.stderr
++        assert "theirs:" in result.stderr
++        assert "--on-conflict" in result.stderr
++
++    def test_packages_are_sorted_in_output(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("zeta", "1.0"), pkg("alpha", "1.0")]),
++            lock_data([pkg("zeta", "1.0"), pkg("alpha", "1.0"), pkg("mid", "1.0")]),
++            lock_data([pkg("zeta", "1.1"), pkg("alpha", "1.0"), pkg("beta", "1.0")]),
++        )
++        _, out = run_merge(pdm, project, base, ours, theirs)
++        names = [p["name"] for p in read_lock(out)["package"]]
++        assert names == ["alpha", "beta", "mid", "zeta"]
++
++    def test_lock_inputs_prefer_changed_side(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([], extra_metadata={"lock_inputs": {"requirements": ["a>=1"]}}),
++            lock_data([], extra_metadata={"lock_inputs": {"requirements": ["a>=1", "b>=2"]}}),
++            lock_data([], extra_metadata={"lock_inputs": {"requirements": ["a>=1"]}}),
++        )
++        _, out = run_merge(pdm, project, base, ours, theirs)
++        metadata = read_lock(out)["metadata"]
++        assert metadata["lock_inputs"] == {"requirements": ["a>=1", "b>=2"]}
++
++    def test_change_lines_unit(self):
++        base = lock_data([pkg("a", "1.0"), pkg("b", "1.0")])
++        ours = lock_data([pkg("a", "1.1"), pkg("c", "1.0")])
++        theirs = lock_data([pkg("a", "1.0"), pkg("d", "1.0")])
++        result = merge_lock_data(base, ours, theirs)
++        assert result.change_lines() == ["  add c 1.0", "  add d 1.0", "  remove b 1.0", "  update a 1.1"]
++
++
++class TestThreeWaySet:
++    def test_union_of_additions(self):
++        from pdm.project.lockfile.merge import three_way_set
++
++        assert three_way_set(["a"], ["a", "b"], ["a", "c"]) == ["a", "b", "c"]
++
++    def test_deletion_by_one_side_wins_over_unchanged(self):
++        from pdm.project.lockfile.merge import three_way_set
++
++        assert three_way_set(["a", "b"], ["a"], ["a", "b"]) == ["a"]
++
++    def test_deletion_by_both_sides(self):
++        from pdm.project.lockfile.merge import three_way_set
++
++        assert three_way_set(["a", "b"], ["a"], ["a"]) == ["a"]
++
++    def test_addition_by_both_sides_deduplicated(self):
++        from pdm.project.lockfile.merge import three_way_set
++
++        assert three_way_set([], ["b"], ["b"]) == ["b"]
++
++
++class TestFieldLevelMerge:
++    def test_summary_updated_on_one_side(self):
++        base = lock_data([pkg("a", "1.0", summary="old")])
++        ours = lock_data([pkg("a", "1.0", summary="new")])
++        theirs = lock_data([pkg("a", "1.0", summary="old")])
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        assert result.packages[0].summary == "new"
++
++    def test_summary_conflict(self):
++        base = lock_data([pkg("a", "1.0", summary="old")])
++        ours = lock_data([pkg("a", "1.0", summary="ours summary")])
++        theirs = lock_data([pkg("a", "1.0", summary="theirs summary")])
++        result = merge_lock_data(base, ours, theirs)
++        assert not result.clean
++        assert result.conflicts[0].field == "summary"
++        resolved = merge_lock_data(base, ours, theirs, ConflictStrategy.THEIRS)
++        assert resolved.packages[0].summary == "theirs summary"
++
++    def test_requires_python_conflict(self):
++        base = lock_data([pkg("a", "1.0", requires_python=">=3.8")])
++        ours = lock_data([pkg("a", "1.0", requires_python=">=3.9")])
++        theirs = lock_data([pkg("a", "1.0", requires_python=">=3.10")])
++        result = merge_lock_data(base, ours, theirs)
++        assert not result.clean
++        assert result.conflicts[0].field == "requires_python"
++
++    def test_dependencies_removed_on_one_side(self):
++        base = lock_data([pkg("a", "1.0", dependencies=("x>=1", "y>=1"))])
++        ours = lock_data([pkg("a", "1.0", dependencies=("x>=1",))])
++        theirs = lock_data([pkg("a", "1.0", dependencies=("x>=1", "y>=1"))])
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        assert result.packages[0].dependencies == ("x>=1",)
++
++    def test_extras_merged_as_a_set(self):
++        base = lock_data([pkg("a", "1.0", extras=("security",))])
++        ours = lock_data([pkg("a", "1.0", extras=("security", "socks"))])
++        theirs = lock_data([pkg("a", "1.0", extras=("security",))])
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        assert result.packages[0].extras == ("security", "socks")
++
++    def test_extras_are_part_of_the_identity(self):
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.0"), pkg("a", "1.0", extras=("security",))])
++        theirs = lock_data([pkg("a", "1.1")])
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        plain = [p for p in result.packages if not p.extras]
++        assert plain[0].version == "1.1"
++        assert any(p.extras == ("security",) for p in result.packages)
++
++
++class TestConflictReport:
++    def test_report_format(self):
++        from pdm.project.lockfile.merge import format_conflict_report
++
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.1")])
++        theirs = lock_data([pkg("a", "1.2")])
++        result = merge_lock_data(base, ours, theirs)
++        report = format_conflict_report(result.conflicts)
++        assert "Lockfile merge conflicts:" in report
++        assert "[conflict] a" in report
++        assert "base:   a 1.0" in report
++        assert "ours:   a 1.1" in report
++        assert "theirs: a 1.2" in report
++        assert "--on-conflict=newer|ours|theirs" in report
++
++    def test_report_of_removal_conflict(self):
++        from pdm.project.lockfile.merge import format_conflict_report
++
++        base = lock_data([pkg("a", "1.0")])
++        ours = lock_data([pkg("a", "1.1")])
++        theirs = lock_data([])
++        result = merge_lock_data(base, ours, theirs)
++        report = format_conflict_report(result.conflicts)
++        assert "removed vs modified" in report
++        assert "theirs: <removed>" in report
++
++
++class TestLockMetadataParsing:
++    def test_legacy_boolean_flags_folded_into_strategy(self):
++        from pdm.project.lockfile.merge import LockMetadata
++
++        metadata = LockMetadata.from_mapping(
++            {"metadata": {"lock_version": "4.5", "static_urls": True}}
++        )
++        assert "static_urls" in metadata.strategy
++
++    def test_missing_metadata_gives_defaults(self):
++        from pdm.project.lockfile.merge import LockMetadata
++
++        metadata = LockMetadata.from_mapping({})
++        assert metadata.groups == ()
++        assert metadata.lock_version == ""
++        assert metadata.lock_inputs is None
++
++
++class TestStrategyEndToEnd:
++    @pytest.mark.parametrize("strategy,expected", [("ours", "1.1"), ("theirs", "1.2"), ("newer", "1.2")])
++    def test_version_conflict_strategies(self, pdm, project, three_locks, strategy, expected):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0")]),
++            lock_data([pkg("a", "1.1")]),
++            lock_data([pkg("a", "1.2")]),
++        )
++        result, out = run_merge(pdm, project, base, ours, theirs, f"--on-conflict={strategy}")
++        assert "resolved" in result.outputs
++        assert package_map(read_lock(out))["a"]["version"] == expected
++
++    def test_newer_keeps_modification_over_removal(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0")]),
++            lock_data([pkg("a", "1.5"), pkg("b", "1.0")]),
++            lock_data([pkg("b", "1.0")]),
++        )
++        result, out = run_merge(pdm, project, base, ours, theirs, "--on-conflict=newer")
++        assert result.exit_code == 0, result.outputs
++        merged = package_map(read_lock(out))
++        assert merged["a"]["version"] == "1.5"
++
++    def test_ours_applies_removal(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0")]),
++            lock_data([pkg("b", "1.0")]),  # removed a
++            lock_data([pkg("a", "1.5"), pkg("b", "1.0")]),  # upgraded a
++        )
++        result, out = run_merge(pdm, project, base, ours, theirs, "--on-conflict=ours")
++        assert result.exit_code == 0, result.outputs
++        assert set(package_map(read_lock(out))) == {"b"}
++
++    def test_multiple_conflicts_reported_together(self, pdm, project, three_locks):
++        base, ours, theirs = three_locks(
++            lock_data([pkg("a", "1.0"), pkg("b", "1.0"), pkg("c", "1.0")]),
++            lock_data([pkg("a", "1.1"), pkg("b", "1.1"), pkg("c", "1.0")]),
++            lock_data([pkg("a", "1.2"), pkg("b", "1.2"), pkg("c", "1.0")]),
++        )
++        out = ours.parent / "merged.lock"
++        result = pdm(
++            ["merge-lock", str(base), str(ours), str(theirs), "-o", str(out)],
++            obj=project,
++        )
++        assert result.exit_code != 0
++        assert "a (both sides changed 'version' differently)" in result.stderr
++        assert "b (both sides changed 'version' differently)" in result.stderr
++        assert "c (both sides changed" not in result.stderr
++
++
++class TestVcsEntries:
++    def test_revision_bump_on_one_side(self):
++        base = lock_data([pkg("a", None, git="https://github.com/x/a.git", ref="main", revision="aaa")])
++        ours = lock_data([pkg("a", None, git="https://github.com/x/a.git", ref="main", revision="bbb")])
++        theirs = lock_data([pkg("a", None, git="https://github.com/x/a.git", ref="main", revision="aaa")])
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        assert dict(result.packages[0].request)["revision"] == "bbb"
++
++    def test_url_entry_version_bump(self):
++        base = lock_data(
++            [pkg("a", "1.0", url="https://example.com/a-1.0.tar.gz", files=(file_row("a-1.0.tar.gz", "h1"),))]
++        )
++        ours = lock_data(
++            [pkg("a", "1.0", url="https://example.com/a-1.0.tar.gz", files=(file_row("a-1.0.tar.gz", "h1"),))]
++        )
++        theirs = lock_data(
++            [pkg("a", "1.1", url="https://example.com/a-1.1.tar.gz", files=(file_row("a-1.1.tar.gz", "h2"),))]
++        )
++        result = merge_lock_data(base, ours, theirs)
++        assert result.clean
++        entry = result.packages[0]
++        assert entry.version == "1.1"
++        assert dict(entry.request)["url"] == "https://example.com/a-1.1.tar.gz"
++
++    def test_subdirectory_attribute_preserved(self):
++        entry = pkg("a", "1.0", git="https://github.com/x/mono.git", ref="main", revision="abc", subdirectory="packages/a")
++        data = lock_data([entry])
++        result = merge_lock_data(data, data, data)
++        assert result.clean
++        assert dict(result.packages[0].request)["subdirectory"] == "packages/a"
++
++    def test_editable_flag_in_identity(self):
++        regular = PackageEntry.from_mapping(pkg("a", None, path="libs/a"))
++        editable = PackageEntry.from_mapping(pkg("a", None, path="libs/a", editable=True))
++        assert regular.key != editable.key

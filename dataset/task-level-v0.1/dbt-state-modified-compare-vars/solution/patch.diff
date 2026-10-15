@@ -1,0 +1,3196 @@
+diff --git a/.changes/unreleased/Features-20260826-090000.yaml b/.changes/unreleased/Features-20260826-090000.yaml
+new file mode 100644
+index 000000000..a7bd1d1a3
+--- /dev/null
++++ b/.changes/unreleased/Features-20260826-090000.yaml
+@@ -0,0 +1,8 @@
++kind: Features
++body: Record the resolved values of vars referenced by each resource at parse time,
++  and compare them in state:modified selection when the state_modified_compare_vars
++  behavior flag is enabled. Also adds the granular state:modified.vars selector.
++time: 2026-08-26T09:00:00.000000+00:00
++custom:
++  Author: yupei
++  Issue: "10793"
+diff --git a/core/dbt/artifacts/resources/v1/components.py b/core/dbt/artifacts/resources/v1/components.py
+index bc62dbb7b..e9c3ad6b8 100644
+--- a/core/dbt/artifacts/resources/v1/components.py
++++ b/core/dbt/artifacts/resources/v1/components.py
+@@ -260,6 +260,9 @@ class ParsedResource(ParsedResourceMandatory):
+     relation_name: Optional[str] = None
+     raw_code: str = ""
+     doc_blocks: List[str] = field(default_factory=list)
++    # resolved values of the vars this resource referenced at parse time;
++    # compared by state:modified when state_modified_compare_vars is enabled
++    vars: Dict[str, Any] = field(default_factory=dict)
+ 
+     def __post_serialize__(self, dct: Dict, context: Optional[Dict] = None):
+         dct = super().__post_serialize__(dct, context)
+diff --git a/core/dbt/artifacts/resources/v1/exposure.py b/core/dbt/artifacts/resources/v1/exposure.py
+index b3002f0ec..13e92d549 100644
+--- a/core/dbt/artifacts/resources/v1/exposure.py
++++ b/core/dbt/artifacts/resources/v1/exposure.py
+@@ -43,6 +43,9 @@ class Exposure(GraphResource):
+     tags: List[str] = field(default_factory=list)
+     config: ExposureConfig = field(default_factory=ExposureConfig)
+     unrendered_config: Dict[str, Any] = field(default_factory=dict)
++    # resolved values of the vars referenced by this exposure's yaml entry;
++    # compared by state:modified when state_modified_compare_vars is enabled
++    vars: Dict[str, Any] = field(default_factory=dict)
+     url: Optional[str] = None
+     depends_on: DependsOn = field(default_factory=DependsOn)
+     refs: List[RefArgs] = field(default_factory=list)
+diff --git a/core/dbt/artifacts/resources/v1/source_definition.py b/core/dbt/artifacts/resources/v1/source_definition.py
+index 1fbddd487..ff9e288c9 100644
+--- a/core/dbt/artifacts/resources/v1/source_definition.py
++++ b/core/dbt/artifacts/resources/v1/source_definition.py
+@@ -80,6 +80,9 @@ class SourceDefinition(ParsedSourceMandatory):
+     config: SourceConfig = field(default_factory=SourceConfig)
+     patch_path: Optional[str] = None
+     unrendered_config: Dict[str, Any] = field(default_factory=dict)
++    # resolved values of the vars referenced by this source's yaml entry;
++    # compared by state:modified when state_modified_compare_vars is enabled
++    vars: Dict[str, Any] = field(default_factory=dict)
+     relation_name: Optional[str] = None
+     created_at: float = field(default_factory=lambda: time.time())
+     unrendered_database: Optional[str] = None
+diff --git a/core/dbt/context/configured.py b/core/dbt/context/configured.py
+index 8e282d6c7..4cf1bea0a 100644
+--- a/core/dbt/context/configured.py
++++ b/core/dbt/context/configured.py
+@@ -43,17 +43,23 @@ class ConfiguredVar(Var):
+         context: BaseContext,
+         config: AdapterRequiredConfig,
+         project_name: str,
++        schema_yaml_vars: Optional["SchemaYamlVars"] = None,
+     ) -> None:
+         super().__init__(context, config.cli_vars)
+         self._config = config
+         self._project_name = project_name
++        self._schema_yaml_vars = schema_yaml_vars
+ 
+     def __call__(self, var_name, default=Var._VAR_NOTSET):
+         my_config = self._config.load_dependencies()[self._project_name]
+ 
++        var_found = False
++        var_value = None
++
+         # cli vars > active project > local project
+         if var_name in self._config.cli_vars:
+-            return self._config.cli_vars[var_name]
++            var_found = True
++            var_value = self._config.cli_vars[var_name]
+ 
+         adapter_type = self._config.credentials.type
+         lookup = FQNLookup(self._project_name)
+@@ -64,13 +70,24 @@ class ConfiguredVar(Var):
+             all_vars.add(my_config.vars.vars_for(lookup, adapter_type))
+         all_vars.add(active_vars)
+ 
+-        if var_name in all_vars:
+-            return all_vars[var_name]
++        if not var_found and var_name in all_vars:
++            var_found = True
++            var_value = all_vars[var_name]
++
++        if not var_found and default is not Var._VAR_NOTSET:
++            var_found = True
++            var_value = default
++
++        if not var_found:
++            return self.get_missing_var(var_name)
+ 
+-        if default is not Var._VAR_NOTSET:
+-            return default
++        # Record the resolved value of every var referenced while rendering
++        # schema yaml so that state comparison can detect value changes of
++        # the vars a resource actually depends on.
++        if self._schema_yaml_vars is not None:
++            self._schema_yaml_vars.vars[var_name] = var_value
+ 
+-        return self.get_missing_var(var_name)
++        return var_value
+ 
+ 
+ class SchemaYamlVars:
+@@ -88,7 +105,7 @@ class SchemaYamlContext(ConfiguredContext):
+ 
+     @contextproperty()
+     def var(self) -> ConfiguredVar:
+-        return ConfiguredVar(self, self.config, self._project_name)
++        return ConfiguredVar(self, self.config, self._project_name, self.schema_yaml_vars)
+ 
+     @contextmember()
+     def env_var(self, var: str, default: Optional[str] = None) -> str:
+diff --git a/core/dbt/context/providers.py b/core/dbt/context/providers.py
+index 1149864df..dfe56d839 100644
+--- a/core/dbt/context/providers.py
++++ b/core/dbt/context/providers.py
+@@ -973,6 +973,18 @@ class ParseVar(ModelConfiguredVar):
+         # in the parser, just always return None.
+         return None
+ 
++    def __call__(self, var_name: str, default: Any = ModelConfiguredVar._VAR_NOTSET) -> Any:
++        var_value = super().__call__(var_name, default)
++
++        # Record the resolved value of each var referenced at parse time so
++        # that state comparison (state:modified) can tell when the value of a
++        # var this node depends on has changed, even if the node's raw code
++        # and unrendered config are untouched.
++        if self._node is not None and hasattr(self._node, "vars"):
++            self._node.vars[var_name] = var_value
++
++        return var_value
++
+ 
+ class RuntimeVar(ModelConfiguredVar):
+     pass
+diff --git a/core/dbt/contracts/files.py b/core/dbt/contracts/files.py
+index 8f0da8ebb..9b90b7f1b 100644
+--- a/core/dbt/contracts/files.py
++++ b/core/dbt/contracts/files.py
+@@ -223,6 +223,10 @@ class SchemaSourceFile(BaseSourceFile):
+     unrendered_configs: Dict[str, Any] = field(default_factory=dict)
+     unrendered_databases: Dict[str, Any] = field(default_factory=dict)
+     unrendered_schemas: Dict[str, Any] = field(default_factory=dict)
++    # resolved values of the vars referenced by each yaml entry, keyed by
++    # yaml key and entry name. Used to detect var value changes in state
++    # comparison (state:modified) when state_modified_compare_vars is on.
++    vars: Dict[str, Any] = field(default_factory=dict)
+     pp_dict: Optional[Dict[str, Any]] = None
+     pp_test_index: Optional[Dict[str, Any]] = None
+ 
+@@ -379,6 +383,28 @@ class SchemaSourceFile(BaseSourceFile):
+             if not self.env_vars[yaml_key]:
+                 del self.env_vars[yaml_key]
+ 
++    def add_vars(self, vars: Dict[str, Any], yaml_key: str, name: str) -> None:
++        if yaml_key not in self.vars:
++            self.vars[yaml_key] = {}
++        # always overwrite: the entry was (re)rendered, so the recorded
++        # values must reflect the latest render
++        self.vars[yaml_key][name] = dict(vars)
++
++    def get_vars(self, yaml_key: str, name: str) -> Dict[str, Any]:
++        if yaml_key not in self.vars:
++            return {}
++        if name not in self.vars[yaml_key]:
++            return {}
++        return self.vars[yaml_key][name]
++
++    def delete_from_vars(self, yaml_key, name):
++        # We delete all recorded vars for this yaml_key/name because the
++        # entry has been scheduled for reparsing.
++        if yaml_key in self.vars and name in self.vars[yaml_key]:
++            del self.vars[yaml_key][name]
++            if not self.vars[yaml_key]:
++                del self.vars[yaml_key]
++
+     def add_unrendered_database(self, yaml_key: str, name: str, unrendered_database: str) -> None:
+         if yaml_key not in self.unrendered_databases:
+             self.unrendered_databases[yaml_key] = {}
+diff --git a/core/dbt/contracts/graph/nodes.py b/core/dbt/contracts/graph/nodes.py
+index 8419e3731..e800feb54 100644
+--- a/core/dbt/contracts/graph/nodes.py
++++ b/core/dbt/contracts/graph/nodes.py
+@@ -395,6 +395,9 @@ class ParsedNode(ParsedResource, NodeInfoMixin, ParsedNodeMandatory, Serializabl
+         # This would only apply to seeds
+         return True
+ 
++    def same_vars(self, old: "ParsedNode") -> bool:
++        return self.vars == old.vars
++
+     def same_contents(self, old: Optional["ParsedNode"], adapter_type: Optional[str]) -> bool:
+         if old is None:
+             return False
+@@ -402,12 +405,21 @@ class ParsedNode(ParsedResource, NodeInfoMixin, ParsedNodeMandatory, Serializabl
+         # Need to ensure that same_contract is called because it
+         # could throw an error
+         same_contract = self.same_contract(old, adapter_type)
++
++        # Legacy behaviour: only compare resolved var values when the
++        # state_modified_compare_vars behavior flag is enabled
++        if not get_flags().state_modified_compare_vars:
++            same_vars = True
++        else:
++            same_vars = self.same_vars(old)
++
+         return (
+             self.same_body(old)
+             and self.same_config(old)
+             and self.same_persisted_description(old)
+             and self.same_fqn(old)
+             and self.same_database_representation(old)
++            and same_vars
+             and same_contract
+             and True
+         )
+@@ -1165,7 +1177,14 @@ class GenericTestNode(GenericTestResource, TestShouldStoreFailures, CompiledNode
+         if other is None:
+             return False
+ 
+-        return self.same_config(other) and self.same_fqn(other) and True
++        # Legacy behaviour: only compare resolved var values when the
++        # state_modified_compare_vars behavior flag is enabled
++        if not get_flags().state_modified_compare_vars:
++            same_vars = True
++        else:
++            same_vars = self.same_vars(other)
++
++        return self.same_config(other) and self.same_fqn(other) and same_vars and True
+ 
+     @property
+     def test_node_type(self) -> str:
+@@ -1451,6 +1470,9 @@ class SourceDefinition(
+             old.unrendered_config,
+         )
+ 
++    def same_vars(self, other: "SourceDefinition") -> bool:
++        return self.vars == other.vars
++
+     def same_contents(self, old: Optional["SourceDefinition"]) -> bool:
+         # existing when it didn't before is a change!
+         if old is None:
+@@ -1464,6 +1486,13 @@ class SourceDefinition(
+         # freshness changes are changes, I guess
+         # metadata/tags changes are not "changes"
+         # patching/description changes are not "changes"
++        # Legacy behaviour: only compare resolved var values when the
++        # state_modified_compare_vars behavior flag is enabled
++        if not get_flags().state_modified_compare_vars:
++            same_vars = True
++        else:
++            same_vars = self.same_vars(old)
++
+         return (
+             self.same_database_representation(old)
+             and self.same_fqn(old)
+@@ -1471,6 +1500,7 @@ class SourceDefinition(
+             and self.same_quoting(old)
+             and self.same_freshness(old)
+             and self.same_external(old)
++            and same_vars
+             and True
+         )
+ 
+@@ -1567,12 +1597,22 @@ class Exposure(NodeInfoMixin, GraphNode, ExposureResource):
+             old.unrendered_config,
+         )
+ 
++    def same_vars(self, old: "Exposure") -> bool:
++        return self.vars == old.vars
++
+     def same_contents(self, old: Optional["Exposure"]) -> bool:
+         # existing when it didn't before is a change!
+         # metadata/tags changes are not "changes"
+         if old is None:
+             return True
+ 
++        # Legacy behaviour: only compare resolved var values when the
++        # state_modified_compare_vars behavior flag is enabled
++        if not get_flags().state_modified_compare_vars:
++            same_vars = True
++        else:
++            same_vars = self.same_vars(old)
++
+         return (
+             self.same_fqn(old)
+             and self.same_exposure_type(old)
+@@ -1583,6 +1623,7 @@ class Exposure(NodeInfoMixin, GraphNode, ExposureResource):
+             and self.same_label(old)
+             and self.same_depends_on(old)
+             and self.same_config(old)
++            and same_vars
+             and True
+         )
+ 
+@@ -1908,6 +1949,7 @@ class ParsedNodePatch(ParsedPatch):
+     agg_time_dimension: Optional[str] = None
+     primary_entity: Optional[str] = None
+     freshness: Optional[ModelFreshness] = None
++    vars: Dict[str, Any] = field(default_factory=dict)
+ 
+ 
+ @dataclass
+diff --git a/core/dbt/graph/selector_methods.py b/core/dbt/graph/selector_methods.py
+index 9a722cb61..dd70ec7b9 100644
+--- a/core/dbt/graph/selector_methods.py
++++ b/core/dbt/graph/selector_methods.py
+@@ -793,6 +793,7 @@ class StateSelectorMethod(SelectorMethod):
+             "modified.relation": self.check_modified_factory("same_database_representation"),
+             "modified.macros": self.check_modified_macros,
+             "modified.contract": self.check_modified_contract("same_contract", adapter_type),
++            "modified.vars": self.check_modified_factory("same_vars"),
+         }
+         if selector in state_checks:
+             checker = state_checks[selector]
+diff --git a/core/dbt/parser/partial.py b/core/dbt/parser/partial.py
+index 6b1697d93..5a8091b50 100644
+--- a/core/dbt/parser/partial.py
++++ b/core/dbt/parser/partial.py
+@@ -963,6 +963,7 @@ class PartialParsing:
+ 
+         schema_file.delete_from_env_vars(key, patch["name"])
+         schema_file.delete_from_unrendered_configs(key, patch["name"])
++        schema_file.delete_from_vars(key, patch["name"])
+         self.add_to_pp_files(schema_file)
+ 
+     # For model, seed, snapshot, analysis schema dictionary keys,
+diff --git a/core/dbt/parser/schema_generic_tests.py b/core/dbt/parser/schema_generic_tests.py
+index 932547adb..a90e5d87c 100644
+--- a/core/dbt/parser/schema_generic_tests.py
++++ b/core/dbt/parser/schema_generic_tests.py
+@@ -235,6 +235,13 @@ class SchemaGenericTestParser(SimpleParser):
+         )
+         self.render_test_update(node, config, builder, schema_file_id)
+ 
++        # Attach the resolved values of the vars referenced while rendering
++        # this test's definition, so state comparison can detect value
++        # changes of the vars it depends on.
++        if self.schema_yaml_vars.vars:
++            node.vars = {**self.schema_yaml_vars.vars, **node.vars}
++            self.schema_yaml_vars.vars = {}
++
+         return node
+ 
+     def _lookup_attached_node(
+diff --git a/core/dbt/parser/schema_yaml_readers.py b/core/dbt/parser/schema_yaml_readers.py
+index 20c24c76a..a306d463b 100644
+--- a/core/dbt/parser/schema_yaml_readers.py
++++ b/core/dbt/parser/schema_yaml_readers.py
+@@ -117,6 +117,9 @@ class ExposureParser(YamlReader):
+         unique_id = f"{NodeType.Exposure}.{package_name}.{unparsed.name}"
+         path = self.yaml.path.relative_path
+ 
++        assert isinstance(self.yaml.file, SchemaSourceFile)
++        exposure_vars = self.yaml.file.get_vars(self.key, unparsed.name)
++
+         fqn = self.schema_parser.get_fqn_prefix(path)
+         fqn.append(unparsed.name)
+ 
+@@ -168,6 +171,7 @@ class ExposureParser(YamlReader):
+             maturity=unparsed.maturity,
+             config=config,
+             unrendered_config=unrendered_config,
++            vars=exposure_vars,
+         )
+         ctx = generate_parse_exposure(
+             parsed,
+diff --git a/core/dbt/parser/schemas.py b/core/dbt/parser/schemas.py
+index 55c1a9a04..a2a1313fd 100644
+--- a/core/dbt/parser/schemas.py
++++ b/core/dbt/parser/schemas.py
+@@ -500,6 +500,10 @@ class YamlReader(metaclass=ABCMeta):
+                     schema_file.add_env_var(var, self.key, entry["name"])
+                 self.schema_yaml_vars.env_vars = {}
+ 
++            if self.schema_yaml_vars.vars:
++                schema_file.add_vars(self.schema_yaml_vars.vars, self.key, entry["name"])
++                self.schema_yaml_vars.vars = {}
++
+             yield entry
+ 
+     def render_entry(self, dct):
+@@ -785,6 +789,9 @@ class NodePatchParser(PatchParser[NodeTarget, ParsedNodePatch], Generic[NodeTarg
+         agg_time_dimension = None
+         primary_entity = None
+ 
++        assert isinstance(self.yaml.file, SchemaSourceFile)
++        source_file: SchemaSourceFile = self.yaml.file
++
+         if isinstance(block.target, UnparsedModelUpdate):
+             deprecation_date = block.target.deprecation_date
+             time_spine = (
+@@ -827,6 +834,7 @@ class NodePatchParser(PatchParser[NodeTarget, ParsedNodePatch], Generic[NodeTarg
+             derived_semantics=derived_semantics,
+             agg_time_dimension=agg_time_dimension,
+             primary_entity=primary_entity,
++            vars=source_file.get_vars(block.target.yaml_key, block.target.name),
+         )
+ 
+     def parse_patch(self, block: TargetBlock[NodeTarget], refs: ParserRef) -> None:
+@@ -938,6 +946,10 @@ class NodePatchParser(PatchParser[NodeTarget, ParsedNodePatch], Generic[NodeTarg
+         node.description = patch.description
+         node.columns = patch.columns
+         node.name = patch.name
++        # Prefer var values captured while parsing the node itself (e.g. in
++        # its sql or config block) over var values captured while rendering
++        # the schema yaml patch.
++        node.vars = {**patch.vars, **node.vars}
+ 
+         if not isinstance(node, ModelNode):
+             for attr in ["latest_version", "access", "version", "constraints"]:
+@@ -1093,6 +1105,7 @@ class ModelPatchParser(NodePatchParser[UnparsedModelUpdate]):
+                     latest_version=latest_version,
+                     constraints=unparsed_version.constraints or target.constraints,
+                     deprecation_date=unparsed_version.deprecation_date,
++                    vars=source_file.get_vars(target.yaml_key, target.name),
+                 )
+                 # Node patched before config because config patching depends on model name,
+                 # which may have been updated in the version patch
+diff --git a/core/dbt/parser/sources.py b/core/dbt/parser/sources.py
+index 57ba891ea..8d7ef33d2 100644
+--- a/core/dbt/parser/sources.py
++++ b/core/dbt/parser/sources.py
+@@ -12,6 +12,7 @@ from dbt.context.context_config import (
+     ContextConfigGenerator,
+     UnrenderedConfigGenerator,
+ )
++from dbt.contracts.files import SchemaSourceFile
+ from dbt.contracts.graph.manifest import Manifest, SourceKey
+ from dbt.contracts.graph.nodes import (
+     GenericTestNode,
+@@ -154,6 +155,11 @@ class SourcePatcher:
+ 
+         default_database = self.root_project.credentials.database
+ 
++        source_vars: Dict[str, Any] = {}
++        schema_file = self.manifest.files.get(target.file_id)
++        if isinstance(schema_file, SchemaSourceFile):
++            source_vars = schema_file.get_vars("sources", source.name)
++
+         parsed_source = SourceDefinition(
+             package_name=target.package_name,
+             database=(source.database or default_database),
+@@ -182,6 +188,7 @@ class SourcePatcher:
+             tags=config.tags,
+             config=config,
+             unrendered_config=unrendered_config,
++            vars=source_vars,
+         )
+ 
+         if (
+diff --git a/docs/arch/4.3_Node_Selection.md b/docs/arch/4.3_Node_Selection.md
+index a2fcac41b..62cd285de 100644
+--- a/docs/arch/4.3_Node_Selection.md
++++ b/docs/arch/4.3_Node_Selection.md
+@@ -71,6 +71,32 @@ The `same_contents()` comparison typically checks:
+ - `state:new`: Nodes that exist in current manifest but not in previous state
+ - `state:modified.body`: Only code changes (ignores config changes)
+ - `state:modified.configs`: Only config changes
++- `state:modified.vars`: Only changes to the resolved values of the `var()`s a resource referenced at parse time
++
++### Comparing var values
++
++At parse time, dbt records the resolved value of every `var()` each resource actually references (in its sql, its `config()` block, or its schema yaml entry) onto the resource in the manifest. By default these recorded values are not part of `state:modified` comparisons, preserving the historical behavior where changing a var's value does not mark anything as modified. Setting the `state_modified_compare_vars` behavior flag to `true` makes `same_contents()` also compare the recorded var values, so a change to a var's value (whether in `dbt_project.yml` or via `--vars`) marks exactly the resources referencing that var as modified. The comparison degrades gracefully for state manifests produced by older dbt versions that do not carry recorded var values: those resources compare as having no recorded vars.
++
++#### What is recorded, and where
++
++Var resolution happens at parse time in two distinct rendering paths, and both feed the recorded mapping:
++
++1. **Sql file rendering.** While a model, snapshot, seed, analysis, or singular test is parsed, its sql is rendered once to extract `ref`/`source`/`config` calls. Every `var()` evaluated during that render — including `var()` calls inside macros the sql invokes, and inside the `config()` block — is recorded on the parsed node with the value it resolved to.
++2. **Schema yaml rendering.** While a `schema.yml` entry is rendered (model/seed/snapshot/analysis patches, generic test arguments, source definitions, exposures), every `var()` evaluated is recorded on the schema file, keyed by the yaml section and entry name, and then attached to the resource built from that entry. Test nodes built from generic test definitions get the vars referenced by their own arguments.
++
++The recorded value is the *resolved* value, following the usual precedence: `--vars` on the command line beats `vars:` in `dbt_project.yml`, which beats the default passed to `var()`. Consequently, redefining a var with the value it already resolved to (for example, defining a var whose value equals the in-code default) does not mark anything as modified, while overriding it with a different value marks exactly the resources that reference it.
++
++Descriptions are *not* rendered during schema yaml rendering, so a `var()` that appears only inside a `description` field is not recorded and cannot trigger selection on its own; it is still part of the resource contents compared by other means when relevant.
++
++#### Interaction with partial parsing
++
++Recorded vars live on the resources in the manifest, so they survive serialization to `partial_parse.msgpack` exactly like any other node attribute. Any change to a var source already invalidates partial parsing (command line vars via the manifest `state_check` vars hash, project-level vars via the project file hash), so the recorded values are never served stale from a warm cache. When an individual schema yaml entry is scheduled for reparsing, its recorded vars are discarded and re-recorded during the reparse.
++
++#### Compatibility notes
++
++- The flag defaults to `false`. With the flag off, recorded vars are still written to the manifest (so that enabling the flag later compares correctly against states produced before it was enabled), but they are ignored by `state:modified`.
++- State manifests written by dbt versions without var tracking deserialize with an empty recorded mapping. With the flag on, a resource that references vars then compares as changed against such a state — a one-time effect on first adoption.
++- `state:modified.body` and `state:modified.configs` are intentionally unaffected: a var value change is neither a code change nor an unrendered config change. Use `state:modified.vars` to select only resources whose resolved var values changed.
+ 
+ ## Indirect Selection
+ 
+diff --git a/schemas/dbt/manifest/v12.json b/schemas/dbt/manifest/v12.json
+index 659edec5a..0d0fcbd53 100644
+--- a/schemas/dbt/manifest/v12.json
++++ b/schemas/dbt/manifest/v12.json
+@@ -1445,6 +1445,10 @@
+                   }
+                 ],
+                 "default": null
++              },
++              "vars": {
++                "type": "object",
++                "description": "Resolved values of the vars this resource referenced at parse time"
+               }
+             },
+             "additionalProperties": false,
+@@ -2454,6 +2458,10 @@
+                   }
+                 },
+                 "additionalProperties": false
++              },
++              "vars": {
++                "type": "object",
++                "description": "Resolved values of the vars this resource referenced at parse time"
+               }
+             },
+             "additionalProperties": false,
+@@ -3326,6 +3334,10 @@
+                   }
+                 },
+                 "additionalProperties": false
++              },
++              "vars": {
++                "type": "object",
++                "description": "Resolved values of the vars this resource referenced at parse time"
+               }
+             },
+             "additionalProperties": false,
+@@ -4346,6 +4358,10 @@
+                   }
+                 ],
+                 "default": null
++              },
++              "vars": {
++                "type": "object",
++                "description": "Resolved values of the vars this resource referenced at parse time"
+               }
+             },
+             "additionalProperties": false,
+@@ -6055,6 +6071,10 @@
+                   }
+                 ],
+                 "default": null
++              },
++              "vars": {
++                "type": "object",
++                "description": "Resolved values of the vars this resource referenced at parse time"
+               }
+             },
+             "additionalProperties": false,
+@@ -7064,6 +7084,10 @@
+                   }
+                 },
+                 "additionalProperties": false
++              },
++              "vars": {
++                "type": "object",
++                "description": "Resolved values of the vars this resource referenced at parse time"
+               }
+             },
+             "additionalProperties": false,
+@@ -7997,6 +8021,10 @@
+                   }
+                 },
+                 "additionalProperties": false
++              },
++              "vars": {
++                "type": "object",
++                "description": "Resolved values of the vars this resource referenced at parse time"
+               }
+             },
+             "additionalProperties": false,
+@@ -9548,6 +9576,10 @@
+                   }
+                 ],
+                 "default": null
++              },
++              "vars": {
++                "type": "object",
++                "description": "Resolved values of the vars this resource referenced at parse time"
+               }
+             },
+             "additionalProperties": false,
+@@ -11318,6 +11350,10 @@
+                   }
+                 ],
+                 "default": null
++              },
++              "vars": {
++                "type": "object",
++                "description": "Resolved values of the vars this resource referenced at parse time"
+               }
+             },
+             "additionalProperties": false,
+@@ -12284,6 +12320,10 @@
+             "items": {
+               "type": "string"
+             }
++          },
++          "vars": {
++            "type": "object",
++            "description": "Resolved values of the vars this resource referenced at parse time"
+           }
+         },
+         "additionalProperties": false,
+@@ -12806,6 +12846,10 @@
+           },
+           "created_at": {
+             "type": "number"
++          },
++          "vars": {
++            "type": "object",
++            "description": "Resolved values of the vars this resource referenced at parse time"
+           }
+         },
+         "additionalProperties": false,
+@@ -14397,6 +14441,10 @@
+             "items": {
+               "type": "string"
+             }
++          },
++          "vars": {
++            "type": "object",
++            "description": "Resolved values of the vars this resource referenced at parse time"
+           }
+         },
+         "additionalProperties": false,
+@@ -15804,6 +15852,10 @@
+                         }
+                       ],
+                       "default": null
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -16813,6 +16865,10 @@
+                         }
+                       },
+                       "additionalProperties": false
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -17685,6 +17741,10 @@
+                         }
+                       },
+                       "additionalProperties": false
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -18705,6 +18765,10 @@
+                         }
+                       ],
+                       "default": null
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -20414,6 +20478,10 @@
+                         }
+                       ],
+                       "default": null
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -21423,6 +21491,10 @@
+                         }
+                       },
+                       "additionalProperties": false
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -22356,6 +22428,10 @@
+                         }
+                       },
+                       "additionalProperties": false
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -23907,6 +23983,10 @@
+                         }
+                       ],
+                       "default": null
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -25677,6 +25757,10 @@
+                         }
+                       ],
+                       "default": null
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -26634,6 +26718,10 @@
+                       "items": {
+                         "type": "string"
+                       }
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -26902,6 +26990,10 @@
+                     },
+                     "created_at": {
+                       "type": "number"
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -28486,6 +28578,10 @@
+                       "items": {
+                         "type": "string"
+                       }
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -28671,6 +28767,10 @@
+                             "propertyNames": {
+                               "type": "string"
+                             }
++                          },
++                          "vars": {
++                            "type": "object",
++                            "description": "Resolved values of the vars this resource referenced at parse time"
+                           }
+                         },
+                         "additionalProperties": false,
+@@ -28914,6 +29014,10 @@
+                           }
+                         }
+                       ]
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -29697,6 +29801,10 @@
+                         }
+                       ],
+                       "default": null
++                    },
++                    "vars": {
++                      "type": "object",
++                      "description": "Resolved values of the vars this resource referenced at parse time"
+                     }
+                   },
+                   "additionalProperties": false,
+@@ -30330,6 +30438,10 @@
+                   "propertyNames": {
+                     "type": "string"
+                   }
++                },
++                "vars": {
++                  "type": "object",
++                  "description": "Resolved values of the vars this resource referenced at parse time"
+                 }
+               },
+               "additionalProperties": false,
+@@ -30573,6 +30685,10 @@
+                 }
+               }
+             ]
++          },
++          "vars": {
++            "type": "object",
++            "description": "Resolved values of the vars this resource referenced at parse time"
+           }
+         },
+         "additionalProperties": false,
+@@ -31363,6 +31479,10 @@
+               }
+             ],
+             "default": null
++          },
++          "vars": {
++            "type": "object",
++            "description": "Resolved values of the vars this resource referenced at parse time"
+           }
+         },
+         "additionalProperties": false,
+@@ -33519,6 +33639,10 @@
+               }
+             ],
+             "default": null
++          },
++          "vars": {
++            "type": "object",
++            "description": "Resolved values of the vars this resource referenced at parse time"
+           }
+         },
+         "additionalProperties": false,
+@@ -33563,4 +33687,4 @@
+     "unit_tests"
+   ],
+   "$id": "https://schemas.getdbt.com/dbt/manifest/v12.json"
+-}
+\ No newline at end of file
++}
+diff --git a/tests/functional/artifacts/expected_manifest.py b/tests/functional/artifacts/expected_manifest.py
+index 041a1c375..f27a1d16f 100644
+--- a/tests/functional/artifacts/expected_manifest.py
++++ b/tests/functional/artifacts/expected_manifest.py
+@@ -249,6 +249,19 @@ class LineIndifferent:
+         return self.__repr__()
+ 
+ 
++def _expect_empty_vars(manifest, recorded_vars=None):
++    # parsed resources now record the resolved values of the vars they
++    # referenced at parse time (state_modified_compare_vars). Most fixture
++    # resources reference no vars, so the recorded mapping is empty; resources
++    # that do reference vars get their resolved values via `recorded_vars`.
++    recorded_vars = recorded_vars or {}
++    for key in ("nodes", "sources", "exposures"):
++        for unique_id, entry in (manifest.get(key) or {}).items():
++            if isinstance(entry, dict) and "unrendered_config" in entry:
++                entry.setdefault("vars", recorded_vars.get(unique_id, {}))
++    return manifest
++
++
+ def expected_seeded_manifest(project, model_database=None, quote_model=False):
+ 
+     model_sql_path = os.path.join("models", "model.sql")
+@@ -296,7 +309,7 @@ def expected_seeded_manifest(project, model_database=None, quote_model=False):
+ 
+     model_raw_code = read_file_replace_returns(model_sql_path).rstrip("\r\n")
+ 
+-    return {
++    return _expect_empty_vars({
+         "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v7.json",
+         "dbt_version": dbt.version.__version__,
+         "nodes": {
+@@ -1062,7 +1075,10 @@ def expected_seeded_manifest(project, model_database=None, quote_model=False):
+         "unit_tests": {},
+         "saved_queries": {},
+         "functions": {},
+-    }
++    }, {
++        "snapshot.test.snapshot_seed": {"alternate_schema": alternate_schema},
++        "source.test.my_source.my_table": {"test_schema": my_schema_name},
++    })
+ 
+ 
+ def expected_references_manifest(project):
+@@ -1082,7 +1098,7 @@ def expected_references_manifest(project):
+     view_summary_sql = read_file_replace_returns(view_summary_path).rstrip("\r\n")
+     alternate_schema = project.test_schema + "_test"
+ 
+-    return {
++    return _expect_empty_vars({
+         "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v7.json",
+         "dbt_version": dbt.version.__version__,
+         "nodes": {
+@@ -1719,7 +1735,10 @@ def expected_references_manifest(project):
+         "unit_tests": {},
+         "saved_queries": {},
+         "functions": {},
+-    }
++    }, {
++        "snapshot.test.snapshot_seed": {"alternate_schema": alternate_schema},
++        "source.test.my_source.my_table": {"test_schema": my_schema_name},
++    })
+ 
+ 
+ def expected_versions_manifest(project):
+@@ -1741,7 +1760,7 @@ def expected_versions_manifest(project):
+     test_audit_schema = my_schema_name + "_dbt_test__audit"
+     model_schema_yml_path = os.path.join("models", "schema.yml")
+ 
+-    return {
++    return _expect_empty_vars({
+         "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v7.json",
+         "dbt_version": dbt.version.__version__,
+         "nodes": {
+@@ -2249,4 +2268,4 @@ def expected_versions_manifest(project):
+         "semantic_models": {},
+         "unit_tests": {},
+         "saved_queries": {},
+-    }
++    })
+diff --git a/tests/functional/defer_state/test_modified_state_compare_vars.py b/tests/functional/defer_state/test_modified_state_compare_vars.py
+new file mode 100644
+index 000000000..c206f5bae
+--- /dev/null
++++ b/tests/functional/defer_state/test_modified_state_compare_vars.py
+@@ -0,0 +1,1322 @@
++import pytest
++
++from dbt.tests.util import run_dbt, update_config_file
++from tests.functional.defer_state.test_modified_state import BaseModifiedState
++
++
++class TestCompareVarsFlagOff(BaseModifiedState):
++    """With state_modified_compare_vars disabled (the default), changing the
++    value of a var must not produce any state:modified selection, preserving
++    the legacy behaviour."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": False,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_var.sql": "select {{ var('my_var') }} as id",
++        }
++
++    def test_changed_vars_not_detected(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        # No var change -> no false positive
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        # Modify var (my_var: 1 -> 2) -> still nothing, flag is off
++        update_config_file({"vars": {"my_var": 2}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == []
++
++        # Same for CLI-provided vars
++        assert (
++            run_dbt(
++                ["list", "--vars", '{"my_var": 3}', "-s", "state:modified", "--state", "./state"]
++            )
++            == []
++        )
++
++
++class TestCompareVarsModelBody(BaseModifiedState):
++    """A var referenced from a model's sql body participates in
++    state:modified when the flag is enabled."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1, "unrelated_var": "a"},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_var.sql": "select {{ var('my_var') }} as id",
++            "model_without_var.sql": "select 2 as id",
++        }
++
++    def test_changed_vars(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        # No var change -> no false positive
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        # Modify var via dbt_project.yml (my_var: 1 -> 2)
++        update_config_file({"vars": {"my_var": 2, "unrelated_var": "a"}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.model_with_var"
++        ]
++        # The var change is not a body change, nor an unrendered config change
++        assert not run_dbt(["list", "-s", "state:modified.body", "--state", "./state"])
++        assert not run_dbt(["list", "-s", "state:modified.configs", "--state", "./state"])
++        # The granular state:modified.vars selector picks the model as well
++        assert run_dbt(["list", "-s", "state:modified.vars", "--state", "./state"]) == [
++            "test.model_with_var"
++        ]
++
++        # Reset dbt_project.yml
++        update_config_file({"vars": {"my_var": 1, "unrelated_var": "a"}}, "dbt_project.yml")
++
++        # Modify var via the --vars CLI flag
++        assert not run_dbt(
++            ["list", "--vars", '{"my_var": 1}', "-s", "state:modified", "--state", "./state"]
++        )
++        assert run_dbt(
++            ["list", "--vars", '{"my_var": 2}', "-s", "state:modified", "--state", "./state"]
++        ) == ["test.model_with_var"]
++
++    def test_unrelated_var_change_selects_nothing(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        # Only unrelated_var changes; nothing references it
++        update_config_file({"vars": {"my_var": 1, "unrelated_var": "b"}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == []
++
++
++class TestCompareVarsModelConfig(BaseModifiedState):
++    """A var referenced from an in-file config() call participates in
++    state:modified when the flag is enabled, even though the unrendered
++    config (and therefore state:modified.configs) is unchanged."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_materialization": "table"},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_config_var.sql": (
++                "{{ config(materialized=var('my_materialization')) }}\nselect 1 as id"
++            ),
++        }
++
++    def test_changed_config_var(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        # Modify var (my_materialization: table -> view)
++        update_config_file({"vars": {"my_materialization": "view"}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.model_with_config_var"
++        ]
++        assert not run_dbt(["list", "-s", "state:modified.configs", "--state", "./state"])
++
++
++schema_yml_with_vars = """
++version: 2
++
++models:
++  - name: model_patched
++    config:
++      meta:
++        region: "{{ var('region') }}"
++
++exposures:
++  - name: exposure_with_var
++    type: dashboard
++    owner:
++      name: "{{ var('owner_name') }}"
++    depends_on:
++      - ref('model_patched')
++
++sources:
++  - name: source_with_var
++    schema: analytics
++    meta:
++      dataset: "{{ var('dataset') }}"
++    tables:
++      - name: events
++      - name: orders
++"""
++
++
++class TestCompareVarsSchemaYml(BaseModifiedState):
++    """Vars referenced from schema.yml entries (model patches, exposures,
++    sources) participate in state:modified when the flag is enabled."""
++
++    original_vars = {"region": "emea", "owner_name": "alice", "dataset": "raw_v1"}
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": dict(self.original_vars),
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_patched.sql": "select 1 as id",
++            "schema.yml": schema_yml_with_vars,
++        }
++
++    def reset_vars_and_save_state(self):
++        # restore the original var values so each test starts from a known
++        # baseline regardless of what previous tests left behind
++        update_config_file({"vars": dict(self.original_vars)}, "dbt_project.yml")
++        run_dbt(["run"])
++        self.copy_state()
++
++    def test_model_patch_var(self, project):
++        self.reset_vars_and_save_state()
++
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        new_vars = dict(self.original_vars)
++        new_vars["region"] = "apac"
++        update_config_file({"vars": new_vars}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.model_patched"
++        ]
++
++    def test_exposure_var(self, project):
++        self.reset_vars_and_save_state()
++
++        new_vars = dict(self.original_vars)
++        new_vars["owner_name"] = "bob"
++        update_config_file({"vars": new_vars}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "exposure:test.exposure_with_var"
++        ]
++
++    def test_source_var(self, project):
++        self.reset_vars_and_save_state()
++
++        new_vars = dict(self.original_vars)
++        new_vars["dataset"] = "raw_v2"
++        update_config_file({"vars": new_vars}, "dbt_project.yml")
++        assert sorted(run_dbt(["list", "-s", "state:modified", "--state", "./state"])) == sorted(
++            [
++                "source:test.source_with_var.events",
++                "source:test.source_with_var.orders",
++            ]
++        )
++
++
++singular_test_with_var_sql = """
++select * from {{ ref('model_a') }} where 1 = {{ var('test_knob', 1) }}
++"""
++
++
++class TestCompareVarsSingularTest(BaseModifiedState):
++    """A var referenced from a singular test's sql participates in
++    state:modified when the flag is enabled."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"test_knob": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_a.sql": "select 1 as id",
++        }
++
++    @pytest.fixture(scope="class")
++    def tests(self):
++        return {
++            "singular_with_var.sql": singular_test_with_var_sql,
++        }
++
++    def test_changed_test_var(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        update_config_file({"vars": {"test_knob": 2}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.singular_with_var"
++        ]
++
++
++class TestCompareVarsPartialParsing(BaseModifiedState):
++    """Var-driven state comparison keeps working across warm partial-parse
++    caches: parsing again without any change must stay stable, and a var
++    change must be picked up even when a partial_parse.msgpack is present."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_var.sql": "select {{ var('my_var') }} as id",
++        }
++
++    def test_partial_parse_stability(self, project):
++        run_dbt(["parse"])
++        self.copy_state()
++
++        # warm the partial parse cache with an identical parse
++        run_dbt(["parse"])
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        # a CLI var change invalidates the cache and is detected
++        assert run_dbt(
++            ["list", "--vars", '{"my_var": 2}', "-s", "state:modified", "--state", "./state"]
++        ) == ["test.model_with_var"]
++
++
++macro_using_var_sql = """
++{% macro threshold_macro() %}
++    {{ var('my_var') * 2 }}
++{% endmacro %}
++"""
++
++
++class TestCompareVarsMacroBody(BaseModifiedState):
++    """A var referenced inside a macro that a model calls at parse time is
++    attributed to the calling model: changing the var marks the model (and
++    not any macro) as modified."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_macro.sql": "select {{ threshold_macro() }} as id",
++        }
++
++    @pytest.fixture(scope="class")
++    def macros(self):
++        return {
++            "threshold_macro.sql": macro_using_var_sql,
++        }
++
++    def test_changed_macro_var(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        # Modify var (my_var: 1 -> 2)
++        update_config_file({"vars": {"my_var": 2}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.model_with_macro"
++        ]
++        # the macro itself did not change
++        assert not run_dbt(["list", "-s", "state:modified.macros", "--state", "./state"])
++
++
++seed_schema_yml_with_var = """
++version: 2
++
++seeds:
++  - name: my_seed
++    config:
++      meta:
++        region: "{{ var('region') }}"
++"""
++
++seed_csv_data = """id,value
++1,a
++2,b
++"""
++
++
++class TestCompareVarsSeedPatch(BaseModifiedState):
++    """A var referenced from a seed's schema.yml patch participates in
++    state:modified when the flag is enabled."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"region": "emea"},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {}
++
++    @pytest.fixture(scope="class")
++    def seeds(self):
++        return {
++            "my_seed.csv": seed_csv_data,
++            "schema.yml": seed_schema_yml_with_var,
++        }
++
++    def test_changed_seed_patch_var(self, project):
++        run_dbt(["seed"])
++        self.copy_state()
++
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        update_config_file({"vars": {"region": "apac"}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.my_seed"
++        ]
++
++
++snapshot_using_var_sql = """
++{% snapshot snapshot_with_var %}
++    {{
++        config(
++            target_schema=var('snap_schema', 'default_snap_schema'),
++            unique_key='id',
++            strategy='timestamp',
++            updated_at='updated_at',
++        )
++    }}
++    select 1 as id, '2024-01-01'::timestamp as updated_at
++{% endsnapshot %}
++"""
++
++
++class TestCompareVarsSnapshot(BaseModifiedState):
++    """A var referenced from a snapshot's config participates in
++    state:modified when the flag is enabled."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"snap_schema": "snap_v1"},
++        }
++
++    @pytest.fixture(scope="class")
++    def snapshots(self):
++        return {
++            "snapshot_with_var.sql": snapshot_using_var_sql,
++        }
++
++    def test_changed_snapshot_var(self, project):
++        run_dbt(["snapshot"])
++        self.copy_state()
++
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        update_config_file({"vars": {"snap_schema": "snap_v2"}}, "dbt_project.yml")
++        results = run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++        assert len(results) == 1
++        assert results[0].endswith("snapshot_with_var")
++
++
++class TestCompareVarsUnmodified(BaseModifiedState):
++    """state:unmodified is the complement: with the flag on, a resource whose
++    vars changed is excluded from state:unmodified while untouched resources
++    remain selected."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_var.sql": "select {{ var('my_var') }} as id",
++            "model_without_var.sql": "select 2 as id",
++        }
++
++    def test_unmodified_complement(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        update_config_file({"vars": {"my_var": 2}}, "dbt_project.yml")
++        assert "test.model_without_var" in run_dbt(
++            ["list", "-s", "state:unmodified", "--state", "./state"]
++        )
++        assert "test.model_with_var" not in run_dbt(
++            ["list", "-s", "state:unmodified", "--state", "./state"]
++        )
++
++
++class TestCompareVarsOldManifest(BaseModifiedState):
++    """Comparing against a state manifest that predates var tracking (no
++    recorded vars on any resource) must not fail; resources referencing vars
++    simply compare as changed."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_var.sql": "select {{ var('my_var') }} as id",
++            "model_without_var.sql": "select 2 as id",
++        }
++
++    def test_old_manifest_without_vars(self, project):
++        import json
++
++        run_dbt(["run"])
++        self.copy_state()
++
++        # simulate a manifest written by an older dbt: strip all recorded vars
++        with open("state/manifest.json") as fp:
++            manifest_dict = json.load(fp)
++        for key in ("nodes", "sources", "exposures", "disabled"):
++            for entry in manifest_dict.get(key, {}).values():
++                if isinstance(entry, dict):
++                    entry.pop("vars", None)
++        with open("state/manifest.json", "w") as fp:
++            json.dump(manifest_dict, fp)
++
++        # must not error; the model referencing a var compares as changed,
++        # the model without vars is still unmodified
++        results = run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++        assert results == ["test.model_with_var"]
++
++
++class TestCompareVarsDefer(BaseModifiedState):
++    """Enabling the flag does not interfere with --defer resolution: an
++    unmodified model still defers to the state manifest's relation."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_var.sql": "select {{ var('my_var') }} as id",
++            "downstream_model.sql": "select * from {{ ref('model_with_var') }}",
++        }
++
++    def test_defer_still_resolves(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        # without any change, nothing is selected, and defer runs fine
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++        results = run_dbt(
++            [
++                "list",
++                "-s",
++                "state:unmodified",
++                "--state",
++                "./state",
++                "--defer",
++                "--favor-state",
++            ]
++        )
++        assert sorted(results) == ["test.downstream_model", "test.model_with_var", "test.seed"]
++
++
++class TestCompareVarsGranularSelectorFlagOff(BaseModifiedState):
++    """The granular state:modified.vars selector is opt-in and works without
++    enabling the flag, while state:modified itself remains insensitive."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_var.sql": "select {{ var('my_var') }} as id",
++        }
++
++    def test_granular_selector(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        update_config_file({"vars": {"my_var": 2}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == []
++        assert run_dbt(["list", "-s", "state:modified.vars", "--state", "./state"]) == [
++            "test.model_with_var"
++        ]
++
++
++class TestCompareVarsAnalysis(BaseModifiedState):
++    """A var referenced from an analysis file participates in state:modified
++    when the flag is enabled."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {}
++
++    @pytest.fixture(scope="class")
++    def analyses(self):
++        return {
++            "analysis_with_var.sql": "select {{ var('my_var') }} as id",
++        }
++
++    def test_changed_analysis_var(self, project):
++        run_dbt(["compile"])
++        self.copy_state()
++
++        # analyses are not part of the default `dbt ls` resource types
++        assert not run_dbt(
++            ["list", "-s", "state:modified", "--state", "./state", "--resource-type", "analysis"]
++        )
++
++        update_config_file({"vars": {"my_var": 2}}, "dbt_project.yml")
++        assert run_dbt(
++            ["list", "-s", "state:modified", "--state", "./state", "--resource-type", "analysis"]
++        ) == ["test.analysis.analysis_with_var"]
++
++
++class TestCompareVarsIsolationAcrossResources(BaseModifiedState):
++    """Changing one var only selects the resources referencing that var, even
++    when several resources reference different vars from the same files."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"var_a": 1, "var_b": 10, "var_c": "x"},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_uses_a.sql": "select {{ var('var_a') }} as id",
++            "model_uses_b.sql": "select {{ var('var_b') }} as id",
++            "model_uses_ab.sql": "select {{ var('var_a') }} + {{ var('var_b') }} as id",
++        }
++
++    def test_change_var_a(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        update_config_file({"vars": {"var_a": 2, "var_b": 10, "var_c": "x"}}, "dbt_project.yml")
++        assert sorted(run_dbt(["list", "-s", "state:modified", "--state", "./state"])) == [
++            "test.model_uses_a",
++            "test.model_uses_ab",
++        ]
++
++    def test_change_var_c_selects_nothing(self, project):
++        # restore baseline first: previous test may have left var_a modified
++        update_config_file({"vars": {"var_a": 1, "var_b": 10, "var_c": "x"}}, "dbt_project.yml")
++        run_dbt(["run"])
++        self.copy_state()
++
++        update_config_file({"vars": {"var_a": 1, "var_b": 10, "var_c": "y"}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == []
++
++    def test_change_var_a_and_b(self, project):
++        update_config_file({"vars": {"var_a": 1, "var_b": 10, "var_c": "x"}}, "dbt_project.yml")
++        run_dbt(["run"])
++        self.copy_state()
++
++        update_config_file({"vars": {"var_a": 5, "var_b": 50, "var_c": "x"}}, "dbt_project.yml")
++        assert sorted(run_dbt(["list", "-s", "state:modified", "--state", "./state"])) == [
++            "test.model_uses_a",
++            "test.model_uses_ab",
++            "test.model_uses_b",
++        ]
++
++
++class TestCompareVarsCliPrecedence(BaseModifiedState):
++    """The recorded value respects var resolution precedence: --vars beats
++    dbt_project.yml. Changing a project-level var that is overridden on the
++    command line has no effect on the recorded (resolved) value."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_var.sql": "select {{ var('my_var') }} as id",
++        }
++
++    def test_cli_override_shadows_project_change(self, project):
++        run_dbt(["run", "--vars", '{"my_var": 7}'])
++        self.copy_state()
++
++        # changing the project-level value alone is invisible while --vars
++        # pins the resolved value
++        update_config_file({"vars": {"my_var": 2}}, "dbt_project.yml")
++        assert (
++            run_dbt(
++                ["list", "--vars", '{"my_var": 7}', "-s", "state:modified", "--state", "./state"]
++            )
++            == []
++        )
++        # changing the pinned cli value is detected
++        assert run_dbt(
++            ["list", "--vars", '{"my_var": 8}', "-s", "state:modified", "--state", "./state"]
++        ) == ["test.model_with_var"]
++
++
++class TestCompareVarsRepeatedParseStability(BaseModifiedState):
++    """Recording vars must not introduce non-determinism: repeated parses of
++    an unchanged project compare identical, with and without warm partial
++    parse caches."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_var.sql": "select {{ var('my_var') }} as id",
++            "model_with_default_var.sql": "select {{ var('other_var', 'fallback') }} as id",
++        }
++
++    def test_repeated_parse_is_stable(self, project):
++        run_dbt(["parse"])
++        self.copy_state()
++
++        # second parse from a warm partial parse cache
++        run_dbt(["parse"])
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        # third parse from scratch
++        import os
++        import shutil
++
++        if os.path.exists("target/partial_parse.msgpack"):
++            shutil.rmtree("target")
++            run_dbt(["parse"])
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++
++generic_test_schema_yml = """
++version: 2
++
++models:
++  - name: model_with_generic_test
++    data_tests:
++      - accepted_values:
++          arguments:
++            values: ["{{ var('region') }}", "unknown"]
++"""
++
++
++class TestCompareVarsGenericTest(BaseModifiedState):
++    """A var referenced from a generic (schema) test's arguments is recorded
++    on the test node and participates in state:modified when the flag is
++    enabled."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"region": "emea"},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_generic_test.sql": "select 'emea' as region",
++            "schema.yml": generic_test_schema_yml,
++        }
++
++    def test_changed_generic_test_var(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        update_config_file({"vars": {"region": "apac"}}, "dbt_project.yml")
++        results = run_dbt(
++            ["list", "-s", "state:modified", "--state", "./state", "--resource-type", "test"]
++        )
++        assert len(results) == 1
++        assert results[0].startswith("test.accepted_values_model_with_generic_test")
++
++
++class TestCompareVarsGenericTestFlagOff(BaseModifiedState):
++    """With the flag off, a var change in generic test arguments must not
++    select anything (legacy behaviour)."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "vars": {"region": "emea"},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_generic_test.sql": "select 'emea' as region",
++            "schema.yml": generic_test_schema_yml,
++        }
++
++    def test_changed_generic_test_var_flag_off(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        update_config_file({"vars": {"region": "apac"}}, "dbt_project.yml")
++        assert (
++            run_dbt(
++                [
++                    "list",
++                    "-s",
++                    "state:modified",
++                    "--state",
++                    "./state",
++                    "--resource-type",
++                    "test",
++                ]
++            )
++            == []
++        )
++
++
++class TestCompareVarsIndirectSelection(BaseModifiedState):
++    """Graph operators compose with var-driven state selection: downstream
++    models of a var-affected model are selected by state:modified+."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "upstream_var.sql": "select {{ var('my_var') }} as id",
++            "downstream_plain.sql": "select * from {{ ref('upstream_var') }}",
++        }
++
++    def test_downstream_selected_by_graph_operator(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        update_config_file({"vars": {"my_var": 2}}, "dbt_project.yml")
++        assert sorted(run_dbt(["list", "-s", "state:modified+", "--state", "./state"])) == [
++            "test.downstream_plain",
++            "test.upstream_var",
++        ]
++        # without the graph operator, only the directly affected model
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.upstream_var"
++        ]
++
++
++class TestCompareVarsDisabledModel(BaseModifiedState):
++    """A disabled model is not selected even when a var it references
++    changes; state selection only considers enabled resources."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "disabled_model.sql": (
++                "{{ config(enabled=False) }}\nselect {{ var('my_var') }} as id"
++            ),
++            "enabled_model.sql": "select 1 as id",
++        }
++
++    def test_disabled_model_not_selected(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        update_config_file({"vars": {"my_var": 2}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == []
++
++
++class TestCompareVarsColumnTest(BaseModifiedState):
++    """A var referenced from a column-level generic test participates in
++    state:modified when the flag is enabled."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"allowed_id": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_column_test.sql": "select 1 as id",
++            "schema.yml": """
++version: 2
++
++models:
++  - name: model_with_column_test
++    columns:
++      - name: id
++        data_tests:
++          - accepted_values:
++              arguments:
++                values: ["{{ var('allowed_id') }}"]
++""",
++        }
++
++    def test_changed_column_test_var(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        update_config_file({"vars": {"allowed_id": 2}}, "dbt_project.yml")
++        results = run_dbt(
++            ["list", "-s", "state:modified", "--state", "./state", "--resource-type", "test"]
++        )
++        assert len(results) == 1
++        assert "model_with_column_test" in results[0]
++
++
++class TestCompareVarsMixedProject(BaseModifiedState):
++    """End-to-end matrix over a project mixing every var usage site: model
++    sql, model config, schema.yml patch, singular test, generic test, source
++    and exposure. Changing one var must select exactly its dependents."""
++
++    original_vars = {
++        "threshold": 100,
++        "region": "emea",
++        "owner": "alice",
++        "dataset": "raw_v1",
++    }
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": dict(self.original_vars),
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "m_body.sql": "select {{ var('threshold') }} as threshold",
++            "m_config.sql": "{{ config(tags=[var('region')]) }}\nselect 2 as id",
++            "m_plain.sql": "select 3 as id",
++            "schema.yml": """
++version: 2
++
++models:
++  - name: m_plain
++    config:
++      meta:
++        region: "{{ var('region') }}"
++    data_tests:
++      - accepted_values:
++          arguments:
++            values: ["{{ var('region') }}"]
++
++sources:
++  - name: gov_src
++    meta:
++      dataset: "{{ var('dataset') }}"
++    tables:
++      - name: events
++
++exposures:
++  - name: gov_exp
++    type: dashboard
++    owner:
++      name: "{{ var('owner') }}"
++    depends_on:
++      - ref('m_plain')
++""",
++        }
++
++    @pytest.fixture(scope="class")
++    def tests(self):
++        return {
++            "t_singular.sql": "select {{ var('threshold') }} as threshold",
++        }
++
++    def reset_and_baseline(self):
++        update_config_file({"vars": dict(self.original_vars)}, "dbt_project.yml")
++        run_dbt(["run"])
++        self.copy_state()
++
++    def test_threshold_selects_body_and_singular(self, project):
++        self.reset_and_baseline()
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        new_vars = dict(self.original_vars)
++        new_vars["threshold"] = 200
++        update_config_file({"vars": new_vars}, "dbt_project.yml")
++        assert sorted(run_dbt(["list", "-s", "state:modified", "--state", "./state"])) == [
++            "test.m_body",
++            "test.t_singular",
++        ]
++
++    def test_region_selects_config_patch_and_generic_test(self, project):
++        self.reset_and_baseline()
++
++        new_vars = dict(self.original_vars)
++        new_vars["region"] = "apac"
++        update_config_file({"vars": new_vars}, "dbt_project.yml")
++        results = run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++        generic = [r for r in results if r.startswith("test.accepted_values")]
++        assert len(generic) == 1
++        assert sorted(r for r in results if not r.startswith("test.accepted_values")) == [
++            "test.m_config",
++            "test.m_plain",
++        ]
++
++    def test_owner_selects_exposure_only(self, project):
++        self.reset_and_baseline()
++
++        new_vars = dict(self.original_vars)
++        new_vars["owner"] = "bob"
++        update_config_file({"vars": new_vars}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "exposure:test.gov_exp"
++        ]
++
++    def test_dataset_selects_source_only(self, project):
++        self.reset_and_baseline()
++
++        new_vars = dict(self.original_vars)
++        new_vars["dataset"] = "raw_v2"
++        update_config_file({"vars": new_vars}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "source:test.gov_src.events"
++        ]
++
++
++class TestCompareVarsDefaultTransitions(BaseModifiedState):
++    """Resolved-value semantics: what matters is the value a var resolves
++    to, not where it is defined. Defining a var with the same value as the
++    in-code default is a no-op; defining it with a different value (or
++    changing an undefined var's resolution from None) is a change."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_with_default.sql": "select {{ var('maybe_defined', 10) }} as id",
++        }
++
++    def test_define_var_with_default_value_is_noop(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        update_config_file({"vars": {"maybe_defined": 10}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == []
++
++    def test_define_var_with_other_value_is_change(self, project):
++        # make sure the project is back to baseline (no vars defined)
++        update_config_file({"vars": {}}, "dbt_project.yml")
++        run_dbt(["run"])
++        self.copy_state()
++
++        update_config_file({"vars": {"maybe_defined": 20}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.model_with_default"
++        ]
++
++    def test_remove_var_definition_is_change(self, project):
++        update_config_file({"vars": {"maybe_defined": 20}}, "dbt_project.yml")
++        run_dbt(["run"])
++        self.copy_state()
++
++        update_config_file({"vars": {}}, "dbt_project.yml")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.model_with_default"
++        ]
++
++
++class TestCompareVarsUnmodifiedComplementSourcesExposures(BaseModifiedState):
++    """The complement selector keeps working for non-model resources:
++    changing a source's var drops it from state:unmodified but leaves the
++    exposure untouched."""
++
++    original_vars = {"dataset": "raw_v1", "owner": "alice"}
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": dict(self.original_vars),
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "m_plain.sql": "select 1 as id",
++            "schema.yml": """
++version: 2
++
++sources:
++  - name: gov_src
++    meta:
++      dataset: "{{ var('dataset') }}"
++    tables:
++      - name: events
++
++exposures:
++  - name: gov_exp
++    type: dashboard
++    owner:
++      name: "{{ var('owner') }}"
++    depends_on:
++      - ref('m_plain')
++""",
++        }
++
++    def test_unmodified_complement(self, project):
++        run_dbt(["run"])
++        self.copy_state()
++
++        new_vars = dict(self.original_vars)
++        new_vars["dataset"] = "raw_v2"
++        update_config_file({"vars": new_vars}, "dbt_project.yml")
++
++        modified = run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++        assert modified == ["source:test.gov_src.events"]
++
++        unmodified = run_dbt(["list", "-s", "state:unmodified", "--state", "./state"])
++        assert "exposure:test.gov_exp" in unmodified
++        assert "test.m_plain" in unmodified
++        assert "source:test.gov_src.events" not in unmodified
++
++
++class TestCompareVarsMacroFileRegression(BaseModifiedState):
++    """Recording vars must not weaken the pre-existing change detection:
++    editing a macro's implementation still marks dependents as modified via
++    state:modified.macros, with and without the flag."""
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": {"my_var": 1},
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "model_uses_macro.sql": "select {{ my_macro() }} as id",
++        }
++
++    @pytest.fixture(scope="class")
++    def macros(self):
++        return {
++            "my_macro.sql": "{% macro my_macro() %} 1 {% endmacro %}",
++        }
++
++    def test_macro_edit_still_detected(self, project):
++        from dbt.tests.util import write_file
++
++        run_dbt(["run"])
++        self.copy_state()
++
++        assert not run_dbt(["list", "-s", "state:modified", "--state", "./state"])
++
++        # edit the macro implementation, vars untouched
++        write_file("{% macro my_macro() %} 2 {% endmacro %}", "macros", "my_macro.sql")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.model_uses_macro"
++        ]
++        assert run_dbt(["list", "-s", "state:modified.macros", "--state", "./state"]) == [
++            "test.model_uses_macro"
++        ]
++        # no var changed, so the vars sub-selector stays empty
++        assert not run_dbt(["list", "-s", "state:modified.vars", "--state", "./state"])
++
++    def test_body_edit_still_detected(self, project):
++        from dbt.tests.util import write_file
++
++        run_dbt(["run"])
++        self.copy_state()
++
++        # edit the model body, vars untouched
++        write_file("select {{ my_macro() }} as id, 2 as extra", "models", "model_uses_macro.sql")
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.model_uses_macro"
++        ]
++        assert run_dbt(["list", "-s", "state:modified.body", "--state", "./state"]) == [
++            "test.model_uses_macro"
++        ]
++
++
++class TestCompareVarsGranularVarsSelector(BaseModifiedState):
++    """The state:modified.vars sub-selector isolates var-driven changes from
++    other change kinds, for models as well as sources and exposures."""
++
++    original_vars = {"threshold": 100, "owner": "alice", "dataset": "raw_v1"}
++
++    @pytest.fixture(scope="class")
++    def project_config_update(self):
++        return {
++            "flags": {
++                "state_modified_compare_vars": True,
++            },
++            "vars": dict(self.original_vars),
++        }
++
++    @pytest.fixture(scope="class")
++    def models(self):
++        return {
++            "m_body.sql": "select {{ var('threshold') }} as threshold",
++            "m_plain.sql": "select 3 as id",
++            "schema.yml": """
++version: 2
++
++sources:
++  - name: gov_src
++    meta:
++      dataset: "{{ var('dataset') }}"
++    tables:
++      - name: events
++
++exposures:
++  - name: gov_exp
++    type: dashboard
++    owner:
++      name: "{{ var('owner') }}"
++    depends_on:
++      - ref('m_plain')
++""",
++        }
++
++    def reset_and_baseline(self):
++        update_config_file({"vars": dict(self.original_vars)}, "dbt_project.yml")
++        run_dbt(["run"])
++        self.copy_state()
++
++    def test_vars_selector_across_resource_kinds(self, project):
++        self.reset_and_baseline()
++
++        new_vars = dict(self.original_vars)
++        new_vars["threshold"] = 200
++        new_vars["dataset"] = "raw_v2"
++        new_vars["owner"] = "bob"
++        update_config_file({"vars": new_vars}, "dbt_project.yml")
++
++        assert sorted(run_dbt(["list", "-s", "state:modified.vars", "--state", "./state"])) == [
++            "exposure:test.gov_exp",
++            "source:test.gov_src.events",
++            "test.m_body",
++        ]
++        # m_plain did not reference any changed var
++        assert "test.m_plain" in run_dbt(
++            ["list", "-s", "state:unmodified", "--state", "./state"]
++        )
++
++    def test_vars_selector_ignores_code_changes(self, project):
++        from dbt.tests.util import write_file
++
++        self.reset_and_baseline()
++
++        # a pure code change is not a vars change
++        write_file("select {{ var('threshold') }} as threshold, 99 as extra", "models", "m_body.sql")
++        assert run_dbt(["list", "-s", "state:modified.vars", "--state", "./state"]) == []
++        assert run_dbt(["list", "-s", "state:modified", "--state", "./state"]) == [
++            "test.m_body"
++        ]
+diff --git a/tests/unit/contracts/graph/test_manifest.py b/tests/unit/contracts/graph/test_manifest.py
+index c05205a19..2ae1bafb1 100644
+--- a/tests/unit/contracts/graph/test_manifest.py
++++ b/tests/unit/contracts/graph/test_manifest.py
+@@ -100,6 +100,7 @@ REQUIRED_PARSED_NODE_KEYS = frozenset(
+         "defer_relation",
+         "time_spine",
+         "batch",
++        "vars",
+     }
+ )
+ 
+diff --git a/tests/unit/contracts/graph/test_nodes.py b/tests/unit/contracts/graph/test_nodes.py
+index a015050ab..03cc39b04 100644
+--- a/tests/unit/contracts/graph/test_nodes.py
++++ b/tests/unit/contracts/graph/test_nodes.py
+@@ -220,6 +220,7 @@ def basic_compiled_dict():
+         "access": "protected",
+         "constraints": [],
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -542,6 +543,7 @@ def basic_compiled_schema_test_dict():
+         "unrendered_config_call_dict": {},
+         "config_call_dict": {},
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+diff --git a/tests/unit/contracts/graph/test_nodes_parsed.py b/tests/unit/contracts/graph/test_nodes_parsed.py
+index 64388ccff..928fdafde 100644
+--- a/tests/unit/contracts/graph/test_nodes_parsed.py
++++ b/tests/unit/contracts/graph/test_nodes_parsed.py
+@@ -253,6 +253,7 @@ def base_parsed_model_dict():
+         "access": AccessType.Protected.value,
+         "constraints": [],
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -381,6 +382,7 @@ def complex_parsed_model_dict():
+         "access": AccessType.Protected.value,
+         "constraints": [],
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -590,6 +592,7 @@ def basic_parsed_seed_dict():
+         "unrendered_config_call_dict": {},
+         "config_call_dict": {},
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -699,6 +702,7 @@ def complex_parsed_seed_dict():
+         "unrendered_config_call_dict": {},
+         "config_call_dict": {},
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -901,6 +905,7 @@ def base_parsed_hook_dict():
+         "unrendered_config_call_dict": {},
+         "config_call_dict": {},
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -1002,6 +1007,7 @@ def complex_parsed_hook_dict():
+         "unrendered_config_call_dict": {},
+         "config_call_dict": {},
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -1149,6 +1155,7 @@ def basic_parsed_schema_test_dict():
+         "unrendered_config_call_dict": {},
+         "config_call_dict": {},
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -1242,6 +1249,7 @@ def complex_parsed_schema_test_dict():
+         "unrendered_config_call_dict": {},
+         "config_call_dict": {},
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -1639,6 +1647,7 @@ def basic_timestamp_snapshot_dict():
+         "unrendered_config_call_dict": {},
+         "config_call_dict": {},
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -1746,6 +1755,7 @@ def basic_check_snapshot_dict():
+         "unrendered_config_call_dict": {},
+         "config_call_dict": {},
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -1967,6 +1977,7 @@ def basic_parsed_source_definition_dict():
+         },
+         "unrendered_config": {},
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -2006,6 +2017,7 @@ def complex_parsed_source_definition_dict():
+         "loaded_at_field": "loaded_at",
+         "unrendered_config": {},
+         "doc_blocks": [],
++        "vars": {},
+     }
+ 
+ 
+@@ -2187,6 +2199,7 @@ def basic_parsed_exposure_dict():
+             "meta": {},
+         },
+         "unrendered_config": {},
++        "vars": {},
+     }
+ 
+ 
+@@ -2244,6 +2257,7 @@ def complex_parsed_exposure_dict():
+             "meta": {},
+         },
+         "unrendered_config": {},
++        "vars": {},
+     }
+ 
+ 
+diff --git a/tests/unit/contracts/graph/test_state_modified_vars.py b/tests/unit/contracts/graph/test_state_modified_vars.py
+new file mode 100644
+index 000000000..3e97aff63
+--- /dev/null
++++ b/tests/unit/contracts/graph/test_state_modified_vars.py
+@@ -0,0 +1,782 @@
++"""Unit tests for var-aware state comparison (state:modified + the
++state_modified_compare_vars behavior flag)."""
++from argparse import Namespace
++from dataclasses import replace
++
++import pytest
++
++from dbt.artifacts.resources import ExposureType, Owner, Quoting, SourceConfig
++from dbt.contracts.files import FileHash, SchemaSourceFile
++from dbt.contracts.graph.nodes import Exposure, ModelNode, SourceDefinition
++from dbt.flags import set_from_args
++from dbt.node_types import NodeType
++from tests.unit.fixtures import model_node as make_model_node
++
++
++@pytest.fixture
++def model_node():
++    return make_model_node()
++
++
++@pytest.fixture
++def args_for_flags() -> Namespace:
++    return Namespace(
++        state_modified_compare_more_unrendered_values=False,
++        state_modified_compare_vars=False,
++    )
++
++
++def enable_compare_vars():
++    set_from_args(
++        Namespace(
++            state_modified_compare_more_unrendered_values=False,
++            state_modified_compare_vars=True,
++        ),
++        {},
++    )
++
++
++def disable_compare_vars():
++    set_from_args(
++        Namespace(
++            state_modified_compare_more_unrendered_values=False,
++            state_modified_compare_vars=False,
++        ),
++        {},
++    )
++
++
++@pytest.fixture
++def source_definition():
++    return SourceDefinition(
++        columns={},
++        database="some_db",
++        description="",
++        fqn=["test", "source", "my_source", "my_source_table"],
++        identifier="my_source_table",
++        loader="stitch",
++        name="my_source_table",
++        original_file_path="/root/models/sources.yml",
++        package_name="test",
++        path="/root/models/sources.yml",
++        quoting=Quoting(),
++        resource_type=NodeType.Source,
++        schema="my_source",
++        source_description="",
++        source_name="my_source",
++        source_meta={},
++        tags=[],
++        config=SourceConfig(),
++        patch_path=None,
++        unrendered_config={},
++        relation_name=None,
++        unique_id="source.test.my_source.my_source_table",
++    )
++
++
++@pytest.fixture
++def exposure():
++    return Exposure(
++        name="my_exposure",
++        resource_type=NodeType.Exposure,
++        type=ExposureType.Notebook,
++        fqn=["test", "exposures", "my_exposure"],
++        unique_id="exposure.test.my_exposure",
++        package_name="test",
++        path="models/something.yml",
++        original_file_path="models/something.yml",
++        description="",
++        owner=Owner(email="test@example.com"),
++    )
++
++
++class TestModelSameVars:
++    def test_same_vars_equal(self, model_node):  # noqa F811
++        other = replace(model_node, vars={"a": 1})
++        node = replace(model_node, vars={"a": 1})
++        assert node.same_vars(other) is True
++
++    def test_same_vars_different_value(self, model_node):  # noqa F811
++        other = replace(model_node, vars={"a": 1})
++        node = replace(model_node, vars={"a": 2})
++        assert node.same_vars(other) is False
++
++    def test_same_vars_different_keys(self, model_node):  # noqa F811
++        other = replace(model_node, vars={"a": 1})
++        node = replace(model_node, vars={"b": 1})
++        assert node.same_vars(other) is False
++
++    def test_same_vars_missing_on_old(self, model_node):  # noqa F811
++        # manifests written before vars were tracked deserialize with {}
++        other = replace(model_node, vars={})
++        node = replace(model_node, vars={"a": 1})
++        assert node.same_vars(other) is False
++
++    def test_same_contents_flag_off_ignores_vars(self, model_node):  # noqa F811
++        disable_compare_vars()
++        other = replace(model_node, vars={"a": 1})
++        node = replace(model_node, vars={"a": 2})
++        assert node.same_contents(other, "postgres") is True
++
++    def test_same_contents_flag_on_detects_vars(self, model_node):  # noqa F811
++        enable_compare_vars()
++        other = replace(model_node, vars={"a": 1})
++        node = replace(model_node, vars={"a": 2})
++        assert node.same_contents(other, "postgres") is False
++
++    def test_same_contents_flag_on_same_vars(self, model_node):  # noqa F811
++        enable_compare_vars()
++        other = replace(model_node, vars={"a": 1})
++        node = replace(model_node, vars={"a": 1})
++        assert node.same_contents(other, "postgres") is True
++
++    def test_same_contents_flag_on_no_vars_anywhere(self, model_node):  # noqa F811
++        enable_compare_vars()
++        other = replace(model_node, vars={})
++        node = replace(model_node, vars={})
++        assert node.same_contents(other, "postgres") is True
++
++
++class TestSourceSameVars:
++    def test_same_vars(self, source_definition):
++        other = replace(source_definition, vars={"a": 1})
++        node = replace(source_definition, vars={"a": 2})
++        assert node.same_vars(other) is False
++        assert node.same_vars(replace(other, vars={"a": 2})) is True
++
++    def test_same_contents_flag_off_ignores_vars(self, source_definition):
++        disable_compare_vars()
++        other = replace(source_definition, vars={"a": 1})
++        node = replace(source_definition, vars={"a": 2})
++        assert node.same_contents(other) is True
++
++    def test_same_contents_flag_on_detects_vars(self, source_definition):
++        enable_compare_vars()
++        other = replace(source_definition, vars={"a": 1})
++        node = replace(source_definition, vars={"a": 2})
++        assert node.same_contents(other) is False
++
++    def test_same_contents_flag_on_same_vars(self, source_definition):
++        enable_compare_vars()
++        other = replace(source_definition, vars={"a": 1})
++        node = replace(source_definition, vars={"a": 1})
++        assert node.same_contents(other) is True
++
++
++class TestExposureSameVars:
++    def test_same_vars(self, exposure):
++        other = replace(exposure, vars={"a": 1})
++        node = replace(exposure, vars={"a": 2})
++        assert node.same_vars(other) is False
++        assert node.same_vars(replace(other, vars={"a": 2})) is True
++
++    def test_same_contents_flag_off_ignores_vars(self, exposure):
++        disable_compare_vars()
++        other = replace(exposure, vars={"a": 1})
++        node = replace(exposure, vars={"a": 2})
++        assert node.same_contents(other) is True
++
++    def test_same_contents_flag_on_detects_vars(self, exposure):
++        enable_compare_vars()
++        other = replace(exposure, vars={"a": 1})
++        node = replace(exposure, vars={"a": 2})
++        assert node.same_contents(other) is False
++
++    def test_same_contents_flag_on_same_vars(self, exposure):
++        enable_compare_vars()
++        other = replace(exposure, vars={"a": 1})
++        node = replace(exposure, vars={"a": 1})
++        assert node.same_contents(other) is True
++
++
++def _schema_file() -> SchemaSourceFile:
++    return SchemaSourceFile(
++        path=_make_file_path(),
++        checksum=FileHash.from_contents(""),
++        project_name="test",
++    )
++
++
++def _make_file_path():
++    from dbt.contracts.files import FilePath
++
++    return FilePath(
++        searched_path="models",
++        relative_path="schema.yml",
++        modification_time=0.0,
++        project_root="/root",
++    )
++
++
++class TestSchemaSourceFileVars:
++    def test_add_and_get_vars(self):
++        schema_file = _schema_file()
++        schema_file.add_vars({"a": 1, "b": "x"}, "models", "my_model")
++        assert schema_file.get_vars("models", "my_model") == {"a": 1, "b": "x"}
++
++    def test_get_vars_missing_key(self):
++        schema_file = _schema_file()
++        assert schema_file.get_vars("models", "my_model") == {}
++
++    def test_get_vars_missing_name(self):
++        schema_file = _schema_file()
++        schema_file.add_vars({"a": 1}, "models", "my_model")
++        assert schema_file.get_vars("models", "other_model") == {}
++
++    def test_add_vars_overwrites_on_reparse(self):
++        schema_file = _schema_file()
++        schema_file.add_vars({"a": 1}, "models", "my_model")
++        schema_file.add_vars({"a": 2}, "models", "my_model")
++        assert schema_file.get_vars("models", "my_model") == {"a": 2}
++
++    def test_add_vars_keys_are_isolated(self):
++        schema_file = _schema_file()
++        schema_file.add_vars({"a": 1}, "models", "my_model")
++        schema_file.add_vars({"b": 2}, "sources", "my_source")
++        assert schema_file.get_vars("models", "my_model") == {"a": 1}
++        assert schema_file.get_vars("sources", "my_source") == {"b": 2}
++
++    def test_add_vars_copies_input(self):
++        schema_file = _schema_file()
++        recorded = {"a": 1}
++        schema_file.add_vars(recorded, "models", "my_model")
++        recorded["a"] = 999
++        assert schema_file.get_vars("models", "my_model") == {"a": 1}
++
++    def test_delete_from_vars(self):
++        schema_file = _schema_file()
++        schema_file.add_vars({"a": 1}, "models", "my_model")
++        schema_file.add_vars({"a": 1}, "models", "other_model")
++        schema_file.delete_from_vars("models", "my_model")
++        assert schema_file.get_vars("models", "my_model") == {}
++        assert schema_file.get_vars("models", "other_model") == {"a": 1}
++
++    def test_delete_from_vars_cleans_up_empty_key(self):
++        schema_file = _schema_file()
++        schema_file.add_vars({"a": 1}, "models", "my_model")
++        schema_file.delete_from_vars("models", "my_model")
++        assert "models" not in schema_file.vars
++
++    def test_delete_from_vars_noop_when_missing(self):
++        schema_file = _schema_file()
++        # must not raise
++        schema_file.delete_from_vars("models", "my_model")
++
++    def test_vars_roundtrip_serialization(self):
++        schema_file = _schema_file()
++        schema_file.add_vars({"a": 1}, "models", "my_model")
++        dct = schema_file.to_dict()
++        restored = SchemaSourceFile.from_dict(dct)
++        assert restored.get_vars("models", "my_model") == {"a": 1}
++
++    def test_vars_missing_key_deserialization(self):
++        # partial parse files written before vars were tracked have no 'vars'
++        # key; they must still load, defaulting to empty
++        schema_file = _schema_file()
++        dct = schema_file.to_dict()
++        dct.pop("vars", None)
++        restored = SchemaSourceFile.from_dict(dct)
++        assert restored.get_vars("models", "my_model") == {}
++
++
++class TestNodeVarsRoundTrip:
++    def test_model_node_vars_serialization(self, model_node):  # noqa F811
++        node = replace(model_node, vars={"a": [1, 2], "b": {"c": "d"}})
++        dct = node.to_dict()
++        assert dct["vars"] == {"a": [1, 2], "b": {"c": "d"}}
++        restored = ModelNode.from_dict(dct)
++        assert restored.vars == {"a": [1, 2], "b": {"c": "d"}}
++
++    def test_model_node_vars_default_when_missing(self, model_node):  # noqa F811
++        node = replace(model_node, vars={"a": 1})
++        dct = node.to_dict()
++        dct.pop("vars", None)
++        restored = ModelNode.from_dict(dct)
++        assert restored.vars == {}
++
++
++class TestSelectorFactorySameVars:
++    """state:modified.vars uses the standard check_modified_factory plumbing."""
++
++    def _factory(self):
++        from dbt.graph.selector_methods import StateSelectorMethod
++
++        return StateSelectorMethod.check_modified_factory("same_vars")
++
++    def _node(self, vars_value):
++        from unittest.mock import MagicMock
++
++        node = MagicMock()
++        node.same_vars = lambda old: vars_value == old.vars
++        node.vars = vars_value
++        return node
++
++    def test_new_node_is_modified(self):
++        factory = self._factory()
++        assert factory(None, self._node({"a": 1})) is True
++
++    def test_same_vars_is_not_modified(self):
++        factory = self._factory()
++        old = self._node({"a": 1})
++        new = self._node({"a": 1})
++        assert factory(old, new) is False
++
++    def test_different_vars_is_modified(self):
++        factory = self._factory()
++        old = self._node({"a": 1})
++        new = self._node({"a": 2})
++        assert factory(old, new) is True
++
++    def test_resource_without_same_vars_is_skipped(self):
++        factory = self._factory()
++        old = self._node({"a": 1})
++
++        class NoVars:
++            pass
++
++        assert factory(old, NoVars()) is False
++
++
++class TestExposureVarsSerialization:
++    def test_vars_roundtrip(self, exposure):
++        node = replace(exposure, vars={"owner": "alice", "n": [1, 2]})
++        dct = node.to_dict()
++        assert dct["vars"] == {"owner": "alice", "n": [1, 2]}
++        restored = Exposure.from_dict(dct)
++        assert restored.vars == {"owner": "alice", "n": [1, 2]}
++
++    def test_vars_default_when_missing(self, exposure):
++        node = replace(exposure, vars={"owner": "alice"})
++        dct = node.to_dict()
++        dct.pop("vars", None)
++        restored = Exposure.from_dict(dct)
++        assert restored.vars == {}
++
++
++class TestSourceVarsSerialization:
++    def test_vars_roundtrip(self, source_definition):
++        node = replace(source_definition, vars={"dataset": "raw_v1"})
++        dct = node.to_dict()
++        assert dct["vars"] == {"dataset": "raw_v1"}
++        restored = SourceDefinition.from_dict(dct)
++        assert restored.vars == {"dataset": "raw_v1"}
++
++    def test_vars_default_when_missing(self, source_definition):
++        node = replace(source_definition, vars={"dataset": "raw_v1"})
++        dct = node.to_dict()
++        dct.pop("vars", None)
++        restored = SourceDefinition.from_dict(dct)
++        assert restored.vars == {}
++
++
++class TestParsedNodePatchVars:
++    def _patch_kwargs(self):
++        from dbt.artifacts.resources import Docs
++
++        return dict(
++            name="foo",
++            original_file_path="models/schema.yml",
++            yaml_key="models",
++            package_name="test",
++            description="",
++            meta={},
++            docs=Docs(),
++            config={},
++            columns={},
++            access=None,
++            version=None,
++            latest_version=None,
++            constraints=[],
++            deprecation_date=None,
++        )
++
++    def test_vars_default_empty(self):
++        from dbt.contracts.graph.nodes import ParsedNodePatch
++
++        patch = ParsedNodePatch(**self._patch_kwargs())
++        assert patch.vars == {}
++
++    def test_vars_explicit(self):
++        from dbt.contracts.graph.nodes import ParsedNodePatch
++
++        patch = ParsedNodePatch(**self._patch_kwargs(), vars={"a": 1})
++        assert patch.vars == {"a": 1}
++
++
++class TestConfiguredVarRecording:
++    """ConfiguredVar records the resolved value of each referenced var into
++    the SchemaYamlVars collector, following cli > project > default
++    precedence."""
++
++    def _make_config(self, project_vars, cli_vars):
++        from types import SimpleNamespace
++
++        class _Vars:
++            def __init__(self, values):
++                self._values = values
++
++            def vars_for(self, lookup, adapter_type):
++                return self._values
++
++        project = SimpleNamespace(project_name="test", vars=_Vars(project_vars))
++        return SimpleNamespace(
++            project_name="test",
++            cli_vars=cli_vars,
++            credentials=SimpleNamespace(type="duckdb"),
++            vars=_Vars(project_vars),
++            load_dependencies=lambda: {"test": project},
++        )
++
++    def _make_var(self, project_vars, cli_vars, schema_yaml_vars):
++        from dbt.context.base import BaseContext
++        from dbt.context.configured import ConfiguredVar
++
++        context = BaseContext(cli_vars)
++        return ConfiguredVar(
++            context, self._make_config(project_vars, cli_vars), "test", schema_yaml_vars
++        )
++
++    def test_records_project_var(self):
++        from dbt.context.configured import SchemaYamlVars
++
++        collector = SchemaYamlVars()
++        var = self._make_var({"a": 1}, {}, collector)
++        assert var("a") == 1
++        assert collector.vars == {"a": 1}
++
++    def test_cli_var_wins_and_is_recorded(self):
++        from dbt.context.configured import SchemaYamlVars
++
++        collector = SchemaYamlVars()
++        var = self._make_var({"a": 1}, {"a": 99}, collector)
++        assert var("a") == 99
++        assert collector.vars == {"a": 99}
++
++    def test_default_is_recorded_for_undefined_var(self):
++        from dbt.context.configured import SchemaYamlVars
++
++        collector = SchemaYamlVars()
++        var = self._make_var({}, {}, collector)
++        assert var("missing", "fallback") == "fallback"
++        assert collector.vars == {"missing": "fallback"}
++
++    def test_missing_var_without_default_raises(self):
++        from dbt.context.configured import SchemaYamlVars
++        from dbt.exceptions import RequiredVarNotFoundError
++
++        collector = SchemaYamlVars()
++        var = self._make_var({}, {}, collector)
++        with pytest.raises(RequiredVarNotFoundError):
++            var("missing")
++        # nothing recorded for an unresolvable var
++        assert collector.vars == {}
++
++    def test_no_collector_no_recording(self):
++        var = self._make_var({"a": 1}, {}, None)
++        # must not raise even though there is no collector attached
++        assert var("a") == 1
++
++
++@pytest.fixture
++def generic_test_node():
++    from tests.unit.fixtures import generic_test_node as make_generic_test_node
++
++    return make_generic_test_node()
++
++
++class TestGenericTestSameVars:
++    """GenericTestNode overrides same_contents, so the vars comparison must
++    be wired into it explicitly."""
++
++    def test_same_contents_flag_off_ignores_vars(self, generic_test_node):
++        disable_compare_vars()
++        other = replace(generic_test_node, vars={"a": 1})
++        node = replace(generic_test_node, vars={"a": 2})
++        assert node.same_contents(other, "postgres") is True
++
++    def test_same_contents_flag_on_detects_vars(self, generic_test_node):
++        enable_compare_vars()
++        other = replace(generic_test_node, vars={"a": 1})
++        node = replace(generic_test_node, vars={"a": 2})
++        assert node.same_contents(other, "postgres") is False
++
++    def test_same_contents_flag_on_same_vars(self, generic_test_node):
++        enable_compare_vars()
++        other = replace(generic_test_node, vars={"a": 1})
++        node = replace(generic_test_node, vars={"a": 1})
++        assert node.same_contents(other, "postgres") is True
++
++    def test_same_contents_none_old_is_modified(self, generic_test_node):
++        enable_compare_vars()
++        node = replace(generic_test_node, vars={"a": 1})
++        assert node.same_contents(None, "postgres") is False
++
++
++class TestVarsComparisonAcrossNodeTypes:
++    """All ParsedNode subclasses share the same_contents vars comparison."""
++
++    def _check(self, node):
++        other = replace(node, vars={"a": 1})
++        changed = replace(node, vars={"a": 2})
++        same = replace(node, vars={"a": 1})
++
++        disable_compare_vars()
++        assert changed.same_contents(other, "postgres") is True
++
++        enable_compare_vars()
++        assert changed.same_contents(other, "postgres") is False
++        assert same.same_contents(other, "postgres") is True
++
++    def test_model_node(self, model_node):
++        self._check(model_node)
++
++    def test_seed_node(self):
++        from dbt.contracts.graph.nodes import SeedNode
++
++        node = SeedNode(
++            package_name="test",
++            path="/root/seeds/seed.csv",
++            original_file_path="seeds/seed.csv",
++            raw_code="",
++            name="seed",
++            resource_type=NodeType.Seed,
++            unique_id="seed.test.seed",
++            fqn=["test", "seeds", "seed"],
++            database="test_db",
++            schema="test_schema",
++            alias="seed",
++            checksum=FileHash.from_contents(""),
++        )
++        self._check(node)
++
++    def test_snapshot_node(self):
++        from dbt.contracts.graph.model_config import SnapshotConfig
++        from dbt.contracts.graph.nodes import DependsOn, SnapshotNode
++
++        node = SnapshotNode(
++            package_name="test",
++            path="/root/x/path.sql",
++            original_file_path="/root/path.sql",
++            language="sql",
++            raw_code="select * from wherever",
++            name="foo",
++            resource_type=NodeType.Snapshot,
++            unique_id="snapshot.test.foo",
++            fqn=["test", "snapshots", "foo"],
++            refs=[],
++            sources=[],
++            metrics=[],
++            depends_on=DependsOn(),
++            description="",
++            database="test_db",
++            schema="test_schema",
++            alias="bar",
++            tags=[],
++            config=SnapshotConfig(
++                strategy="timestamp",
++                unique_key="id",
++                updated_at="last_update",
++            ),
++            checksum=FileHash.from_contents(""),
++            unrendered_config={
++                "strategy": "timestamp",
++                "unique_key": "id",
++                "updated_at": "last_update",
++            },
++        )
++        self._check(node)
++
++    def test_singular_test_node(self):
++        from dbt.contracts.graph.nodes import SingularTestNode
++
++        node = SingularTestNode(
++            package_name="test",
++            path="/root/tests/t.sql",
++            original_file_path="tests/t.sql",
++            language="sql",
++            raw_code="select 1 as id",
++            name="t",
++            resource_type=NodeType.Test,
++            unique_id="test.test.t",
++            fqn=["test", "tests", "t"],
++            refs=[],
++            sources=[],
++            metrics=[],
++            description="",
++            database="test_db",
++            schema="test_schema",
++            alias="t",
++            tags=[],
++            checksum=FileHash.from_contents(""),
++            unrendered_config={},
++        )
++        self._check(node)
++
++    def test_analysis_node(self):
++        from dbt.contracts.graph.nodes import AnalysisNode
++
++        node = AnalysisNode(
++            package_name="test",
++            path="/root/analyses/a.sql",
++            original_file_path="analyses/a.sql",
++            language="sql",
++            raw_code="select 1 as id",
++            name="a",
++            resource_type=NodeType.Analysis,
++            unique_id="analysis.test.a",
++            fqn=["test", "analyses", "a"],
++            refs=[],
++            sources=[],
++            metrics=[],
++            description="",
++            database="test_db",
++            schema="test_schema",
++            alias="a",
++            tags=[],
++            checksum=FileHash.from_contents(""),
++            unrendered_config={},
++        )
++        self._check(node)
++
++
++class TestParseVarRecording:
++    """ParseVar records the resolved value of each var referenced at parse
++    time onto the node being parsed."""
++
++    def _make_config(self, project_vars, cli_vars):
++        from types import SimpleNamespace
++
++        class _Vars:
++            def __init__(self, values):
++                self._values = values
++
++            def vars_for(self, node, adapter_type):
++                return self._values
++
++        project = SimpleNamespace(project_name="test", vars=_Vars(project_vars))
++        return SimpleNamespace(
++            project_name="test",
++            cli_vars=cli_vars,
++            credentials=SimpleNamespace(type="duckdb"),
++            vars=_Vars(project_vars),
++            load_dependencies=lambda: {"test": project},
++        )
++
++    def _make_parse_var(self, node, project_vars, cli_vars=None):
++        from dbt.context.base import BaseContext
++        from dbt.context.providers import ParseVar
++
++        context = BaseContext(cli_vars or {})
++        return ParseVar(context, self._make_config(project_vars, cli_vars or {}), node)
++
++    def test_records_resolved_value_on_node(self):
++        from types import SimpleNamespace
++
++        node = SimpleNamespace(name="m", package_name="test", vars={})
++        var = self._make_parse_var(node, {"a": 1})
++        assert var("a") == 1
++        assert node.vars == {"a": 1}
++
++    def test_records_default_for_undefined_var(self):
++        from types import SimpleNamespace
++
++        node = SimpleNamespace(name="m", package_name="test", vars={})
++        var = self._make_parse_var(node, {})
++        assert var("missing", "dflt") == "dflt"
++        assert node.vars == {"missing": "dflt"}
++
++    def test_records_none_for_missing_var_at_parse(self):
++        from types import SimpleNamespace
++
++        node = SimpleNamespace(name="m", package_name="test", vars={})
++        var = self._make_parse_var(node, {})
++        # at parse time a missing var without default resolves to None
++        assert var("missing") is None
++        assert node.vars == {"missing": None}
++
++    def test_cli_value_recorded_over_project_value(self):
++        from types import SimpleNamespace
++
++        node = SimpleNamespace(name="m", package_name="test", vars={})
++        var = self._make_parse_var(node, {"a": 1}, {"a": 5})
++        assert var("a") == 5
++        assert node.vars == {"a": 5}
++
++    def test_no_node_attribute_no_crash(self):
++        from types import SimpleNamespace
++
++        # macros and other parse-time contexts have no `vars` attribute
++        node = SimpleNamespace(name="m", package_name="test")
++        var = self._make_parse_var(node, {"a": 1})
++        assert var("a") == 1
++
++    def test_records_complex_values(self):
++        from types import SimpleNamespace
++
++        node = SimpleNamespace(name="m", package_name="test", vars={})
++        var = self._make_parse_var(node, {"mapping": {"x": [1, 2]}})
++        assert var("mapping") == {"x": [1, 2]}
++        assert node.vars == {"mapping": {"x": [1, 2]}}
++
++
++class TestGenericTestVarsSerialization:
++    def test_vars_roundtrip(self, generic_test_node):
++        node = replace(generic_test_node, vars={"region": "emea"})
++        dct = node.to_dict()
++        assert dct["vars"] == {"region": "emea"}
++        from dbt.contracts.graph.nodes import GenericTestNode
++
++        restored = GenericTestNode.from_dict(dct)
++        assert restored.vars == {"region": "emea"}
++
++    def test_vars_default_when_missing(self, generic_test_node):
++        node = replace(generic_test_node, vars={"region": "emea"})
++        dct = node.to_dict()
++        dct.pop("vars", None)
++        from dbt.contracts.graph.nodes import GenericTestNode
++
++        restored = GenericTestNode.from_dict(dct)
++        assert restored.vars == {}
++
++
++class TestVarsRecordingDeterminism:
++    """Recording must be deterministic across equivalent parses, otherwise
++    every state comparison would be a false positive."""
++
++    def test_dict_order_does_not_matter_for_equality(self):
++        assert {"a": 1, "b": 2} == {"b": 2, "a": 1}
++
++    def test_same_vars_is_plain_dict_equality(self, model_node):
++        other = replace(model_node, vars={"a": [1, 2], "b": {"c": "d"}})
++        node = replace(model_node, vars={"b": {"c": "d"}, "a": [1, 2]})
++        assert node.same_vars(other) is True
++
++
++class TestVarsComparisonValueSemantics:
++    """Equality is by resolved value, not by how the value was produced."""
++
++    def test_int_vs_string_is_different(self, model_node):
++        other = replace(model_node, vars={"a": 1})
++        node = replace(model_node, vars={"a": "1"})
++        enable_compare_vars()
++        assert node.same_contents(other, "postgres") is False
++
++    def test_none_vs_missing_is_different(self, model_node):
++        # a var that resolved to None (missing at parse) is not the same as
++        # the var never having been referenced
++        other = replace(model_node, vars={})
++        node = replace(model_node, vars={"a": None})
++        enable_compare_vars()
++        assert node.same_contents(other, "postgres") is False
++
++    def test_nested_structures_compare_by_value(self, model_node):
++        other = replace(model_node, vars={"a": {"x": [1, {"y": 2}]}})
++        node = replace(model_node, vars={"a": {"x": [1, {"y": 2}]}})
++        enable_compare_vars()
++        assert node.same_contents(other, "postgres") is True
++
++    def test_extra_recorded_var_is_different(self, model_node):
++        other = replace(model_node, vars={"a": 1})
++        node = replace(model_node, vars={"a": 1, "b": 2})
++        enable_compare_vars()
++        assert node.same_contents(other, "postgres") is False

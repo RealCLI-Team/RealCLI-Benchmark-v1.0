@@ -1,0 +1,2781 @@
+diff --git a/gradio/__init__.py b/gradio/__init__.py
+index 56718dc..e560ff3 100644
+--- a/gradio/__init__.py
++++ b/gradio/__init__.py
+@@ -92,6 +92,13 @@ from gradio.events import (
+     api,
+     on,
+ )
++from gradio.event_recorder import (
++    EventRecorder,
++    ReplayReport,
++    ReplayResult,
++    load_events,
++    replay_events,
++)
+ from gradio.exceptions import Error
+ from gradio.external import load, load_chat, load_openapi
+ from gradio.flagging import (
+diff --git a/gradio/blocks.py b/gradio/blocks.py
+index 3af6490..61b6b9d 100644
+--- a/gradio/blocks.py
++++ b/gradio/blocks.py
+@@ -16,7 +16,7 @@ import time
+ import warnings
+ import weakref
+ import webbrowser
+-from collections import defaultdict
++from collections import OrderedDict, defaultdict
+ from collections.abc import AsyncIterator, Callable, Coroutine, Sequence, Set
+ from pathlib import Path
+ from types import ModuleType
+@@ -1086,6 +1086,18 @@ class Blocks(BlockContext, BlocksEvents, metaclass=BlocksMeta):
+         self.max_threads = 40
+         self.pending_streams = defaultdict(dict)
+         self.pending_diff_streams = defaultdict(dict)
++        # Ordered map of currently-registered call hooks. Public API is
++        # add_call_hook / remove_call_hook / get_call_hooks; the recording
++        # wrapper around process_api reads this dict directly. When it is
++        # empty, process_api takes a fast path that dispatches straight to
++        # _process_api_impl without allocating any hook context.
++        self._call_hooks: OrderedDict[str, Callable[[str, dict[str, Any]], None]] = (
++            OrderedDict()
++        )
++        # Counter tracked by replay_events() so that recording hooks can
++        # ignore calls made during replay. Kept as an int (not a bool) so
++        # nested replay calls compose safely.
++        self._event_recording_suspended = 0
+         self.show_error = True
+         self.fill_height = fill_height
+         self.fill_width = fill_width
+@@ -2019,6 +2031,57 @@ Received inputs:
+ 
+         return data
+ 
++    def add_call_hook(
++        self,
++        name: str,
++        hook: Callable[[str, dict[str, Any]], None],
++    ) -> None:
++        """Register a hook invoked around every ``process_api`` call.
++
++        The hook is called with two positional arguments: a phase string
++        (``"before"`` or ``"after"``) and a mutable context dict describing
++        the call. The public keys of the context are:
++
++        * ``api_name`` — the endpoint name, or ``None`` for un-named events;
++        * ``fn_name`` — the Python function's name;
++        * ``session_hash`` — the caller's session hash (may be ``None``);
++        * ``inputs`` — the raw input payload as received by ``process_api``;
++        * ``outputs`` — ``None`` before the call, the function's output on
++          success after the call, ``None`` after an error;
++        * ``error`` — ``None`` unless the function raised, in which case the
++          exception class name is provided;
++        * ``duration`` — ``None`` before the call, elapsed seconds after.
++
++        The same dict instance is passed to both phases, so hooks may stash
++        per-call state (e.g. captured inputs) under a private key. Extra
++        keys ``block_fn``, ``state`` and ``iterator`` are also included for
++        hooks that need to inspect the underlying invocation.
++
++        Registration by name lets consumers install and remove hooks
++        independently: ``remove_call_hook(name)`` unregisters exactly one
++        hook, and ``get_call_hooks()`` lists what is currently attached.
++        Registering the same name twice replaces the previous hook.
++        """
++        self._call_hooks[name] = hook
++
++    def remove_call_hook(self, name: str) -> None:
++        """Unregister a previously-registered call hook.
++
++        Silently no-ops if ``name`` is not currently registered, so removal
++        is idempotent — a shutdown path can call this without first
++        checking whether the hook was ever installed.
++        """
++        self._call_hooks.pop(name, None)
++
++    def get_call_hooks(self) -> list[str]:
++        """Return the names of the currently-registered call hooks.
++
++        The list is a snapshot in registration order (insertion order),
++        independent of the internal dict, so a caller can safely iterate or
++        mutate the returned list without affecting future dispatch.
++        """
++        return list(self._call_hooks.keys())
++
+     async def process_api(
+         self,
+         block_fn: BlockFunction | int,
+@@ -2038,6 +2101,14 @@ Received inputs:
+         Processes API calls from the frontend. First preprocesses the data,
+         then runs the relevant function, then postprocesses the output.
+ 
++        This is a thin dispatcher around the real implementation,
++        :py:meth:`_process_api_impl`. When one or more call hooks are
++        attached (see :py:meth:`add_call_hook`), each call is bracketed by
++        ``before``/``after`` hook invocations that share a mutable context
++        dict; when no hooks are attached, the dispatcher jumps straight to
++        the implementation with zero extra allocation so recording adds no
++        overhead to plain runs.
++
+         Parameters:
+             fn_index: Index of function to run.
+             inputs: input data received from the frontend
+@@ -2058,6 +2129,107 @@ Received inputs:
+             - "average_duration": the average duration of the function call
+             - "render_config": the render config for the function
+         """
++        if not self._call_hooks:
++            # Fast path: no observers attached, so we do not construct a
++            # hook context at all. Delegating to _process_api_impl directly
++            # keeps ``process_api`` a zero-overhead wrapper in the common
++            # case (see the "no hooks, no overhead" contract in the
++            # public call-hook docs).
++            return await self._process_api_impl(
++                block_fn,
++                inputs,
++                state,
++                request,
++                iterator,
++                session_hash,
++                event_id,
++                event_data,
++                in_event_listener,
++                simple_format,
++                explicit_call,
++                root_path,
++            )
++
++        resolved_fn = self.fns[block_fn] if isinstance(block_fn, int) else block_fn
++        api_name = (
++            resolved_fn.api_name if isinstance(resolved_fn.api_name, str) else None
++        )
++        ctx: dict[str, Any] = {
++            "api_name": api_name,
++            "fn_name": resolved_fn.name,
++            "session_hash": session_hash,
++            "inputs": inputs,
++            "outputs": None,
++            "error": None,
++            "duration": None,
++            "block_fn": resolved_fn,
++            "state": state,
++            "iterator": iterator,
++        }
++        hooks = list(self._call_hooks.values())
++        for hook in hooks:
++            hook("before", ctx)
++        started_at = time.time()
++        try:
++            output = await self._process_api_impl(
++                block_fn,
++                inputs,
++                state,
++                request,
++                iterator,
++                session_hash,
++                event_id,
++                event_data,
++                in_event_listener,
++                simple_format,
++                explicit_call,
++                root_path,
++            )
++        except BaseException as exc:
++            ctx["duration"] = time.time() - started_at
++            ctx["error"] = type(exc).__name__
++            for hook in hooks:
++                # A misbehaving hook must not swallow the original exception;
++                # we swallow the hook's failure so the app still sees the
++                # real error the function raised.
++                try:
++                    hook("after", ctx)
++                except Exception:
++                    pass
++            raise
++        ctx["duration"] = time.time() - started_at
++        ctx["outputs"] = output["data"]
++        for hook in hooks:
++            try:
++                hook("after", ctx)
++            except Exception:
++                # Hook failures never invalidate a successful function
++                # call: an observer that raises just gets ignored.
++                pass
++        return output
++
++    async def _process_api_impl(
++        self,
++        block_fn: BlockFunction | int,
++        inputs: list[Any],
++        state: SessionState | None = None,
++        request: Request | list[Request] | None = None,
++        iterator: AsyncIterator | None = None,
++        session_hash: str | None = None,
++        event_id: str | None = None,
++        event_data: EventData | None = None,
++        in_event_listener: bool = True,
++        simple_format: bool = False,
++        explicit_call: bool = False,
++        root_path: str | None = None,
++    ) -> dict[str, Any]:
++        """The concrete process_api implementation. See ``process_api``.
++
++        Kept as a separate method so ``process_api`` can wrap it with
++        call-hook dispatch and so test code / advanced consumers can
++        subclass or monkey-patch the implementation without disturbing the
++        wrapper's hook semantics.
++        """
+         if isinstance(block_fn, int):
+             block_fn = self.fns[block_fn]
+         batch = block_fn.batch
+diff --git a/gradio/event_recorder.py b/gradio/event_recorder.py
+new file mode 100644
+index 0000000..08998b5
+--- /dev/null
++++ b/gradio/event_recorder.py
+@@ -0,0 +1,998 @@
++"""Record and replay the backend function calls of a Gradio app.
++
++This module implements an event recording and replay mechanism for Blocks apps.
++An :class:`EventRecorder` attached to a :class:`gradio.Blocks` instance captures
++every backend function invocation (api name, inputs, outputs, session hash,
++errors, duration) to a JSONL record file, whether the call comes from the HTTP
++API routes, the queue, or a direct ``Blocks.process_api()`` call.
++:func:`replay_events` then re-executes a record file against a (possibly
++modified) app and reports which events still produce the recorded outputs and
++which ones diverge.
++
++The recorder plugs into ``Blocks`` through the public call-hook registry
++(``add_call_hook`` / ``remove_call_hook``), so it needs no server, no
++browser, and no monkey-patching of gradio internals. It writes each event as
++one canonical (sorted-key, unicode-preserving) JSON line, with a per-line
++integrity checksum that chains back to the header — a record file that is
++edited, reordered, or has a line dropped will fail to load. The record
++file's serialization goes through ``gradio.utils.canonical_json_dumps`` so
++it is stable, byte-for-byte, across runs and diffable.
++
++Typical workflow:
++
++1. Attach an :class:`EventRecorder` to a running app and let real usage (or
++   a scripted session) produce a record file.
++2. After changing the app's code, call :func:`replay_events` with the record
++   file to get a :class:`ReplayReport` describing any behavioral
++   differences.
++
++Guarantees:
++
++* Recording is a thin wrapper around ``Blocks.process_api()``: it works
++  from any transport (HTTP, queue, direct call) and never starts a server.
++* Recording never observes calls made during a ``replay_events()`` run
++  (a per-blocks counter suspends every attached recorder for the duration
++  of a replay).
++* When no recorders and no other call hooks are attached, ``process_api``
++  takes a zero-overhead fast path that does not allocate a context dict.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import copy
++import hashlib
++import json
++import threading
++import time
++from dataclasses import dataclass, field
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import TYPE_CHECKING, Any, Iterable, Sequence
++
++from gradio.state_holder import SessionState
++from gradio.utils import canonical_json_dumps
++
++if TYPE_CHECKING:
++    from gradio.block_function import BlockFunction
++    from gradio.blocks import Blocks
++
++RECORD_FORMAT_VERSION = 1
++HEADER_RECORD_TYPE = "header"
++EVENT_RECORD_TYPE = "event"
++REDACTED_VALUE = "***"
++
++#: Valid per-event statuses in a replay report.
++STATUS_MATCH = "match"
++STATUS_MISMATCH = "mismatch"
++STATUS_MISSING = "missing"
++STATUS_ERROR = "error"
++
++#: Reserved event field whose value is a checksum chained from the previous
++#: line. It exists on both header and event lines and is what makes a record
++#: file tamper-evident (see ``_next_chain`` / ``read_record``).
++_CHECKSUM_FIELD = "checksum"
++
++__all__ = [
++    "EventRecorder",
++    "ReplayReport",
++    "ReplayResult",
++    "load_events",
++    "read_record",
++    "replay_events",
++]
++
++
++# ----------------------------------------------------------------------
++# helpers
++# ----------------------------------------------------------------------
++
++
++def _json_safe(value: Any) -> Any:
++    """Convert an arbitrary value to a JSON-compatible structure.
++
++    Pydantic models (e.g. the data models produced by components such as
++    ``gr.JSON``) are dumped to plain dicts/lists first. Values that are
++    still not natively JSON serializable afterwards (sets, custom objects)
++    fall back to their string representation. Tuples are normalized to
++    lists. This keeps record files portable and diffable.
++    """
++    model_dump = getattr(value, "model_dump", None)
++    if callable(model_dump):
++        try:
++            return _json_safe(model_dump())
++        except Exception:
++            pass
++    if isinstance(value, dict):
++        return {str(k): _json_safe(v) for k, v in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_json_safe(v) for v in value]
++    try:
++        json.dumps(value)
++        return value
++    except (TypeError, ValueError):
++        return str(value)
++
++
++def _exception_name(exc: BaseException | str) -> str:
++    """Return the class name of an exception (or pass through a name string)."""
++    if isinstance(exc, str):
++        return exc
++    return type(exc).__name__
++
++
++def _block_label(block: Any) -> str | None:
++    """Return the label of a component, or ``None`` if it has none."""
++    label = getattr(block, "label", None)
++    return label if isinstance(label, str) else None
++
++
++def capture_effective_inputs(
++    block_fn: BlockFunction,
++    raw_inputs: Sequence[Any],
++    state: SessionState | None,
++) -> list[Any]:
++    """Capture the input values the backend function actually sees.
++
++    For regular components this is the raw payload value. For stateful
++    components (``gr.State``) the raw payload is ignored by the runtime and
++    the function receives the current session value instead, so the session
++    value is what gets recorded. When no session is available the
++    component's declared default value is used as a best-effort stand-in.
++    """
++    effective: list[Any] = []
++    for i, block in enumerate(block_fn.inputs):
++        raw = raw_inputs[i] if i < len(raw_inputs) else None
++        if getattr(block, "stateful", False):
++            if isinstance(state, SessionState):
++                value = state[block._id]
++            else:
++                value = getattr(block, "value", None)
++            effective.append(copy.deepcopy(value))
++        else:
++            effective.append(copy.deepcopy(raw))
++    return effective
++
++
++def capture_effective_outputs(
++    block_fn: BlockFunction,
++    data: Sequence[Any],
++    state: SessionState | None,
++) -> list[Any]:
++    """Capture the output values produced by a backend function call.
++
++    For regular components this is the postprocessed payload value. For
++    stateful components (``gr.State``) the payload position holds a
++    placeholder (usually ``None``) and the meaningful value is the new
++    session value, so the new session value is recorded when a session is
++    available.
++    """
++    effective: list[Any] = []
++    for i, block in enumerate(block_fn.outputs):
++        value = data[i] if i < len(data) else None
++        if getattr(block, "stateful", False) and isinstance(state, SessionState):
++            value = state[block._id]
++        effective.append(copy.deepcopy(value))
++    return effective
++
++
++# ----------------------------------------------------------------------
++# integrity chain
++# ----------------------------------------------------------------------
++
++
++def _hash_hex(data: str) -> str:
++    """Return the hex-encoded SHA-256 of ``data`` (as UTF-8 bytes)."""
++    return hashlib.sha256(data.encode("utf-8")).hexdigest()
++
++
++def _seed_chain(header_without_checksum: dict[str, Any]) -> str:
++    """Compute the initial chain value from a header record.
++
++    The header's own ``checksum`` field is the SHA-256 of the canonical JSON
++    of the rest of the header. It seeds the per-event chain below so that
++    the first event is bound to the header, and modifying the header
++    (e.g. downgrading the format version) invalidates every event that
++    follows.
++    """
++    canonical = canonical_json_dumps(header_without_checksum)
++    return _hash_hex(canonical)
++
++
++def _next_chain(prev_chain: str, event_without_checksum: dict[str, Any]) -> str:
++    """Compute the next chain value from the previous chain and an event.
++
++    Each event's ``checksum`` field is the SHA-256 of the previous chain
++    value concatenated with the canonical JSON of the event minus its own
++    checksum. Because ``prev_chain`` is threaded through every line, any
++    change to any prior line — including reordering or dropping one —
++    breaks the chain from that point on.
++    """
++    canonical = canonical_json_dumps(event_without_checksum)
++    return _hash_hex(prev_chain + "\n" + canonical)
++
++
++# ----------------------------------------------------------------------
++# EventRecorder
++# ----------------------------------------------------------------------
++
++
++class EventRecorder:
++    """Records the backend function calls of a Blocks app to a JSONL file.
++
++    The recorder installs itself as a public call hook on the target
++    :class:`gradio.Blocks` when it starts recording, and removes itself
++    when it stops. Calls are captured regardless of whether they arrive
++    through the HTTP API routes, the queue, or a direct
++    ``Blocks.process_api()`` call, and no server or browser is required.
++
++    Each recorded call is written as one JSON line with sorted keys, ending
++    up on disk with the following canonical layout:
++
++    * ``api_name`` — the endpoint name (or the fn_name fallback);
++    * ``checksum`` — chained per-line SHA-256 (integrity, tamper-evident);
++    * ``duration`` — elapsed seconds spent inside the function;
++    * ``error`` — exception class name, or ``None`` on success;
++    * ``fn_name`` — the Python function's name;
++    * ``index`` — per-recorder monotonically increasing event index;
++    * ``inputs`` — captured effective input values (stateful values resolved);
++    * ``outputs`` — captured effective output values (or ``None`` on error);
++    * ``session_hash`` — the caller's session hash (may be ``None``);
++    * ``timestamp`` — POSIX seconds when the event was captured;
++    * ``type`` — always the literal string ``"event"``.
++
++    Example::
++
++        import gradio as gr
++
++        with gr.Blocks() as demo:
++            ...
++
++        with gr.EventRecorder(demo, "usage.jsonl"):
++            # ... drive the app through its API ...
++            pass
++
++        report = gr.replay_events(demo, "usage.jsonl")
++        assert report.ok
++    """
++
++    def __init__(
++        self,
++        blocks: Blocks,
++        record_path: str | Path,
++        include: Sequence[str] | None = None,
++        exclude: Sequence[str] | None = None,
++        redact: Sequence[str] | None = None,
++    ):
++        """
++        Parameters:
++            blocks: the Blocks app whose backend function calls are recorded.
++            record_path: path of the JSONL record file. The file (and its
++                parent directories) is created when recording starts.
++            include: if provided, only events whose api name or function
++                name matches one of these entries are recorded.
++            exclude: events whose api name or function name matches one of
++                these entries are skipped (applied after ``include``).
++            redact: input components whose label exactly matches one of
++                these entries have their recorded input value replaced by
++                ``"***"``.
++        """
++        self.blocks = blocks
++        self._record_path = Path(record_path)
++        self.include = list(include) if include is not None else None
++        self.exclude = list(exclude) if exclude is not None else None
++        self.redact = list(redact) if redact is not None else []
++        self._is_recording = False
++        self._events: list[dict[str, Any]] = []
++        self._lock = threading.Lock()
++        self._file = None
++        # The chain head is updated after every write; its initial value
++        # comes from the header. See ``_write_header_locked``.
++        self._chain: str | None = None
++        # A per-instance private key on the shared hook context — lets us
++        # stash the effective input snapshot captured on the ``before``
++        # phase without racing other recorders on the same blocks.
++        self._ctx_key = f"__event_recorder_{id(self)}__inputs"
++        self._hook_name = f"__event_recorder_{id(self)}"
++
++    # ------------------------------------------------------------------
++    # properties
++    # ------------------------------------------------------------------
++
++    @property
++    def record_path(self) -> Path:
++        """The path of the JSONL record file."""
++        return self._record_path
++
++    @property
++    def is_recording(self) -> bool:
++        """Whether the recorder is currently capturing events."""
++        return self._is_recording
++
++    @property
++    def events(self) -> list[dict[str, Any]]:
++        """A copy of the events recorded so far by this recorder."""
++        with self._lock:
++            return copy.deepcopy(self._events)
++
++    def __repr__(self) -> str:
++        state = "recording" if self._is_recording else "stopped"
++        return (
++            f"EventRecorder(record_path={str(self._record_path)!r}, "
++            f"events={len(self._events)}, {state})"
++        )
++
++    # ------------------------------------------------------------------
++    # recording lifecycle
++    # ------------------------------------------------------------------
++
++    def start(self) -> EventRecorder:
++        """Start recording. Idempotent: repeated calls have no extra effect.
++
++        The record file is created (with a header line) the first time
++        recording starts. Events are appended and flushed immediately so a
++        crashing process does not lose already-recorded events. Starting
++        also registers this recorder in the Blocks call-hook registry, so
++        ``blocks.get_call_hooks()`` will list one entry per active recorder.
++        """
++        with self._lock:
++            if self._is_recording:
++                return self
++            if self._file is None:
++                self._record_path.parent.mkdir(parents=True, exist_ok=True)
++                new_file = not self._record_path.exists()
++                self._file = open(self._record_path, "a", encoding="utf-8")
++                if new_file:
++                    self._write_header_locked()
++                else:
++                    # Resuming into an existing file: seed the chain from
++                    # the last line so subsequent events chain correctly.
++                    self._reseed_chain_locked()
++            self.blocks.add_call_hook(self._hook_name, self._on_event)
++            self._is_recording = True
++        return self
++
++    def stop(self) -> EventRecorder:
++        """Stop recording. Idempotent.
++
++        The recorder deregisters itself from the Blocks call-hook registry
++        but keeps its in-memory events. Calling ``start()`` again resumes
++        with a fresh hook registration and appends to the existing file.
++        """
++        with self._lock:
++            if self._is_recording:
++                self._is_recording = False
++                try:
++                    self.blocks.remove_call_hook(self._hook_name)
++                except Exception:
++                    pass
++            if self._file is not None:
++                try:
++                    self._file.flush()
++                finally:
++                    self._file.close()
++                self._file = None
++        return self
++
++    def close(self) -> None:
++        """Stop recording and detach the recorder from the Blocks instance."""
++        self.stop()
++
++    def __enter__(self) -> EventRecorder:
++        return self.start()
++
++    def __exit__(self, exc_type, exc_value, traceback) -> None:
++        self.close()
++
++    # ------------------------------------------------------------------
++    # internal record writing
++    # ------------------------------------------------------------------
++
++    def _write_header_locked(self) -> None:
++        """Emit the header line and seed the integrity chain from it.
++
++        The header is written in canonical form (sorted keys, unicode
++        preserved) with a ``checksum`` field derived from the rest of the
++        header. That checksum becomes the seed of the per-event chain so
++        modifying header metadata invalidates every event line downstream.
++        """
++        body = {
++            "created_at": datetime.now(timezone.utc).isoformat(),
++            "format_version": RECORD_FORMAT_VERSION,
++            "gradio_version": _gradio_version(),
++            "type": HEADER_RECORD_TYPE,
++        }
++        self._chain = _seed_chain(body)
++        header = dict(body)
++        header[_CHECKSUM_FIELD] = self._chain
++        self._file.write(canonical_json_dumps(header) + "\n")
++        self._file.flush()
++
++    def _reseed_chain_locked(self) -> None:
++        """Restore the chain head when resuming into an existing file."""
++        try:
++            header, events = read_record(self._record_path)
++        except Exception:
++            # Best-effort: on a corrupt file, fall back to re-seeding from
++            # the header alone; a subsequent write may then fail integrity
++            # verification, which is exactly what a caller would want.
++            self._chain = None
++            return
++        if events:
++            self._chain = events[-1].get(_CHECKSUM_FIELD)
++        else:
++            body = {k: v for k, v in header.items() if k != _CHECKSUM_FIELD}
++            self._chain = _seed_chain(body)
++
++    def _should_record(self, block_fn: BlockFunction) -> bool:
++        """Whether a call to this function passes the include/exclude filters."""
++        names = {
++            name
++            for name in (
++                block_fn.api_name if isinstance(block_fn.api_name, str) else None,
++                block_fn.name,
++            )
++            if name
++        }
++        if self.include is not None and not names.intersection(self.include):
++            return False
++        if self.exclude is not None and names.intersection(self.exclude):
++            return False
++        return True
++
++    def _redact_inputs(
++        self, block_fn: BlockFunction, inputs: list[Any]
++    ) -> list[Any]:
++        """Redact input values whose component label matches a redact entry."""
++        if not self.redact:
++            return inputs
++        redacted = list(inputs)
++        for i, block in enumerate(block_fn.inputs):
++            if i >= len(redacted):
++                break
++            label = _block_label(block)
++            if label is not None and label in self.redact:
++                redacted[i] = REDACTED_VALUE
++        return redacted
++
++    def _record(
++        self,
++        block_fn: BlockFunction,
++        effective_inputs: list[Any],
++        data: Sequence[Any] | None,
++        state: SessionState | None,
++        session_hash: str | None,
++        error_name: str | None,
++        duration: float,
++    ) -> dict[str, Any] | None:
++        """Build, store and persist one event record."""
++        if not self.is_recording:
++            return None
++        if error_name is None:
++            outputs = capture_effective_outputs(block_fn, data or [], state)
++        else:
++            outputs = None
++        inputs = self._redact_inputs(block_fn, effective_inputs)
++        with self._lock:
++            if not self._is_recording:
++                return None
++            body = {
++                "api_name": (
++                    block_fn.api_name
++                    if isinstance(block_fn.api_name, str)
++                    else None
++                ),
++                "duration": duration,
++                "error": error_name,
++                "fn_name": block_fn.name,
++                "index": len(self._events),
++                "inputs": _json_safe(inputs),
++                "outputs": _json_safe(outputs),
++                "session_hash": session_hash,
++                "timestamp": time.time(),
++                "type": EVENT_RECORD_TYPE,
++            }
++            prev = self._chain or ""
++            chain = _next_chain(prev, body)
++            self._chain = chain
++            event = dict(body)
++            event[_CHECKSUM_FIELD] = chain
++            self._events.append(event)
++            if self._file is not None:
++                self._file.write(canonical_json_dumps(event) + "\n")
++                self._file.flush()
++        return copy.deepcopy(event)
++
++    # ------------------------------------------------------------------
++    # call-hook adapter
++    # ------------------------------------------------------------------
++
++    def _on_event(self, phase: str, ctx: dict[str, Any]) -> None:
++        """Adapter between the public call-hook protocol and ``_record``.
++
++        On ``"before"`` we snapshot the effective inputs, which is what the
++        function sees *at the start of the call*: state-holding inputs must
++        be captured before the function has a chance to mutate them. On
++        ``"after"`` we build the outputs (or the error name) and persist
++        one event record.
++        """
++        # A replay of the same file must not re-record itself; the
++        # replay machinery increments this counter for the duration of a
++        # ``replay_events()`` call.
++        if getattr(self.blocks, "_event_recording_suspended", 0) > 0:
++            return
++        if not self._is_recording:
++            return
++        block_fn = ctx.get("block_fn")
++        if block_fn is None:
++            return
++        # Continuation calls of generator functions carry an in-progress
++        # iterator; we only record the initial call.
++        if ctx.get("iterator") is not None:
++            return
++        if not self._should_record(block_fn):
++            return
++        state = ctx.get("state")
++        if phase == "before":
++            ctx[self._ctx_key] = capture_effective_inputs(
++                block_fn, ctx.get("inputs") or [], state
++            )
++            return
++        if phase != "after":
++            return
++        effective_inputs = ctx.get(self._ctx_key)
++        if effective_inputs is None:
++            # ``before`` did not fire (e.g. a hook was added mid-call);
++            # fall back to a best-effort snapshot from the raw payload.
++            effective_inputs = capture_effective_inputs(
++                block_fn, ctx.get("inputs") or [], state
++            )
++        error = ctx.get("error")
++        duration = ctx.get("duration") or 0.0
++        if error is None:
++            self._record(
++                block_fn,
++                effective_inputs,
++                ctx.get("outputs") or [],
++                state,
++                ctx.get("session_hash"),
++                error_name=None,
++                duration=duration,
++            )
++        else:
++            self._record(
++                block_fn,
++                effective_inputs,
++                None,
++                state,
++                ctx.get("session_hash"),
++                error_name=_exception_name(error),
++                duration=duration,
++            )
++
++
++def _gradio_version() -> str:
++    """Return the installed gradio version string for the record header."""
++    try:
++        from gradio import utils
++
++        return utils.get_package_version()
++    except Exception:
++        return "unknown"
++
++
++# ----------------------------------------------------------------------
++# record file reading
++# ----------------------------------------------------------------------
++
++
++def read_record(
++    record_path: str | Path,
++) -> tuple[dict[str, Any], list[dict[str, Any]]]:
++    """Read a JSONL record file and return ``(header, events)``.
++
++    Raises:
++        FileNotFoundError: if the record file does not exist.
++        ValueError: if the file is empty, has an invalid or unsupported
++            header, contains a corrupt or malformed event line, or fails
++            the per-line integrity check (chain hash mismatch,
++            reordering, or a dropped line).
++    """
++    path = Path(record_path)
++    if not path.exists():
++        raise FileNotFoundError(f"Record file not found: {path}")
++
++    with open(path, encoding="utf-8") as f:
++        first_line = f.readline()
++        if not first_line.strip():
++            raise ValueError(f"Record file is empty: {path}")
++        try:
++            header = json.loads(first_line)
++        except json.JSONDecodeError as e:
++            raise ValueError(
++                f"Record file {path} has a corrupt header line: {e}"
++            ) from e
++        if not isinstance(header, dict) or header.get("type") != HEADER_RECORD_TYPE:
++            raise ValueError(
++                f"Record file {path} does not start with a valid header record."
++            )
++        if header.get("format_version") != RECORD_FORMAT_VERSION:
++            raise ValueError(
++                f"Unsupported record format version: "
++                f"{header.get('format_version')!r} "
++                f"(expected {RECORD_FORMAT_VERSION})."
++            )
++        stored_header_checksum = header.get(_CHECKSUM_FIELD)
++        if not isinstance(stored_header_checksum, str):
++            raise ValueError(
++                f"Record file {path} header is missing an integrity checksum."
++            )
++        body_only = {k: v for k, v in header.items() if k != _CHECKSUM_FIELD}
++        expected_seed = _seed_chain(body_only)
++        if expected_seed != stored_header_checksum:
++            raise ValueError(
++                f"Record file {path} header failed integrity check "
++                "(checksum mismatch)."
++            )
++        prev_chain = stored_header_checksum
++
++        events: list[dict[str, Any]] = []
++        for lineno, line in enumerate(f, start=2):
++            stripped = line.strip()
++            if not stripped:
++                continue
++            try:
++                record = json.loads(stripped)
++            except json.JSONDecodeError as e:
++                raise ValueError(
++                    f"Record file {path} has a corrupt event at line {lineno}: {e}"
++                ) from e
++            if (
++                not isinstance(record, dict)
++                or record.get("type") != EVENT_RECORD_TYPE
++            ):
++                raise ValueError(
++                    f"Record file {path} has a malformed event at line "
++                    f"{lineno}: missing 'type': 'event'."
++                )
++            checksum = record.get(_CHECKSUM_FIELD)
++            if not isinstance(checksum, str):
++                raise ValueError(
++                    f"Record file {path} event at line {lineno} is missing "
++                    "its integrity checksum."
++                )
++            body_only = {k: v for k, v in record.items() if k != _CHECKSUM_FIELD}
++            expected = _next_chain(prev_chain, body_only)
++            if expected != checksum:
++                raise ValueError(
++                    f"Record file {path} failed integrity check at line "
++                    f"{lineno}: the file has been modified, reordered, or "
++                    "an event was dropped."
++                )
++            prev_chain = checksum
++            events.append(record)
++    return header, events
++
++
++def load_events(record_path: str | Path) -> list[dict[str, Any]]:
++    """Load the recorded events from a JSONL record file (header excluded).
++
++    Raises the same errors as :func:`read_record`.
++    """
++    _, events = read_record(record_path)
++    return events
++
++
++# ----------------------------------------------------------------------
++# replay
++# ----------------------------------------------------------------------
++
++
++@dataclass
++class ReplayResult:
++    """The outcome of replaying a single recorded event.
++
++    Attributes:
++        index: the ``index`` field of the recorded event.
++        api_name: the recorded api name (may be ``None``).
++        fn_name: the recorded function name.
++        status: one of ``"match"``, ``"mismatch"``, ``"missing"`` or
++            ``"error"``.
++        expected: the recorded outputs (list) or recorded exception name
++            (string) for error events; ``None`` when not applicable.
++        actual: the replayed outputs (list) or replayed exception name
++            (string); ``None`` when not applicable.
++        error: additional detail for status ``"error"`` (an unexpected
++            failure of the replay machinery itself), otherwise ``None``.
++    """
++
++    index: int
++    api_name: str | None
++    fn_name: str | None
++    status: str
++    expected: Any = None
++    actual: Any = None
++    error: str | None = None
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return a JSON-serializable representation of this result."""
++        return {
++            "index": self.index,
++            "api_name": self.api_name,
++            "fn_name": self.fn_name,
++            "status": self.status,
++            "expected": _json_safe(self.expected),
++            "actual": _json_safe(self.actual),
++            "error": self.error,
++        }
++
++
++@dataclass
++class ReplayReport:
++    """Aggregated outcome of replaying a record file against an app.
++
++    Attributes:
++        results: the per-event replay results, in record order.
++    """
++
++    results: list[ReplayResult] = field(default_factory=list)
++
++    @property
++    def total(self) -> int:
++        """Total number of events replayed."""
++        return len(self.results)
++
++    def _count(self, status: str) -> int:
++        return sum(1 for r in self.results if r.status == status)
++
++    @property
++    def matched(self) -> int:
++        """Number of events whose replayed behavior matches the record."""
++        return self._count(STATUS_MATCH)
++
++    @property
++    def mismatched(self) -> int:
++        """Number of events whose replayed outputs or error differ."""
++        return self._count(STATUS_MISMATCH)
++
++    @property
++    def missing(self) -> int:
++        """Number of events whose function no longer exists in the app."""
++        return self._count(STATUS_MISSING)
++
++    @property
++    def errors(self) -> int:
++        """Number of events that could not be replayed at all."""
++        return self._count(STATUS_ERROR)
++
++    @property
++    def ok(self) -> bool:
++        """True when every recorded event replayed successfully and matched."""
++        return self.total > 0 and self.matched == self.total
++
++    @property
++    def mismatches(self) -> list[ReplayResult]:
++        """All results that did not match (mismatch, missing or error)."""
++        return [r for r in self.results if r.status != STATUS_MATCH]
++
++    def summary(self) -> str:
++        """A one-line human readable summary of the report."""
++        return (
++            f"replayed {self.total} event(s): {self.matched} matched, "
++            f"{self.mismatched} mismatched, {self.missing} missing, "
++            f"{self.errors} error(s)"
++        )
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return a JSON-serializable representation of this report."""
++        return {
++            "total": self.total,
++            "matched": self.matched,
++            "mismatched": self.mismatched,
++            "missing": self.missing,
++            "errors": self.errors,
++            "ok": self.ok,
++            "results": [r.to_dict() for r in self.results],
++        }
++
++    def __bool__(self) -> bool:
++        return self.ok
++
++    def assert_ok(self) -> None:
++        """Raise an AssertionError describing the divergences, if any.
++
++        Convenience helper for using replay reports directly as regression
++        checks in a test suite: ``gr.replay_events(demo, path).assert_ok()``.
++        """
++        if self.ok:
++            return
++        lines = [self.summary()]
++        for result in self.mismatches:
++            lines.append(
++                f"  event {result.index} (api_name={result.api_name!r}): "
++                f"{result.status}, expected={result.expected!r}, "
++                f"actual={result.actual!r}"
++            )
++        raise AssertionError("\n".join(lines))
++
++    def __repr__(self) -> str:
++        return f"ReplayReport({self.summary()})"
++
++
++def _find_block_fn(blocks: Blocks, api_name: str | None, fn_name: str | None):
++    """Locate the BlockFunction a recorded event refers to.
++
++    Api names are matched first (they are the stable identifier the record
++    file was written with); the function name is used as a fallback for
++    events that were recorded without an api name, and for records whose
++    api name was renamed but whose function was not.
++    """
++    if api_name is not None:
++        for block_fn in blocks.fns.values():
++            if block_fn.api_name == api_name:
++                return block_fn
++    if fn_name:
++        for block_fn in blocks.fns.values():
++            if block_fn.name == fn_name:
++                return block_fn
++    return None
++
++
++def _event_matches_filter(
++    event: dict[str, Any], api_names: Iterable[str] | None
++) -> bool:
++    """Whether an event passes the replay filter (matches on api or fn name)."""
++    if api_names is None:
++        return True
++    names = {event.get("api_name"), event.get("fn_name")}
++    return bool(names.intersection(api_names))
++
++
++async def _replay_single_event(
++    blocks: Blocks,
++    block_fn: BlockFunction,
++    event: dict[str, Any],
++) -> tuple[Any, str | None]:
++    """Re-execute one recorded event and return ``(effective_outputs, error)``.
++
++    A fresh session is created for the event, the recorded values of
++    stateful inputs are injected into it via
++    :meth:`SessionState.restore`, and the call is run through the same
++    ``process_api()`` pipeline as a real frontend call.
++    """
++    session = SessionState(blocks)
++    inputs = list(event.get("inputs") or [])
++    snapshot: dict[int, Any] = {}
++    for i, block in enumerate(block_fn.inputs):
++        if i >= len(inputs):
++            break
++        if getattr(block, "stateful", False):
++            snapshot[block._id] = copy.deepcopy(inputs[i])
++    if snapshot:
++        session.restore(snapshot)
++    try:
++        output = await blocks.process_api(
++            block_fn=block_fn,
++            inputs=inputs,
++            state=session,
++            session_hash=event.get("session_hash"),
++        )
++    except Exception as e:
++        return None, _exception_name(e)
++    return capture_effective_outputs(block_fn, output["data"], session), None
++
++
++def replay_events(
++    blocks: Blocks,
++    record_path: str | Path,
++    api_names: Sequence[str] | None = None,
++) -> ReplayReport:
++    """Replay a record file against a Blocks app and compare behavior.
++
++    Each recorded event is re-executed through the regular invocation
++    pipeline (no server is started) with a fresh session; the recorded
++    values of stateful inputs are restored before the call using
++    :meth:`SessionState.restore`. Replayed outputs are compared to the
++    recorded outputs with strict (structural) equality; error events are
++    compared by exception class name. Calls made during replay are never
++    captured by attached recorders.
++
++    Parameters:
++        blocks: the app to replay the events against.
++        record_path: path of the JSONL record file produced by
++            :class:`EventRecorder`.
++        api_names: if provided, only events whose api name or function
++            name matches one of these entries are replayed.
++
++    Returns:
++        A :class:`ReplayReport` with one :class:`ReplayResult` per
++        replayed event.
++    """
++    events = load_events(record_path)
++    report = ReplayReport()
++    blocks._event_recording_suspended += 1  # noqa: SLF001
++    try:
++        for event in events:
++            if not _event_matches_filter(event, api_names):
++                continue
++            index = event.get("index", len(report.results))
++            api_name = event.get("api_name")
++            fn_name = event.get("fn_name")
++            block_fn = _find_block_fn(blocks, api_name, fn_name)
++            if block_fn is None:
++                report.results.append(
++                    ReplayResult(
++                        index=index,
++                        api_name=api_name,
++                        fn_name=fn_name,
++                        status=STATUS_MISSING,
++                        expected=event.get("outputs") or event.get("error"),
++                        actual=None,
++                    )
++                )
++                continue
++            try:
++                asyncio.get_running_loop()
++            except RuntimeError:
++                loop_already_running = False
++            else:
++                loop_already_running = True
++            if loop_already_running:
++                report.results.append(
++                    ReplayResult(
++                        index=index,
++                        api_name=api_name,
++                        fn_name=fn_name,
++                        status=STATUS_ERROR,
++                        expected=event.get("outputs") or event.get("error"),
++                        actual=None,
++                        error=(
++                            "RuntimeError: replay_events() cannot be called "
++                            "from a running event loop; call it from "
++                            "synchronous code."
++                        ),
++                    )
++                )
++                continue
++            try:
++                actual_outputs, actual_error = asyncio.run(
++                    _replay_single_event(blocks, block_fn, event)
++                )
++            except Exception as e:
++                report.results.append(
++                    ReplayResult(
++                        index=index,
++                        api_name=api_name,
++                        fn_name=fn_name,
++                        status=STATUS_ERROR,
++                        expected=event.get("outputs") or event.get("error"),
++                        actual=None,
++                        error=f"{_exception_name(e)}: {e}",
++                    )
++                )
++                continue
++            expected_error = event.get("error")
++            if expected_error is not None or actual_error is not None:
++                matched = (
++                    expected_error is not None
++                    and expected_error == actual_error
++                )
++                expected: Any = expected_error
++                actual: Any = actual_error
++            else:
++                expected = _json_safe(event.get("outputs"))
++                actual = _json_safe(actual_outputs)
++                matched = expected == actual
++            report.results.append(
++                ReplayResult(
++                    index=index,
++                    api_name=api_name,
++                    fn_name=fn_name,
++                    status=STATUS_MATCH if matched else STATUS_MISMATCH,
++                    expected=expected,
++                    actual=actual,
++                )
++            )
++    finally:
++        blocks._event_recording_suspended -= 1  # noqa: SLF001
++    return report
+diff --git a/gradio/state_holder.py b/gradio/state_holder.py
+index bcca47e..85ba3e3 100644
+--- a/gradio/state_holder.py
++++ b/gradio/state_holder.py
+@@ -135,6 +135,52 @@ class SessionState:
+             if config:
+                 yield config
+ 
++    def snapshot(self) -> dict[int, Any]:
++        """Return a deep copy of every stateful component's session value.
++
++        The result maps a stateful component's block id to a deep copy of the
++        value that this session currently holds for it. Non-stateful
++        components are not represented at all, since their value lives on
++        the ``Blocks`` config rather than on the session.
++
++        The dict and every value in it are fresh copies: mutating the returned
++        structure never touches session state, and the same is true in
++        reverse — later mutations of session state never surface in a
++        previously returned snapshot. This makes ``snapshot()`` safe to
++        stash for comparisons, JSON dumps, or later ``restore()`` calls.
++        """
++        from gradio.components import State
++
++        result: dict[int, Any] = {}
++        for key, block in self.blocks_config.blocks.items():
++            if isinstance(block, State) or getattr(block, "stateful", False):
++                if key in self.state_data:
++                    result[key] = deepcopy(self.state_data[key])
++        return result
++
++    def restore(self, snapshot: dict[int, Any]) -> None:
++        """Overwrite this session's stateful values from a prior ``snapshot``.
++
++        Each ``(component_id, value)`` pair from ``snapshot`` is deep-copied
++        into the session, replacing whatever value the session previously
++        held for that stateful component. Keys that refer to blocks the
++        current app no longer has are silently skipped, so a snapshot taken
++        against one app version can be replayed against a compatible variant.
++
++        This is the inverse of ``snapshot()`` and is meant to reinstate a
++        session at a known point in time — typically for regression replay:
++        capture the state at record time, restore it on a fresh session, run
++        the recorded call, and compare outputs.
++        """
++        for key, value in snapshot.items():
++            if key not in self.blocks_config.blocks:
++                continue
++            self.state_data[key] = deepcopy(value)
++            self._state_ttl.setdefault(
++                key, (getattr(self.blocks_config.blocks[key], "time_to_live", None),
++                      datetime.datetime.now()),
++            )
++
+     @property
+     def state_components(self) -> Iterator[tuple[State, Any, bool]]:
+         from gradio.components import State
+diff --git a/gradio/utils.py b/gradio/utils.py
+index bccb877..9707bbb 100644
+--- a/gradio/utils.py
++++ b/gradio/utils.py
+@@ -95,6 +95,63 @@ def get_package_version() -> str:
+         return ""
+ 
+ 
++def canonical_json_dumps(obj: Any) -> str:
++    """Serialize ``obj`` to JSON in Gradio's canonical form.
++
++    The canonical form is the byte-for-byte-stable representation shared by
++    every part of Gradio that writes JSON meant to be diffed, archived, or
++    included in code review (record files, snapshot dumps, and similar). It
++    guarantees:
++
++    * dictionary keys are sorted alphabetically at every level;
++    * non-ASCII characters are preserved verbatim (``ensure_ascii=False``);
++    * ``NaN``, ``Infinity`` and ``-Infinity`` are rejected — a value that
++      cannot round-trip through strict JSON has no canonical form, so
++      ``ValueError`` is raised;
++    * Python tuples (which have no JSON counterpart) are normalized to lists
++      so that ``(1, 2)`` and ``[1, 2]`` produce the same output.
++    """
++    normalized = _canonical_normalize(obj)
++    try:
++        return json.dumps(
++            normalized,
++            sort_keys=True,
++            ensure_ascii=False,
++            allow_nan=False,
++            separators=(", ", ": "),
++        )
++    except ValueError as e:
++        # json.dumps raises ValueError on NaN/Infinity when allow_nan=False;
++        # re-raise with a message that names the offender for the caller.
++        raise ValueError(
++            f"cannot serialize non-finite float in canonical JSON: {e}"
++        ) from e
++
++
++def _canonical_normalize(obj: Any) -> Any:
++    """Recursively normalize a value so ``canonical_json_dumps`` is stable.
++
++    Tuples become lists, dicts are rebuilt with sorted keys (json.dumps does
++    the sorting on write, but eager rebuilding keeps behavior identical
++    regardless of how the caller pretty-prints), and floats are validated
++    up front so a bad value points to its container path rather than the
++    opaque json.dumps message.
++    """
++    import math
++
++    if isinstance(obj, dict):
++        return {str(k): _canonical_normalize(v) for k, v in obj.items()}
++    if isinstance(obj, (list, tuple)):
++        return [_canonical_normalize(v) for v in obj]
++    if isinstance(obj, float):
++        if math.isnan(obj) or math.isinf(obj):
++            raise ValueError(
++                "canonical_json_dumps: refusing to serialize non-finite float "
++                f"({obj!r})"
++            )
++    return obj
++
++
+ def safe_get_lock() -> asyncio.Lock:
+     """Get asyncio.Lock() without fear of getting an Exception.
+ 
+diff --git a/test/test_event_recorder.py b/test/test_event_recorder.py
+new file mode 100644
+index 0000000..b2734e3
+--- /dev/null
++++ b/test/test_event_recorder.py
+@@ -0,0 +1,1415 @@
++"""Tests for gradio.event_recorder: EventRecorder, load_events, replay_events."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import threading
++import time
++
++import pytest
++from fastapi.testclient import TestClient
++
++import gradio as gr
++from gradio.event_recorder import (
++    RECORD_FORMAT_VERSION,
++    EventRecorder,
++    ReplayReport,
++    read_record,
++)
++from gradio.routes import App
++from gradio.state_holder import SessionState
++
++
++def run(coro):
++    return asyncio.run(coro)
++
++
++def make_number_app(fn, api_name="add"):
++    with gr.Blocks() as demo:
++        a = gr.Number(label="a")
++        b = gr.Number(label="b")
++        out = gr.Number(label="sum")
++        btn = gr.Button("go")
++        btn.click(fn, [a, b], out, api_name=api_name)
++    return demo
++
++
++def add(a, b):
++    return a + b
++
++
++def read_lines(path):
++    with open(path, encoding="utf-8") as f:
++        return [json.loads(line) for line in f if line.strip()]
++
++
++class TestEventRecorderLifecycle:
++    def test_not_recording_before_start(self, tmp_path):
++        demo = make_number_app(add)
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path)
++        assert not rec.is_recording
++        state = SessionState(demo)
++        result = run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        assert result["data"] == [3.0]
++        assert rec.events == []
++        assert not path.exists()
++
++    def test_file_created_with_header_on_start(self, tmp_path):
++        demo = make_number_app(add)
++        path = tmp_path / "sub" / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        assert path.exists()
++        header, events = read_record(path)
++        assert header["type"] == "header"
++        assert header["format_version"] == RECORD_FORMAT_VERSION
++        assert header["gradio_version"]
++        assert header["created_at"]
++        assert events == []
++        rec.close()
++
++    def test_existing_file_not_duplicating_header(self, tmp_path):
++        demo = make_number_app(add)
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.stop()
++        rec.start()
++        run(demo.process_api(0, [3.0, 4.0], state=state, session_hash="s"))
++        rec.stop()
++        lines = read_lines(path)
++        assert sum(1 for line in lines if line["type"] == "header") == 1
++        assert sum(1 for line in lines if line["type"] == "event") == 2
++
++    def test_start_stop_idempotent(self, tmp_path):
++        demo = make_number_app(add)
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path)
++        rec.start()
++        rec.start()
++        assert rec.is_recording
++        rec.stop()
++        rec.stop()
++        assert not rec.is_recording
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        assert rec.events == []
++
++    def test_restart_continues_index(self, tmp_path):
++        demo = make_number_app(add)
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.stop()
++        rec.start()
++        run(demo.process_api(0, [4.0, 5.0], state=state, session_hash="s"))
++        rec.stop()
++        assert [e["index"] for e in rec.events] == [0, 1]
++
++    def test_context_manager(self, tmp_path):
++        demo = make_number_app(add)
++        path = tmp_path / "rec.jsonl"
++        with EventRecorder(demo, path) as rec:
++            assert rec.is_recording
++            state = SessionState(demo)
++            run(demo.process_api(0, [2.0, 3.0], state=state, session_hash="s"))
++        assert not rec.is_recording
++        assert len(rec.events) == 1
++        # after close() the recorder is detached: no more recording even after start?
++        # close() detaches, but start() re-attaches.
++        rec.start()
++        run(demo.process_api(0, [2.0, 3.0], state=state, session_hash="s"))
++        rec.stop()
++        assert len(rec.events) == 2
++
++    def test_close_detaches(self, tmp_path):
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl")
++        # Not-yet-started: no call hook is registered.
++        assert demo.get_call_hooks() == []
++        rec.start()
++        assert len(demo.get_call_hooks()) == 1
++        rec.close()
++        assert demo.get_call_hooks() == []
++
++    def test_record_path_property(self, tmp_path):
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl")
++        assert str(rec.record_path).endswith("rec.jsonl")
++
++    def test_events_property_returns_copy(self, tmp_path):
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        events = rec.events
++        events[0]["inputs"][0] = 999
++        events.append({"fake": True})
++        assert len(rec.events) == 1
++        assert rec.events[0]["inputs"] == [1.0, 2.0]
++        rec.close()
++
++
++class TestEventRecording:
++    def test_basic_event_fields(self, tmp_path):
++        demo = make_number_app(add)
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="sess-1"))
++        rec.stop()
++        (event,) = rec.events
++        assert event["type"] == "event"
++        assert event["index"] == 0
++        assert event["api_name"] == "add"
++        assert event["fn_name"] == "add"
++        assert event["session_hash"] == "sess-1"
++        assert event["inputs"] == [1.0, 2.0]
++        assert event["outputs"] == [3.0]
++        assert event["error"] is None
++        assert event["duration"] >= 0
++        assert event["timestamp"] > 0
++        # the file contains exactly the same event
++        file_events = gr.load_events(path)
++        assert file_events == rec.events
++
++    def test_events_flushed_immediately(self, tmp_path):
++        demo = make_number_app(add)
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        # readable while still recording
++        events = gr.load_events(path)
++        assert len(events) == 1
++        rec.close()
++
++    def test_multiple_events_in_order(self, tmp_path):
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        for i in range(5):
++            run(
++                demo.process_api(0, [float(i), 1.0], state=state, session_hash="s")
++            )
++        rec.close()
++        assert [e["index"] for e in rec.events] == list(range(5))
++        assert [e["outputs"] for e in rec.events] == [[float(i) + 1.0] for i in range(5)]
++
++    def test_multiple_recorders_on_same_app(self, tmp_path):
++        demo = make_number_app(add)
++        rec1 = EventRecorder(demo, tmp_path / "r1.jsonl").start()
++        rec2 = EventRecorder(demo, tmp_path / "r2.jsonl").start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec1.close()
++        rec2.close()
++        # ``checksum`` chains from the header so two independent files
++        # necessarily disagree on it even for otherwise identical events.
++        volatile = ("timestamp", "duration", "checksum")
++        strip = lambda events: [  # noqa: E731
++            {k: v for k, v in e.items() if k not in volatile} for e in events
++        ]
++        assert strip(rec1.events) == strip(rec2.events)
++        assert strip(gr.load_events(tmp_path / "r1.jsonl")) == strip(
++            gr.load_events(tmp_path / "r2.jsonl")
++        )
++
++    def test_stopped_recorder_gets_nothing_while_other_records(self, tmp_path):
++        demo = make_number_app(add)
++        rec1 = EventRecorder(demo, tmp_path / "r1.jsonl").start()
++        rec2 = EventRecorder(demo, tmp_path / "r2.jsonl")  # never started
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec1.close()
++        assert len(rec1.events) == 1
++        assert rec2.events == []
++
++    def test_unnamed_api_records_fn_name(self, tmp_path):
++        with gr.Blocks() as demo:
++            a = gr.Number(label="a")
++            b = gr.Number(label="b")
++            out = gr.Number(label="sum")
++            btn = gr.Button("go")
++            btn.click(add, [a, b], out)  # no api_name
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++        (event,) = rec.events
++        assert event["api_name"] == "add"  # falls back to function name
++        assert event["fn_name"] == "add"
++
++    def test_include_filter(self, tmp_path):
++        with gr.Blocks() as demo:
++            a = gr.Number(label="a")
++            b = gr.Number(label="b")
++            out = gr.Number(label="sum")
++            diff = gr.Number(label="diff")
++            btn = gr.Button("go")
++            btn.click(add, [a, b], out, api_name="add")
++            btn.click(lambda x, y: x - y, [a, b], diff, api_name="sub")
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl", include=["add"]).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [3.0, 1.0], state=state, session_hash="s"))
++        run(demo.process_api(1, [3.0, 1.0], state=state, session_hash="s"))
++        rec.close()
++        assert len(rec.events) == 1
++        assert rec.events[0]["api_name"] == "add"
++
++    def test_exclude_filter(self, tmp_path):
++        with gr.Blocks() as demo:
++            a = gr.Number(label="a")
++            b = gr.Number(label="b")
++            out = gr.Number(label="sum")
++            diff = gr.Number(label="diff")
++            btn = gr.Button("go")
++            btn.click(add, [a, b], out, api_name="add")
++            btn.click(lambda x, y: x - y, [a, b], diff, api_name="sub")
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl", exclude=["sub"]).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [3.0, 1.0], state=state, session_hash="s"))
++        run(demo.process_api(1, [3.0, 1.0], state=state, session_hash="s"))
++        rec.close()
++        assert len(rec.events) == 1
++        assert rec.events[0]["api_name"] == "add"
++
++    def test_filter_matches_fn_name_too(self, tmp_path):
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl", include=["add"]).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 1.0], state=state, session_hash="s"))
++        rec.close()
++        assert len(rec.events) == 1
++
++    def test_error_event_recorded_and_exception_propagates(self, tmp_path):
++        def boom(a, b):
++            raise ValueError("cannot compute")
++
++        demo = make_number_app(boom)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        with pytest.raises(ValueError, match="cannot compute"):
++            run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++        (event,) = rec.events
++        assert event["error"] == "ValueError"
++        assert event["outputs"] is None
++        assert event["inputs"] == [1.0, 2.0]
++
++    def test_redaction_by_label(self, tmp_path):
++        def login(user, password):
++            return f"{user}:{password}"
++
++        with gr.Blocks() as demo:
++            user = gr.Textbox(label="用户名")
++            password = gr.Textbox(label="密码")
++            out = gr.Textbox(label="out")
++            btn = gr.Button("login")
++            btn.click(login, [user, password], out, api_name="login")
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl", redact=["密码"]).start()
++        state = SessionState(demo)
++        run(
++            demo.process_api(
++                0, ["alice", "hunter2"], state=state, session_hash="s"
++            )
++        )
++        rec.close()
++        (event,) = rec.events
++        assert event["inputs"] == ["alice", "***"]
++        # outputs are not redacted
++        assert event["outputs"] == ["alice:hunter2"]
++
++    def test_redaction_non_matching_label_untouched(self, tmp_path):
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl", redact=["密码"]).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++        assert rec.events[0]["inputs"] == [1.0, 2.0]
++
++    def test_stateful_input_records_session_value(self, tmp_path):
++        def counter(n, st):
++            return st + n
++
++        with gr.Blocks() as demo:
++            n = gr.Number(label="n")
++            st = gr.State(100)
++            out = gr.Number(label="out")
++            btn = gr.Button("go")
++            btn.click(counter, [n, st], out, api_name="counter")
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        # the raw payload value for the State component is ignored by gradio;
++        # the session value (100) is what the function actually sees.
++        run(demo.process_api(0, [5.0, None], state=state, session_hash="s"))
++        rec.close()
++        (event,) = rec.events
++        assert event["inputs"] == [5.0, 100]
++        assert event["outputs"] == [105.0]
++
++    def test_stateful_output_records_new_session_value(self, tmp_path):
++        def counter(n, st):
++            return st + n, st + n
++
++        with gr.Blocks() as demo:
++            n = gr.Number(label="n")
++            st = gr.State(0)
++            out = gr.Number(label="out")
++            btn = gr.Button("go")
++            btn.click(counter, [n, st], [out, st], api_name="counter")
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [5.0, None], state=state, session_hash="s"))
++        run(demo.process_api(0, [5.0, None], state=state, session_hash="s"))
++        rec.close()
++        first, second = rec.events
++        # the raw `data` payload holds None for State outputs; the recorder
++        # stores the new session value instead.
++        assert first["outputs"] == [5.0, 5.0]
++        assert second["inputs"] == [5.0, 5.0]
++        assert second["outputs"] == [10.0, 10.0]
++
++    def test_generator_records_only_first_call(self, tmp_path):
++        def gen(x):
++            for i in range(3):
++                yield x + i
++
++        with gr.Blocks() as demo:
++            x = gr.Number(label="x")
++            o = gr.Number(label="o")
++            b = gr.Button("g")
++            b.click(gen, x, o, api_name="gen")
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        first = run(demo.process_api(0, [10.0], state=state, session_hash="g"))
++        assert first["is_generating"]
++        second = run(
++            demo.process_api(
++                0, [], state=state, session_hash="g", iterator=first["iterator"]
++            )
++        )
++        assert second["is_generating"]
++        rec.close()
++        assert len(rec.events) == 1
++        assert rec.events[0]["inputs"] == [10.0]
++        assert rec.events[0]["outputs"] == [10.0]
++
++    def test_non_serializable_values_normalized(self, tmp_path):
++        def make_tuple(a, b):
++            return (a, b)  # tuples are not JSON arrays natively
++
++        with gr.Blocks() as demo:
++            a = gr.Number(label="a")
++            b = gr.Number(label="b")
++            o1 = gr.Number(label="o1")
++            o2 = gr.Number(label="o2")
++            btn = gr.Button("go")
++            btn.click(make_tuple, [a, b], [o1, o2], api_name="tup")
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++        # every event must round-trip through JSON
++        json.dumps(rec.events[0])
++        assert rec.events[0]["outputs"] == [1.0, 2.0]
++
++    def test_recording_thread_safe(self, tmp_path):
++        def slow_add(a, b):
++            time.sleep(0.01)
++            return a + b
++
++        demo = make_number_app(slow_add)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++
++        def call(i):
++            state = SessionState(demo)
++            run(demo.process_api(0, [float(i), 1.0], state=state, session_hash=f"s{i}"))
++
++        threads = [threading.Thread(target=call, args=(i,)) for i in range(10)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++        rec.close()
++        assert len(rec.events) == 10
++        assert sorted(e["index"] for e in rec.events) == list(range(10))
++        # file lines are well-formed (no interleaved writes)
++        events = gr.load_events(tmp_path / "rec.jsonl")
++        assert len(events) == 10
++
++
++class TestHttpPathRecording:
++    def test_queue_calls_are_recorded(self, tmp_path):
++        def echo(name):
++            return f"hi {name}"
++
++        with gr.Blocks() as demo:
++            name = gr.Textbox(label="name")
++            out = gr.Textbox(label="out")
++            btn = gr.Button("go")
++            btn.click(echo, name, out, api_name="echo")
++
++        demo.queue()
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        app = App.create_app(demo)
++        with TestClient(app) as client:
++            client.get("/gradio_api/startup-events", timeout=10)
++            client.post(
++                "/gradio_api/queue/join",
++                json={
++                    "data": ["alice"],
++                    "fn_index": 0,
++                    "event_data": None,
++                    "session_hash": "sess-http",
++                    "trigger_id": None,
++                },
++                timeout=10,
++            )
++            response = client.get(
++                "/gradio_api/queue/data?session_hash=sess-http", timeout=15
++            )
++            for line in response.iter_lines():
++                if "process_completed" in line:
++                    break
++        rec.close()
++        (event,) = rec.events
++        assert event["api_name"] == "echo"
++        assert event["session_hash"] == "sess-http"
++        assert event["inputs"] == ["alice"]
++        assert event["outputs"] == ["hi alice"]
++
++
++class TestLoadEvents:
++    def test_missing_file(self, tmp_path):
++        with pytest.raises(FileNotFoundError):
++            gr.load_events(tmp_path / "nope.jsonl")
++
++    def test_empty_file(self, tmp_path):
++        path = tmp_path / "empty.jsonl"
++        path.write_text("")
++        with pytest.raises(ValueError):
++            gr.load_events(path)
++
++    def test_corrupt_header(self, tmp_path):
++        path = tmp_path / "bad.jsonl"
++        path.write_text("not json\n")
++        with pytest.raises(ValueError):
++            gr.load_events(path)
++
++    def test_wrong_record_type(self, tmp_path):
++        path = tmp_path / "bad.jsonl"
++        path.write_text(json.dumps({"type": "event", "index": 0}) + "\n")
++        with pytest.raises(ValueError):
++            gr.load_events(path)
++
++    def test_unsupported_format_version(self, tmp_path):
++        path = tmp_path / "bad.jsonl"
++        path.write_text(
++            json.dumps({"type": "header", "format_version": 999}) + "\n"
++        )
++        with pytest.raises(ValueError):
++            gr.load_events(path)
++
++    def test_corrupt_event_line(self, tmp_path):
++        path = tmp_path / "bad.jsonl"
++        header = {"type": "header", "format_version": RECORD_FORMAT_VERSION}
++        path.write_text(json.dumps(header) + "\n{bad json\n")
++        with pytest.raises(ValueError):
++            gr.load_events(path)
++
++    def test_malformed_event_line(self, tmp_path):
++        path = tmp_path / "bad.jsonl"
++        header = {"type": "header", "format_version": RECORD_FORMAT_VERSION}
++        path.write_text(json.dumps(header) + "\n" + json.dumps({"type": "x"}) + "\n")
++        with pytest.raises(ValueError):
++            gr.load_events(path)
++
++
++class TestReplay:
++    def record_two_calls(self, tmp_path, name="rec.jsonl"):
++        demo = make_number_app(add)
++        path = tmp_path / name
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s1"))
++        run(demo.process_api(0, [10.0, 5.0], state=state, session_hash="s1"))
++        rec.close()
++        return path
++
++    def test_replay_identical_app(self, tmp_path):
++        path = self.record_two_calls(tmp_path)
++        demo2 = make_number_app(add)
++        report = gr.replay_events(demo2, path)
++        assert isinstance(report, ReplayReport)
++        assert report.ok
++        assert bool(report)
++        assert report.total == 2
++        assert report.matched == 2
++        assert report.mismatched == 0
++        assert report.missing == 0
++        assert report.errors == 0
++        assert report.mismatches == []
++        assert all(r.status == "match" for r in report.results)
++        assert "2 matched" in report.summary()
++
++    def test_replay_detects_behavior_change(self, tmp_path):
++        path = self.record_two_calls(tmp_path)
++
++        def add_plus_one(a, b):
++            return a + b + 1
++
++        demo2 = make_number_app(add_plus_one)
++        report = gr.replay_events(demo2, path)
++        assert not report.ok
++        assert not bool(report)
++        assert report.mismatched == 2
++        first = report.results[0]
++        assert first.status == "mismatch"
++        assert first.expected == [3.0]
++        assert first.actual == [4.0]
++        assert len(report.mismatches) == 2
++
++    def test_replay_missing_fn(self, tmp_path):
++        path = self.record_two_calls(tmp_path)
++
++        def subtract(a, b):
++            return a - b
++
++        demo2 = make_number_app(subtract, api_name="subtract")
++        report = gr.replay_events(demo2, path)
++        assert not report.ok
++        assert report.missing == 2
++        assert all(r.status == "missing" for r in report.results)
++
++    def test_replay_error_event_matches_same_exception(self, tmp_path):
++        def boom(a, b):
++            raise ValueError("nope")
++
++        demo = make_number_app(boom)
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        with pytest.raises(ValueError):
++            run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++
++        def boom2(a, b):
++            raise ValueError("different message, same type")
++
++        report = gr.replay_events(make_number_app(boom2), path)
++        assert report.ok
++        assert report.results[0].expected == "ValueError"
++        assert report.results[0].actual == "ValueError"
++
++    def test_replay_error_event_mismatches_when_fixed(self, tmp_path):
++        def boom(a, b):
++            raise ValueError("nope")
++
++        demo = make_number_app(boom)
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        with pytest.raises(ValueError):
++            run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++
++        report = gr.replay_events(make_number_app(add), path)
++        assert not report.ok
++        result = report.results[0]
++        assert result.status == "mismatch"
++        assert result.expected == "ValueError"
++        assert result.actual is None
++
++    def test_replay_success_event_mismatches_on_new_error(self, tmp_path):
++        path = self.record_two_calls(tmp_path)
++
++        def boom(a, b):
++            raise KeyError("x")
++
++        report = gr.replay_events(make_number_app(boom), path)
++        assert report.mismatched == 2
++        assert report.results[0].actual == "KeyError"
++
++    def test_replay_is_not_recorded(self, tmp_path):
++        path = self.record_two_calls(tmp_path)
++        demo2 = make_number_app(add)
++        rec2 = EventRecorder(demo2, tmp_path / "rec2.jsonl").start()
++        report = gr.replay_events(demo2, path)
++        rec2.close()
++        assert report.ok
++        assert rec2.events == []
++
++    def test_replay_api_names_filter(self, tmp_path):
++        with gr.Blocks() as demo:
++            a = gr.Number(label="a")
++            b = gr.Number(label="b")
++            out = gr.Number(label="sum")
++            diff = gr.Number(label="diff")
++            btn = gr.Button("go")
++            btn.click(add, [a, b], out, api_name="add")
++            btn.click(lambda x, y: x - y, [a, b], diff, api_name="sub")
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [3.0, 1.0], state=state, session_hash="s"))
++        run(demo.process_api(1, [3.0, 1.0], state=state, session_hash="s"))
++        rec.close()
++
++        with gr.Blocks() as demo2:
++            a = gr.Number(label="a")
++            b = gr.Number(label="b")
++            out = gr.Number(label="sum")
++            diff = gr.Number(label="diff")
++            btn = gr.Button("go")
++            btn.click(add, [a, b], out, api_name="add")
++            btn.click(lambda x, y: x - y, [a, b], diff, api_name="sub")
++        report = gr.replay_events(demo2, path, api_names=["sub"])
++        assert report.total == 1
++        assert report.ok
++        assert report.results[0].api_name == "sub"
++
++    def test_replay_restores_stateful_inputs(self, tmp_path):
++        def counter(n, st):
++            return st + n, st + n
++
++        def make_counter_app():
++            with gr.Blocks() as demo:
++                n = gr.Number(label="n")
++                st = gr.State(0)
++                out = gr.Number(label="out")
++                btn = gr.Button("go")
++                btn.click(counter, [n, st], [out, st], api_name="counter")
++            return demo
++
++        demo = make_counter_app()
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [5.0, None], state=state, session_hash="s"))
++        run(demo.process_api(0, [5.0, None], state=state, session_hash="s"))
++        run(demo.process_api(0, [5.0, None], state=state, session_hash="s"))
++        rec.close()
++
++        # a fresh app instance has fresh state, but replay must restore the
++        # recorded state values, so all three events match.
++        report = gr.replay_events(make_counter_app(), path)
++        assert report.ok
++        assert [r.actual for r in report.results] == [
++            [5.0, 5.0],
++            [10.0, 10.0],
++            [15.0, 15.0],
++        ]
++
++    def test_replay_report_to_dict(self, tmp_path):
++        path = self.record_two_calls(tmp_path)
++        report = gr.replay_events(make_number_app(add), path)
++        d = report.to_dict()
++        assert d["total"] == 2
++        assert d["ok"] is True
++        assert len(d["results"]) == 2
++        json.dumps(d)  # must be JSON serializable
++
++    def test_replay_inside_running_loop_marks_errors(self, tmp_path):
++        path = self.record_two_calls(tmp_path)
++        demo2 = make_number_app(add)
++
++        async def main():
++            return gr.replay_events(demo2, path)
++
++        report = asyncio.run(main())
++        assert report.errors == report.total
++        assert not report.ok
++        assert all(r.status == "error" for r in report.results)
++
++
++class TestBackwardCompatibility:
++    def test_process_api_unchanged_without_recorder(self):
++        demo = make_number_app(add)
++        state = SessionState(demo)
++        result = run(demo.process_api(0, [2.0, 3.0], state=state, session_hash="s"))
++        assert result["data"] == [5.0]
++        assert result["is_generating"] is False
++        assert result["duration"] >= 0
++
++    def test_attached_but_stopped_recorder_is_transparent(self, tmp_path):
++        demo = make_number_app(add)
++        EventRecorder(demo, tmp_path / "rec.jsonl")  # attached, not started
++        state = SessionState(demo)
++        result = run(demo.process_api(0, [2.0, 3.0], state=state, session_hash="s"))
++        assert result["data"] == [5.0]
++
++    def test_config_unaffected(self, tmp_path):
++        demo = make_number_app(add)
++        before = demo.get_config_file()
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++        after = demo.get_config_file()
++        assert before == after
++
++    def test_public_api_exported(self):
++        assert gr.EventRecorder is EventRecorder
++        assert callable(gr.replay_events)
++        assert callable(gr.load_events)
++        assert gr.ReplayReport is ReplayReport
++
++
++class TestRecordingMoreComponents:
++    def test_text_and_checkbox_and_slider(self, tmp_path):
++        def describe(name, agree, level):
++            return f"{name}:{agree}:{level}", agree and level > 2
++
++        with gr.Blocks() as demo:
++            name = gr.Textbox(label="name")
++            agree = gr.Checkbox(label="agree")
++            level = gr.Slider(0, 10, label="level")
++            text = gr.Textbox(label="text")
++            ok = gr.Checkbox(label="ok")
++            btn = gr.Button("go")
++            btn.click(describe, [name, agree, level], [text, ok], api_name="describe")
++
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        run(
++            demo.process_api(
++                0, ["alice", True, 7], state=state, session_hash="s"
++            )
++        )
++        rec.close()
++        (event,) = rec.events
++        assert event["inputs"] == ["alice", True, 7]
++        assert event["outputs"] == ["alice:True:7", True]
++
++    def test_dropdown_and_multiselect(self, tmp_path):
++        def pick(choice, tags):
++            return ",".join([choice] + tags)
++
++        with gr.Blocks() as demo:
++            choice = gr.Dropdown(["a", "b", "c"], label="choice")
++            tags = gr.Dropdown(["x", "y", "z"], multiselect=True, label="tags")
++            out = gr.Textbox(label="out")
++            btn = gr.Button("go")
++            btn.click(pick, [choice, tags], out, api_name="pick")
++
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        run(demo.process_api(0, ["b", ["x", "z"]], state=state, session_hash="s"))
++        rec.close()
++        (event,) = rec.events
++        assert event["inputs"] == ["b", ["x", "z"]]
++        assert event["outputs"] == ["b,x,z"]
++
++    def test_unicode_roundtrip(self, tmp_path):
++        def echo(text):
++            return f"收到：{text}"
++
++        with gr.Blocks() as demo:
++            t = gr.Textbox(label="输入")
++            o = gr.Textbox(label="输出")
++            btn = gr.Button("go")
++            btn.click(echo, t, o, api_name="echo")
++
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, ["你好，世界 🌍"], state=state, session_hash="s"))
++        rec.close()
++        raw = path.read_text(encoding="utf-8")
++        assert "你好，世界" in raw
++        (event,) = rec.events
++        assert event["inputs"] == ["你好，世界 🌍"]
++        assert event["outputs"] == ["收到：你好，世界 🌍"]
++
++    def test_record_path_accepts_str_and_path(self, tmp_path):
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, str(tmp_path / "a.jsonl")).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 1.0], state=state, session_hash="s"))
++        rec.close()
++        assert (tmp_path / "a.jsonl").exists()
++        assert len(rec.events) == 1
++
++    def test_none_inputs_and_outputs(self, tmp_path):
++        def passthrough(a, b):
++            return None
++
++        with gr.Blocks() as demo:
++            a = gr.Number(label="a")
++            b = gr.Number(label="b")
++            out = gr.Number(label="out")
++            btn = gr.Button("go")
++            btn.click(passthrough, [a, b], out, api_name="pass")
++
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [None, 2.0], state=state, session_hash="s"))
++        rec.close()
++        (event,) = rec.events
++        assert event["inputs"] == [None, 2.0]
++        assert event["outputs"] == [None]
++
++    def test_batch_function_recorded(self, tmp_path):
++        def batch_add(a_list, b_list):
++            return [[a + b for a, b in zip(a_list, b_list)]]
++
++        with gr.Blocks() as demo:
++            a = gr.Number(label="a")
++            b = gr.Number(label="b")
++            out = gr.Number(label="sum")
++            btn = gr.Button("go")
++            btn.click(batch_add, [a, b], out, api_name="batch_add", batch=True)
++
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        result = run(
++            demo.process_api(
++                0, [[1.0, 2.0], [10.0, 20.0]], state=state, session_hash="s"
++            )
++        )
++        rec.close()
++        assert result["data"] == [(11.0, 22.0)]
++        (event,) = rec.events
++        assert event["inputs"] == [[1.0, 2.0], [10.0, 20.0]]
++        assert event["outputs"] == [[11.0, 22.0]]
++
++    def test_combined_include_and_exclude(self, tmp_path):
++        with gr.Blocks() as demo:
++            a = gr.Number(label="a")
++            b = gr.Number(label="b")
++            out = gr.Number(label="sum")
++            diff = gr.Number(label="diff")
++            prod = gr.Number(label="prod")
++            btn = gr.Button("go")
++            btn.click(add, [a, b], out, api_name="add")
++            btn.click(lambda x, y: x - y, [a, b], diff, api_name="sub")
++            btn.click(lambda x, y: x * y, [a, b], prod, api_name="mul")
++
++        rec = EventRecorder(
++            demo,
++            tmp_path / "rec.jsonl",
++            include=["add", "sub"],
++            exclude=["sub"],
++        ).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [3.0, 1.0], state=state, session_hash="s"))
++        run(demo.process_api(1, [3.0, 1.0], state=state, session_hash="s"))
++        run(demo.process_api(2, [3.0, 1.0], state=state, session_hash="s"))
++        rec.close()
++        assert len(rec.events) == 1
++        assert rec.events[0]["api_name"] == "add"
++
++    def test_redact_on_unlabeled_component_is_noop(self, tmp_path):
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl", redact=["不存在的标签"]).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++        assert rec.events[0]["inputs"] == [1.0, 2.0]
++
++    def test_sessions_recorded_independently(self, tmp_path):
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state_a = SessionState(demo)
++        state_b = SessionState(demo)
++        run(demo.process_api(0, [1.0, 1.0], state=state_a, session_hash="user-a"))
++        run(demo.process_api(0, [2.0, 2.0], state=state_b, session_hash="user-b"))
++        run(demo.process_api(0, [3.0, 3.0], state=state_a, session_hash="user-a"))
++        rec.close()
++        assert [e["session_hash"] for e in rec.events] == [
++            "user-a",
++            "user-b",
++            "user-a",
++        ]
++        assert [e["outputs"] for e in rec.events] == [[2.0], [4.0], [6.0]]
++
++    def test_file_grows_one_line_per_event(self, tmp_path):
++        demo = make_number_app(add)
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        for i in range(7):
++            run(demo.process_api(0, [float(i), 0.0], state=state, session_hash="s"))
++        rec.close()
++        with open(path, encoding="utf-8") as f:
++            lines = [line for line in f if line.strip()]
++        # one header + one line per event
++        assert len(lines) == 8
++
++    def test_interface_api_calls_recorded(self, tmp_path):
++        def greet(name):
++            return f"Hello {name}!"
++
++        demo = gr.Interface(greet, gr.Textbox(label="name"), gr.Textbox(label="out"))
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        result = run(
++            demo.process_api(0, ["world"], state=state, session_hash="s")
++        )
++        rec.close()
++        assert result["data"] == ["Hello world!"]
++        (event,) = rec.events
++        # Interface exposes its function under the default "predict" api name
++        assert event["api_name"] == "predict"
++        assert event["inputs"] == ["world"]
++        assert event["outputs"] == ["Hello world!"]
++
++
++class TestReplayMore:
++    def test_replay_empty_record_is_not_ok(self, tmp_path):
++        path = tmp_path / "rec.jsonl"
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, path).start()
++        rec.stop()  # record nothing
++        report = gr.replay_events(make_number_app(add), path)
++        assert report.total == 0
++        assert not report.ok
++        assert not bool(report)
++
++    def test_replay_strict_float_comparison(self, tmp_path):
++        path = tmp_path / "rec.jsonl"
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [0.1, 0.2], state=state, session_hash="s"))
++        rec.close()
++        (event,) = rec.events
++        assert event["outputs"] == [pytest.approx(0.3)]
++
++        def slightly_off(a, b):
++            return a + b + 1e-12
++
++        report = gr.replay_events(make_number_app(slightly_off), path)
++        assert not report.ok
++        assert report.mismatched == 1
++
++    def test_replay_matches_by_fn_name_when_api_renamed(self, tmp_path):
++        path = tmp_path / "rec.jsonl"
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [2.0, 3.0], state=state, session_hash="s"))
++        rec.close()
++
++        # same function, different api name: the fn name fallback still finds it
++        demo2 = make_number_app(add, api_name="sum_v2")
++        report = gr.replay_events(demo2, path)
++        assert report.ok
++
++    def test_replay_multiple_mismatch_positions(self, tmp_path):
++        def combine(a, b):
++            return a + b, a * b
++
++        def make_combine_app(fn):
++            with gr.Blocks() as demo:
++                a = gr.Number(label="a")
++                b = gr.Number(label="b")
++                s = gr.Number(label="sum")
++                p = gr.Number(label="prod")
++                btn = gr.Button("go")
++                btn.click(fn, [a, b], [s, p], api_name="combine")
++            return demo
++
++        path = tmp_path / "rec.jsonl"
++        demo = make_combine_app(combine)
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [2.0, 3.0], state=state, session_hash="s"))
++        rec.close()
++
++        def combine_changed(a, b):
++            return a + b, a * b * 10  # only the second output changed
++
++        report = gr.replay_events(make_combine_app(combine_changed), path)
++        assert not report.ok
++        result = report.results[0]
++        assert result.status == "mismatch"
++        assert result.expected == [5.0, 6.0]
++        assert result.actual == [5.0, 60.0]
++
++    def test_replay_skips_events_outside_filter(self, tmp_path):
++        with gr.Blocks() as demo:
++            a = gr.Number(label="a")
++            b = gr.Number(label="b")
++            out = gr.Number(label="sum")
++            diff = gr.Number(label="diff")
++            btn = gr.Button("go")
++            btn.click(add, [a, b], out, api_name="add")
++            btn.click(lambda x, y: x - y, [a, b], diff, api_name="sub")
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [3.0, 1.0], state=state, session_hash="s"))
++        run(demo.process_api(1, [3.0, 1.0], state=state, session_hash="s"))
++        rec.close()
++
++        # replay only "sub" against an app where "sub" changed: mismatch shows,
++        # "add" is skipped entirely
++        with gr.Blocks() as demo2:
++            a = gr.Number(label="a")
++            b = gr.Number(label="b")
++            out = gr.Number(label="sum")
++            diff = gr.Number(label="diff")
++            btn = gr.Button("go")
++            btn.click(add, [a, b], out, api_name="add")
++            btn.click(lambda x, y: x - y + 100, [a, b], diff, api_name="sub")
++        report = gr.replay_events(demo2, path, api_names=["sub"])
++        assert report.total == 1
++        assert report.mismatched == 1
++
++    def test_load_events_ignores_blank_lines(self, tmp_path):
++        path = tmp_path / "rec.jsonl"
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++        with open(path, "a", encoding="utf-8") as f:
++            f.write("\n\n")
++        events = gr.load_events(path)
++        assert len(events) == 1
++
++    def test_replay_report_result_fields(self, tmp_path):
++        path = tmp_path / "rec.jsonl"
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++        report = gr.replay_events(make_number_app(add), path)
++        (result,) = report.results
++        d = result.to_dict()
++        assert d["index"] == 0
++        assert d["api_name"] == "add"
++        assert d["fn_name"] == "add"
++        assert d["status"] == "match"
++        assert d["expected"] == [3.0]
++        assert d["actual"] == [3.0]
++        assert d["error"] is None
++        json.dumps(d)
++
++
++class TestGeneratorReplay:
++    def record_generator(self, path, fn=None):
++        def gen(x):
++            for i in range(3):
++                yield x + i
++
++        with gr.Blocks() as demo:
++            x = gr.Number(label="x")
++            o = gr.Number(label="o")
++            b = gr.Button("g")
++            b.click(fn or gen, x, o, api_name="gen")
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [10.0], state=state, session_hash="g"))
++        rec.close()
++        return path
++
++    def test_replay_generator_first_output_matches(self, tmp_path):
++        path = self.record_generator(tmp_path / "rec.jsonl")
++
++        def gen(x):
++            for i in range(3):
++                yield x + i
++
++        with gr.Blocks() as demo2:
++            x = gr.Number(label="x")
++            o = gr.Number(label="o")
++            b = gr.Button("g")
++            b.click(gen, x, o, api_name="gen")
++        report = gr.replay_events(demo2, path)
++        assert report.ok
++        assert report.results[0].expected == [10.0]
++        assert report.results[0].actual == [10.0]
++
++    def test_replay_generator_detects_change(self, tmp_path):
++        path = self.record_generator(tmp_path / "rec.jsonl")
++
++        def gen(x):
++            for i in range(3):
++                yield x + i + 100
++
++        with gr.Blocks() as demo2:
++            x = gr.Number(label="x")
++            o = gr.Number(label="o")
++            b = gr.Button("g")
++            b.click(gen, x, o, api_name="gen")
++        report = gr.replay_events(demo2, path)
++        assert not report.ok
++        assert report.mismatched == 1
++        assert report.results[0].actual == [110.0]
++
++
++class TestHttpErrorRecording:
++    def test_queue_error_calls_are_recorded(self, tmp_path):
++        def boom(name):
++            raise RuntimeError(f"cannot handle {name}")
++
++        with gr.Blocks() as demo:
++            name = gr.Textbox(label="name")
++            out = gr.Textbox(label="out")
++            btn = gr.Button("go")
++            btn.click(boom, name, out, api_name="boom")
++
++        demo.queue()
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        app = App.create_app(demo)
++        with TestClient(app) as client:
++            client.get("/gradio_api/startup-events", timeout=10)
++            client.post(
++                "/gradio_api/queue/join",
++                json={
++                    "data": ["alice"],
++                    "fn_index": 0,
++                    "event_data": None,
++                    "session_hash": "sess-err",
++                    "trigger_id": None,
++                },
++                timeout=10,
++            )
++            response = client.get(
++                "/gradio_api/queue/data?session_hash=sess-err", timeout=15
++            )
++            for line in response.iter_lines():
++                if "process_completed" in line or "process_generating" in line:
++                    if "process_completed" in line:
++                        break
++        rec.close()
++        (event,) = rec.events
++        assert event["api_name"] == "boom"
++        assert event["session_hash"] == "sess-err"
++        assert event["inputs"] == ["alice"]
++        assert event["outputs"] is None
++        assert event["error"] == "RuntimeError"
++
++    def test_concurrent_http_calls_all_recorded(self, tmp_path):
++        def echo(name):
++            time.sleep(0.02)
++            return f"hi {name}"
++
++        with gr.Blocks() as demo:
++            name = gr.Textbox(label="name")
++            out = gr.Textbox(label="out")
++            btn = gr.Button("go")
++            btn.click(echo, name, out, api_name="echo", concurrency_limit=8)
++
++        demo.queue()
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        app = App.create_app(demo)
++        n_calls = 6
++        with TestClient(app) as client:
++            client.get("/gradio_api/startup-events", timeout=10)
++            for i in range(n_calls):
++                client.post(
++                    "/gradio_api/queue/join",
++                    json={
++                        "data": [f"user-{i}"],
++                        "fn_index": 0,
++                        "event_data": None,
++                        "session_hash": f"sess-{i}",
++                        "trigger_id": None,
++                    },
++                    timeout=10,
++                )
++            for i in range(n_calls):
++                response = client.get(
++                    f"/gradio_api/queue/data?session_hash=sess-{i}", timeout=15
++                )
++                for line in response.iter_lines():
++                    if "process_completed" in line:
++                        break
++        rec.close()
++        assert len(rec.events) == n_calls
++        assert sorted(e["inputs"][0] for e in rec.events) == [
++            f"user-{i}" for i in range(n_calls)
++        ]
++        for event in rec.events:
++            name = event["inputs"][0]
++            assert event["outputs"] == [f"hi {name}"]
++            assert event["session_hash"] == f"sess-{name.split('-')[1]}"
++        # file lines are all well-formed JSON (no interleaved writes)
++        events = gr.load_events(tmp_path / "rec.jsonl")
++        assert len(events) == n_calls
++
++
++class TestReportHelpers:
++    def test_assert_ok_passes_on_match(self, tmp_path):
++        path = tmp_path / "rec.jsonl"
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++        report = gr.replay_events(make_number_app(add), path)
++        report.assert_ok()  # should not raise
++
++    def test_assert_ok_raises_with_details(self, tmp_path):
++        path = tmp_path / "rec.jsonl"
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++
++        def add_plus_one(a, b):
++            return a + b + 1
++
++        report = gr.replay_events(make_number_app(add_plus_one), path)
++        with pytest.raises(AssertionError) as exc_info:
++            report.assert_ok()
++        message = str(exc_info.value)
++        assert "mismatch" in message
++        assert "add" in message
++
++    def test_recorder_repr(self, tmp_path):
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl")
++        assert "stopped" in repr(rec)
++        rec.start()
++        assert "recording" in repr(rec)
++        rec.close()
++
++    def test_report_repr(self, tmp_path):
++        path = tmp_path / "rec.jsonl"
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec.close()
++        report = gr.replay_events(make_number_app(add), path)
++        assert "1 matched" in repr(report)
++
++
++class TestNestedPayloads:
++    def test_json_component_nested_payload(self, tmp_path):
++        def transform(payload):
++            return {"doubled": payload["value"] * 2, "tags": payload["tags"] + ["!"]}
++
++        with gr.Blocks() as demo:
++            inp = gr.JSON(label="in")
++            out = gr.JSON(label="out")
++            btn = gr.Button("go")
++            btn.click(transform, inp, out, api_name="transform")
++
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        run(
++            demo.process_api(
++                0,
++                [{"value": 21, "tags": ["a", "b"]}],
++                state=state,
++                session_hash="s",
++            )
++        )
++        rec.close()
++        (event,) = rec.events
++        assert event["inputs"] == [{"value": 21, "tags": ["a", "b"]}]
++        assert event["outputs"] == [{"doubled": 42, "tags": ["a", "b", "!"]}]
++
++        report = gr.replay_events(
++            _build_transform_app(), tmp_path / "rec.jsonl"
++        )
++        assert report.ok
++
++    def test_recording_does_not_change_results(self, tmp_path):
++        demo = make_number_app(add)
++        rec = EventRecorder(demo, tmp_path / "rec.jsonl").start()
++        state = SessionState(demo)
++        result = run(demo.process_api(0, [2.0, 3.0], state=state, session_hash="s"))
++        rec.close()
++        assert result["data"] == [5.0]
++        assert result["is_generating"] is False
++        assert "duration" in result
++        assert "average_duration" in result
++
++
++def _build_transform_app():
++    def transform(payload):
++        return {"doubled": payload["value"] * 2, "tags": payload["tags"] + ["!"]}
++
++    with gr.Blocks() as demo:
++        inp = gr.JSON(label="in")
++        out = gr.JSON(label="out")
++        btn = gr.Button("go")
++        btn.click(transform, inp, out, api_name="transform")
++    return demo
++
++
++class TestIndexContinuity:
++    def test_event_index_continues_across_restarts(self, tmp_path):
++        demo = make_number_app(add)
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        for i in range(3):
++            run(demo.process_api(0, [float(i), 0.0], state=state, session_hash="s"))
++        rec.stop()
++        rec.start()
++        for i in range(3, 6):
++            run(demo.process_api(0, [float(i), 0.0], state=state, session_hash="s"))
++        rec.close()
++        events = gr.load_events(path)
++        assert [e["index"] for e in events] == list(range(6))
++        assert [e["outputs"] for e in events] == [[float(i)] for i in range(6)]
++
++    def test_two_recorders_separate_indices(self, tmp_path):
++        demo = make_number_app(add)
++        rec1 = EventRecorder(demo, tmp_path / "r1.jsonl").start()
++        rec2 = EventRecorder(demo, tmp_path / "r2.jsonl")
++        state = SessionState(demo)
++        run(demo.process_api(0, [1.0, 2.0], state=state, session_hash="s"))
++        rec2.start()
++        run(demo.process_api(0, [3.0, 4.0], state=state, session_hash="s"))
++        rec1.close()
++        rec2.close()
++        assert [e["index"] for e in rec1.events] == [0, 1]
++        # rec2 only saw the second call, indexed from its own zero
++        assert [e["index"] for e in rec2.events] == [0]
++        assert rec2.events[0]["inputs"] == [3.0, 4.0]
++
++
++class TestReplaySessionHandling:
++    def test_replay_with_none_session_hash(self, tmp_path):
++        demo = make_number_app(add)
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [7.0, 8.0], state=state))  # no session_hash
++        rec.close()
++        (event,) = rec.events
++        assert event["session_hash"] is None
++        report = gr.replay_events(make_number_app(add), path)
++        assert report.ok
++        assert report.results[0].actual == [15.0]
++
++    def test_replay_uses_fresh_sessions_per_event(self, tmp_path):
++        # a stateful app where each recorded event started from the default
++        # state: replay must not leak state between events
++        def read_state(st):
++            return st, st
++
++        def make_app():
++            with gr.Blocks() as demo:
++                st = gr.State("initial")
++                out = gr.Textbox(label="out")
++                st_out = gr.State()
++                btn = gr.Button("go")
++                btn.click(read_state, [st], [out, st_out], api_name="read")
++            return demo
++
++        demo = make_app()
++        path = tmp_path / "rec.jsonl"
++        rec = EventRecorder(demo, path).start()
++        state = SessionState(demo)
++        run(demo.process_api(0, [None], state=state, session_hash="a"))
++        run(demo.process_api(0, [None], state=state, session_hash="a"))
++        rec.close()
++        report = gr.replay_events(make_app(), path)
++        assert report.ok
++        for result in report.results:
++            assert result.actual == ["initial", "initial"]

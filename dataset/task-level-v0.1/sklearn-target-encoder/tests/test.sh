@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -uo pipefail
+mkdir -p /logs/verifier
+cd /app
+python -m pytest /tests/test_outputs.py -x -q 2>&1 | tail -60
+status=${PIPESTATUS[0]}
+if [ "$status" -eq 0 ]; then echo 1 > /logs/verifier/reward.txt; else echo 0 > /logs/verifier/reward.txt; fi
+exit "$status"

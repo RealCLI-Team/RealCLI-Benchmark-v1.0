@@ -1,0 +1,2440 @@
+diff --git a/docs/source/release_notes.rst b/docs/source/release_notes.rst
+index 7fad98c0..8c82b06e 100644
+--- a/docs/source/release_notes.rst
++++ b/docs/source/release_notes.rst
+@@ -13,6 +13,18 @@ Release Notes
+ 
+ .. Thanks to the following people for contributing to this release:
+ 
++Future Release
++==============
++    * Enhancements
++        * Support per-instance training windows through a ``training_window`` column in the cutoff time DataFrame
++        * Support numeric ``training_window`` values on entitysets with a numeric time index
++    * Fixes
++        * Fix ``TypeError`` raised when a ``training_window`` was used with an entityset that has a numeric time index
++    * Changes
++    * Documentation Changes
++    * Testing Changes
++        * Add tests covering per-instance training windows and numeric training windows
++
+ v1.31.0 May 14, 2024
+ ====================
+     * Enhancements
+diff --git a/featuretools/computational_backends/calculate_feature_matrix.py b/featuretools/computational_backends/calculate_feature_matrix.py
+index d91943d3..5a23b70f 100644
+--- a/featuretools/computational_backends/calculate_feature_matrix.py
++++ b/featuretools/computational_backends/calculate_feature_matrix.py
+@@ -23,8 +23,10 @@ from featuretools.computational_backends.feature_set_calculator import (
+     FeatureSetCalculator,
+ )
+ from featuretools.computational_backends.utils import (
++    TRAINING_WINDOW_COLUMN,
+     _check_cutoff_time_type,
+     _validate_cutoff_time,
++    _validate_training_window_column,
+     bin_cutoff_times,
+     create_client_and_cluster,
+     gather_approximate_features,
+@@ -83,7 +85,11 @@ def calculate_feature_matrix(
+             the same name as the target dataframe time index or a column named `time`. If the
+             DataFrame has more than two columns, any additional columns will be added to the
+             resulting feature matrix. If a single value is passed, this value will be used for
+-            all instances.
++            all instances. A DataFrame can also contain a column named `training_window`
++            to specify a per-instance training window for each row, instead of passing a
++            single global value to the `training_window` parameter. Rows with a missing
++            value in this column are calculated without a training window. The column is
++            consumed by the calculation and is not passed through to the feature matrix.
+ 
+         instance_ids (list): List of instances to calculate features on. Only
+             used if cutoff_time is a single datetime.
+@@ -105,6 +111,9 @@ def calculate_feature_matrix(
+         training_window (Timedelta or str, optional):
+             Window defining how much time before the cutoff time data
+             can be used when calculating features. If ``None``, all data before cutoff time is used.
++            Cannot be used when the cutoff time DataFrame contains a
++            ``training_window`` column of per-instance windows. On entitysets with a
++            numeric time index, pass an int or float window.
+             Defaults to ``None``.
+ 
+         approximate (Timedelta or str): Frequency to group instances with similar
+@@ -151,6 +160,45 @@ def calculate_feature_matrix(
+ 
+     Returns:
+         pd.DataFrame: The feature matrix.
++
++    Examples:
++        Calculate features for every instance at a single point in time,
++        using all data before that time:
++
++        >>> fm = calculate_feature_matrix(features,
++        ...                               entityset=es,
++        ...                               cutoff_time=pd.Timestamp("2023-01-21"))
++
++        Calculate features at per-instance cutoff times listed in a
++        DataFrame, applying one global training window to every row:
++
++        >>> cutoff_time = pd.DataFrame({
++        ...     "instance_id": [1, 2, 3],
++        ...     "time": pd.to_datetime(["2023-01-21"] * 3),
++        ... })
++        >>> fm = calculate_feature_matrix(features,
++        ...                               entityset=es,
++        ...                               cutoff_time=cutoff_time,
++        ...                               training_window="7 days")
++
++        Calculate features where each row of the cutoff time DataFrame has
++        its own training window, supplied through a ``training_window``
++        column. Rows without a value in that column are calculated with all
++        data before their cutoff time:
++
++        >>> cutoff_time = pd.DataFrame({
++        ...     "instance_id": [1, 2, 3],
++        ...     "time": pd.to_datetime(["2023-01-21"] * 3),
++        ...     "training_window": [pd.Timedelta("7d"), pd.Timedelta("30d"), pd.NaT],
++        ... })
++        >>> fm = calculate_feature_matrix(features,
++        ...                               entityset=es,
++        ...                               cutoff_time=cutoff_time)
++
++        The window boundaries follow the same semantics as a global
++        ``training_window``: data older than or exactly at
++        ``cutoff_time - training_window`` is excluded, while data at the
++        cutoff time itself is included unless ``include_cutoff_time=False``.
+     """
+     assert (
+         isinstance(features, list)
+@@ -184,6 +232,30 @@ def calculate_feature_matrix(
+         target_dataframe = features[0].dataframe
+         ltype = target_dataframe.ww.logical_types[target_dataframe.ww.index]
+         cutoff_time.ww.init(logical_types={"instance_id": ltype})
++        if _validate_training_window_column(
++            cutoff_time,
++            training_window,
++            entityset.time_type,
++        ):
++            if approximate is not None:
++                raise ValueError(
++                    "Using approximate is not supported when the cutoff_time "
++                    "DataFrame contains a 'training_window' column with "
++                    "per-instance training windows.",
++                )
++            # the window column is consumed by the calculation and must not be
++            # passed through to the feature matrix
++            pass_columns.remove(TRAINING_WINDOW_COLUMN)
++            # normalize the column to a uniform dtype so that it can be
++            # grouped on and so Woodwork typing is consistent
++            if entityset.time_type == "numeric":
++                cutoff_time.ww[TRAINING_WINDOW_COLUMN] = pd.to_numeric(
++                    cutoff_time[TRAINING_WINDOW_COLUMN],
++                )
++            else:
++                cutoff_time.ww[TRAINING_WINDOW_COLUMN] = pd.to_timedelta(
++                    cutoff_time[TRAINING_WINDOW_COLUMN],
++                )
+     else:
+         pass_columns = []
+         if cutoff_time is None:
+@@ -434,6 +506,11 @@ def calculate_chunk(
+     else:
+         if schema:
+             cutoff_time.ww.init_with_full_schema(schema=schema)  # pragma: no cover
++        window_column = (
++            TRAINING_WINDOW_COLUMN
++            if TRAINING_WINDOW_COLUMN in cutoff_time.columns
++            else None
++        )
+         for _, group in cutoff_time.groupby(cutoff_df_time_col):
+             # if approximating, calculate the approximate features
+             if approximate is not None:
+@@ -493,6 +570,14 @@ def calculate_chunk(
+             # if all aggregations have been approximated, can calculate all together
+             if no_unapproximated_aggs and approximate is not None:
+                 inner_grouped = [[group_time, group]]
++            elif window_column is not None:
++                # rows with per-instance training windows are calculated in
++                # separate groups for each distinct window value
++                inner_grouped = _group_by_time_and_window(
++                    group,
++                    cutoff_df_time_col,
++                    window_column,
++                )
+             else:
+                 # if approximated features, set cutoff_time to unbinned time
+                 if precalculated_features_trie is not None:
+@@ -503,13 +588,17 @@ def calculate_chunk(
+             if chunk_size is not None:
+                 inner_grouped = _chunk_dataframe_groups(inner_grouped, chunk_size)
+ 
+-            for time_last, group in inner_grouped:
++            for group_key, group in inner_grouped:
++                if window_column is not None:
++                    time_last, window = group_key
++                else:
++                    time_last = group_key
++                    if no_unapproximated_aggs and approximate is not None:
++                        window = None
++                    else:
++                        window = training_window
+                 # sort group by instance id
+                 ids = group["instance_id"].sort_values().values
+-                if no_unapproximated_aggs and approximate is not None:
+-                    window = None
+-                else:
+-                    window = training_window
+ 
+                 # calculate values for those instances at time time_last
+                 _feature_matrix = calc_results(
+@@ -884,6 +973,30 @@ def _chunk_dataframe_groups(grouped, chunk_size):
+                 yield group_key, group_df.iloc[i : i + chunk_size]
+ 
+ 
++def _group_by_time_and_window(group, time_col, window_col):
++    """Split a group of cutoff times sharing one time value by training window.
++
++    Rows that carry a per-instance training window in ``window_col`` are
++    grouped by window value so that each resulting subgroup can be calculated
++    with its own window. Rows with a missing window value are grouped together
++    with a window of ``None``, meaning all data before the cutoff time is used.
++
++    Returns a list of ``((time_last, window), sub_group)`` pairs, compatible
++    with ``_chunk_dataframe_groups``.
++    """
++    time_last = group[time_col].iloc[0]
++    groups = []
++    has_window = group[window_col].notna()
++    if has_window.any():
++        for window, sub_group in group[has_window].groupby(window_col, sort=True):
++            if isinstance(window, np.generic):
++                window = window.item()
++            groups.append(((time_last, window), sub_group))
++    if (~has_window).any():
++        groups.append(((time_last, None), group[~has_window]))
++    return groups
++
++
+ def _handle_chunk_size(chunk_size, total_size):
+     if chunk_size is not None:
+         assert chunk_size > 0, "Chunk size must be greater than 0"
+diff --git a/featuretools/computational_backends/utils.py b/featuretools/computational_backends/utils.py
+index 2efc3590..2adbc1a9 100644
+--- a/featuretools/computational_backends/utils.py
++++ b/featuretools/computational_backends/utils.py
+@@ -2,7 +2,7 @@ import logging
+ import os
+ import typing
+ import warnings
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from functools import wraps
+ 
+ import numpy as np
+@@ -18,6 +18,10 @@ from featuretools.utils.wrangle import _check_time_type, _check_timedelta
+ 
+ logger = logging.getLogger("featuretools.computational_backend")
+ 
++# Name of the reserved cutoff_time DataFrame column that supplies a
++# per-instance training window for each (instance_id, time) row.
++TRAINING_WINDOW_COLUMN = "training_window"
++
+ 
+ def bin_cutoff_times(cutoff_time, bin_size):
+     binned_cutoff_time = cutoff_time.ww.copy()
+@@ -297,6 +301,59 @@ def _validate_cutoff_time(
+     return cutoff_time
+ 
+ 
++def _validate_training_window_column(cutoff_time, training_window, time_type):
++    """Validate a per-instance training window column on a cutoff time DataFrame.
++
++    If the cutoff time DataFrame contains a column named ``training_window``,
++    each non-null value in that column defines the training window used for the
++    corresponding row, instead of a single global ``training_window``. Null
++    values mean that no training window is applied for that row.
++
++    Returns True if the column is present (after validating its values), and
++    False if the column is not present.
++    """
++    if (
++        not isinstance(cutoff_time, pd.DataFrame)
++        or TRAINING_WINDOW_COLUMN not in cutoff_time.columns
++    ):
++        return False
++
++    if training_window is not None:
++        raise ValueError(
++            "Cannot pass a global training_window value when the cutoff_time "
++            "DataFrame contains a 'training_window' column. Pass per-instance "
++            "windows in the column or a single global window, not both.",
++        )
++
++    for value in cutoff_time[TRAINING_WINDOW_COLUMN]:
++        if value is None or (not isinstance(value, str) and pd.isna(value)):
++            continue
++        if time_type == "numeric":
++            valid = isinstance(
++                value,
++                (int, float, np.integer, np.floating),
++            ) and not isinstance(value, bool)
++            negative = valid and value < 0
++            expected = "a non-negative int or float"
++        else:
++            valid = isinstance(value, (pd.Timedelta, timedelta, np.timedelta64))
++            negative = valid and pd.Timedelta(value) < pd.Timedelta(0)
++            expected = "a non-negative pd.Timedelta or datetime.timedelta"
++        if not valid:
++            raise ValueError(
++                "Invalid value %r in the cutoff_time 'training_window' column: "
++                "values must be %s for this entityset, or null to use all "
++                "data before the cutoff time." % (value, expected),
++            )
++        if negative:
++            raise ValueError(
++                "Invalid value %r in the cutoff_time 'training_window' column: "
++                "training windows cannot be negative." % (value,),
++            )
++
++    return True
++
++
+ def _check_cutoff_time_type(cutoff_time, es_time_type):
+     """
+     Check that the cutoff time values are of the proper type given the entityset time type
+diff --git a/featuretools/entityset/entityset.py b/featuretools/entityset/entityset.py
+index 99847252..ce6487bb 100644
+--- a/featuretools/entityset/entityset.py
++++ b/featuretools/entityset/entityset.py
+@@ -10,13 +10,14 @@ from woodwork.logical_types import Datetime, LatLong
+ 
+ from featuretools.entityset import deserialize, serialize
+ from featuretools.entityset.relationship import Relationship, RelationshipPath
++from featuretools.entityset.timedelta import Timedelta
+ from featuretools.feature_base.feature_base import _ES_REF
+ from featuretools.utils.plot_utils import (
+     check_graphviz,
+     get_graphviz_format,
+     save_graph,
+ )
+-from featuretools.utils.wrangle import _check_timedelta
++from featuretools.utils.wrangle import _check_window
+ 
+ pd.options.mode.chained_assignment = None  # default='warn'
+ logger = logging.getLogger("featuretools.entityset")
+@@ -1427,7 +1428,7 @@ class EntitySet(object):
+                 else:
+                     df = df[df[schema.time_index] < time_last]
+                 if training_window is not None:
+-                    training_window = _check_timedelta(training_window)
++                    training_window = _check_window(training_window)
+                     if include_cutoff_time:
+                         mask = df[schema.time_index] > time_last - training_window
+                     else:
+@@ -1491,9 +1492,9 @@ class EntitySet(object):
+ 
+         instance_vals = _vals_to_series(instance_vals, column_name)
+ 
+-        training_window = _check_timedelta(training_window)
++        training_window = _check_window(training_window)
+ 
+-        if training_window is not None:
++        if training_window is not None and isinstance(training_window, Timedelta):
+             assert (
+                 training_window.has_no_observations()
+             ), "Training window cannot be in observations"
+diff --git a/featuretools/synthesis/dfs.py b/featuretools/synthesis/dfs.py
+index b8ccd1ef..94668d85 100644
+--- a/featuretools/synthesis/dfs.py
++++ b/featuretools/synthesis/dfs.py
+@@ -72,6 +72,10 @@ def dfs(
+             the target dataframe time index or a column named `time`. If the DataFrame has more
+             than two columns, any additional columns will be added to the resulting feature
+             matrix. If a single value is passed, this value will be used for all instances.
++            A DataFrame can also contain a column named `training_window` to specify a
++            per-instance training window for each row, instead of passing a single global
++            value to the `training_window` parameter. Rows with a missing value in this
++            column are calculated without a training window.
+ 
+         instance_ids (list): List of instances on which to calculate features. Only
+             used if cutoff_time is a single datetime.
+@@ -163,7 +167,10 @@ def dfs(
+         training_window (Timedelta or str, optional):
+             Window defining how much time before the cutoff time data
+             can be used when calculating features. If ``None`` , all data
+-            before cutoff time is used. Defaults to ``None``. Month and year
++            before cutoff time is used. Cannot be used when the cutoff time
++            DataFrame contains a ``training_window`` column of per-instance
++            windows. On entitysets with a numeric time index, pass an int or
++            float window. Defaults to ``None``. Month and year
+             units are not relative when Pandas Timedeltas are used. Relative
+             units should be passed as a Featuretools Timedelta or a string.
+ 
+diff --git a/featuretools/tests/computational_backend/test_per_instance_training_window.py b/featuretools/tests/computational_backend/test_per_instance_training_window.py
+new file mode 100644
+index 00000000..cd1c8cbd
+--- /dev/null
++++ b/featuretools/tests/computational_backend/test_per_instance_training_window.py
+@@ -0,0 +1,1605 @@
++"""Tests for per-instance training windows supplied through a
++``training_window`` column in the cutoff time DataFrame, and for numeric
++training windows on entitysets with a numeric time index.
++"""
++from datetime import timedelta
++
++import numpy as np
++import pandas as pd
++import pytest
++
++import featuretools as ft
++from featuretools.feature_base import IdentityFeature
++from featuretools.primitives import Count, Max, Mean, Min, Sum
++
++
++def make_shop_es():
++    """Small two-dataframe entityset with a datetime time index.
++
++    customers
++        customer_id 1: events on 01-01(10,a), 01-05(20,a), 01-10(40,b),
++                       01-20(80,b), 01-21(25,a)
++        customer_id 2: events on 01-02(5,a), 01-08(15,b), 01-15(30,b),
++                       01-22(35,b)
++        customer_id 3: events on 01-19(7,a)
++    """
++    customers = pd.DataFrame(
++        {
++            "customer_id": [1, 2, 3],
++            "age": [30, 40, 50],
++            "region": ["north", "south", "north"],
++        },
++    )
++    events = pd.DataFrame(
++        {
++            "event_id": range(10),
++            "customer_id": [1, 1, 1, 1, 2, 2, 2, 3, 1, 2],
++            "time": pd.to_datetime(
++                [
++                    "2023-01-01",
++                    "2023-01-05",
++                    "2023-01-10",
++                    "2023-01-20",
++                    "2023-01-02",
++                    "2023-01-08",
++                    "2023-01-15",
++                    "2023-01-19",
++                    "2023-01-21",
++                    "2023-01-22",
++                ],
++            ),
++            "amount": [10.0, 20.0, 40.0, 80.0, 5.0, 15.0, 30.0, 7.0, 25.0, 35.0],
++            "category": ["a", "a", "b", "b", "a", "b", "b", "a", "a", "b"],
++        },
++    )
++    es = ft.EntitySet("shop")
++    es.add_dataframe(customers, dataframe_name="customers", index="customer_id")
++    es.add_dataframe(
++        events,
++        dataframe_name="events",
++        index="event_id",
++        time_index="time",
++    )
++    es.add_relationship("customers", "customer_id", "events", "customer_id")
++    return es
++
++
++def make_numeric_es():
++    """Small two-dataframe entityset with an integer time index.
++
++    device 1: logs at t=10(v=1), t=30(v=2), t=45(v=3)
++    device 2: logs at t=5(v=4), t=25(v=5), t=49(v=6)
++    """
++    devices = pd.DataFrame({"device_id": [1, 2]})
++    logs = pd.DataFrame(
++        {
++            "log_id": range(6),
++            "device_id": [1, 1, 1, 2, 2, 2],
++            "t": [10, 30, 45, 5, 25, 49],
++            "v": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
++        },
++    )
++    es = ft.EntitySet("numeric_shop")
++    es.add_dataframe(devices, dataframe_name="devices", index="device_id")
++    es.add_dataframe(logs, dataframe_name="logs", index="log_id", time_index="t")
++    es.add_relationship("devices", "device_id", "logs", "device_id")
++    return es
++
++
++def make_windowed_cutoff(times, windows, extra=None):
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [row[0] for row in times],
++            "time": pd.to_datetime([row[1] for row in times]),
++            "training_window": windows,
++        },
++    )
++    if extra:
++        for column, values in extra.items():
++            cutoff[column] = values
++    return cutoff
++
++
++def shop_features(es):
++    count = ft.Feature(
++        es["events"].ww["event_id"],
++        parent_dataframe_name="customers",
++        primitive=Count,
++    )
++    total = ft.Feature(
++        es["events"].ww["amount"],
++        parent_dataframe_name="customers",
++        primitive=Sum,
++    )
++    mean = ft.Feature(
++        es["events"].ww["amount"],
++        parent_dataframe_name="customers",
++        primitive=Mean,
++    )
++    max_amount = ft.Feature(
++        es["events"].ww["amount"],
++        parent_dataframe_name="customers",
++        primitive=Max,
++    )
++    min_amount = ft.Feature(
++        es["events"].ww["amount"],
++        parent_dataframe_name="customers",
++        primitive=Min,
++    )
++    return [count, total, mean, max_amount, min_amount]
++
++
++def numeric_features(es):
++    count = ft.Feature(
++        es["logs"].ww["log_id"],
++        parent_dataframe_name="devices",
++        primitive=Count,
++    )
++    total = ft.Feature(
++        es["logs"].ww["v"],
++        parent_dataframe_name="devices",
++        primitive=Sum,
++    )
++    return [count, total]
++
++
++def test_per_instance_window_basic_values():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[
++            (1, "2023-01-21"),
++            (1, "2023-01-22"),
++            (2, "2023-01-21"),
++            (3, "2023-01-21"),
++        ],
++        windows=[
++            pd.Timedelta("7d"),
++            pd.Timedelta("16d"),
++            pd.Timedelta("7d"),
++            pd.Timedelta("7d"),
++        ],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++
++    # customer 1 @ 01-21, window 7d -> (01-14, 01-21] -> events 01-20, 01-21
++    assert fm["COUNT(events)"].iloc[0] == 2
++    assert fm["SUM(events.amount)"].iloc[0] == 105.0
++    assert fm["MEAN(events.amount)"].iloc[0] == 52.5
++    assert fm["MAX(events.amount)"].iloc[0] == 80.0
++    assert fm["MIN(events.amount)"].iloc[0] == 25.0
++    # customer 1 @ 01-22, window 16d -> (01-06, 01-22] -> 01-10, 01-20, 01-21
++    assert fm["COUNT(events)"].iloc[1] == 3
++    assert fm["SUM(events.amount)"].iloc[1] == 145.0
++    # customer 2 @ 01-21, window 7d -> (01-14, 01-21] -> 01-15 only
++    assert fm["COUNT(events)"].iloc[2] == 1
++    assert fm["SUM(events.amount)"].iloc[2] == 30.0
++    # customer 3 @ 01-21, window 7d -> (01-14, 01-21] -> 01-19 only
++    assert fm["COUNT(events)"].iloc[3] == 1
++    assert fm["SUM(events.amount)"].iloc[3] == 7.0
++
++
++def test_per_instance_window_lower_edge_is_exclusive():
++    es = make_shop_es()
++    features = shop_features(es)
++    # window of exactly 20 days at 01-21 excludes the event exactly 20 days old
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=[pd.Timedelta("20d")],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    # (01-01, 01-21] -> 01-05, 01-10, 01-20, 01-21
++    assert fm["COUNT(events)"].iloc[0] == 4
++    assert fm["SUM(events.amount)"].iloc[0] == 165.0
++
++
++def test_per_instance_window_missing_value_uses_full_history():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[pd.NaT, pd.NaT],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].tolist() == [5, 3]
++    assert fm["SUM(events.amount)"].tolist() == [175.0, 50.0]
++
++
++def test_per_instance_window_mixed_null_and_value():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21"), (3, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.NaT, pd.Timedelta("1d")],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].tolist() == [2, 3, 0]
++    assert fm["SUM(events.amount)"].iloc[0] == 105.0
++    assert fm["SUM(events.amount)"].iloc[1] == 50.0
++    # customer 3 has no events inside (01-20, 01-21]: Sum uses its default
++    # value of 0, Mean has no default and stays null
++    assert fm["SUM(events.amount)"].iloc[2] == 0.0
++    assert pd.isna(fm["MEAN(events.amount)"].iloc[2])
++
++
++def test_per_instance_window_all_null_column_matches_no_column():
++    es = make_shop_es()
++    features = shop_features(es)
++    base_cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 2, 3],
++            "time": pd.to_datetime(["2023-01-21", "2023-01-21", "2023-01-21"]),
++        },
++    )
++    windowed_cutoff = base_cutoff.copy()
++    windowed_cutoff["training_window"] = pd.NaT
++
++    expected = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=base_cutoff)
++    actual = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=windowed_cutoff,
++    )
++    pd.testing.assert_frame_equal(expected, actual)
++
++
++def test_per_instance_window_constant_column_matches_global_window():
++    es = make_shop_es()
++    features = shop_features(es)
++    base_cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 2, 3, 1],
++            "time": pd.to_datetime(
++                ["2023-01-21", "2023-01-21", "2023-01-21", "2023-01-22"],
++            ),
++        },
++    )
++    windowed_cutoff = base_cutoff.copy()
++    windowed_cutoff["training_window"] = [pd.Timedelta("15d")] * 4
++
++    expected = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=base_cutoff,
++        training_window="15 days",
++    )
++    actual = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=windowed_cutoff,
++    )
++    pd.testing.assert_frame_equal(expected, actual)
++
++
++def test_per_instance_window_column_is_not_passed_through():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.NaT],
++        extra={"label": ["x", "y"]},
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert "training_window" not in fm.columns
++    # other additional columns are still passed through untouched
++    assert fm["label"].tolist() == ["x", "y"]
++
++
++def test_per_instance_window_output_row_order_matches_cutoff_order():
++    es = make_shop_es()
++    features = shop_features(es)
++    # intentionally unsorted instance ids and times
++    cutoff = make_windowed_cutoff(
++        times=[
++            (3, "2023-01-21"),
++            (1, "2023-01-22"),
++            (2, "2023-01-21"),
++            (1, "2023-01-21"),
++        ],
++        windows=[pd.Timedelta("7d"), pd.Timedelta("16d"), pd.NaT, pd.Timedelta("7d")],
++        extra={"marker": [10, 11, 12, 13]},
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["marker"].tolist() == [10, 11, 12, 13]
++    assert fm["COUNT(events)"].tolist() == [1, 3, 3, 2]
++
++
++def test_per_instance_window_chunk_size_invariance():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[
++            (1, "2023-01-21"),
++            (1, "2023-01-22"),
++            (2, "2023-01-21"),
++            (3, "2023-01-21"),
++        ],
++        windows=[pd.Timedelta("7d"), pd.Timedelta("16d"), pd.NaT, pd.Timedelta("7d")],
++    )
++    full = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    for chunk_size in [1, 2, 0.5]:
++        chunked = ft.calculate_feature_matrix(
++            features,
++            entityset=es,
++            cutoff_time=cutoff,
++            chunk_size=chunk_size,
++        )
++        pd.testing.assert_frame_equal(full, chunked)
++
++
++def test_per_instance_window_include_cutoff_time_false():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=[pd.Timedelta("7d")],
++    )
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff,
++        include_cutoff_time=False,
++    )
++    # [01-14, 01-21) -> only the 01-20 event
++    assert fm["COUNT(events)"].iloc[0] == 1
++    assert fm["SUM(events.amount)"].iloc[0] == 80.0
++
++
++def test_per_instance_window_include_cutoff_time_false_window_edge():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=[pd.Timedelta("20d")],
++    )
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff,
++        include_cutoff_time=False,
++    )
++    # [01-01, 01-21) -> 01-01, 01-05, 01-10, 01-20
++    assert fm["COUNT(events)"].iloc[0] == 4
++    assert fm["SUM(events.amount)"].iloc[0] == 150.0
++
++
++def test_per_instance_window_zero_window_excludes_all_data():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=[pd.Timedelta(0)],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].iloc[0] == 0
++    assert fm["SUM(events.amount)"].iloc[0] == 0.0
++
++
++def test_per_instance_window_applies_to_where_features():
++    es = make_shop_es()
++    where_feature = ft.Feature(
++        es["events"].ww["event_id"],
++        parent_dataframe_name="customers",
++        primitive=Count,
++        where=IdentityFeature(es["events"].ww["category"]) == "a",
++    )
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (1, "2023-01-22")],
++        windows=[pd.Timedelta("2d"), pd.NaT],
++    )
++    fm = ft.calculate_feature_matrix([where_feature], entityset=es, cutoff_time=cutoff)
++    # (01-19, 01-21] -> events 01-20(b), 01-21(a) -> one "a" event
++    assert fm.iloc[0, 0] == 1
++    # full history at 01-22 -> "a" events on 01-01, 01-05, 01-21
++    assert fm.iloc[1, 0] == 3
++
++
++def test_per_instance_window_leaves_target_identity_features_alone():
++    es = make_shop_es()
++    age = ft.Feature(es["customers"].ww["age"])
++    count = ft.Feature(
++        es["events"].ww["event_id"],
++        parent_dataframe_name="customers",
++        primitive=Count,
++    )
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.Timedelta("7d")],
++    )
++    fm = ft.calculate_feature_matrix([age, count], entityset=es, cutoff_time=cutoff)
++    assert fm["age"].tolist() == [30, 40]
++    assert fm["COUNT(events)"].tolist() == [2, 1]
++
++
++def test_per_instance_window_cutoff_time_in_index():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.NaT],
++    )
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff,
++        cutoff_time_in_index=True,
++    )
++    assert fm.index.names == ["customer_id", "time"]
++    assert fm.index[0] == (1, pd.Timestamp("2023-01-21"))
++    assert fm.index[1] == (2, pd.Timestamp("2023-01-21"))
++    assert fm["COUNT(events)"].tolist() == [2, 3]
++
++
++def test_per_instance_window_dfs_end_to_end():
++    es = make_shop_es()
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21"), (3, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.NaT, pd.Timedelta("1d")],
++    )
++    fm, feature_defs = ft.dfs(
++        entityset=es,
++        target_dataframe_name="customers",
++        cutoff_time=cutoff,
++        agg_primitives=["count", "sum"],
++        trans_primitives=[],
++        max_depth=1,
++    )
++    assert "training_window" not in fm.columns
++    assert fm["COUNT(events)"].tolist() == [2, 3, 0]
++    assert fm["SUM(events.amount)"].tolist() == [105.0, 50.0, 0.0]
++
++
++def test_per_instance_window_with_global_training_window_raises():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=[pd.Timedelta("7d")],
++    )
++    error = "Cannot pass a global training_window"
++    with pytest.raises(ValueError, match=error):
++        ft.calculate_feature_matrix(
++            features,
++            entityset=es,
++            cutoff_time=cutoff,
++            training_window="15 days",
++        )
++
++
++def test_per_instance_window_with_approximate_raises():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=[pd.Timedelta("7d")],
++    )
++    error = "approximate is not supported"
++    with pytest.raises(ValueError, match=error):
++        ft.calculate_feature_matrix(
++            features,
++            entityset=es,
++            cutoff_time=cutoff,
++            approximate="1d",
++        )
++
++
++def test_per_instance_window_negative_window_raises():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=[pd.Timedelta("-1d")],
++    )
++    with pytest.raises(ValueError, match="cannot be negative"):
++        ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++
++
++def test_per_instance_window_string_value_raises():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=["7d"],
++    )
++    with pytest.raises(ValueError, match="Invalid value"):
++        ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++
++
++def test_per_instance_window_numeric_value_datetime_es_raises():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=[7],
++    )
++    with pytest.raises(ValueError, match="Invalid value"):
++        ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++
++
++def test_per_instance_window_accepts_python_timedelta_objects():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[timedelta(days=7), None],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].tolist() == [2, 3]
++
++
++def test_per_instance_window_object_dtype_column():
++    es = make_shop_es()
++    features = shop_features(es)
++    # object dtype column mixing Timedelta values and missing values
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 2, 3],
++            "time": pd.to_datetime(["2023-01-21"] * 3),
++            "training_window": np.array(
++                [pd.Timedelta("7d"), None, pd.Timedelta("1d")],
++                dtype=object,
++            ),
++        },
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].tolist() == [2, 3, 0]
++
++
++def test_per_instance_window_duplicate_cutoff_rows_still_raise():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (1, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.Timedelta("15d")],
++    )
++    error = "Duplicated rows in cutoff time dataframe"
++    with pytest.raises(AssertionError, match=error):
++        ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++
++
++def test_per_instance_window_instance_ids_warning_unchanged():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=[pd.Timedelta("7d")],
++    )
++    warning = "Passing 'instance_ids' is valid only if"
++    with pytest.warns(UserWarning, match=warning):
++        ft.calculate_feature_matrix(
++            features,
++            entityset=es,
++            cutoff_time=cutoff,
++            instance_ids=[1],
++        )
++
++
++def test_no_window_column_behavior_unchanged():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 2, 3],
++            "time": pd.to_datetime(["2023-01-21"] * 3),
++            "label": ["x", "y", "z"],
++        },
++    )
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff,
++        training_window="15 days",
++    )
++    # 15 day global window at 01-21 -> (01-06, 01-21]
++    assert fm["COUNT(events)"].tolist() == [3, 2, 1]
++    assert fm["SUM(events.amount)"].tolist() == [145.0, 45.0, 7.0]
++    assert fm["label"].tolist() == ["x", "y", "z"]
++
++
++def test_numeric_entityset_global_window_now_supported():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=50,
++        training_window=20,
++    )
++    # (30, 50] -> t=45 for device 1; (30, 50] -> t=49 for device 2
++    assert fm["COUNT(logs)"].tolist() == [1, 1]
++    assert fm["SUM(logs.v)"].tolist() == [3.0, 6.0]
++
++
++def test_numeric_entityset_global_window_float_value():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=50,
++        training_window=35.5,
++    )
++    # (14.5, 50] -> t=30, 45 for device 1; t=25, 49 for device 2
++    assert fm["COUNT(logs)"].tolist() == [2, 2]
++    assert fm["SUM(logs.v)"].tolist() == [5.0, 11.0]
++
++
++def test_numeric_entityset_per_instance_windows():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 1, 2, 2],
++            "time": [50, 60, 50, 60],
++            "training_window": [20, None, 25, 5],
++        },
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    # device 1 @ 50, window 20 -> (30, 50] -> t=45
++    # device 1 @ 60, no window -> all three logs
++    # device 2 @ 50, window 25 -> (25, 50] -> t=49
++    # device 2 @ 60, window 5 -> (55, 60] -> no logs
++    assert fm["COUNT(logs)"].tolist() == [1, 3, 1, 0]
++    assert fm["SUM(logs.v)"].iloc[0] == 3.0
++    assert fm["SUM(logs.v)"].iloc[1] == 6.0
++    assert fm["SUM(logs.v)"].iloc[2] == 6.0
++    assert fm["SUM(logs.v)"].iloc[3] == 0.0
++
++
++def test_numeric_entityset_per_instance_window_matches_global():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    base_cutoff = pd.DataFrame({"instance_id": [1, 2], "time": [50, 50]})
++    windowed_cutoff = base_cutoff.copy()
++    windowed_cutoff["training_window"] = [20, 20]
++    expected = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=base_cutoff,
++        training_window=20,
++    )
++    actual = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=windowed_cutoff,
++    )
++    pd.testing.assert_frame_equal(expected, actual)
++
++
++def test_numeric_entityset_timedelta_window_value_raises():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1],
++            "time": [50],
++            "training_window": [pd.Timedelta("2d")],
++        },
++    )
++    with pytest.raises(ValueError, match="Invalid value"):
++        ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++
++
++def test_numeric_entityset_negative_window_value_raises():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1],
++            "time": [50],
++            "training_window": [-5],
++        },
++    )
++    with pytest.raises(ValueError, match="cannot be negative"):
++        ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++
++
++def test_numeric_entityset_window_with_include_cutoff_time_false():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 2],
++            "time": [45, 45],
++            "training_window": [35, 40],
++        },
++    )
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff,
++        include_cutoff_time=False,
++    )
++    # device 1: [10, 45) -> t=10, 30; device 2: [5, 45) -> t=5, 25
++    assert fm["COUNT(logs)"].tolist() == [2, 2]
++    assert fm["SUM(logs.v)"].tolist() == [3.0, 9.0]
++
++
++def make_multihop_es():
++    """Three-dataframe entityset: customers <- sessions <- events.
++
++    sessions
++        s1: customer 1, start 2023-01-03
++        s2: customer 1, start 2023-01-18
++        s3: customer 2, start 2023-01-06
++        s4: customer 2, start 2023-01-19
++    events
++        e1: s1, 2023-01-04, 10
++        e2: s1, 2023-01-10, 20
++        e3: s2, 2023-01-19, 40
++        e4: s2, 2023-01-20, 80
++        e5: s3, 2023-01-07, 5
++        e6: s4, 2023-01-21, 15
++    """
++    customers = pd.DataFrame({"customer_id": [1, 2]})
++    sessions = pd.DataFrame(
++        {
++            "session_id": ["s1", "s2", "s3", "s4"],
++            "customer_id": [1, 1, 2, 2],
++            "session_start": pd.to_datetime(
++                ["2023-01-03", "2023-01-18", "2023-01-06", "2023-01-19"],
++            ),
++            "end_date": pd.to_datetime(
++                ["2023-01-05", "2023-01-20", "2023-01-08", "2023-01-25"],
++            ),
++            "end_reason": ["done", "timeout", "done", None],
++        },
++    )
++    events = pd.DataFrame(
++        {
++            "event_id": ["e1", "e2", "e3", "e4", "e5", "e6"],
++            "session_id": ["s1", "s1", "s2", "s2", "s3", "s4"],
++            "time": pd.to_datetime(
++                [
++                    "2023-01-04",
++                    "2023-01-10",
++                    "2023-01-19",
++                    "2023-01-20",
++                    "2023-01-07",
++                    "2023-01-21",
++                ],
++            ),
++            "amount": [10.0, 20.0, 40.0, 80.0, 5.0, 15.0],
++        },
++    )
++    es = ft.EntitySet("multihop")
++    es.add_dataframe(customers, dataframe_name="customers", index="customer_id")
++    es.add_dataframe(
++        sessions,
++        dataframe_name="sessions",
++        index="session_id",
++        time_index="session_start",
++    )
++    es.add_dataframe(
++        events,
++        dataframe_name="events",
++        index="event_id",
++        time_index="time",
++    )
++    es.add_relationship("customers", "customer_id", "sessions", "customer_id")
++    es.add_relationship("sessions", "session_id", "events", "session_id")
++    return es
++
++
++def test_per_instance_window_applies_across_multiple_hops():
++    es = make_multihop_es()
++    event_count = ft.Feature(
++        es["events"].ww["event_id"],
++        parent_dataframe_name="customers",
++        primitive=Count,
++    )
++    event_total = ft.Feature(
++        es["events"].ww["amount"],
++        parent_dataframe_name="customers",
++        primitive=Sum,
++    )
++    session_count = ft.Feature(
++        es["sessions"].ww["session_id"],
++        parent_dataframe_name="customers",
++        primitive=Count,
++    )
++    features = [event_count, event_total, session_count]
++    cutoff = make_windowed_cutoff(
++        times=[
++            (1, "2023-01-21"),
++            (1, "2023-01-22"),
++            (2, "2023-01-21"),
++            (2, "2023-01-22"),
++        ],
++        windows=[
++            pd.Timedelta("7d"),
++            pd.Timedelta("15d"),
++            pd.Timedelta("7d"),
++            pd.NaT,
++        ],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++
++    # customer 1, window 7d at 01-21 -> (01-14, 01-21]
++    #   events: e3, e4 -> count 2, sum 120; sessions: s2 -> count 1
++    assert fm["COUNT(events)"].iloc[0] == 2
++    assert fm["SUM(events.amount)"].iloc[0] == 120.0
++    assert fm["COUNT(sessions)"].iloc[0] == 1
++    # customer 1, window 15d at 01-22 -> (01-07, 01-22]
++    #   the window filters every dataframe on the path: session s1 (start
++    #   01-03) is filtered out, so its events e1/e2 cannot join through to
++    #   customer 1; events: e3, e4 -> count 2, sum 120; sessions: s2 -> 1
++    assert fm["COUNT(events)"].iloc[1] == 2
++    assert fm["SUM(events.amount)"].iloc[1] == 120.0
++    assert fm["COUNT(sessions)"].iloc[1] == 1
++    # customer 2, window 7d at 01-21 -> (01-14, 01-21]
++    #   events: e6 -> count 1, sum 15; sessions: s4 -> count 1
++    assert fm["COUNT(events)"].iloc[2] == 1
++    assert fm["SUM(events.amount)"].iloc[2] == 15.0
++    assert fm["COUNT(sessions)"].iloc[2] == 1
++    # customer 2, no window at 01-22
++    #   events: e5, e6 -> count 2, sum 20; sessions: s3, s4 -> count 2
++    assert fm["COUNT(events)"].iloc[3] == 2
++    assert fm["SUM(events.amount)"].iloc[3] == 20.0
++    assert fm["COUNT(sessions)"].iloc[3] == 2
++
++
++def test_per_instance_window_multihop_matches_global_window():
++    es = make_multihop_es()
++    event_count = ft.Feature(
++        es["events"].ww["event_id"],
++        parent_dataframe_name="customers",
++        primitive=Count,
++    )
++    session_count = ft.Feature(
++        es["sessions"].ww["session_id"],
++        parent_dataframe_name="customers",
++        primitive=Count,
++    )
++    features = [event_count, session_count]
++    base_cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 2],
++            "time": pd.to_datetime(["2023-01-21", "2023-01-21"]),
++        },
++    )
++    windowed_cutoff = base_cutoff.copy()
++    windowed_cutoff["training_window"] = [pd.Timedelta("10d"), pd.Timedelta("10d")]
++
++    expected = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=base_cutoff,
++        training_window="10 days",
++    )
++    actual = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=windowed_cutoff,
++    )
++    pd.testing.assert_frame_equal(expected, actual)
++
++
++def test_per_instance_window_secondary_time_index_still_applies():
++    es = make_multihop_es()
++    es.set_secondary_time_index(
++        dataframe_name="sessions",
++        secondary_time_index={"end_date": ["end_reason"]},
++    )
++    end_reason = ft.Feature(es["sessions"].ww["end_reason"])
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": ["s2", "s2"],
++            "time": pd.to_datetime(["2023-01-19", "2023-01-21"]),
++            "training_window": [pd.Timedelta("7d"), pd.Timedelta("7d")],
++        },
++    )
++    fm = ft.calculate_feature_matrix([end_reason], entityset=es, cutoff_time=cutoff)
++    # end_date 01-20 is after the 01-19 cutoff, so the value is hidden there
++    assert pd.isna(fm["end_reason"].iloc[0])
++    assert fm["end_reason"].iloc[1] == "timeout"
++
++
++def test_per_instance_window_with_interesting_values_dfs():
++    es = make_shop_es()
++    es.add_interesting_values(
++        dataframe_name="events",
++        values={"category": ["a"]},
++    )
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (1, "2023-01-22")],
++        windows=[pd.Timedelta("7d"), pd.NaT],
++    )
++    fm, feature_defs = ft.dfs(
++        entityset=es,
++        target_dataframe_name="customers",
++        cutoff_time=cutoff,
++        agg_primitives=["count"],
++        trans_primitives=[],
++        where_primitives=["count"],
++        max_depth=1,
++    )
++    where_col = "COUNT(events WHERE category = a)"
++    assert where_col in fm.columns
++    # window 7d at 01-21 -> events 01-20(b), 01-21(a) -> one "a" event
++    assert fm[where_col].iloc[0] == 1
++    # full history at 01-22 -> "a" events on 01-01, 01-05, 01-21
++    assert fm[where_col].iloc[1] == 3
++
++
++def test_per_instance_window_with_seed_features():
++    es = make_shop_es()
++    seed = ft.Feature(
++        es["events"].ww["amount"],
++        parent_dataframe_name="customers",
++        primitive=Sum,
++    )
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.NaT],
++    )
++    fm, feature_defs = ft.dfs(
++        entityset=es,
++        target_dataframe_name="customers",
++        cutoff_time=cutoff,
++        agg_primitives=["count"],
++        trans_primitives=[],
++        seed_features=[seed],
++        max_depth=1,
++    )
++    assert fm["SUM(events.amount)"].tolist() == [105.0, 50.0]
++
++
++def test_per_instance_window_features_only_dfs_does_not_raise():
++    es = make_shop_es()
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=[pd.Timedelta("7d")],
++    )
++    feature_defs = ft.dfs(
++        entityset=es,
++        target_dataframe_name="customers",
++        cutoff_time=cutoff,
++        agg_primitives=["count"],
++        trans_primitives=[],
++        features_only=True,
++    )
++    assert len(feature_defs) > 0
++
++
++def test_per_instance_window_features_from_dfs_definitions():
++    es = make_shop_es()
++    feature_defs = ft.dfs(
++        entityset=es,
++        target_dataframe_name="customers",
++        agg_primitives=["count", "mean"],
++        trans_primitives=[],
++        features_only=True,
++        max_depth=1,
++    )
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (3, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.Timedelta("7d")],
++    )
++    fm = ft.calculate_feature_matrix(feature_defs, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].tolist() == [2, 1]
++    assert fm["MEAN(events.amount)"].tolist() == [52.5, 7.0]
++
++
++def test_validate_training_window_column_no_column():
++    from featuretools.computational_backends.utils import (
++        _validate_training_window_column,
++    )
++
++    cutoff = pd.DataFrame(
++        {"instance_id": [1], "time": pd.to_datetime(["2023-01-21"])},
++    )
++    assert _validate_training_window_column(cutoff, None, "numeric") is False
++    assert _validate_training_window_column(cutoff, "2 days", "numeric") is False
++
++
++def test_validate_training_window_column_accepts_missing_values():
++    from featuretools.computational_backends.utils import (
++        _validate_training_window_column,
++    )
++
++    for missing in [None, np.nan, pd.NaT]:
++        cutoff = pd.DataFrame(
++            {
++                "instance_id": [1, 2],
++                "time": pd.to_datetime(["2023-01-21", "2023-01-21"]),
++                "training_window": [pd.Timedelta("7d"), missing],
++            },
++        )
++        assert _validate_training_window_column(cutoff, None, "datetime") is True
++
++
++def test_validate_training_window_column_rejects_bool():
++    from featuretools.computational_backends.utils import (
++        _validate_training_window_column,
++    )
++
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1],
++            "time": [50],
++            "training_window": [True],
++        },
++    )
++    with pytest.raises(ValueError, match="Invalid value"):
++        _validate_training_window_column(cutoff, None, "numeric")
++
++
++def test_group_by_time_and_window_orders_groups():
++    from featuretools.computational_backends.calculate_feature_matrix import (
++        _group_by_time_and_window,
++    )
++
++    group = pd.DataFrame(
++        {
++            "instance_id": [1, 2, 3, 4],
++            "time": pd.to_datetime(["2023-01-21"] * 4),
++            "training_window": pd.to_timedelta(["10d", None, "5d", "10d"]),
++        },
++    )
++    groups = _group_by_time_and_window(group, "time", "training_window")
++    # window groups come first in sorted order, missing-window rows come last
++    keys = [key for key, _ in groups]
++    assert keys == [
++        (pd.Timestamp("2023-01-21"), pd.Timedelta("5d")),
++        (pd.Timestamp("2023-01-21"), pd.Timedelta("10d")),
++        (pd.Timestamp("2023-01-21"), None),
++    ]
++    assert groups[0][1]["instance_id"].tolist() == [3]
++    assert groups[1][1]["instance_id"].tolist() == [1, 4]
++    assert groups[2][1]["instance_id"].tolist() == [2]
++
++
++def test_group_by_time_and_window_all_missing():
++    from featuretools.computational_backends.calculate_feature_matrix import (
++        _group_by_time_and_window,
++    )
++
++    group = pd.DataFrame(
++        {
++            "instance_id": [1, 2],
++            "time": pd.to_datetime(["2023-01-21"] * 2),
++            "training_window": pd.to_timedelta([None, None]),
++        },
++    )
++    groups = _group_by_time_and_window(group, "time", "training_window")
++    assert len(groups) == 1
++    assert groups[0][0] == (pd.Timestamp("2023-01-21"), None)
++    assert len(groups[0][1]) == 2
++
++
++def test_per_instance_window_many_distinct_windows_same_time():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[
++            (1, "2023-01-21"),
++            (1, "2023-01-22"),
++            (1, "2023-01-23"),
++            (2, "2023-01-21"),
++            (2, "2023-01-22"),
++            (2, "2023-01-23"),
++            (3, "2023-01-21"),
++        ],
++        windows=[
++            pd.Timedelta("5d"),
++            pd.Timedelta("10d"),
++            pd.Timedelta("21d"),
++            pd.Timedelta("5d"),
++            pd.Timedelta("10d"),
++            pd.Timedelta("21d"),
++            pd.NaT,
++        ],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    # customer 1
++    #   5d at 01-21  -> (01-16, 01-21] -> 01-20, 01-21 -> 2 events
++    #   10d at 01-22 -> (01-12, 01-22] -> 01-20, 01-21 -> 2 events
++    #   21d at 01-23 -> (01-02, 01-23] -> all except 01-01 -> 4 events
++    assert fm["COUNT(events)"].tolist()[:3] == [2, 2, 4]
++    # customer 2
++    #   5d at 01-21  -> (01-16, 01-21] -> none -> 0
++    #   10d at 01-22 -> (01-12, 01-22] -> 01-15, 01-22 -> 2 events
++    #   21d at 01-23 -> (01-02, 01-23] -> 01-08, 01-15, 01-22 -> 3 events
++    assert fm["COUNT(events)"].tolist()[3:6] == [0, 2, 3]
++    # customer 3 without window at 01-21 -> 1 event
++    assert fm["COUNT(events)"].iloc[6] == 1
++
++
++def test_per_instance_window_each_row_calculated_with_own_window():
++    """Regression guard: two rows sharing a time but with different windows
++    must not leak their windows onto each other."""
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.NaT],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    # if the 7 day window leaked onto customer 2, its count would be 1
++    assert fm["COUNT(events)"].tolist() == [2, 3]
++    # swap the windows around and check the results swap as well
++    cutoff_swapped = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[pd.NaT, pd.Timedelta("7d")],
++    )
++    fm_swapped = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff_swapped,
++    )
++    assert fm_swapped["COUNT(events)"].tolist() == [5, 1]
++
++
++def test_per_instance_window_nan_and_none_both_missing():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 2, 3],
++            "time": pd.to_datetime(["2023-01-21"] * 3),
++            "training_window": [np.nan, None, pd.NaT],
++        },
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].tolist() == [5, 3, 1]
++
++
++def test_per_instance_window_with_alternate_instance_column_name():
++    es = make_shop_es()
++    features = shop_features(es)
++    # cutoff DataFrame uses the target dataframe index name instead of instance_id
++    cutoff = pd.DataFrame(
++        {
++            "customer_id": [1, 2],
++            "time": pd.to_datetime(["2023-01-21", "2023-01-21"]),
++            "training_window": [pd.Timedelta("7d"), pd.NaT],
++        },
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].tolist() == [2, 3]
++
++
++def test_per_instance_window_empty_result_for_small_window():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(2, "2023-01-21")],
++        windows=[pd.Timedelta("6d")],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    # (01-15, 01-21] contains no customer 2 events
++    assert fm["COUNT(events)"].iloc[0] == 0
++    assert fm["SUM(events.amount)"].iloc[0] == 0.0
++    assert pd.isna(fm["MEAN(events.amount)"].iloc[0])
++    assert pd.isna(fm["MAX(events.amount)"].iloc[0])
++    assert pd.isna(fm["MIN(events.amount)"].iloc[0])
++
++
++def test_numeric_entityset_per_instance_float_windows():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 2],
++            "time": [50, 50],
++            "training_window": [35.5, 44.5],
++        },
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    # device 1: (14.5, 50] -> t=30, 45; device 2: (5.5, 50] -> t=25, 49
++    assert fm["COUNT(logs)"].tolist() == [2, 2]
++    assert fm["SUM(logs.v)"].tolist() == [5.0, 11.0]
++
++
++def test_numeric_entityset_window_edge_is_exclusive():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 1],
++            "time": [50, 51],
++            "training_window": [40, 41],
++        },
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    # (10, 50] excludes t=10; (10, 51] also excludes t=10
++    assert fm["COUNT(logs)"].tolist() == [2, 2]
++    # window of 41 at t=50 would include t=10
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1],
++            "time": [50],
++            "training_window": [41],
++        },
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(logs)"].iloc[0] == 3
++
++
++def test_numeric_entityset_zero_window_excludes_all_data():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1],
++            "time": [45],
++            "training_window": [0],
++        },
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(logs)"].iloc[0] == 0
++    assert fm["SUM(logs.v)"].iloc[0] == 0.0
++
++
++def test_numeric_entityset_global_window_with_single_cutoff_and_ids():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=50,
++        instance_ids=[1],
++        training_window=20,
++    )
++    assert fm["COUNT(logs)"].tolist() == [1]
++    assert fm["SUM(logs.v)"].tolist() == [3.0]
++
++
++def test_numeric_entityset_global_window_no_cutoff_time():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        training_window=20,
++    )
++    # numeric entitysets use np.inf as the default cutoff time; a window
++    # relative to np.inf excludes every row, matching the datetime behavior
++    # of a window relative to "now" excluding older data
++    assert fm["COUNT(logs)"].tolist() == [0, 0]
++    assert fm["SUM(logs.v)"].tolist() == [0.0, 0.0]
++
++
++def test_numeric_entityset_global_observations_window_still_raises():
++    from featuretools import Timedelta
++
++    es = make_numeric_es()
++    features = numeric_features(es)
++    error = "Training window cannot be in observations"
++    with pytest.raises(AssertionError, match=error):
++        ft.calculate_feature_matrix(
++            features,
++            entityset=es,
++            cutoff_time=50,
++            training_window=Timedelta(2, "observations"),
++        )
++
++
++def test_datetime_entityset_global_observations_window_still_raises():
++    from featuretools import Timedelta
++
++    es = make_shop_es()
++    features = shop_features(es)
++    error = "Training window cannot be in observations"
++    with pytest.raises(AssertionError, match=error):
++        ft.calculate_feature_matrix(
++            features,
++            entityset=es,
++            cutoff_time=pd.Timestamp("2023-01-21"),
++            training_window=Timedelta(2, "observations"),
++        )
++
++
++def test_per_instance_window_very_large_window_matches_full_history():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[pd.Timedelta("10000d"), pd.Timedelta("10000d")],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].tolist() == [5, 3]
++    assert fm["SUM(events.amount)"].tolist() == [175.0, 50.0]
++
++
++def test_per_instance_window_numpy_timedelta64_values():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[np.timedelta64(7, "D"), np.timedelta64(1, "D")],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].tolist() == [2, 0]
++
++
++def test_per_instance_window_negative_python_timedelta_raises():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21")],
++        windows=[timedelta(days=-1)],
++    )
++    with pytest.raises(ValueError, match="cannot be negative"):
++        ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++
++
++def test_per_instance_window_non_numeric_string_raises():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1],
++            "time": [50],
++            "training_window": ["not_a_window"],
++        },
++    )
++    with pytest.raises(ValueError, match="Invalid value"):
++        ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++
++
++def test_per_instance_window_save_progress(tmp_path):
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21"), (3, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.NaT, pd.Timedelta("1d")],
++    )
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff,
++        save_progress=str(tmp_path),
++    )
++    assert fm["COUNT(events)"].tolist() == [2, 3, 0]
++
++
++def test_per_instance_window_woodwork_initialized_cutoff():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.NaT],
++    )
++    cutoff.ww.init()
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].tolist() == [2, 3]
++
++
++def test_per_instance_window_transform_features_unaffected():
++    es = make_shop_es()
++    trans = ft.Feature([ft.Feature(es["customers"].ww["age"])], primitive=ft.primitives.CumSum)
++    count = ft.Feature(
++        es["events"].ww["event_id"],
++        parent_dataframe_name="customers",
++        primitive=Count,
++    )
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21"), (3, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.NaT, pd.Timedelta("1d")],
++    )
++    fm = ft.calculate_feature_matrix([trans, count], entityset=es, cutoff_time=cutoff)
++    # transform features on the target dataframe do not depend on the window
++    base_cutoff = cutoff.drop(columns=["training_window"])
++    fm_base = ft.calculate_feature_matrix([trans, count], entityset=es, cutoff_time=base_cutoff)
++    assert fm["CUM_SUM(age)"].tolist() == fm_base["CUM_SUM(age)"].tolist()
++    assert fm["COUNT(events)"].tolist() == [2, 3, 0]
++
++
++def test_per_instance_window_stacked_transform_on_aggregation():
++    es = make_shop_es()
++    total = ft.Feature(
++        es["events"].ww["amount"],
++        parent_dataframe_name="customers",
++        primitive=Sum,
++    )
++    percentile = ft.Feature([total], primitive=ft.primitives.Percentile)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21"), (3, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.NaT, pd.Timedelta("1d")],
++    )
++    fm = ft.calculate_feature_matrix([total, percentile], entityset=es, cutoff_time=cutoff)
++    assert fm["SUM(events.amount)"].tolist() == [105.0, 50.0, 0.0]
++    # the stacked transform consumes the windowed aggregation values
++    assert fm["PERCENTILE(SUM(events.amount))"].tolist() == [1.0, 2 / 3, 0.5]
++
++
++def test_per_instance_window_cutoff_not_sorted_by_time():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[
++            (1, "2023-01-23"),
++            (2, "2023-01-21"),
++            (1, "2023-01-21"),
++            (2, "2023-01-23"),
++        ],
++        windows=[
++            pd.Timedelta("21d"),
++            pd.Timedelta("7d"),
++            pd.Timedelta("7d"),
++            pd.NaT,
++        ],
++        extra={"order_marker": [0, 1, 2, 3]},
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    # rows must come back in the same order as the cutoff DataFrame
++    assert fm["order_marker"].tolist() == [0, 1, 2, 3]
++    # customer 1, 21d at 01-23 -> (01-02, 01-23] -> 4 events
++    # customer 2, 7d at 01-21 -> (01-14, 01-21] -> 1 event
++    # customer 1, 7d at 01-21 -> 2 events
++    # customer 2, no window at 01-23 -> 4 events (01-02, 01-08, 01-15, 01-22)
++    assert fm["COUNT(events)"].tolist() == [4, 1, 2, 4]
++
++
++def test_per_instance_window_multiple_features_same_column():
++    es = make_shop_es()
++    total = ft.Feature(
++        es["events"].ww["amount"],
++        parent_dataframe_name="customers",
++        primitive=Sum,
++    )
++    mean = ft.Feature(
++        es["events"].ww["amount"],
++        parent_dataframe_name="customers",
++        primitive=Mean,
++    )
++    max_amount = ft.Feature(
++        es["events"].ww["amount"],
++        parent_dataframe_name="customers",
++        primitive=Max,
++    )
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (1, "2023-01-22")],
++        windows=[pd.Timedelta("7d"), pd.NaT],
++    )
++    fm = ft.calculate_feature_matrix(
++        [total, mean, max_amount],
++        entityset=es,
++        cutoff_time=cutoff,
++    )
++    assert fm["SUM(events.amount)"].tolist() == [105.0, 175.0]
++    assert fm["MEAN(events.amount)"].tolist() == [52.5, 35.0]
++    assert fm["MAX(events.amount)"].tolist() == [80.0, 80.0]
++
++
++def test_per_instance_window_on_child_target_dataframe():
++    es = make_multihop_es()
++    # target sessions: the window filters every dataframe on the path,
++    # including the target dataframe itself, so a session whose own start
++    # time falls outside its window sees no events at all
++    event_count = ft.Feature(
++        es["events"].ww["event_id"],
++        parent_dataframe_name="sessions",
++        primitive=Count,
++    )
++    cutoff = make_windowed_cutoff(
++        times=[("s1", "2023-01-21"), ("s2", "2023-01-21"), ("s4", "2023-01-21")],
++        windows=[pd.NaT, pd.Timedelta("4d"), pd.Timedelta("4d")],
++    )
++    fm = ft.calculate_feature_matrix([event_count], entityset=es, cutoff_time=cutoff)
++    # s1 without window: e1, e2 -> 2
++    # s2 (start 01-18) inside (01-17, 01-21]: its events e3(01-19), e4(01-20) -> 2
++    # s4 (start 01-19) inside (01-17, 01-21]: its event e6(01-21) -> 1
++    assert fm["COUNT(events)"].tolist() == [2, 2, 1]
++
++
++def test_numeric_entityset_per_instance_window_chunk_size_invariance():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 1, 2, 2],
++            "time": [50, 60, 50, 60],
++            "training_window": [20, None, 25, 5],
++        },
++    )
++    full = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    for chunk_size in [1, 2, 0.5]:
++        chunked = ft.calculate_feature_matrix(
++            features,
++            entityset=es,
++            cutoff_time=cutoff,
++            chunk_size=chunk_size,
++        )
++        pd.testing.assert_frame_equal(full, chunked)
++
++
++def test_numeric_entityset_window_column_all_null_matches_no_column():
++    es = make_numeric_es()
++    features = numeric_features(es)
++    base_cutoff = pd.DataFrame({"instance_id": [1, 2], "time": [50, 50]})
++    windowed_cutoff = base_cutoff.copy()
++    windowed_cutoff["training_window"] = np.nan
++    expected = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=base_cutoff)
++    actual = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=windowed_cutoff,
++    )
++    pd.testing.assert_frame_equal(expected, actual)
++
++
++def test_approximate_without_window_column_still_works():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": [1, 2, 3],
++            "time": pd.to_datetime(["2023-01-21"] * 3),
++        },
++    )
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff,
++        approximate="1d",
++    )
++    assert fm["COUNT(events)"].tolist() == [5, 3, 1]
++
++
++def test_per_instance_window_same_window_value_different_times():
++    es = make_shop_es()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (1, "2023-01-22"), (2, "2023-01-22")],
++        windows=[pd.Timedelta("7d"), pd.Timedelta("7d"), pd.Timedelta("7d")],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    # customer 1 at 01-21 -> (01-14, 01-21] -> 2 events
++    # customer 1 at 01-22 -> (01-15, 01-22] -> 2 events (01-20, 01-21)
++    # customer 2 at 01-22 -> (01-15, 01-22] -> only 01-22 (01-15 is the
++    #   exclusive lower edge) -> 1 event
++    assert fm["COUNT(events)"].tolist() == [2, 2, 1]
++    assert fm["SUM(events.amount)"].tolist() == [105.0, 105.0, 35.0]
++
++
++def test_per_instance_window_last_time_index_interaction():
++    # with last time indexes added, the windowed calculation must still work
++    es = make_shop_es()
++    es.add_last_time_indexes()
++    features = shop_features(es)
++    cutoff = make_windowed_cutoff(
++        times=[(1, "2023-01-21"), (2, "2023-01-21")],
++        windows=[pd.Timedelta("7d"), pd.NaT],
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert fm["COUNT(events)"].tolist() == [2, 3]
++
++
++def test_per_instance_window_large_mixed_cutoff_matches_rowwise_global():
++    # every row of a large mixed cutoff DataFrame must match the value that
++    # the pre-existing global training_window code path produces for the
++    # same (instance, time, window) combination
++    es = make_shop_es()
++    features = shop_features(es)
++    rows = []
++    windows = []
++    for customer_id in [1, 2, 3]:
++        for day, window in [
++            ("2023-01-20", pd.Timedelta("3d")),
++            ("2023-01-21", pd.Timedelta("7d")),
++            ("2023-01-22", pd.NaT),
++            ("2023-01-23", pd.Timedelta("14d")),
++        ]:
++            rows.append((customer_id, day))
++            windows.append(window)
++    cutoff = make_windowed_cutoff(times=rows, windows=windows)
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert len(fm) == 12
++    for position, ((customer_id, day), window) in enumerate(zip(rows, windows)):
++        global_window = None if pd.isna(window) else window
++        expected = ft.calculate_feature_matrix(
++            features,
++            entityset=es,
++            cutoff_time=pd.DataFrame(
++                {"instance_id": [customer_id], "time": [pd.Timestamp(day)]},
++            ),
++            training_window=global_window,
++        )
++        actual_row = fm.iloc[[position]][list(expected.columns)]
++        pd.testing.assert_frame_equal(
++            actual_row.reset_index(drop=True),
++            expected.reset_index(drop=True),
++        )
+diff --git a/featuretools/tests/computational_backend/test_per_instance_training_window_ecommerce.py b/featuretools/tests/computational_backend/test_per_instance_training_window_ecommerce.py
+new file mode 100644
+index 00000000..7db1ff15
+--- /dev/null
++++ b/featuretools/tests/computational_backend/test_per_instance_training_window_ecommerce.py
+@@ -0,0 +1,426 @@
++"""Integration tests for per-instance training windows using the standard
++ecommerce entityset fixtures (``es`` with a datetime time index and
++``int_es`` with an integer time index).
++
++Most assertions here are equivalences against the pre-existing global
++``training_window`` behavior: rows that share a window value must produce
++exactly the same feature values as a separate calculation using that window
++globally, and rows without a window value must match a calculation without
++any window.
++"""
++import pandas as pd
++import pytest
++
++import featuretools as ft
++from featuretools.primitives import Count, Mean, Sum
++
++
++def ecommerce_features(es):
++    count = ft.Feature(
++        es["log"].ww["id"],
++        parent_dataframe_name="sessions",
++        primitive=Count,
++    )
++    total = ft.Feature(
++        es["log"].ww["value"],
++        parent_dataframe_name="sessions",
++        primitive=Sum,
++    )
++    mean = ft.Feature(
++        es["log"].ww["value"],
++        parent_dataframe_name="sessions",
++        primitive=Mean,
++    )
++    return [count, total, mean]
++
++
++def cutoff_for_sessions(es, windows, times=None):
++    session_ids = es["sessions"].ww["id"].tolist()[: len(windows)]
++    if times is None:
++        times = [pd.Timestamp("2011-04-09 10:30:00")] * len(windows)
++    return pd.DataFrame(
++        {
++            "instance_id": session_ids,
++            "time": times,
++            "training_window": windows,
++        },
++    )
++
++
++def assert_windowed_rows_match_global(es, features, cutoff, window, global_window):
++    """Rows of ``cutoff`` whose window column equals ``window`` must match a
++    calculation of the same rows with ``global_window`` as the global
++    training_window (or no window at all if ``global_window`` is None)."""
++    mask = cutoff["training_window"].isna()
++    if window is not None:
++        mask = cutoff["training_window"] == window
++    rows = cutoff[mask][["instance_id", "time"]]
++    expected = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=rows,
++        training_window=global_window,
++    )
++    actual = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    actual_rows = actual.loc[actual.index.isin(expected.index)]
++    pd.testing.assert_frame_equal(
++        expected.sort_index(),
++        actual_rows.sort_index(),
++    )
++
++
++def test_ecommerce_per_instance_window_matches_global_per_window(es):
++    features = ecommerce_features(es)
++    cutoff = cutoff_for_sessions(
++        es,
++        [
++            pd.Timedelta("10min"),
++            pd.Timedelta("1h"),
++            pd.Timedelta("1h"),
++            pd.NaT,
++            pd.Timedelta("10min"),
++            pd.NaT,
++        ],
++    )
++    assert_windowed_rows_match_global(
++        es,
++        features,
++        cutoff,
++        pd.Timedelta("10min"),
++        "10 minutes",
++    )
++    assert_windowed_rows_match_global(es, features, cutoff, pd.Timedelta("1h"), "1h")
++    assert_windowed_rows_match_global(es, features, cutoff, None, None)
++
++
++def test_ecommerce_constant_window_column_matches_global(es):
++    features = ecommerce_features(es)
++    base_cutoff = pd.DataFrame(
++        {
++            "instance_id": es["sessions"].ww["id"].tolist()[:6],
++            "time": [pd.Timestamp("2011-04-09 10:30:00")] * 6,
++        },
++    )
++    windowed_cutoff = base_cutoff.copy()
++    windowed_cutoff["training_window"] = [pd.Timedelta("2h")] * 6
++    expected = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=base_cutoff,
++        training_window="2h",
++    )
++    actual = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=windowed_cutoff,
++    )
++    pd.testing.assert_frame_equal(expected, actual)
++
++
++def test_ecommerce_per_instance_window_multiple_times(es):
++    features = ecommerce_features(es)
++    session_ids = es["sessions"].ww["id"].tolist()[:4]
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": session_ids + session_ids,
++            "time": [pd.Timestamp("2011-04-09 10:30:00")] * 4
++            + [pd.Timestamp("2011-04-10 11:00:00")] * 4,
++            "training_window": [pd.Timedelta("1h")] * 4 + [pd.NaT] * 4,
++        },
++    )
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert len(fm) == 8
++    early = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff.iloc[:4][["instance_id", "time"]],
++        training_window="1h",
++    )
++    late = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff.iloc[4:][["instance_id", "time"]],
++    )
++    pd.testing.assert_frame_equal(
++        fm.sort_index(),
++        pd.concat([early, late]).sort_index(),
++    )
++
++
++def test_ecommerce_per_instance_window_pass_through(es):
++    features = ecommerce_features(es)
++    cutoff = cutoff_for_sessions(
++        es,
++        [pd.Timedelta("1h"), pd.NaT],
++        times=[pd.Timestamp("2011-04-09 10:30:00")] * 2,
++    )
++    cutoff["session_label"] = ["first", "second"]
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    assert "training_window" not in fm.columns
++    assert fm["session_label"].tolist() == ["first", "second"]
++
++
++def test_ecommerce_per_instance_window_cutoff_time_in_index(es):
++    features = ecommerce_features(es)
++    cutoff = cutoff_for_sessions(
++        es,
++        [pd.Timedelta("1h"), pd.NaT],
++        times=[pd.Timestamp("2011-04-09 10:30:00")] * 2,
++    )
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff,
++        cutoff_time_in_index=True,
++    )
++    assert fm.index.names == ["id", "time"]
++    assert "training_window" not in fm.columns
++
++
++def test_ecommerce_per_instance_window_chunk_size_invariance(es):
++    features = ecommerce_features(es)
++    cutoff = cutoff_for_sessions(
++        es,
++        [pd.Timedelta("1h"), pd.Timedelta("10min"), pd.NaT, pd.Timedelta("1h")],
++    )
++    full = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=cutoff)
++    for chunk_size in [1, 2, 0.5]:
++        chunked = ft.calculate_feature_matrix(
++            features,
++            entityset=es,
++            cutoff_time=cutoff,
++            chunk_size=chunk_size,
++        )
++        pd.testing.assert_frame_equal(full, chunked)
++
++
++def test_ecommerce_per_instance_window_dfs(es):
++    cutoff = cutoff_for_sessions(
++        es,
++        [pd.Timedelta("1h"), pd.NaT],
++        times=[pd.Timestamp("2011-04-09 10:30:00")] * 2,
++    )
++    fm, _ = ft.dfs(
++        entityset=es,
++        target_dataframe_name="sessions",
++        cutoff_time=cutoff,
++        agg_primitives=["count", "sum", "mean"],
++        trans_primitives=[],
++        max_depth=1,
++    )
++    assert "training_window" not in fm.columns
++    expected_windowed, _ = ft.dfs(
++        entityset=es,
++        target_dataframe_name="sessions",
++        cutoff_time=cutoff.iloc[[0]][["instance_id", "time"]],
++        training_window="1h",
++        agg_primitives=["count", "sum", "mean"],
++        trans_primitives=[],
++        max_depth=1,
++    )
++    expected_full, _ = ft.dfs(
++        entityset=es,
++        target_dataframe_name="sessions",
++        cutoff_time=cutoff.iloc[[1]][["instance_id", "time"]],
++        agg_primitives=["count", "sum", "mean"],
++        trans_primitives=[],
++        max_depth=1,
++    )
++    pd.testing.assert_frame_equal(
++        fm.sort_index(),
++        pd.concat([expected_windowed, expected_full]).sort_index(),
++    )
++
++
++def test_ecommerce_per_instance_window_deep_features(es):
++    """Per-instance windows must also apply to aggregations two hops away."""
++    count = ft.Feature(
++        es["log"].ww["id"],
++        parent_dataframe_name="customers",
++        primitive=Count,
++    )
++    mean = ft.Feature(
++        es["log"].ww["value"],
++        parent_dataframe_name="customers",
++        primitive=Mean,
++    )
++    features = [count, mean]
++    customer_ids = es["customers"].ww["id"].tolist()[:3]
++    base_cutoff = pd.DataFrame(
++        {
++            "instance_id": customer_ids,
++            "time": [pd.Timestamp("2011-04-09 10:30:00")] * 3,
++        },
++    )
++    windowed_cutoff = base_cutoff.copy()
++    windowed_cutoff["training_window"] = [
++        pd.Timedelta("1h"),
++        pd.NaT,
++        pd.Timedelta("10min"),
++    ]
++    fm = ft.calculate_feature_matrix(features, entityset=es, cutoff_time=windowed_cutoff)
++    for idx, global_window in enumerate(["1h", None, "10 minutes"]):
++        expected = ft.calculate_feature_matrix(
++            features,
++            entityset=es,
++            cutoff_time=base_cutoff.iloc[[idx]],
++            training_window=global_window,
++        )
++        pd.testing.assert_frame_equal(fm.iloc[[idx]], expected)
++
++
++def test_ecommerce_per_instance_window_with_global_raises_via_dfs(es):
++    cutoff = cutoff_for_sessions(
++        es,
++        [pd.Timedelta("1h")],
++        times=[pd.Timestamp("2011-04-09 10:30:00")],
++    )
++    error = "Cannot pass a global training_window"
++    with pytest.raises(ValueError, match=error):
++        ft.dfs(
++            entityset=es,
++            target_dataframe_name="sessions",
++            cutoff_time=cutoff,
++            training_window="1h",
++            agg_primitives=["count"],
++            trans_primitives=[],
++        )
++
++
++def test_ecommerce_per_instance_window_with_approximate_raises_via_dfs(es):
++    cutoff = cutoff_for_sessions(
++        es,
++        [pd.Timedelta("1h")],
++        times=[pd.Timestamp("2011-04-09 10:30:00")],
++    )
++    error = "approximate is not supported"
++    with pytest.raises(ValueError, match=error):
++        ft.dfs(
++            entityset=es,
++            target_dataframe_name="sessions",
++            cutoff_time=cutoff,
++            approximate="1h",
++            agg_primitives=["count"],
++            trans_primitives=[],
++        )
++
++
++def test_ecommerce_global_window_still_works(es):
++    """Sanity check that global windows on the datetime fixture are unchanged."""
++    features = ecommerce_features(es)
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": es["sessions"].ww["id"].tolist()[:3],
++            "time": [pd.Timestamp("2011-04-09 10:30:00")] * 3,
++        },
++    )
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=es,
++        cutoff_time=cutoff,
++        training_window="1h",
++    )
++    assert len(fm) == 3
++
++
++def test_int_es_global_numeric_window(int_es):
++    count = ft.Feature(
++        int_es["log"].ww["id"],
++        parent_dataframe_name="sessions",
++        primitive=Count,
++    )
++    total = ft.Feature(
++        int_es["log"].ww["value"],
++        parent_dataframe_name="sessions",
++        primitive=Sum,
++    )
++    fm = ft.calculate_feature_matrix(
++        [count, total],
++        entityset=int_es,
++        cutoff_time=430,
++        training_window=100,
++    )
++    assert len(fm) == 6
++
++
++def test_int_es_per_instance_numeric_windows(int_es):
++    count = ft.Feature(
++        int_es["log"].ww["id"],
++        parent_dataframe_name="sessions",
++        primitive=Count,
++    )
++    total = ft.Feature(
++        int_es["log"].ww["value"],
++        parent_dataframe_name="sessions",
++        primitive=Sum,
++    )
++    features = [count, total]
++    session_ids = int_es["sessions"].ww["id"].tolist()[:6]
++    base_cutoff = pd.DataFrame(
++        {
++            "instance_id": session_ids,
++            "time": [430] * 6,
++        },
++    )
++    windowed_cutoff = base_cutoff.copy()
++    windowed_cutoff["training_window"] = [100, None, 50, 100, None, 50]
++    fm = ft.calculate_feature_matrix(
++        features,
++        entityset=int_es,
++        cutoff_time=windowed_cutoff,
++    )
++    assert len(fm) == 6
++    for idx, global_window in enumerate([100, None, 50]):
++        rows = base_cutoff.iloc[[i for i in range(6) if i % 3 == idx]]
++        expected = ft.calculate_feature_matrix(
++            features,
++            entityset=int_es,
++            cutoff_time=rows,
++            training_window=global_window,
++        )
++        pd.testing.assert_frame_equal(
++            fm.loc[fm.index.isin(expected.index)].sort_index(),
++            expected.sort_index(),
++        )
++
++
++def test_int_es_per_instance_window_column_not_passed_through(int_es):
++    count = ft.Feature(
++        int_es["log"].ww["id"],
++        parent_dataframe_name="sessions",
++        primitive=Count,
++    )
++    session_ids = int_es["sessions"].ww["id"].tolist()[:2]
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": session_ids,
++            "time": [430, 430],
++            "training_window": [100, None],
++        },
++    )
++    fm = ft.calculate_feature_matrix([count], entityset=int_es, cutoff_time=cutoff)
++    assert "training_window" not in fm.columns
++
++
++def test_int_es_per_instance_window_with_global_raises(int_es):
++    count = ft.Feature(
++        int_es["log"].ww["id"],
++        parent_dataframe_name="sessions",
++        primitive=Count,
++    )
++    session_ids = int_es["sessions"].ww["id"].tolist()[:2]
++    cutoff = pd.DataFrame(
++        {
++            "instance_id": session_ids,
++            "time": [430, 430],
++            "training_window": [100, None],
++        },
++    )
++    error = "Cannot pass a global training_window"
++    with pytest.raises(ValueError, match=error):
++        ft.calculate_feature_matrix(
++            [count],
++            entityset=int_es,
++            cutoff_time=cutoff,
++            training_window=100,
++        )
+diff --git a/featuretools/utils/wrangle.py b/featuretools/utils/wrangle.py
+index e160175c..b2946aa3 100644
+--- a/featuretools/utils/wrangle.py
++++ b/featuretools/utils/wrangle.py
+@@ -9,6 +9,21 @@ from woodwork.logical_types import Datetime, Ordinal
+ from featuretools.entityset.timedelta import Timedelta
+ 
+ 
++def _check_window(window):
++    """Validate a training window value.
++
++    Behaves like :func:`_check_timedelta`, except that plain numeric values
++    are returned unchanged so they can be used directly as windows on
++    entitysets with a numeric time index.
++    """
++    if isinstance(window, (int, float, np.integer, np.floating)) and not isinstance(
++        window,
++        bool,
++    ):
++        return window
++    return _check_timedelta(window)
++
++
+ def _check_timedelta(td):
+     """
+     Convert strings to Timedelta objects

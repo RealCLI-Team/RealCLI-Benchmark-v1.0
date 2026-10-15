@@ -1,0 +1,2858 @@
+diff --git a/core/diskscan/__init__.py b/core/diskscan/__init__.py
+new file mode 100644
+index 00000000..1433d0f5
+--- /dev/null
++++ b/core/diskscan/__init__.py
+@@ -0,0 +1,174 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Disk-usage analyzer built on top of dupeGuru's ``core``.
++
++A scriptable, offline "where did my disk space go" toolkit. It layers on
++:mod:`core.fs` (the file model and its staged hashing) and
++:mod:`core.directories` (tree walking with normal / reference / excluded folder
++states) to turn a set of directories into:
++
++* a **usage tree** with per-directory apparent and allocated (block) sizes,
++* **hotspots** (the heaviest directories) and the **largest files**,
++* **breakdowns** by extension and by age bucket,
++* a **cruft** classification (empty / temp / cache / log / backup files),
++* a **duplicate-waste** estimate (byte-identical copies), and
++* configurable **threshold** checks that turn the numbers into pass/warn/fail.
++
++Everything after the initial scan is pure computation over a flat list of
++:class:`FileEntry`, so a report can be serialised, compared and re-sliced with
++no further disk access.
++"""
++
++from .errors import (
++    DiskScanError,
++    DiskScanConfigError,
++    InvalidScanRootError,
++    UnknownBucketError,
++    ScanInterruptedError,
++)
++from .units import (
++    STAT_BLOCK_SIZE,
++    allocated_size_of,
++    blocks_to_bytes,
++    format_size,
++    format_count,
++    percent_of,
++    SECONDS_PER_DAY,
++    SECONDS_PER_WEEK,
++    SECONDS_PER_MONTH,
++    SECONDS_PER_YEAR,
++)
++from .entry import FileEntry
++from .ages import AgeBucket, AgeLadder, default_age_ladder, DEFAULT_AGE_CUTOFFS
++from .tree import UsageNode, UsageTree
++from .breakdown import (
++    BreakdownRow,
++    Breakdown,
++    breakdown_by_extension,
++    breakdown_by_age,
++    breakdown_by_top_directory,
++)
++from .cruft import (
++    CruftRule,
++    CruftTag,
++    CruftReport,
++    CruftClassifier,
++    default_rules,
++    CATEGORY_EMPTY,
++    CATEGORY_TEMP,
++    CATEGORY_CACHE,
++    CATEGORY_LOG,
++    CATEGORY_BACKUP,
++    ALL_CATEGORIES,
++)
++from .duplicates import (
++    DuplicateSet,
++    DuplicateReport,
++    find_duplicate_sets,
++    DEFAULT_BIG_FILE_SIZE,
++)
++from .thresholds import (
++    ThresholdRule,
++    ThresholdBreach,
++    ThresholdResult,
++    ThresholdSet,
++    default_thresholds,
++    severity_rank,
++    SEVERITY_INFO,
++    SEVERITY_WARNING,
++    SEVERITY_CRITICAL,
++    SEVERITIES,
++)
++from .scanner import ScanSpec, ScanResult, DiskScanner
++from .report import AnalysisReport, build_report
++from .session import DiskScanSession
++from .loader import (
++    merge_documents,
++    load_settings,
++    load_session,
++    load_thresholds,
++    DEFAULT_SETTINGS,
++)
++
++__all__ = [
++    # errors
++    "DiskScanError",
++    "DiskScanConfigError",
++    "InvalidScanRootError",
++    "UnknownBucketError",
++    "ScanInterruptedError",
++    # units
++    "STAT_BLOCK_SIZE",
++    "allocated_size_of",
++    "blocks_to_bytes",
++    "format_size",
++    "format_count",
++    "percent_of",
++    "SECONDS_PER_DAY",
++    "SECONDS_PER_WEEK",
++    "SECONDS_PER_MONTH",
++    "SECONDS_PER_YEAR",
++    # entry
++    "FileEntry",
++    # ages
++    "AgeBucket",
++    "AgeLadder",
++    "default_age_ladder",
++    "DEFAULT_AGE_CUTOFFS",
++    # tree
++    "UsageNode",
++    "UsageTree",
++    # breakdown
++    "BreakdownRow",
++    "Breakdown",
++    "breakdown_by_extension",
++    "breakdown_by_age",
++    "breakdown_by_top_directory",
++    # cruft
++    "CruftRule",
++    "CruftTag",
++    "CruftReport",
++    "CruftClassifier",
++    "default_rules",
++    "CATEGORY_EMPTY",
++    "CATEGORY_TEMP",
++    "CATEGORY_CACHE",
++    "CATEGORY_LOG",
++    "CATEGORY_BACKUP",
++    "ALL_CATEGORIES",
++    # duplicates
++    "DuplicateSet",
++    "DuplicateReport",
++    "find_duplicate_sets",
++    "DEFAULT_BIG_FILE_SIZE",
++    # thresholds
++    "ThresholdRule",
++    "ThresholdBreach",
++    "ThresholdResult",
++    "ThresholdSet",
++    "default_thresholds",
++    "severity_rank",
++    "SEVERITY_INFO",
++    "SEVERITY_WARNING",
++    "SEVERITY_CRITICAL",
++    "SEVERITIES",
++    # scanner
++    "ScanSpec",
++    "ScanResult",
++    "DiskScanner",
++    # report
++    "AnalysisReport",
++    "build_report",
++    # session
++    "DiskScanSession",
++    # loader
++    "merge_documents",
++    "load_settings",
++    "load_session",
++    "load_thresholds",
++    "DEFAULT_SETTINGS",
++]
+diff --git a/core/diskscan/ages.py b/core/diskscan/ages.py
+new file mode 100644
+index 00000000..9723974d
+--- /dev/null
++++ b/core/diskscan/ages.py
+@@ -0,0 +1,138 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Age bucketing: slicing files by "how long since they were touched".
++
++A big part of "where did my space go" is *when* it went there: 40 GiB of files
++nobody has modified in over a year is a very different story from 40 GiB written
++this week. This module turns a continuous age (in seconds) into a small, ordered
++set of named buckets so the report can say things like "31% of your space is in
++files older than a year".
++
++The default ladder is deliberately coarse and human-legible. Callers who want a
++different granularity build their own :class:`AgeLadder` from a list of
++(label, max_age_seconds) cut-offs; the last bucket always catches "everything
++older", so the ladder is total -- every age lands in exactly one bucket.
++"""
++
++from __future__ import annotations
++
++from .units import (
++    SECONDS_PER_DAY,
++    SECONDS_PER_MONTH,
++    SECONDS_PER_WEEK,
++    SECONDS_PER_YEAR,
++)
++
++
++class AgeBucket:
++    """One named age range ``[lower, upper)`` in seconds.
++
++    ``upper`` may be ``None`` to mean "and everything older" -- the open-ended
++    final bucket. Buckets don't hold files themselves; they're just the labelled
++    ranges. The aggregation code (see :mod:`core.diskscan.breakdown`) tallies
++    entries into them.
++    """
++
++    __slots__ = ("label", "lower", "upper")
++
++    def __init__(self, label, lower, upper):
++        self.label = label
++        self.lower = float(lower)
++        self.upper = float(upper) if upper is not None else None
++
++    def contains(self, age_seconds):
++        """True if ``age_seconds`` falls in ``[lower, upper)``."""
++        if age_seconds < self.lower:
++            return False
++        if self.upper is None:
++            return True
++        return age_seconds < self.upper
++
++    def __repr__(self):
++        upper = "inf" if self.upper is None else f"{self.upper:g}"
++        return f"<AgeBucket {self.label} [{self.lower:g},{upper})>"
++
++    def __eq__(self, other):
++        if not isinstance(other, AgeBucket):
++            return NotImplemented
++        return (self.label, self.lower, self.upper) == (other.label, other.lower, other.upper)
++
++    def __hash__(self):
++        return hash((self.label, self.lower, self.upper))
++
++
++class AgeLadder:
++    """An ordered, total set of :class:`AgeBucket` ranges.
++
++    Built from a list of ``(label, max_age_seconds)`` cut-offs sorted youngest
++    first; the final cut-off's ``max_age_seconds`` must be ``None`` (the
++    catch-all). ``bucket_for(age)`` returns the single bucket an age lands in,
++    and it's guaranteed to always find one.
++    """
++
++    def __init__(self, cutoffs):
++        cutoffs = list(cutoffs)
++        if not cutoffs:
++            raise ValueError("an age ladder needs at least one bucket")
++        buckets = []
++        lower = 0.0
++        for index, (label, upper) in enumerate(cutoffs):
++            is_last = index == len(cutoffs) - 1
++            if upper is None and not is_last:
++                raise ValueError("only the final age bucket may be open-ended")
++            if upper is not None and not is_last:
++                if upper <= lower:
++                    raise ValueError("age ladder cut-offs must strictly increase")
++            buckets.append(AgeBucket(label, lower, upper))
++            lower = upper if upper is not None else lower
++        if buckets[-1].upper is not None:
++            raise ValueError("the final age bucket must be open-ended (max_age=None)")
++        self.buckets = buckets
++
++    def __iter__(self):
++        return iter(self.buckets)
++
++    def __len__(self):
++        return len(self.buckets)
++
++    @property
++    def labels(self):
++        return [b.label for b in self.buckets]
++
++    def bucket_for(self, age_seconds):
++        """Return the bucket ``age_seconds`` lands in.
++
++        Ages are clamped at zero first (a file mtime in the future -- clock
++        skew, a bad archive -- reads as "brand new" rather than negative).
++        """
++        age = max(0.0, float(age_seconds))
++        for bucket in self.buckets:
++            if bucket.contains(age):
++                return bucket
++        # The ladder is total, so this is unreachable; return the oldest bucket
++        # defensively rather than None.
++        return self.buckets[-1]
++
++    def label_for(self, age_seconds):
++        return self.bucket_for(age_seconds).label
++
++
++# The default ladder used when a scan doesn't ask for a custom one. Youngest
++# first, ending in the open-ended "older than a year" catch-all.
++DEFAULT_AGE_CUTOFFS = [
++    ("day", SECONDS_PER_DAY),
++    ("week", SECONDS_PER_WEEK),
++    ("month", SECONDS_PER_MONTH),
++    ("quarter", 3 * SECONDS_PER_MONTH),
++    ("year", SECONDS_PER_YEAR),
++    ("older", None),
++]
++
++
++def default_age_ladder():
++    """Return a fresh copy of the default age ladder."""
++    return AgeLadder(DEFAULT_AGE_CUTOFFS)
+diff --git a/core/diskscan/breakdown.py b/core/diskscan/breakdown.py
+new file mode 100644
+index 00000000..cf2f25de
+--- /dev/null
++++ b/core/diskscan/breakdown.py
+@@ -0,0 +1,201 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Cross-cutting breakdowns of a scan: by extension and by age.
++
++Where :mod:`core.diskscan.tree` answers "*which directory* holds the space",
++these breakdowns answer "*what kind* of thing holds the space" and "*how old* is
++the thing holding the space". Both are simple tallies over the flat entry list,
++producing an ordered table of :class:`BreakdownRow` where each row carries a
++count and both size notions, sorted heaviest-first for the report.
++"""
++
++from __future__ import annotations
++
++from .ages import default_age_ladder
++from .units import percent_of
++
++
++class BreakdownRow:
++    """One line of a breakdown table: a key plus its tallied totals."""
++
++    __slots__ = ("key", "count", "apparent", "allocated")
++
++    def __init__(self, key, count=0, apparent=0, allocated=0):
++        self.key = key
++        self.count = count
++        self.apparent = apparent
++        self.allocated = allocated
++
++    def add(self, entry):
++        self.count += 1
++        self.apparent += entry.apparent_size
++        self.allocated += entry.allocated_size
++
++    def as_dict(self, whole_allocated=None):
++        d = {
++            "key": self.key,
++            "count": self.count,
++            "apparent": self.apparent,
++            "allocated": self.allocated,
++        }
++        if whole_allocated is not None:
++            d["fraction"] = percent_of(self.allocated, whole_allocated)
++        return d
++
++    def __repr__(self):
++        return f"<BreakdownRow {self.key!r} n={self.count} alloc={self.allocated}>"
++
++    def __eq__(self, other):
++        if not isinstance(other, BreakdownRow):
++            return NotImplemented
++        return (self.key, self.count, self.apparent, self.allocated) == (
++            other.key,
++            other.count,
++            other.apparent,
++            other.allocated,
++        )
++
++    def __hash__(self):
++        return hash((self.key, self.count, self.apparent, self.allocated))
++
++
++class Breakdown:
++    """An ordered collection of :class:`BreakdownRow` with lookup helpers."""
++
++    def __init__(self, dimension, rows):
++        self.dimension = dimension
++        self.rows = list(rows)
++
++    def __iter__(self):
++        return iter(self.rows)
++
++    def __len__(self):
++        return len(self.rows)
++
++    def __getitem__(self, index):
++        return self.rows[index]
++
++    @property
++    def total_allocated(self):
++        return sum(r.allocated for r in self.rows)
++
++    @property
++    def total_apparent(self):
++        return sum(r.apparent for r in self.rows)
++
++    @property
++    def total_count(self):
++        return sum(r.count for r in self.rows)
++
++    def row_for(self, key):
++        """Return the row with the given key, or ``None``."""
++        for row in self.rows:
++            if row.key == key:
++                return row
++        return None
++
++    def top(self, limit):
++        """Return a new breakdown holding only the ``limit`` heaviest rows.
++
++        Any rows beyond the cut are folded into a single trailing
++        ``"(other)"`` row so the totals still add up -- silent truncation would
++        make the percentages lie.
++        """
++        if limit is None or limit >= len(self.rows):
++            return Breakdown(self.dimension, list(self.rows))
++        kept = self.rows[:limit]
++        rest = self.rows[limit:]
++        if rest:
++            other = BreakdownRow("(other)")
++            for row in rest:
++                other.count += row.count
++                other.apparent += row.apparent
++                other.allocated += row.allocated
++            kept = kept + [other]
++        return Breakdown(self.dimension, kept)
++
++    def as_dict(self):
++        whole = self.total_allocated
++        return {
++            "dimension": self.dimension,
++            "total_allocated": whole,
++            "total_apparent": self.total_apparent,
++            "total_count": self.total_count,
++            "rows": [r.as_dict(whole_allocated=whole) for r in self.rows],
++        }
++
++
++def _sorted_rows(row_map):
++    """Order rows heaviest allocated first, key as the stable tie-break."""
++    return sorted(row_map.values(), key=lambda r: (-r.allocated, str(r.key)))
++
++
++def breakdown_by_extension(entries, empty_key="(none)"):
++    """Tally entries by file extension.
++
++    Files with no extension collapse into a single ``empty_key`` row so they
++    don't scatter. Rows come back heaviest-first.
++    """
++    rows = {}
++    for entry in entries:
++        key = entry.extension or empty_key
++        row = rows.get(key)
++        if row is None:
++            row = BreakdownRow(key)
++            rows[key] = row
++        row.add(entry)
++    return Breakdown("extension", _sorted_rows(rows))
++
++
++def breakdown_by_age(entries, ref_time, ladder=None):
++    """Tally entries into age buckets.
++
++    ``ref_time`` anchors the age computation (one clock for the whole table).
++    Buckets are emitted in ladder order (youngest first) *not* size order,
++    because an age table reads naturally as a timeline; callers who want it
++    sorted by size can re-sort the rows.
++    """
++    if ladder is None:
++        ladder = default_age_ladder()
++    # Preserve ladder order and guarantee every bucket appears even if empty.
++    rows = {bucket.label: BreakdownRow(bucket.label) for bucket in ladder}
++    for entry in entries:
++        age = entry.age_seconds(ref_time)
++        label = ladder.label_for(age)
++        rows[label].add(entry)
++    ordered = [rows[bucket.label] for bucket in ladder]
++    return Breakdown("age", ordered)
++
++
++def breakdown_by_top_directory(tree, depth=1):
++    """Tally allocated usage by the directory ``depth`` levels below the root.
++
++    Handy for a "which top-level folder" summary. ``depth=1`` groups by the
++    immediate children of the root. Files sitting above ``depth`` (directly in
++    the root) collapse into a ``"(root)"`` row.
++    """
++    root = tree.root
++    rows = {}
++
++    def key_for(entry):
++        try:
++            rel = entry.path.parent.relative_to(root.path)
++        except ValueError:
++            return "(root)"
++        parts = rel.parts[:depth]
++        if not parts:
++            return "(root)"
++        return "/".join(parts)
++
++    for entry in tree.entries:
++        key = key_for(entry)
++        row = rows.get(key)
++        if row is None:
++            row = BreakdownRow(key)
++            rows[key] = row
++        row.add(entry)
++    return Breakdown("top_directory", _sorted_rows(rows))
+diff --git a/core/diskscan/cruft.py b/core/diskscan/cruft.py
+new file mode 100644
+index 00000000..d7ededf3
+--- /dev/null
++++ b/core/diskscan/cruft.py
+@@ -0,0 +1,303 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Cruft classification: flagging files that are *probably* reclaimable.
++
++"Cruft" here means files that, by name / size / location, look like waste rather
++than data you meant to keep: zero-byte files, editor and OS junk
++(``.DS_Store``, ``Thumbs.db``, ``*.tmp``, ``*~``), build / cache artefacts
++(``__pycache__``, ``node_modules``, ``.o`` / ``.pyc``), and log files. This is a
++*heuristic* -- it never deletes anything, it only labels -- so the analyzer can
++say "here's 3.2 GiB of stuff that's very likely safe to clear" and let a human
++(or the retention sweeper) decide.
++
++Classification is rule-based and pluggable. Each :class:`CruftRule` matches an
++entry and, if it fires, tags it with a category and a human reason. An entry can
++match several rules; the classifier keeps the highest-confidence tag but records
++all categories, so a ``.pyc`` inside ``__pycache__`` is both "cache" and, well,
++"cache" -- consistently one tag.
++"""
++
++from __future__ import annotations
++
++import re
++
++from .units import percent_of
++
++# --- Categories ---------------------------------------------------------------
++CATEGORY_EMPTY = "empty"          # zero-byte files
++CATEGORY_TEMP = "temp"            # editor / OS temp & junk
++CATEGORY_CACHE = "cache"          # build / dependency caches
++CATEGORY_LOG = "log"             # log files
++CATEGORY_BACKUP = "backup"        # editor / tool backup copies
++
++# Rough confidence ranking so that when several rules fire we report the most
++# specific (highest) one as the entry's primary category.
++_CONFIDENCE = {
++    CATEGORY_EMPTY: 60,
++    CATEGORY_CACHE: 50,
++    CATEGORY_TEMP: 40,
++    CATEGORY_BACKUP: 30,
++    CATEGORY_LOG: 20,
++}
++
++ALL_CATEGORIES = (
++    CATEGORY_EMPTY,
++    CATEGORY_TEMP,
++    CATEGORY_CACHE,
++    CATEGORY_LOG,
++    CATEGORY_BACKUP,
++)
++
++
++class CruftTag:
++    """The verdict for one entry that matched at least one cruft rule."""
++
++    __slots__ = ("entry", "primary", "categories", "reasons")
++
++    def __init__(self, entry, primary, categories, reasons):
++        self.entry = entry
++        self.primary = primary
++        self.categories = tuple(categories)
++        self.reasons = tuple(reasons)
++
++    @property
++    def path(self):
++        return self.entry.path
++
++    @property
++    def allocated(self):
++        return self.entry.allocated_size
++
++    @property
++    def apparent(self):
++        return self.entry.apparent_size
++
++    def as_dict(self):
++        return {
++            "path": str(self.entry.path),
++            "primary": self.primary,
++            "categories": list(self.categories),
++            "reasons": list(self.reasons),
++            "allocated": self.entry.allocated_size,
++            "apparent": self.entry.apparent_size,
++        }
++
++    def __repr__(self):
++        return f"<CruftTag {self.primary} {str(self.entry.path)}>"
++
++
++class CruftRule:
++    """A single classification rule.
++
++    ``matcher`` is a callable ``(entry) -> bool``; when it returns True the rule
++    contributes its ``category`` and a ``reason`` string. Rules are pure and
++    stateless so the rule set is safe to share across scans.
++    """
++
++    __slots__ = ("name", "category", "matcher", "reason")
++
++    def __init__(self, name, category, matcher, reason):
++        self.name = name
++        self.category = category
++        self.matcher = matcher
++        self.reason = reason
++
++    def matches(self, entry):
++        try:
++            return bool(self.matcher(entry))
++        except Exception:
++            # A defensive rule should never take down the whole scan.
++            return False
++
++
++# --- Default rule set ---------------------------------------------------------
++# Directory-name markers whose *contents* are almost always regenerable.
++_CACHE_DIR_NAMES = frozenset(
++    {
++        "__pycache__",
++        "node_modules",
++        ".cache",
++        ".mypy_cache",
++        ".pytest_cache",
++        ".gradle",
++        ".tox",
++        "build",
++        "dist",
++        ".ipynb_checkpoints",
++    }
++)
++
++# Exact junk file names.
++_TEMP_NAMES = frozenset(
++    {
++        ".ds_store",
++        "thumbs.db",
++        "desktop.ini",
++        ".localized",
++    }
++)
++
++# Extension-based markers (lower-cased, no dot).
++_CACHE_EXTS = frozenset({"pyc", "pyo", "o", "class", "obj"})
++_TEMP_EXTS = frozenset({"tmp", "temp", "swp", "swo", "part", "crdownload"})
++_LOG_EXTS = frozenset({"log"})
++_BACKUP_EXTS = frozenset({"bak", "old", "orig"})
++
++_TILDE_BACKUP = re.compile(r".+~$")
++
++
++def _in_cache_dir(entry):
++    return any(part in _CACHE_DIR_NAMES for part in entry.path.parts)
++
++
++def default_rules():
++    """Return the built-in ordered list of cruft rules."""
++    return [
++        CruftRule(
++            "empty-file",
++            CATEGORY_EMPTY,
++            lambda e: e.apparent_size == 0,
++            "zero-byte file",
++        ),
++        CruftRule(
++            "cache-dir",
++            CATEGORY_CACHE,
++            _in_cache_dir,
++            "inside a build/dependency cache directory",
++        ),
++        CruftRule(
++            "cache-ext",
++            CATEGORY_CACHE,
++            lambda e: e.extension in _CACHE_EXTS,
++            "compiled/cache artefact by extension",
++        ),
++        CruftRule(
++            "temp-name",
++            CATEGORY_TEMP,
++            lambda e: e.name.lower() in _TEMP_NAMES,
++            "OS/editor junk file",
++        ),
++        CruftRule(
++            "temp-ext",
++            CATEGORY_TEMP,
++            lambda e: e.extension in _TEMP_EXTS,
++            "temporary file by extension",
++        ),
++        CruftRule(
++            "tilde-backup",
++            CATEGORY_BACKUP,
++            lambda e: bool(_TILDE_BACKUP.match(e.name)),
++            "editor tilde backup",
++        ),
++        CruftRule(
++            "backup-ext",
++            CATEGORY_BACKUP,
++            lambda e: e.extension in _BACKUP_EXTS,
++            "backup copy by extension",
++        ),
++        CruftRule(
++            "log-ext",
++            CATEGORY_LOG,
++            lambda e: e.extension in _LOG_EXTS,
++            "log file",
++        ),
++    ]
++
++
++class CruftReport:
++    """The result of classifying a scan's entries as cruft or not."""
++
++    def __init__(self, tags):
++        self.tags = list(tags)
++
++    def __iter__(self):
++        return iter(self.tags)
++
++    def __len__(self):
++        return len(self.tags)
++
++    @property
++    def total_allocated(self):
++        return sum(t.entry.allocated_size for t in self.tags)
++
++    @property
++    def total_apparent(self):
++        return sum(t.entry.apparent_size for t in self.tags)
++
++    @property
++    def count(self):
++        return len(self.tags)
++
++    def of_category(self, category):
++        """Return the tags whose *primary* category is ``category``."""
++        return [t for t in self.tags if t.primary == category]
++
++    def category_totals(self):
++        """Return ``{category: (count, allocated)}`` over primary categories."""
++        totals = {}
++        for tag in self.tags:
++            count, allocated = totals.get(tag.primary, (0, 0))
++            totals[tag.primary] = (count + 1, allocated + tag.entry.allocated_size)
++        return totals
++
++    def paths(self):
++        return [t.entry.path for t in self.tags]
++
++    def as_dict(self, whole_allocated=None):
++        cats = {}
++        for category, (count, allocated) in self.category_totals().items():
++            entry = {"count": count, "allocated": allocated}
++            if whole_allocated is not None:
++                entry["fraction"] = percent_of(allocated, whole_allocated)
++            cats[category] = entry
++        return {
++            "count": self.count,
++            "total_allocated": self.total_allocated,
++            "total_apparent": self.total_apparent,
++            "categories": cats,
++            "tags": [t.as_dict() for t in self.tags],
++        }
++
++
++class CruftClassifier:
++    """Applies a rule set to entries and produces a :class:`CruftReport`.
++
++    Reference (protected) entries are *never* classified as cruft -- if a user
++    declared a directory as their master copy, its junk-looking files are still
++    theirs to keep. That mirrors the reference semantics elsewhere in the disk
++    tooling.
++    """
++
++    def __init__(self, rules=None, include_reference=False):
++        self.rules = list(rules) if rules is not None else default_rules()
++        self.include_reference = include_reference
++
++    def classify_entry(self, entry):
++        """Return a :class:`CruftTag` for ``entry`` or ``None`` if it's clean."""
++        if entry.is_reference and not self.include_reference:
++            return None
++        fired = [rule for rule in self.rules if rule.matches(entry)]
++        if not fired:
++            return None
++        categories = []
++        reasons = []
++        for rule in fired:
++            if rule.category not in categories:
++                categories.append(rule.category)
++            reasons.append(rule.reason)
++        primary = max(categories, key=lambda c: _CONFIDENCE.get(c, 0))
++        return CruftTag(entry, primary=primary, categories=categories, reasons=reasons)
++
++    def classify(self, entries):
++        tags = []
++        for entry in entries:
++            tag = self.classify_entry(entry)
++            if tag is not None:
++                tags.append(tag)
++        # Deterministic order: biggest reclaimable first, path as tie-break.
++        tags.sort(key=lambda t: (-t.entry.allocated_size, str(t.entry.path)))
++        return CruftReport(tags)
+diff --git a/core/diskscan/duplicates.py b/core/diskscan/duplicates.py
+new file mode 100644
+index 00000000..6264f657
+--- /dev/null
++++ b/core/diskscan/duplicates.py
+@@ -0,0 +1,187 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Estimating the space wasted by byte-identical duplicates.
++
++A usage report is more actionable if it can say "of your 40 GiB, 6 GiB is
++literally the same bytes stored more than once". This module answers that by
++grouping the scanned entries by content -- reusing dupeGuru's staged digests
++from :mod:`core.fs` exactly the way its own content scan does (bucket by size,
++then cheap partial digest, then full/sampled digest) -- and reporting, per
++group, how many bytes could be reclaimed by keeping a single copy.
++
++This deliberately does *not* decide which copy to keep or delete anything: that
++is the reclaim planner's job. Here we only quantify "wasted" space so the disk
++report can surface it as a headline number.
++"""
++
++from __future__ import annotations
++
++from core import fs
++
++# Above this size we compare via sampled digests rather than a full read, which
++# matches dupeGuru's own big-file handling and keeps the scan affordable.
++DEFAULT_BIG_FILE_SIZE = 100 * 1024 * 1024  # 100 MiB
++
++
++class DuplicateSet:
++    """A set of entries whose contents are byte-identical.
++
++    ``wasted`` is the reclaimable space: every copy but one. Which copy is
++    "kept" is irrelevant to the figure -- they're the same size -- so we simply
++    charge ``(count - 1) * size``.
++    """
++
++    __slots__ = ("entries", "size", "allocated_each")
++
++    def __init__(self, entries):
++        # Sort for a stable representative and deterministic reporting.
++        self.entries = sorted(entries, key=lambda e: str(e.path))
++        self.size = self.entries[0].apparent_size
++        self.allocated_each = self.entries[0].allocated_size
++
++    @property
++    def count(self):
++        return len(self.entries)
++
++    @property
++    def representative(self):
++        return self.entries[0]
++
++    @property
++    def wasted_apparent(self):
++        return (self.count - 1) * self.size
++
++    @property
++    def wasted_allocated(self):
++        return (self.count - 1) * self.allocated_each
++
++    @property
++    def paths(self):
++        return [e.path for e in self.entries]
++
++    def as_dict(self):
++        return {
++            "size": self.size,
++            "count": self.count,
++            "wasted_apparent": self.wasted_apparent,
++            "wasted_allocated": self.wasted_allocated,
++            "paths": [str(p) for p in self.paths],
++        }
++
++    def __repr__(self):
++        return f"<DuplicateSet n={self.count} size={self.size} wasted={self.wasted_allocated}>"
++
++
++class DuplicateReport:
++    """All duplicate sets found in a scan, plus the headline waste figure."""
++
++    def __init__(self, sets):
++        # Heaviest waste first, size then representative path as tie-breaks.
++        self.sets = sorted(
++            sets,
++            key=lambda s: (-s.wasted_allocated, -s.size, str(s.representative.path)),
++        )
++
++    def __iter__(self):
++        return iter(self.sets)
++
++    def __len__(self):
++        return len(self.sets)
++
++    @property
++    def group_count(self):
++        return len(self.sets)
++
++    @property
++    def duplicate_count(self):
++        """Total number of redundant copies (excludes the one kept per set)."""
++        return sum(s.count - 1 for s in self.sets)
++
++    @property
++    def wasted_allocated(self):
++        return sum(s.wasted_allocated for s in self.sets)
++
++    @property
++    def wasted_apparent(self):
++        return sum(s.wasted_apparent for s in self.sets)
++
++    def as_dict(self):
++        return {
++            "group_count": self.group_count,
++            "duplicate_count": self.duplicate_count,
++            "wasted_allocated": self.wasted_allocated,
++            "wasted_apparent": self.wasted_apparent,
++            "sets": [s.as_dict() for s in self.sets],
++        }
++
++
++def _digest_for(entry, big_file_size):
++    """Full-content digest for an entry, sampled above ``big_file_size``.
++
++    Reuses the ``core.fs.File`` digest machinery so we share dupeGuru's cache
++    and its exact hashing; we never re-implement the read loop.
++    """
++    file = fs.get_file(entry.path)
++    if file is None:
++        return None
++    if big_file_size and entry.apparent_size > big_file_size:
++        return ("s", file.digest_samples)
++    return ("f", file.digest)
++
++
++def _partial_for(entry):
++    file = fs.get_file(entry.path)
++    if file is None:
++        return None
++    return file.digest_partial
++
++
++def find_duplicate_sets(entries, min_size=1, big_file_size=DEFAULT_BIG_FILE_SIZE):
++    """Group ``entries`` by identical content and return a :class:`DuplicateReport`.
++
++    Staged to minimise I/O, exactly like dupeGuru's own content scan:
++
++    1. bucket by apparent size (different size => can't be equal, no read);
++    2. within a size bucket, subdivide by the cheap **partial** digest;
++    3. within a partial bucket, subdivide by the full (or sampled) digest.
++
++    Entries smaller than ``min_size`` are ignored (a duplicated empty file
++    reclaims nothing and tiny files collide readily). Zero-size files are never
++    grouped regardless of ``min_size`` because "empty" isn't "duplicate data".
++    """
++    # Stage 1: size buckets.
++    by_size = {}
++    for entry in entries:
++        size = entry.apparent_size
++        if size < max(1, min_size):
++            continue
++        by_size.setdefault(size, []).append(entry)
++
++    sets = []
++    for size, bucket in by_size.items():
++        if len(bucket) < 2:
++            continue
++        # Stage 2: partial-digest sub-buckets.
++        by_partial = {}
++        for entry in bucket:
++            key = _partial_for(entry)
++            by_partial.setdefault(key, []).append(entry)
++        for partial_key, sub in by_partial.items():
++            if len(sub) < 2:
++                continue
++            # Stage 3: full/sampled-digest sub-buckets.
++            by_full = {}
++            for entry in sub:
++                key = _digest_for(entry, big_file_size)
++                by_full.setdefault(key, []).append(entry)
++            for full_key, group in by_full.items():
++                if full_key is None:
++                    continue
++                if len(group) < 2:
++                    continue
++                sets.append(DuplicateSet(group))
++    return DuplicateReport(sets)
+diff --git a/core/diskscan/entry.py b/core/diskscan/entry.py
+new file mode 100644
+index 00000000..06529830
+--- /dev/null
++++ b/core/diskscan/entry.py
+@@ -0,0 +1,248 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""The per-file record the analyzer works with.
++
++A :class:`FileEntry` is the atom of the whole analysis: one leaf file, with the
++few facts we care about (both size notions, its timestamps, its classification
++inputs) snapshotted at scan time. Everything downstream -- aggregation into a
++tree, breakdowns by extension / age, cruft detection, threshold checks -- reads
++these records and never touches the disk again. That separation is what makes
++the analysis reproducible and cheap to re-slice.
++
++Entries are built from :class:`core.fs.File` (reusing dupeGuru's file model and
++its lazy ``size`` / ``mtime`` reading) rather than from raw ``os.stat`` calls,
++so the analyzer stays layered on top of the existing ``core`` machinery. The
++one thing ``core.fs.File`` does *not* surface is the allocated (block) size, so
++we take a single ``stat`` for that and cache it on the entry.
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++from core import fs
++
++from .units import allocated_size_of
++
++
++class FileEntry:
++    """A single scanned file with its size / age facts snapshotted.
++
++    The entry is deliberately immutable-ish: all the disk-derived numbers are
++    read once at construction and then just read back. ``age_seconds`` and the
++    age-bucket assignment are computed relative to a *reference time* supplied
++    by the caller (usually "now" captured once at the start of a scan), so an
++    entire analysis shares one consistent clock instead of each file racing to
++    call ``time.time()`` at slightly different moments.
++    """
++
++    __slots__ = (
++        "path",
++        "apparent_size",
++        "allocated_size",
++        "mtime",
++        "atime",
++        "_ref_time",
++        "is_reference",
++    )
++
++    def __init__(
++        self,
++        path,
++        apparent_size,
++        allocated_size,
++        mtime,
++        atime=None,
++        ref_time=None,
++        is_reference=False,
++    ):
++        self.path = Path(path)
++        self.apparent_size = int(apparent_size)
++        self.allocated_size = int(allocated_size)
++        self.mtime = float(mtime)
++        self.atime = float(atime) if atime is not None else float(mtime)
++        # ``ref_time`` anchors every age computation. It may legitimately be
++        # None while an entry is being staged; consumers that need an age must
++        # supply it (see :meth:`with_ref_time`).
++        self._ref_time = float(ref_time) if ref_time is not None else None
++        self.is_reference = bool(is_reference)
++
++    # --- Construction helpers -------------------------------------------------
++    @classmethod
++    def from_file(cls, file, ref_time=None, is_reference=False):
++        """Build an entry from a :class:`core.fs.File`.
++
++        We lean on ``core.fs`` for the apparent size and mtime (it already reads
++        and caches them lazily), and take exactly one extra ``stat`` for the
++        allocated size and atime, which the file model doesn't expose.
++        """
++        path = Path(file.path)
++        apparent = int(file.size)
++        mtime = float(file.mtime)
++        atime = mtime
++        allocated = apparent
++        try:
++            st = path.stat()
++            allocated = allocated_size_of(st)
++            atime = float(st.st_atime)
++            # Prefer the freshly-stat'd figures; they and ``file.size`` agree in
++            # practice, but the direct stat is the authoritative allocated read.
++            apparent = int(st.st_size)
++            mtime = float(st.st_mtime)
++        except OSError:
++            # A file that vanished between the directory walk and now: keep the
++            # figures the file model already gave us rather than exploding.
++            pass
++        return cls(
++            path=path,
++            apparent_size=apparent,
++            allocated_size=allocated,
++            mtime=mtime,
++            atime=atime,
++            ref_time=ref_time,
++            is_reference=is_reference,
++        )
++
++    @classmethod
++    def from_path(cls, path, ref_time=None, is_reference=False):
++        """Build an entry straight from a filesystem path.
++
++        A thin convenience around :meth:`from_file` that wraps the path in the
++        ``core.fs`` file model first, so the same layered code path is used.
++        """
++        path = Path(path)
++        file = fs.get_file(path)
++        if file is None:
++            # Not a plain file (symlink, socket, ...). Still produce an entry so
++            # the caller can decide -- but based on a raw stat, no file model.
++            st = path.stat()
++            return cls(
++                path=path,
++                apparent_size=int(st.st_size),
++                allocated_size=allocated_size_of(st),
++                mtime=float(st.st_mtime),
++                atime=float(st.st_atime),
++                ref_time=ref_time,
++                is_reference=is_reference,
++            )
++        return cls.from_file(file, ref_time=ref_time, is_reference=is_reference)
++
++    def with_ref_time(self, ref_time):
++        """Return a copy of this entry anchored to a new reference time.
++
++        Entries are cheap; rather than mutate the shared clock in place we hand
++        back a fresh entry, which keeps aggregation code free of aliasing
++        surprises.
++        """
++        return FileEntry(
++            path=self.path,
++            apparent_size=self.apparent_size,
++            allocated_size=self.allocated_size,
++            mtime=self.mtime,
++            atime=self.atime,
++            ref_time=ref_time,
++            is_reference=self.is_reference,
++        )
++
++    # --- Derived facts --------------------------------------------------------
++    @property
++    def name(self):
++        return self.path.name
++
++    @property
++    def stem(self):
++        return self.path.stem
++
++    @property
++    def extension(self):
++        """Lower-cased extension without the leading dot (``""`` if none).
++
++        Mirrors the spelling used elsewhere in the disk tooling so per-extension
++        breakdowns line up regardless of how the file was cased on disk.
++        """
++        suffix = self.path.suffix
++        if not suffix:
++            return ""
++        return suffix.lower().lstrip(".")
++
++    @property
++    def parent(self):
++        return self.path.parent
++
++    @property
++    def slack_bytes(self):
++        """Bytes the file occupies on disk beyond its logical length.
++
++        Positive for the common case (a small file rounded up to a block),
++        clamped at zero for sparse files whose allocation is *smaller* than
++        their apparent size -- "slack" is never negative in the report.
++        """
++        return max(0, self.allocated_size - self.apparent_size)
++
++    @property
++    def is_sparse(self):
++        """True when the file is allocated fewer bytes than it logically spans."""
++        return self.allocated_size < self.apparent_size
++
++    @property
++    def is_empty(self):
++        """True for a zero-length file."""
++        return self.apparent_size == 0
++
++    @property
++    def ref_time(self):
++        return self._ref_time
++
++    def age_seconds(self, ref_time=None):
++        """Seconds since the file was last modified.
++
++        Uses the explicit ``ref_time`` argument if given, else the entry's own
++        anchored reference time. Raises if neither is available -- an age with
++        no clock is a programming error, not a silent zero.
++        """
++        anchor = ref_time if ref_time is not None else self._ref_time
++        if anchor is None:
++            raise ValueError("age_seconds requires a reference time")
++        return max(0.0, float(anchor) - self.mtime)
++
++    def idle_seconds(self, ref_time=None):
++        """Seconds since the file was last *accessed* (read or written)."""
++        anchor = ref_time if ref_time is not None else self._ref_time
++        if anchor is None:
++            raise ValueError("idle_seconds requires a reference time")
++        return max(0.0, float(anchor) - self.atime)
++
++    # --- Dict / equality ------------------------------------------------------
++    def as_dict(self):
++        d = {
++            "path": str(self.path),
++            "name": self.name,
++            "extension": self.extension,
++            "apparent_size": self.apparent_size,
++            "allocated_size": self.allocated_size,
++            "slack_bytes": self.slack_bytes,
++            "mtime": self.mtime,
++            "atime": self.atime,
++            "is_reference": self.is_reference,
++            "is_empty": self.is_empty,
++            "is_sparse": self.is_sparse,
++        }
++        if self._ref_time is not None:
++            d["age_seconds"] = self.age_seconds()
++        return d
++
++    def __eq__(self, other):
++        if not isinstance(other, FileEntry):
++            return NotImplemented
++        return self.path == other.path
++
++    def __hash__(self):
++        return hash(self.path)
++
++    def __repr__(self):
++        return f"<FileEntry {str(self.path)} {self.allocated_size}b>"
+diff --git a/core/diskscan/errors.py b/core/diskscan/errors.py
+new file mode 100644
+index 00000000..560dc69f
+--- /dev/null
++++ b/core/diskscan/errors.py
+@@ -0,0 +1,35 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Exceptions for the disk-usage analyzer.
++
++Like the rest of the disk tooling, configuration problems (a bad scan root, an
++unknown breakdown key) are kept distinct from runtime problems, so a caller can
++validate a request up-front and be confident nothing was walked yet.
++"""
++
++
++class DiskScanError(Exception):
++    """Root of every error raised by :mod:`core.diskscan`."""
++
++
++class DiskScanConfigError(DiskScanError):
++    """The analysis was misconfigured (bad root, unknown option, ...).
++
++    Detectable before walking anything.
++    """
++
++
++class InvalidScanRootError(DiskScanConfigError):
++    """A path handed to the scanner is missing or is not a directory."""
++
++
++class UnknownBucketError(DiskScanConfigError):
++    """A breakdown was requested by a dimension name we don't recognise."""
++
++
++class ScanInterruptedError(DiskScanError):
++    """The walk was cancelled through the job-progress hook."""
+diff --git a/core/diskscan/loader.py b/core/diskscan/loader.py
+new file mode 100644
+index 00000000..996c9aaa
+--- /dev/null
++++ b/core/diskscan/loader.py
+@@ -0,0 +1,149 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Layered configuration for disk-usage analyses.
++
++A real audit config is layered: a shared base (the roots and rules everyone
++agrees on), plus per-machine or per-user overlays. This module deep-merges a
++list of such documents into one settings dict, following the same rules the
++reclaim loader uses so the two tools' configs behave identically:
++
++* later documents override earlier ones for **scalar** values;
++* **list** fields (``roots``, ``include_ext`` ...) are **appended**, not
++  replaced, so overlays extend rather than clobber;
++* a key explicitly set to ``None`` **deletes** whatever earlier layers set.
++
++It then materialises a ready-to-run :class:`~core.diskscan.session.DiskScanSession`,
++including any threshold rules declared in a ``thresholds`` block.
++"""
++
++from __future__ import annotations
++
++import copy
++
++from .ages import AgeLadder, default_age_ladder
++from .errors import DiskScanConfigError
++from .scanner import ScanSpec
++from .session import DiskScanSession
++from .thresholds import default_thresholds
++
++__all__ = ["merge_documents", "load_settings", "load_session", "load_thresholds", "DEFAULT_SETTINGS"]
++
++_APPEND_LIST_KEYS = {
++    "roots",
++    "paths",
++    "reference_roots",
++    "references",
++    "excluded_roots",
++    "excludes",
++    "include_ext",
++    "exclude_ext",
++    "include_globs",
++    "exclude_globs",
++}
++
++DEFAULT_SETTINGS = {
++    "detect_duplicates": True,
++    "duplicate_min_size": 1,
++}
++
++
++def _merge_into(base, overlay):
++    for key, value in overlay.items():
++        if value is None:
++            base.pop(key, None)
++            continue
++        if key in _APPEND_LIST_KEYS and isinstance(value, list):
++            existing = base.get(key)
++            if isinstance(existing, list):
++                merged = list(existing)
++                for item in value:
++                    if item not in merged:
++                        merged.append(item)
++                base[key] = merged
++            else:
++                base[key] = list(value)
++            continue
++        if isinstance(value, dict) and isinstance(base.get(key), dict):
++            _merge_into(base[key], value)
++            continue
++        base[key] = copy.deepcopy(value)
++
++
++def merge_documents(documents):
++    """Deep-merge a sequence of config dicts into one settings dict."""
++    result = {}
++    for doc in documents:
++        if doc is None:
++            continue
++        if not isinstance(doc, dict):
++            raise DiskScanConfigError(f"config document must be a dict, got {type(doc).__name__}")
++        _merge_into(result, doc)
++    return result
++
++
++def load_settings(documents):
++    """Merge ``documents`` on top of the defaults; return the settings dict."""
++    return merge_documents([DEFAULT_SETTINGS] + list(documents))
++
++
++def _ladder_from_settings(settings):
++    """Build a custom age ladder from an ``age_buckets`` block, if present.
++
++    The block is a list of ``[label, max_age_seconds]`` pairs (last one's
++    max_age ``None``); absent, we use the default ladder.
++    """
++    spec = settings.get("age_buckets")
++    if not spec:
++        return None
++    try:
++        cutoffs = [(label, upper) for label, upper in spec]
++    except (TypeError, ValueError):
++        raise DiskScanConfigError("age_buckets must be a list of [label, max_age] pairs")
++    return AgeLadder(cutoffs)
++
++
++def load_thresholds(settings):
++    """Build a :class:`ThresholdSet` from a ``thresholds`` block, if present."""
++    block = settings.get("thresholds")
++    if not block:
++        return None
++    if not isinstance(block, dict):
++        raise DiskScanConfigError("thresholds must be a mapping of limit -> value")
++    known = {
++        "max_total_allocated",
++        "max_hotspot_allocated",
++        "max_cruft_fraction",
++        "max_duplicate_fraction",
++        "max_empty_files",
++    }
++    unknown = set(block) - known
++    if unknown:
++        raise DiskScanConfigError(f"unknown threshold keys: {sorted(unknown)}")
++    return default_thresholds(**block)
++
++
++def load_session(documents):
++    """Build a :class:`DiskScanSession` from layered config documents."""
++    settings = load_settings(documents)
++    if not settings.get("roots") and not settings.get("paths"):
++        raise DiskScanConfigError("config must declare at least one scan root")
++    spec = ScanSpec.from_dict(settings)
++    ladder = _ladder_from_settings(settings)
++
++    kwargs = {}
++    if "detect_duplicates" in settings:
++        kwargs["detect_duplicates"] = bool(settings["detect_duplicates"])
++    if "duplicate_min_size" in settings:
++        kwargs["duplicate_min_size"] = settings["duplicate_min_size"]
++    if "duplicate_big_file_size" in settings:
++        kwargs["duplicate_big_file_size"] = settings["duplicate_big_file_size"]
++    if "include_reference_cruft" in settings:
++        kwargs["include_reference_cruft"] = bool(settings["include_reference_cruft"])
++    if ladder is not None:
++        kwargs["age_ladder"] = ladder
++
++    return DiskScanSession(spec, **kwargs)
+diff --git a/core/diskscan/report.py b/core/diskscan/report.py
+new file mode 100644
+index 00000000..51f60ccd
+--- /dev/null
++++ b/core/diskscan/report.py
+@@ -0,0 +1,231 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""The assembled analysis report.
++
++:class:`AnalysisReport` is the single object that ties every facet of a scan
++together -- the usage tree, the extension and age breakdowns, the cruft scan and
++the duplicate-waste estimate -- and knows how to render itself as a dict, as
++JSON, and as a compact human-readable text summary. It holds *no* live disk
++handles: it's built entirely from the flat :class:`FileEntry` list a scan
++produced, so it can be serialised, compared, and re-sliced freely.
++
++The report is pure data + presentation. The orchestration that produces it
++lives in :mod:`core.diskscan.session`.
++"""
++
++from __future__ import annotations
++
++import json
++
++from .breakdown import breakdown_by_age, breakdown_by_extension, breakdown_by_top_directory
++from .cruft import CruftClassifier
++from .duplicates import find_duplicate_sets
++from .tree import UsageTree
++from .units import format_count, format_size, percent_of
++
++
++class AnalysisReport:
++    """A complete, serialisable view of one disk-usage analysis."""
++
++    def __init__(
++        self,
++        tree,
++        extension_breakdown,
++        age_breakdown,
++        cruft,
++        duplicates,
++        ref_time,
++        root,
++    ):
++        self.tree = tree
++        self.extension_breakdown = extension_breakdown
++        self.age_breakdown = age_breakdown
++        self.cruft = cruft
++        self.duplicates = duplicates
++        self.ref_time = ref_time
++        self.root = root
++
++    # --- Convenience pass-throughs -------------------------------------------
++    @property
++    def entries(self):
++        return self.tree.entries
++
++    @property
++    def total_allocated(self):
++        return self.tree.total_allocated
++
++    @property
++    def total_apparent(self):
++        return self.tree.total_apparent
++
++    @property
++    def total_files(self):
++        return self.tree.total_files
++
++    @property
++    def total_dirs(self):
++        return self.tree.total_dirs
++
++    @property
++    def slack_bytes(self):
++        """Total bytes lost to block rounding across every file."""
++        return sum(e.slack_bytes for e in self.entries)
++
++    def hotspots(self, limit=10, min_fraction=0.0):
++        return self.tree.hotspots(limit=limit, min_fraction=min_fraction)
++
++    def largest_files(self, limit=10):
++        return self.tree.largest_files(limit=limit)
++
++    # --- Serialisation --------------------------------------------------------
++    def as_dict(self, tree_depth=2, tree_min_fraction=0.0, top=10):
++        whole = self.total_allocated
++        return {
++            "root": str(self.root),
++            "totals": {
++                "allocated": self.total_allocated,
++                "apparent": self.total_apparent,
++                "files": self.total_files,
++                "dirs": self.total_dirs,
++                "slack": self.slack_bytes,
++            },
++            "tree": self.tree.root.as_dict(
++                max_depth=tree_depth,
++                min_fraction=tree_min_fraction,
++                whole_allocated=whole,
++            ),
++            "hotspots": [
++                {
++                    "path": str(n.path),
++                    "allocated": n.total_allocated,
++                    "apparent": n.total_apparent,
++                    "files": n.total_files,
++                    "fraction": percent_of(n.total_allocated, whole),
++                }
++                for n in self.hotspots(limit=top)
++            ],
++            "largest_files": [
++                {
++                    "path": str(e.path),
++                    "allocated": e.allocated_size,
++                    "apparent": e.apparent_size,
++                }
++                for e in self.largest_files(limit=top)
++            ],
++            "by_extension": self.extension_breakdown.top(top).as_dict(),
++            "by_age": self.age_breakdown.as_dict(),
++            "cruft": self.cruft.as_dict(whole_allocated=whole),
++            "duplicates": self.duplicates.as_dict(),
++        }
++
++    def as_json(self, indent=2, **kwargs):
++        return json.dumps(self.as_dict(**kwargs), indent=indent, ensure_ascii=False, sort_keys=True)
++
++    def render_text(self, top=10):
++        """Return a compact multi-line summary suitable for a terminal."""
++        whole = self.total_allocated
++        lines = []
++        lines.append(f"Disk usage report for {self.root}")
++        lines.append(
++            "  total: {} allocated ({} apparent) across {} files in {} dirs".format(
++                format_size(self.total_allocated),
++                format_size(self.total_apparent),
++                format_count(self.total_files),
++                format_count(self.total_dirs),
++            )
++        )
++        lines.append(f"  slack (block rounding): {format_size(self.slack_bytes)}")
++        lines.append("")
++        lines.append(f"Top {top} directories:")
++        for node in self.hotspots(limit=top):
++            lines.append(
++                "  {:>10}  {:>5.1f}%  {}".format(
++                    format_size(node.total_allocated),
++                    percent_of(node.total_allocated, whole),
++                    node.path,
++                )
++            )
++        lines.append("")
++        lines.append("By extension:")
++        for row in self.extension_breakdown.top(top):
++            lines.append(
++                "  {:>10}  {:>5.1f}%  {} ({} files)".format(
++                    format_size(row.allocated),
++                    percent_of(row.allocated, whole),
++                    row.key,
++                    format_count(row.count),
++                )
++            )
++        lines.append("")
++        lines.append("By age:")
++        for row in self.age_breakdown:
++            lines.append(
++                "  {:>10}  {:>5.1f}%  {} ({} files)".format(
++                    format_size(row.allocated),
++                    percent_of(row.allocated, whole),
++                    row.key,
++                    format_count(row.count),
++                )
++            )
++        lines.append("")
++        lines.append(
++            "Cruft: {} in {} files ({:.1f}% of tree)".format(
++                format_size(self.cruft.total_allocated),
++                format_count(self.cruft.count),
++                percent_of(self.cruft.total_allocated, whole),
++            )
++        )
++        lines.append(
++            "Duplicates: {} wasted across {} groups ({:.1f}% of tree)".format(
++                format_size(self.duplicates.wasted_allocated),
++                format_count(self.duplicates.group_count),
++                percent_of(self.duplicates.wasted_allocated, whole),
++            )
++        )
++        return "\n".join(lines)
++
++
++def build_report(
++    entries,
++    root,
++    ref_time,
++    age_ladder=None,
++    cruft_rules=None,
++    include_reference_cruft=False,
++    duplicate_min_size=1,
++    duplicate_big_file_size=None,
++    detect_duplicates=True,
++    dirs=None,
++):
++    """Assemble an :class:`AnalysisReport` from a flat entry list.
++
++    This is the pure aggregation step: it builds the tree, both breakdowns, the
++    cruft scan and (optionally) the duplicate estimate, all from ``entries``
++    without touching the disk again -- except duplicate detection, which must
++    read file contents to hash them and is therefore opt-out for a fast run.
++    """
++    tree = UsageTree.from_entries(root, entries, dirs=dirs)
++    extension_breakdown = breakdown_by_extension(entries)
++    age_breakdown = breakdown_by_age(entries, ref_time=ref_time, ladder=age_ladder)
++    classifier = CruftClassifier(rules=cruft_rules, include_reference=include_reference_cruft)
++    cruft = classifier.classify(entries)
++    if detect_duplicates:
++        kwargs = {"min_size": duplicate_min_size}
++        if duplicate_big_file_size is not None:
++            kwargs["big_file_size"] = duplicate_big_file_size
++        duplicates = find_duplicate_sets(entries, **kwargs)
++    else:
++        duplicates = find_duplicate_sets([], min_size=duplicate_min_size)
++    return AnalysisReport(
++        tree=tree,
++        extension_breakdown=extension_breakdown,
++        age_breakdown=age_breakdown,
++        cruft=cruft,
++        duplicates=duplicates,
++        ref_time=ref_time,
++        root=root,
++    )
+diff --git a/core/diskscan/scanner.py b/core/diskscan/scanner.py
+new file mode 100644
+index 00000000..5138b6a2
+--- /dev/null
++++ b/core/diskscan/scanner.py
+@@ -0,0 +1,268 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Walking directories into a flat list of :class:`FileEntry`.
++
++Like the reclaim scanner, this layers on :class:`core.directories.Directories`
++rather than re-implementing tree walking. It honours the same folder-state
++vocabulary -- *normal*, *reference*, *excluded* -- so a "master" tree can be
++counted toward usage while being flagged (its entries carry ``is_reference``,
++which the cruft scanner and any downstream reclaim step respect).
++
++The scanner is where the disk is actually touched; everything after it works off
++the returned :class:`FileEntry` list. It captures one **reference time** at the
++start of the walk so the entire analysis shares a single clock for age
++computations.
++"""
++
++from __future__ import annotations
++
++import fnmatch
++import os
++from pathlib import Path
++
++from hscommon.jobprogress import job
++
++from core import fs
++from core.directories import Directories, DirectoryState, InvalidPathError
++
++from .entry import FileEntry
++from .errors import InvalidScanRootError
++
++__all__ = ["ScanSpec", "DiskScanner"]
++
++
++class ScanSpec:
++    """Declarative description of *what* to scan.
++
++    Mirrors the reclaim scanner's spec vocabulary so config files can be shared
++    between the two tools, but the disk analyzer keeps *everything* by default
++    (no ``min_size`` gate) because tiny files are exactly what the cruft and
++    empty-file detection want to see.
++    """
++
++    __slots__ = (
++        "roots",
++        "reference_roots",
++        "excluded_roots",
++        "include_ext",
++        "exclude_ext",
++        "include_globs",
++        "exclude_globs",
++        "min_size",
++        "max_size",
++        "follow_symlinks",
++    )
++
++    def __init__(
++        self,
++        roots,
++        reference_roots=None,
++        excluded_roots=None,
++        include_ext=None,
++        exclude_ext=None,
++        include_globs=None,
++        exclude_globs=None,
++        min_size=0,
++        max_size=0,
++        follow_symlinks=False,
++    ):
++        self.roots = [Path(p) for p in roots]
++        self.reference_roots = [Path(p) for p in (reference_roots or [])]
++        self.excluded_roots = [Path(p) for p in (excluded_roots or [])]
++        self.include_ext = {e.lower().lstrip(".") for e in (include_ext or [])}
++        self.exclude_ext = {e.lower().lstrip(".") for e in (exclude_ext or [])}
++        self.include_globs = list(include_globs or [])
++        self.exclude_globs = list(exclude_globs or [])
++        self.min_size = min_size
++        self.max_size = max_size
++        self.follow_symlinks = follow_symlinks
++
++    @classmethod
++    def from_dict(cls, data):
++        return cls(
++            roots=data.get("roots", data.get("paths", [])),
++            reference_roots=data.get("reference_roots", data.get("references", [])),
++            excluded_roots=data.get("excluded_roots", data.get("excludes", [])),
++            include_ext=data.get("include_ext"),
++            exclude_ext=data.get("exclude_ext"),
++            include_globs=data.get("include_globs"),
++            exclude_globs=data.get("exclude_globs"),
++            min_size=data.get("min_size", 0),
++            max_size=data.get("max_size", 0),
++            follow_symlinks=data.get("follow_symlinks", False),
++        )
++
++    @property
++    def primary_root(self):
++        """The root the usage tree is anchored at.
++
++        Every scanned file -- including files in reference roots that sit
++        outside the normal roots -- must live under the anchor, or the tree
++        would silently drop them. So the anchor is the common ancestor of *all*
++        roots the scan touches (normal + reference); for the common single-root
++        case it's just that root.
++        """
++        if not self.roots:
++            raise InvalidScanRootError("a scan needs at least one root")
++        all_roots = list(self.roots) + list(self.reference_roots)
++        if len(all_roots) == 1:
++            return all_roots[0]
++        # Common ancestor of all roots.
++        parts = [p.resolve().parts for p in all_roots]
++        common = []
++        for group in zip(*parts):
++            if all(g == group[0] for g in group):
++                common.append(group[0])
++            else:
++                break
++        if not common:
++            return Path(all_roots[0].anchor or "/")
++        return Path(*common)
++
++    def _name_allowed(self, name):
++        ext = Path(name).suffix.lower().lstrip(".")
++        if self.include_ext and ext not in self.include_ext:
++            return False
++        if self.exclude_ext and ext in self.exclude_ext:
++            return False
++        if self.include_globs and not any(fnmatch.fnmatch(name, g) for g in self.include_globs):
++            return False
++        if self.exclude_globs and any(fnmatch.fnmatch(name, g) for g in self.exclude_globs):
++            return False
++        return True
++
++    def _size_allowed(self, size):
++        if self.min_size and size < self.min_size:
++            return False
++        if self.max_size and size > self.max_size:
++            return False
++        return True
++
++
++class ScanResult:
++    """The raw output of a scan: entries plus the clock and root they share.
++
++    ``dirs`` is the set of directory paths visited during the walk (including
++    ones that held no files), so downstream tree-building can materialise empty
++    directories that a file-only view would miss.
++    """
++
++    def __init__(self, entries, ref_time, root, dirs=None):
++        self.entries = entries
++        self.ref_time = ref_time
++        self.root = Path(root)
++        self.dirs = list(dirs or [])
++
++    def __iter__(self):
++        return iter(self.entries)
++
++    def __len__(self):
++        return len(self.entries)
++
++    @property
++    def total_apparent(self):
++        return sum(e.apparent_size for e in self.entries)
++
++    @property
++    def total_allocated(self):
++        return sum(e.allocated_size for e in self.entries)
++
++
++class DiskScanner:
++    """Collects :class:`FileEntry` for a :class:`ScanSpec`."""
++
++    def __init__(self, spec, ref_time=None):
++        self.spec = spec
++        # Anchor time for age math. Supplied by the caller (the session captures
++        # ``time.time()`` once) so scans are reproducible in tests that pass a
++        # fixed clock.
++        self._ref_time = ref_time
++
++    def _build_directories(self):
++        dirs = Directories()
++        for root in self.spec.roots:
++            if not root.exists() or not root.is_dir():
++                raise InvalidScanRootError(f"scan root does not exist or is not a directory: {root}")
++            try:
++                dirs.add_path(root)
++            except InvalidPathError:
++                raise InvalidScanRootError(f"invalid scan root: {root}")
++        for ref in self.spec.reference_roots:
++            if not ref.exists() or not ref.is_dir():
++                raise InvalidScanRootError(f"reference root does not exist: {ref}")
++            if ref not in dirs:
++                try:
++                    dirs.add_path(ref)
++                except InvalidPathError:
++                    raise InvalidScanRootError(f"invalid reference root: {ref}")
++            dirs.set_state(ref, DirectoryState.REFERENCE)
++        for exc in self.spec.excluded_roots:
++            dirs.set_state(Path(exc), DirectoryState.EXCLUDED)
++        return dirs
++
++    def scan(self, ref_time=None, j=job.nulljob):
++        """Walk the spec's roots and return a :class:`ScanResult`.
++
++        ``ref_time`` overrides the scanner's construction-time clock for this
++        one call; if neither is set the entries are left un-anchored and any
++        age query on them must supply its own reference time.
++        """
++        anchor = ref_time if ref_time is not None else self._ref_time
++        dirs = self._build_directories()
++        entries = []
++        for file in dirs.get_files(fileclasses=[fs.File], j=j):
++            name = file.path.name
++            if not self.spec._name_allowed(name):
++                continue
++            if not self.spec._size_allowed(file.size):
++                continue
++            entry = FileEntry.from_file(
++                file,
++                ref_time=anchor,
++                is_reference=getattr(file, "is_ref", False),
++            )
++            entries.append(entry)
++        # Deterministic order regardless of directory iteration order.
++        entries.sort(key=lambda e: str(e.path))
++        visited_dirs = self._collect_dirs(dirs)
++        return ScanResult(
++            entries=entries,
++            ref_time=anchor,
++            root=self.spec.primary_root,
++            dirs=visited_dirs,
++        )
++
++    def _collect_dirs(self, dirs):
++        """Return every non-excluded directory under the scan roots.
++
++        We reuse the same ``Directories`` state map so an excluded subtree is
++        skipped here too, keeping the directory census consistent with the file
++        walk. Directories that held no files still show up -- which is exactly
++        what empty-directory detection needs.
++        """
++        found = []
++        seen = set()
++        for root in self.spec.roots:
++            for dirpath, dirnames, _filenames in os.walk(root):
++                current = Path(dirpath)
++                # Honour excluded state and dot-folder skipping the same way the
++                # file walk does: prune excluded / dot subdirectories in place.
++                kept = []
++                for name in dirnames:
++                    child = current / name
++                    if name.startswith("."):
++                        continue
++                    if dirs.get_state(child) == DirectoryState.EXCLUDED:
++                        continue
++                    kept.append(name)
++                dirnames[:] = kept
++                if dirs.get_state(current) == DirectoryState.EXCLUDED:
++                    continue
++                if current not in seen:
++                    seen.add(current)
++                    found.append(current)
++        return found
+diff --git a/core/diskscan/session.py b/core/diskscan/session.py
+new file mode 100644
+index 00000000..9fb8a3b8
+--- /dev/null
++++ b/core/diskscan/session.py
+@@ -0,0 +1,110 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""The high-level entry point tying scanning to reporting.
++
++:class:`DiskScanSession` is the thing most callers actually use: hand it a
++:class:`~core.diskscan.scanner.ScanSpec` (and optional knobs), call
++:meth:`analyze`, and get back a fully-assembled
++:class:`~core.diskscan.report.AnalysisReport`. It captures a single reference
++time at scan start (so every age in the report shares one clock), caches the
++result, and exposes :meth:`evaluate` to run a threshold set against the analysis.
++
++The session performs no file mutation of any kind -- it only reads. That keeps
++the disk analyzer squarely a *measurement* tool; anything that deletes lives in
++the reclaim / sweep packages.
++"""
++
++from __future__ import annotations
++
++import time
++
++from hscommon.jobprogress import job
++
++from .report import build_report
++from .scanner import DiskScanner, ScanSpec
++from .thresholds import ThresholdSet
++
++
++class DiskScanSession:
++    """Orchestrates scan -> report and holds the cached result."""
++
++    def __init__(
++        self,
++        spec,
++        age_ladder=None,
++        cruft_rules=None,
++        include_reference_cruft=False,
++        detect_duplicates=True,
++        duplicate_min_size=1,
++        duplicate_big_file_size=None,
++        clock=None,
++    ):
++        self.spec = spec
++        self.age_ladder = age_ladder
++        self.cruft_rules = cruft_rules
++        self.include_reference_cruft = include_reference_cruft
++        self.detect_duplicates = detect_duplicates
++        self.duplicate_min_size = duplicate_min_size
++        self.duplicate_big_file_size = duplicate_big_file_size
++        # Injectable clock keeps age math testable with a fixed "now".
++        self._clock = clock or time.time
++        self._report = None
++        self._scan_result = None
++
++    # --- Analysis -------------------------------------------------------------
++    def analyze(self, force=False, ref_time=None, j=job.nulljob):
++        """Scan the spec's roots and build the report, caching the result.
++
++        Pass ``force=True`` to re-scan (e.g. after files changed). ``ref_time``
++        overrides the session clock for this analysis, which is what tests use
++        to make ages deterministic.
++        """
++        if self._report is not None and not force:
++            return self._report
++        anchor = ref_time if ref_time is not None else float(self._clock())
++        scanner = DiskScanner(self.spec, ref_time=anchor)
++        scan_result = scanner.scan(ref_time=anchor, j=j)
++        report = build_report(
++            entries=scan_result.entries,
++            root=scan_result.root,
++            ref_time=anchor,
++            age_ladder=self.age_ladder,
++            cruft_rules=self.cruft_rules,
++            include_reference_cruft=self.include_reference_cruft,
++            duplicate_min_size=self.duplicate_min_size,
++            duplicate_big_file_size=self.duplicate_big_file_size,
++            detect_duplicates=self.detect_duplicates,
++            dirs=scan_result.dirs,
++        )
++        self._scan_result = scan_result
++        self._report = report
++        return report
++
++    @property
++    def report(self):
++        """The cached report, running :meth:`analyze` on first access."""
++        if self._report is None:
++            return self.analyze()
++        return self._report
++
++    def evaluate(self, thresholds, force=False):
++        """Run a :class:`~core.diskscan.thresholds.ThresholdSet` against the report.
++
++        Accepts either a ready :class:`ThresholdSet` or a bare iterable of
++        rules. Analyses first if needed so a caller can go straight from spec to
++        verdict.
++        """
++        report = self.analyze(force=force)
++        if not isinstance(thresholds, ThresholdSet):
++            thresholds = ThresholdSet(list(thresholds))
++        return thresholds.evaluate(report)
++
++    # --- Constructors ---------------------------------------------------------
++    @classmethod
++    def from_spec_dict(cls, data, **kwargs):
++        """Build a session from a plain dict describing the scan spec."""
++        return cls(ScanSpec.from_dict(data), **kwargs)
+diff --git a/core/diskscan/thresholds.py b/core/diskscan/thresholds.py
+new file mode 100644
+index 00000000..a1fc0143
+--- /dev/null
++++ b/core/diskscan/thresholds.py
+@@ -0,0 +1,268 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Threshold rules: turning a scan into pass / warn / fail signals.
++
++A usage report is often consumed by something that wants a *decision*: "alert me
++if any single directory is over 10 GiB", "fail the check if reclaimable cruft
++exceeds 20% of the tree", "warn when there are more than 1000 empty files". This
++module lets a caller declare those rules and evaluate them against an
++:class:`~core.diskscan.report.AnalysisReport`, producing an ordered list of
++:class:`ThresholdBreach` with a severity.
++
++Rules are pure predicates over the analysis; they never mutate anything. The
++severity vocabulary is deliberately tiny (``info`` < ``warning`` < ``critical``)
++so the overall verdict is just "the worst breach that fired".
++"""
++
++from __future__ import annotations
++
++from .errors import DiskScanConfigError
++from .units import format_size, percent_of
++
++# Severity ladder, least to most severe.
++SEVERITY_INFO = "info"
++SEVERITY_WARNING = "warning"
++SEVERITY_CRITICAL = "critical"
++
++_SEVERITY_ORDER = {
++    SEVERITY_INFO: 10,
++    SEVERITY_WARNING: 20,
++    SEVERITY_CRITICAL: 30,
++}
++
++SEVERITIES = (SEVERITY_INFO, SEVERITY_WARNING, SEVERITY_CRITICAL)
++
++
++def severity_rank(severity):
++    if severity not in _SEVERITY_ORDER:
++        raise DiskScanConfigError(f"unknown severity: {severity!r}")
++    return _SEVERITY_ORDER[severity]
++
++
++class ThresholdBreach:
++    """A single fired rule: what tripped, by how much, how bad."""
++
++    __slots__ = ("name", "severity", "message", "observed", "limit")
++
++    def __init__(self, name, severity, message, observed, limit):
++        self.name = name
++        self.severity = severity
++        self.message = message
++        self.observed = observed
++        self.limit = limit
++
++    @property
++    def rank(self):
++        return severity_rank(self.severity)
++
++    def as_dict(self):
++        return {
++            "name": self.name,
++            "severity": self.severity,
++            "message": self.message,
++            "observed": self.observed,
++            "limit": self.limit,
++        }
++
++    def __repr__(self):
++        return f"<ThresholdBreach {self.severity} {self.name}>"
++
++
++class ThresholdRule:
++    """A named predicate over an analysis report.
++
++    ``metric`` is a callable ``(report) -> number`` extracting the observed
++    value; the rule fires when that value crosses ``limit`` in the configured
++    ``direction`` (``"above"`` or ``"below"``). ``format_value`` renders the
++    number for the message (bytes vs. count vs. percent).
++    """
++
++    __slots__ = ("name", "metric", "limit", "severity", "direction", "format_value", "description")
++
++    def __init__(
++        self,
++        name,
++        metric,
++        limit,
++        severity=SEVERITY_WARNING,
++        direction="above",
++        format_value=None,
++        description="",
++    ):
++        if direction not in ("above", "below"):
++            raise DiskScanConfigError(f"threshold direction must be 'above' or 'below', got {direction!r}")
++        severity_rank(severity)  # validate
++        self.name = name
++        self.metric = metric
++        self.limit = limit
++        self.severity = severity
++        self.direction = direction
++        self.format_value = format_value or (lambda v: str(v))
++        self.description = description
++
++    def _fires(self, observed):
++        if self.direction == "above":
++            return observed > self.limit
++        return observed < self.limit
++
++    def evaluate(self, report):
++        """Return a :class:`ThresholdBreach` if the rule fires, else ``None``."""
++        observed = self.metric(report)
++        if not self._fires(observed):
++            return None
++        rendered = self.format_value(observed)
++        rendered_limit = self.format_value(self.limit)
++        arrow = "exceeds" if self.direction == "above" else "is below"
++        message = self.description or f"{self.name}: {rendered} {arrow} {rendered_limit}"
++        return ThresholdBreach(
++            name=self.name,
++            severity=self.severity,
++            message=message,
++            observed=observed,
++            limit=self.limit,
++        )
++
++
++class ThresholdResult:
++    """The outcome of evaluating a rule set against a report."""
++
++    def __init__(self, breaches):
++        # Most severe first, then by name for stability.
++        self.breaches = sorted(breaches, key=lambda b: (-b.rank, b.name))
++
++    def __iter__(self):
++        return iter(self.breaches)
++
++    def __len__(self):
++        return len(self.breaches)
++
++    @property
++    def passed(self):
++        """True when nothing at ``warning`` or worse fired."""
++        return not any(b.rank >= _SEVERITY_ORDER[SEVERITY_WARNING] for b in self.breaches)
++
++    @property
++    def worst_severity(self):
++        """The highest severity that fired, or ``None`` when clean."""
++        if not self.breaches:
++            return None
++        return self.breaches[0].severity
++
++    def of_severity(self, severity):
++        return [b for b in self.breaches if b.severity == severity]
++
++    def as_dict(self):
++        return {
++            "passed": self.passed,
++            "worst_severity": self.worst_severity,
++            "breaches": [b.as_dict() for b in self.breaches],
++        }
++
++
++# --- Convenience metric builders ---------------------------------------------
++# These make the common rules read declaratively at call sites.
++def largest_hotspot_allocated(report):
++    hotspots = report.hotspots
++    return hotspots[0].total_allocated if hotspots else 0
++
++
++def cruft_fraction(report):
++    return percent_of(report.cruft.total_allocated, report.total_allocated)
++
++
++def duplicate_fraction(report):
++    return percent_of(report.duplicates.wasted_allocated, report.total_allocated)
++
++
++def empty_file_count(report):
++    return sum(1 for e in report.entries if e.is_empty)
++
++
++class ThresholdSet:
++    """A named, ordered collection of :class:`ThresholdRule`."""
++
++    def __init__(self, rules=None):
++        self.rules = list(rules or [])
++
++    def add(self, rule):
++        self.rules.append(rule)
++        return self
++
++    def evaluate(self, report):
++        breaches = []
++        for rule in self.rules:
++            breach = rule.evaluate(report)
++            if breach is not None:
++                breaches.append(breach)
++        return ThresholdResult(breaches)
++
++
++def default_thresholds(
++    max_total_allocated=None,
++    max_hotspot_allocated=None,
++    max_cruft_fraction=None,
++    max_duplicate_fraction=None,
++    max_empty_files=None,
++):
++    """Assemble a :class:`ThresholdSet` from a few common limits.
++
++    Only the limits you pass become rules, so a caller can enable just the
++    checks they care about. All are "above" checks at ``warning`` severity by
++    default; wrap or extend the set for finer control.
++    """
++    rules = []
++    if max_total_allocated is not None:
++        rules.append(
++            ThresholdRule(
++                "total-allocated",
++                metric=lambda r: r.total_allocated,
++                limit=max_total_allocated,
++                severity=SEVERITY_WARNING,
++                format_value=format_size,
++            )
++        )
++    if max_hotspot_allocated is not None:
++        rules.append(
++            ThresholdRule(
++                "hotspot-allocated",
++                metric=largest_hotspot_allocated,
++                limit=max_hotspot_allocated,
++                severity=SEVERITY_WARNING,
++                format_value=format_size,
++            )
++        )
++    if max_cruft_fraction is not None:
++        rules.append(
++            ThresholdRule(
++                "cruft-fraction",
++                metric=cruft_fraction,
++                limit=max_cruft_fraction,
++                severity=SEVERITY_WARNING,
++                format_value=lambda v: f"{v:.1f}%",
++            )
++        )
++    if max_duplicate_fraction is not None:
++        rules.append(
++            ThresholdRule(
++                "duplicate-fraction",
++                metric=duplicate_fraction,
++                limit=max_duplicate_fraction,
++                severity=SEVERITY_WARNING,
++                format_value=lambda v: f"{v:.1f}%",
++            )
++        )
++    if max_empty_files is not None:
++        rules.append(
++            ThresholdRule(
++                "empty-files",
++                metric=empty_file_count,
++                limit=max_empty_files,
++                severity=SEVERITY_INFO,
++                format_value=str,
++            )
++        )
++    return ThresholdSet(rules)
+diff --git a/core/diskscan/tree.py b/core/diskscan/tree.py
+new file mode 100644
+index 00000000..8aab5575
+--- /dev/null
++++ b/core/diskscan/tree.py
+@@ -0,0 +1,357 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""The directory-usage tree.
++
++The heart of the analyzer is a tree of :class:`UsageNode` objects mirroring the
++directory hierarchy under a scan root. Each node knows:
++
++* its **own** contribution (files directly inside that directory), and
++* its **subtree** totals (itself plus everything beneath it),
++
++for both size notions (apparent and allocated), plus file / directory counts.
++Totals roll up from the leaves so a parent's subtree size is exactly the sum of
++its children's subtree sizes plus its own direct files -- which is what makes
++"which directory is eating my disk" answerable at a glance.
++
++The tree is built by :meth:`UsageTree.from_entries` from a flat list of
++:class:`core.diskscan.entry.FileEntry`, so the same walk output can feed the
++tree, the extension breakdown, the cruft scan, etc. without re-touching disk.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++from .units import percent_of
++
++
++class UsageNode:
++    """A directory in the usage tree.
++
++    ``direct_*`` figures cover files sitting immediately in this directory;
++    ``total_*`` figures (properties) cover the whole subtree rooted here. Empty
++    directories are represented too -- an interior node with no direct files and
++    no children is exactly a leaf empty directory, which the cruft scan cares
++    about.
++    """
++
++    __slots__ = (
++        "path",
++        "name",
++        "_children",
++        "direct_files",
++        "direct_apparent",
++        "direct_allocated",
++        "_total_apparent",
++        "_total_allocated",
++        "_total_files",
++        "_total_dirs",
++        "_totals_valid",
++    )
++
++    def __init__(self, path):
++        self.path = Path(path)
++        self.name = self.path.name or str(self.path)
++        self._children = {}  # name -> UsageNode
++        self.direct_files = []  # FileEntry directly in this dir
++        self.direct_apparent = 0
++        self.direct_allocated = 0
++        # Cached subtree totals; invalidated whenever the subtree changes.
++        self._total_apparent = 0
++        self._total_allocated = 0
++        self._total_files = 0
++        self._total_dirs = 0
++        self._totals_valid = False
++
++    # --- Mutation (build time) ------------------------------------------------
++    def child(self, name):
++        """Return the child node named ``name``, creating it if needed."""
++        node = self._children.get(name)
++        if node is None:
++            node = UsageNode(self.path / name)
++            self._children[name] = node
++            self._totals_valid = False
++        return node
++
++    def add_direct_file(self, entry):
++        """Attach a file that lives directly in this directory."""
++        self.direct_files.append(entry)
++        self.direct_apparent += entry.apparent_size
++        self.direct_allocated += entry.allocated_size
++        self._invalidate_up_to_root_hint()
++
++    def _invalidate_up_to_root_hint(self):
++        # We don't hold a parent pointer (keeps the node cheap and avoids
++        # cycles); instead the whole-tree recompute is driven from the root
++        # after building. This just marks the local cache dirty.
++        self._totals_valid = False
++
++    # --- Totals ---------------------------------------------------------------
++    def recompute(self):
++        """Recompute subtree totals bottom-up and return this node's totals.
++
++        Called once on the root after the tree is fully built. It's a plain
++        post-order fold: a node's totals are its direct files plus the sum of
++        its recomputed children.
++        """
++        total_apparent = self.direct_apparent
++        total_allocated = self.direct_allocated
++        total_files = len(self.direct_files)
++        total_dirs = 0
++        for child in self._children.values():
++            child.recompute()
++            total_apparent += child._total_apparent
++            total_allocated += child._total_allocated
++            total_files += child._total_files
++            # each child is itself a directory, plus whatever dirs it contains
++            total_dirs += 1 + child._total_dirs
++        self._total_apparent = total_apparent
++        self._total_allocated = total_allocated
++        self._total_files = total_files
++        self._total_dirs = total_dirs
++        self._totals_valid = True
++        return self
++
++    def _ensure_totals(self):
++        if not self._totals_valid:
++            self.recompute()
++
++    @property
++    def children(self):
++        """Child nodes sorted by descending subtree allocated size (stable).
++
++        The dominant consumer wants "biggest first"; ties break on name so the
++        order is deterministic regardless of insertion order.
++        """
++        self._ensure_totals()
++        return sorted(
++            self._children.values(),
++            key=lambda n: (-n.total_allocated, n.name),
++        )
++
++    @property
++    def children_by_name(self):
++        return dict(self._children)
++
++    @property
++    def total_apparent(self):
++        self._ensure_totals()
++        return self._total_apparent
++
++    @property
++    def total_allocated(self):
++        self._ensure_totals()
++        return self._total_allocated
++
++    @property
++    def total_files(self):
++        self._ensure_totals()
++        return self._total_files
++
++    @property
++    def total_dirs(self):
++        self._ensure_totals()
++        return self._total_dirs
++
++    @property
++    def is_leaf(self):
++        return not self._children
++
++    @property
++    def is_empty_dir(self):
++        """True when this directory holds no files anywhere in its subtree."""
++        return self.total_files == 0
++
++    def fraction_of(self, whole_allocated):
++        """This subtree's allocated size as a percentage of ``whole_allocated``."""
++        return percent_of(self.total_allocated, whole_allocated)
++
++    # --- Traversal ------------------------------------------------------------
++    def walk(self):
++        """Yield this node then every descendant (pre-order, biggest first)."""
++        yield self
++        for child in self.children:
++            yield from child.walk()
++
++    def iter_files(self):
++        """Yield every :class:`FileEntry` in this subtree."""
++        for entry in self.direct_files:
++            yield entry
++        for child in self._children.values():
++            yield from child.iter_files()
++
++    def find(self, path):
++        """Return the node at ``path`` within this subtree, or ``None``.
++
++        ``path`` must be at or below this node's path.
++        """
++        path = Path(path)
++        if path == self.path:
++            return self
++        try:
++            rel = path.relative_to(self.path)
++        except ValueError:
++            return None
++        node = self
++        for part in rel.parts:
++            node = node._children.get(part)
++            if node is None:
++                return None
++        return node
++
++    def as_dict(self, max_depth=None, min_fraction=0.0, whole_allocated=None):
++        """Serialise the subtree to nested dicts.
++
++        ``max_depth`` prunes below a certain depth (the pruned node still
++        reports its totals, just not its children). ``min_fraction`` drops
++        children whose share of ``whole_allocated`` is below the threshold, so a
++        report can hide the long tail of tiny directories.
++        """
++        self._ensure_totals()
++        if whole_allocated is None:
++            whole_allocated = self._total_allocated
++        node = {
++            "path": str(self.path),
++            "name": self.name,
++            "total_apparent": self._total_apparent,
++            "total_allocated": self._total_allocated,
++            "direct_apparent": self.direct_apparent,
++            "direct_allocated": self.direct_allocated,
++            "total_files": self._total_files,
++            "total_dirs": self._total_dirs,
++            "fraction": percent_of(self._total_allocated, whole_allocated),
++        }
++        if max_depth is not None and max_depth <= 0:
++            return node
++        children = []
++        for child in self.children:
++            if percent_of(child.total_allocated, whole_allocated) < min_fraction:
++                continue
++            children.append(
++                child.as_dict(
++                    max_depth=None if max_depth is None else max_depth - 1,
++                    min_fraction=min_fraction,
++                    whole_allocated=whole_allocated,
++                )
++            )
++        if children:
++            node["children"] = children
++        return node
++
++    def __repr__(self):
++        return f"<UsageNode {str(self.path)} files={len(self.direct_files)}>"
++
++
++class UsageTree:
++    """A rooted directory-usage tree plus the flat entry list it was built from.
++
++    Keeping the flat ``entries`` alongside the ``root`` node means downstream
++    slicing (by extension, by age, cruft, duplicates) can iterate the flat list
++    without re-walking the tree, while size-by-directory questions use the tree.
++    """
++
++    def __init__(self, root, entries):
++        self.root = root
++        self.entries = entries
++
++    @classmethod
++    def from_entries(cls, root_path, entries, dirs=None):
++        """Build a tree rooted at ``root_path`` from a flat entry list.
++
++        Every entry must live at or below ``root_path``. Intermediate
++        directories are materialised on demand, so a file three levels down
++        creates the two directories above it even if they held nothing else.
++
++        ``dirs`` is an optional iterable of directory paths visited during the
++        scan; materialising them lets the tree represent directories that held
++        no files at all (empty-directory detection depends on this -- a
++        file-only build can't know an empty directory exists).
++        """
++        root_path = Path(root_path)
++        root = UsageNode(root_path)
++        entries = list(entries)
++        for entry in entries:
++            try:
++                rel = entry.path.parent.relative_to(root_path)
++            except ValueError:
++                # Entry outside the root: skip rather than corrupt the tree.
++                continue
++            node = root
++            for part in rel.parts:
++                node = node.child(part)
++            node.add_direct_file(entry)
++        for dirpath in dirs or []:
++            dirpath = Path(dirpath)
++            if dirpath == root_path:
++                continue
++            try:
++                rel = dirpath.relative_to(root_path)
++            except ValueError:
++                continue
++            node = root
++            for part in rel.parts:
++                node = node.child(part)
++        root.recompute()
++        return cls(root=root, entries=entries)
++
++    @property
++    def total_allocated(self):
++        return self.root.total_allocated
++
++    @property
++    def total_apparent(self):
++        return self.root.total_apparent
++
++    @property
++    def total_files(self):
++        return self.root.total_files
++
++    @property
++    def total_dirs(self):
++        return self.root.total_dirs
++
++    def node_at(self, path):
++        return self.root.find(path)
++
++    def hotspots(self, limit=10, min_fraction=0.0):
++        """Return the ``limit`` heaviest directories, biggest allocated first.
++
++        A "hotspot" is any directory node (excluding the root itself) whose
++        subtree accounts for at least ``min_fraction`` percent of the total.
++        The list is sorted by descending allocated size with name as the
++        tie-breaker, so it's stable across runs.
++        """
++        whole = self.total_allocated
++        candidates = []
++        for node in self.root.walk():
++            if node is self.root:
++                continue
++            if percent_of(node.total_allocated, whole) < min_fraction:
++                continue
++            candidates.append(node)
++        candidates.sort(key=lambda n: (-n.total_allocated, str(n.path)))
++        if limit is not None:
++            candidates = candidates[:limit]
++        return candidates
++
++    def largest_files(self, limit=10):
++        """Return the ``limit`` largest individual files by allocated size."""
++        entries = sorted(
++            self.entries,
++            key=lambda e: (-e.allocated_size, str(e.path)),
++        )
++        if limit is not None:
++            entries = entries[:limit]
++        return entries
++
++    def empty_dirs(self):
++        """Return every directory node whose entire subtree holds no files.
++
++        The root is included when the whole tree is empty. ``walk`` already
++        yields nodes in a deterministic order, so no extra sorting is needed.
++        """
++        return [node for node in self.root.walk() if node.is_empty_dir]
+diff --git a/core/diskscan/units.py b/core/diskscan/units.py
+new file mode 100644
+index 00000000..fbf81ea6
+--- /dev/null
++++ b/core/diskscan/units.py
+@@ -0,0 +1,105 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Small value helpers shared across the disk-usage analyzer.
++
++The analyzer speaks in two different notions of "how big is this":
++
++* **apparent size** -- the logical length of a file, i.e. ``st_size``. This is
++  the number you get from ``ls -l`` and what most people mean by "file size".
++* **allocated size** -- the number of bytes the file actually occupies on the
++  block device, i.e. ``st_blocks * 512``. A one-byte file still consumes a full
++  filesystem block, and sparse files occupy *less* than their apparent size.
++  When you want to know how much space you'd get *back* by deleting something,
++  this is the honest number.
++
++This module also owns the age-bucketing vocabulary (how we slice files by "how
++long since they were last touched") and a couple of tiny formatting helpers so
++the textual report doesn't have to reinvent them.
++"""
++
++from __future__ import annotations
++
++# A filesystem block, for the purpose of turning ``st_blocks`` into bytes, is
++# always 512 bytes regardless of the actual block size of the device -- this is
++# a POSIX contract, not the ``st_blksize`` value.
++STAT_BLOCK_SIZE = 512
++
++# Binary size unit ladder, smallest first.
++_SIZE_UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
++
++# Seconds in the calendar spans we care about. We deliberately use fixed-length
++# approximations (30-day months, 365-day years); the analyzer is about
++# ball-parking where the space went, not about calendar precision.
++SECONDS_PER_MINUTE = 60
++SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE
++SECONDS_PER_DAY = 24 * SECONDS_PER_HOUR
++SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY
++SECONDS_PER_MONTH = 30 * SECONDS_PER_DAY
++SECONDS_PER_YEAR = 365 * SECONDS_PER_DAY
++
++
++def blocks_to_bytes(st_blocks: int) -> int:
++    """Turn a ``stat`` ``st_blocks`` count into a byte figure.
++
++    ``st_blocks`` counts 512-byte units by POSIX definition, so this is just a
++    multiply -- but giving it a name keeps the intent legible at call sites and
++    guards the one place the magic constant lives.
++    """
++    if st_blocks is None or st_blocks < 0:
++        return 0
++    return int(st_blocks) * STAT_BLOCK_SIZE
++
++
++def allocated_size_of(stat_result) -> int:
++    """Best-effort allocated size for an ``os.stat_result``.
++
++    On platforms that expose ``st_blocks`` (every POSIX system) we use it. On
++    the odd platform that doesn't, we fall back to the apparent size so callers
++    always get *some* sensible figure rather than a crash.
++    """
++    st_blocks = getattr(stat_result, "st_blocks", None)
++    if st_blocks is None:
++        return int(getattr(stat_result, "st_size", 0) or 0)
++    return blocks_to_bytes(st_blocks)
++
++
++def format_size(size: int, binary: bool = True, precision: int = 1) -> str:
++    """Render a byte count as a short human string, e.g. ``"1.5 MiB"``.
++
++    This is intentionally independent of ``hscommon.util.format_size`` because
++    we want the binary (1024) ladder and a stable, dependency-free spelling in
++    the report. ``size`` is clamped at zero -- negative sizes are meaningless
++    here and only ever arise from bad callers.
++    """
++    if size is None:
++        size = 0
++    size = max(0, int(size))
++    if size < 1024:
++        return f"{size} B"
++    value = float(size)
++    step = 1024.0 if binary else 1000.0
++    unit_index = 0
++    while value >= step and unit_index < len(_SIZE_UNITS) - 1:
++        value /= step
++        unit_index += 1
++    return f"{value:.{precision}f} {_SIZE_UNITS[unit_index]}"
++
++
++def format_count(count: int) -> str:
++    """Render an integer with thousands separators (``"12,345"``)."""
++    return f"{int(count):,}"
++
++
++def percent_of(part: int, whole: int, precision: int = 1) -> float:
++    """Return ``part`` as a percentage of ``whole``.
++
++    Guards against a zero (or negative) denominator by returning ``0.0`` -- a
++    breakdown of an empty tree is legitimately "0% of nothing".
++    """
++    if not whole or whole <= 0:
++        return 0.0
++    return round(part * 100.0 / whole, precision)

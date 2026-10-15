@@ -1,0 +1,2606 @@
+diff --git a/docs/topics/downloader-middleware.rst b/docs/topics/downloader-middleware.rst
+index 5eda7d9..eb7eddc 100644
+--- a/docs/topics/downloader-middleware.rst
++++ b/docs/topics/downloader-middleware.rst
+@@ -225,6 +225,96 @@ middleware, see the :ref:`downloader middleware usage guide
+ For a list of the components enabled by default (and their orders) see the
+ :setting:`DOWNLOADER_MIDDLEWARES_BASE` setting.
+ 
++.. _topics-dlmw-conditional-requests:
++
++ConditionalRequestsMiddleware
++-----------------------------
++
++.. module:: scrapy.downloadermiddlewares.conditional
++   :synopsis: Conditional requests downloader middleware
++
++.. class:: ConditionalRequestsMiddleware
++
++    This middleware implements lightweight incremental re-crawling through
++    `HTTP conditional requests`_.
++
++    .. _HTTP conditional requests: https://www.rfc-editor.org/rfc/rfc9110#field.if-none-match
++
++    It is part of the default downloader middleware chain, but it stays
++    disabled unless :setting:`CONDITIONAL_REQUESTS_ENABLED` is set to
++    ``True``.
++
++    A minimal configuration for a daily incremental job looks like this:
++
++    .. code-block:: python
++
++        # settings.py
++        CONDITIONAL_REQUESTS_ENABLED = True
++        CONDITIONAL_REQUESTS_DIR = "/var/cache/myproject/conditional"
++
++    With this configuration the first crawl of the day behaves as usual,
++    except that the ``ETag`` and ``Last-Modified`` values of every
++    successful response are written to
++    ``/var/cache/myproject/conditional/<spider name>_conditional_requests``.
++    Every later crawl reuses those values: unchanged pages answer ``304 Not
++    Modified`` and are silently dropped, while changed pages are parsed and
++    their new validators replace the old ones.
++
++    Unlike :class:`~scrapy.downloadermiddlewares.httpcache.HttpCacheMiddleware`,
++    this middleware does not store response bodies. It only remembers the
++    ``ETag`` and ``Last-Modified`` header values of seen responses and uses
++    them to make later requests conditional:
++
++    *   When a ``GET`` or ``HEAD`` request is about to be downloaded and a
++        previous crawl stored validators for the same request fingerprint,
++        the middleware adds ``If-None-Match`` and/or ``If-Modified-Since``
++        headers to the request. Headers that are already set on the request,
++        e.g. by the spider, are never overwritten.
++
++    *   When the origin server answers such a request with ``304 Not
++        Modified``, the response is dropped by raising
++        :exc:`~scrapy.exceptions.IgnoreRequest`, so unchanged pages never
++        reach the spider callbacks and produce no duplicate items or
++        follow-up requests.
++
++    *   When a ``200 OK`` response carries an ``ETag`` and/or a
++        ``Last-Modified`` header, those values are stored under the request
++        fingerprint, replacing any previously stored values. Responses whose
++        ``Cache-Control`` header contains ``no-store`` are not recorded.
++
++    A typical use case is a spider that runs periodically over the same
++    start URLs. With conditional requests enabled, pages that did not change
++    since the previous run cost a single round trip and are filtered out
++    automatically, while changed pages are processed normally and update the
++    stored validators.
++
++    By default validators are kept in memory, which covers incremental
++    behavior within a single run. Set :setting:`CONDITIONAL_REQUESTS_DIR` to
++    a directory path to persist validators on disk (one database file per
++    spider, named ``<spider name>_conditional_requests``), so that separate
++    runs, e.g. a daily cron job, can benefit from the validators collected
++    by earlier runs.
++
++    .. reqmeta:: conditional_request
++
++    To opt a single request out of all conditional-request handling, set its
++    :reqmeta:`conditional_request` meta key to ``False``. Opted-out requests
++    never get conditional headers, ``304`` responses to them are passed to
++    the spider untouched, and their responses never update the stored
++    validators.
++
++    The middleware keeps track of its activity through the following
++    :ref:`stats <topics-stats>`:
++
++    *   ``conditional_requests/conditional``: number of requests to which
++        the middleware attached conditional headers.
++
++    *   ``conditional_requests/store``: number of responses whose
++        validators were stored.
++
++    *   ``conditional_requests/not_modified``: number of ``304 Not
++        Modified`` responses that were dropped.
++
+ CookiesMiddleware
+ -----------------
+ 
+diff --git a/docs/topics/request-response.rst b/docs/topics/request-response.rst
+index 7344292..ba5eea4 100644
+--- a/docs/topics/request-response.rst
++++ b/docs/topics/request-response.rst
+@@ -827,6 +827,7 @@ Those are:
+ * :reqmeta:`allow_offsite`
+ * :reqmeta:`autothrottle_dont_adjust_delay`
+ * :reqmeta:`bindaddress`
++* :reqmeta:`conditional_request`
+ * :reqmeta:`cookiejar`
+ * :reqmeta:`dont_cache`
+ * :reqmeta:`dont_merge_cookies`
+@@ -895,6 +896,26 @@ This meta key is not supported by
+ :class:`~scrapy.core.downloader.handlers._httpx.HttpxDownloadHandler`, but the
+ :setting:`DOWNLOAD_BIND_ADDRESS` is supported by it.
+ 
++.. reqmeta:: conditional_request
++
++conditional_request
++-------------------
++
++Setting this meta key to ``False`` opts the request out of all handling by
++the
++:class:`~scrapy.downloadermiddlewares.conditional.ConditionalRequestsMiddleware`:
++
++* no ``If-None-Match`` or ``If-Modified-Since`` headers are attached to the
++  request, even if validators were stored for it before,
++
++* a ``304 Not Modified`` response to the request is passed to the spider
++  untouched instead of being dropped,
++
++* validators sent with the response are not stored.
++
++Any value other than ``False``, including an unset key, keeps the default
++behavior. See :ref:`topics-dlmw-conditional-requests` for more information.
++
+ .. reqmeta:: download_timeout
+ 
+ download_timeout
+diff --git a/docs/topics/settings.rst b/docs/topics/settings.rst
+index ffa8e60..3d5ec53 100644
+--- a/docs/topics/settings.rst
++++ b/docs/topics/settings.rst
+@@ -567,6 +567,46 @@ project name). This name will be used for the logging too.
+ It's automatically populated with your project name when you create your
+ project with the :command:`startproject` command.
+ 
++.. setting:: CONDITIONAL_REQUESTS_ENABLED
++
++CONDITIONAL_REQUESTS_ENABLED
++----------------------------
++
++Default: ``False``
++
++Whether the
++:class:`~scrapy.downloadermiddlewares.conditional.ConditionalRequestsMiddleware`
++is active.
++
++When enabled, Scrapy stores the ``ETag`` and ``Last-Modified`` validators of
++successful (``200 OK``) responses and, on subsequent requests for the same
++resource, sends ``If-None-Match`` and/or ``If-Modified-Since`` headers so
++that the origin server can answer ``304 Not Modified`` for unchanged
++resources, in which case the response is dropped before it reaches the
++spider.
++
++See :ref:`topics-dlmw-conditional-requests` for more information.
++
++.. setting:: CONDITIONAL_REQUESTS_DIR
++
++CONDITIONAL_REQUESTS_DIR
++------------------------
++
++Default: ``None``
++
++Directory used by the
++:class:`~scrapy.downloadermiddlewares.conditional.ConditionalRequestsMiddleware`
++to persist the validators of seen responses, so that later crawls, including
++crawls run in a different process, can send conditional requests for
++resources seen before.
++
++For each spider, a database file named
++``<spider name>_conditional_requests`` is created inside this directory. If
++the directory does not exist, it is created when the spider is opened.
++
++If not set, validators are only kept in memory and are lost when the crawl
++finishes.
++
+ .. setting:: CONCURRENT_ITEMS
+ 
+ CONCURRENT_ITEMS
+diff --git a/scrapy/downloadermiddlewares/conditional.py b/scrapy/downloadermiddlewares/conditional.py
+new file mode 100644
+index 0000000..8c66283
+--- /dev/null
++++ b/scrapy/downloadermiddlewares/conditional.py
+@@ -0,0 +1,311 @@
++"""
++Conditional Requests downloader middleware.
++
++This middleware implements lightweight incremental re-crawling based on the
++HTTP conditional request mechanism (:rfc:`9110`, section 13). Unlike
++:class:`~scrapy.downloadermiddlewares.httpcache.HttpCacheMiddleware`, it does
++not store response bodies. It only remembers the ``ETag`` and
++``Last-Modified`` validators of previously seen successful responses and, on
++subsequent crawls (optionally across process restarts), turns matching
++requests into conditional ones by adding ``If-None-Match`` and/or
++``If-Modified-Since`` headers. When the origin server answers ``304 Not
++Modified``, the response is dropped before it reaches the spider, so spiders
++do not have to deal with unchanged pages at all.
++"""
++
++from __future__ import annotations
++
++import dbm.dumb
++import json
++import logging
++import os
++import threading
++from typing import TYPE_CHECKING
++
++from scrapy import signals
++from scrapy.exceptions import IgnoreRequest, NotConfigured
++from scrapy.utils.decorators import _warn_spider_arg
++
++if TYPE_CHECKING:
++    # typing.Self requires Python 3.11
++    from typing_extensions import Self
++
++    from scrapy.crawler import Crawler
++    from scrapy.http.request import Request
++    from scrapy.http.response import Response
++    from scrapy.settings import Settings
++    from scrapy.spiders import Spider
++    from scrapy.statscollectors import StatsCollector
++    from scrapy.utils.request import RequestFingerprinterProtocol
++
++
++logger = logging.getLogger(__name__)
++
++#: Request methods that can carry conditional headers and whose responses can
++#: provide validators worth storing.
++CONDITIONAL_METHODS = ("GET", "HEAD")
++
++#: Meta key that spiders can set to ``False`` to opt a single request out of
++#: all conditional-request handling (neither sending conditional headers nor
++#: storing validators from its response).
++META_KEY = "conditional_request"
++
++#: Internal meta key used to remember that this middleware attached
++#: conditional headers to a request, so that a ``304`` response to it can be
++#: safely attributed to this middleware.
++_SENT_META_KEY = "_conditional_request_sent"
++
++
++class _ValidatorStore:
++    """Mapping from request fingerprint to ``ETag``/``Last-Modified`` pairs.
++
++    Two backends are provided:
++
++    * :class:`_MemoryValidatorStore` keeps validators in a plain ``dict`` and
++      therefore only within a single process run.
++    * :class:`_DbmValidatorStore` persists validators in a :mod:`dbm.dumb`
++      database file so that follow-up crawls started later (e.g. a daily
++      incremental job) still benefit from the validators collected before.
++
++    Both backends expose the same minimal interface so the middleware does not
++    need to care which one is active.
++    """
++
++    def get(self, key: str) -> tuple[str | None, str | None] | None:
++        """Return the stored ``(etag, last_modified)`` pair for *key*.
++
++        Either element may be ``None`` when the origin server only sent one of
++        the two validators. ``None`` is returned when nothing was stored.
++        """
++        raise NotImplementedError
++
++    def set(self, key: str, etag: str | None, last_modified: str | None) -> None:
++        """Store the given validators under *key*, replacing any old value."""
++        raise NotImplementedError
++
++    def close(self) -> None:
++        """Flush pending changes and release resources."""
++
++
++class _MemoryValidatorStore(_ValidatorStore):
++    """Process-local validator store backed by a plain dictionary."""
++
++    def __init__(self) -> None:
++        self._data: dict[str, tuple[str | None, str | None]] = {}
++
++    def get(self, key: str) -> tuple[str | None, str | None] | None:
++        return self._data.get(key)
++
++    def set(self, key: str, etag: str | None, last_modified: str | None) -> None:
++        self._data[key] = (etag, last_modified)
++
++    def close(self) -> None:
++        self._data.clear()
++
++
++class _DbmValidatorStore(_ValidatorStore):
++    """Persistent validator store backed by a :mod:`dbm.dumb` database.
++
++    :mod:`dbm.dumb` is used instead of the faster :mod:`dbm.gnu` backend
++    because it is pure Python and therefore always available, regardless of
++    how the running interpreter was built. Validator lookups only happen once
++    per request, so the performance difference is irrelevant in practice.
++    """
++
++    def __init__(self, path: str) -> None:
++        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++        self._db = dbm.dumb.open(path, "c")
++        self._lock = threading.Lock()
++
++    def get(self, key: str) -> tuple[str | None, str | None] | None:
++        with self._lock:
++            raw = self._db.get(key.encode())
++        if raw is None:
++            return None
++        try:
++            data = json.loads(raw.decode())
++        except (ValueError, UnicodeDecodeError):
++            # A corrupt entry must never break a crawl; treat it as a miss.
++            logger.warning(
++                "Ignoring corrupt conditional-request validator entry for key %s",
++                key,
++            )
++            return None
++        return data.get("etag"), data.get("last_modified")
++
++    def set(self, key: str, etag: str | None, last_modified: str | None) -> None:
++        raw = json.dumps({"etag": etag, "last_modified": last_modified}).encode()
++        with self._lock:
++            self._db[key.encode()] = raw
++
++    def close(self) -> None:
++        with self._lock:
++            self._db.close()
++
++
++class ConditionalRequestsMiddleware:
++    """Downloader middleware for conditional (incremental) re-crawling.
++
++    The middleware is part of the default downloader middleware chain, but it
++    only activates when :setting:`CONDITIONAL_REQUESTS_ENABLED` is set to
++    ``True``; otherwise it disables itself through :exc:`NotConfigured`, like
++    other opt-in built-in middlewares do.
++
++    For every outgoing ``GET`` or ``HEAD`` request the middleware looks up the
++    request fingerprint in its validator store. If a previous crawl stored an
++    ``ETag`` and/or a ``Last-Modified`` value for that fingerprint, the
++    corresponding ``If-None-Match`` and/or ``If-Modified-Since`` headers are
++    added to the request, unless the request already carries them (headers set
++    by the spider or by other middlewares are never overwritten).
++
++    When the response comes back:
++
++    * ``304 Not Modified`` answers to requests that this middleware made
++      conditional are dropped by raising :exc:`~scrapy.exceptions.IgnoreRequest`,
++      so unchanged pages never reach the spider callbacks.
++    * ``200 OK`` responses that carry an ``ETag`` and/or a ``Last-Modified``
++      header have those validators stored under the request fingerprint, so
++      that future requests for the same resource can be made conditional.
++      Responses whose ``Cache-Control`` header contains ``no-store`` are not
++      recorded.
++
++    Individual requests can opt out of all of this behavior by setting
++    ``request.meta["conditional_request"] = False``.
++
++    The middleware keeps the following :ref:`stats <topics-stats>`:
++
++    * ``conditional_requests/conditional``: number of requests to which
++      conditional headers were attached.
++    * ``conditional_requests/store``: number of responses whose validators
++      were stored.
++    * ``conditional_requests/not_modified``: number of ``304`` responses that
++      were dropped.
++    """
++
++    def __init__(
++        self,
++        settings: Settings,
++        stats: StatsCollector,
++        fingerprinter: RequestFingerprinterProtocol,
++    ) -> None:
++        if not settings.getbool("CONDITIONAL_REQUESTS_ENABLED"):
++            raise NotConfigured
++        self.stats = stats
++        self.fingerprinter = fingerprinter
++        self._storage_dir: str | None = settings.get("CONDITIONAL_REQUESTS_DIR")
++        self._store: _ValidatorStore = _MemoryValidatorStore()
++        self.crawler: Crawler
++
++    @classmethod
++    def from_crawler(cls, crawler: Crawler) -> Self:
++        o = cls(crawler.settings, crawler.stats, crawler.request_fingerprinter)
++        crawler.signals.connect(o.spider_opened, signal=signals.spider_opened)
++        crawler.signals.connect(o.spider_closed, signal=signals.spider_closed)
++        o.crawler = crawler
++        return o
++
++    def spider_opened(self, spider: Spider) -> None:
++        if self._storage_dir:
++            path = os.path.join(
++                self._storage_dir, f"{spider.name}_conditional_requests"
++            )
++            self._store = _DbmValidatorStore(path)
++
++    def spider_closed(self, spider: Spider) -> None:
++        self._store.close()
++
++    def _fingerprint(self, request: Request) -> str:
++        return self.fingerprinter.fingerprint(request).hex()
++
++    def _get_validators(self, request: Request) -> tuple[str | None, str | None] | None:
++        return self._store.get(self._fingerprint(request))
++
++    def _store_validators(
++        self, request: Request, etag: str | None, last_modified: str | None
++    ) -> None:
++        self._store.set(self._fingerprint(request), etag, last_modified)
++
++    @staticmethod
++    def _eligible(request: Request) -> bool:
++        """Whether conditional handling applies to *request* at all."""
++        if request.meta.get(META_KEY, True) is False:
++            return False
++        return request.method.upper() in CONDITIONAL_METHODS
++
++    @_warn_spider_arg
++    def process_request(
++        self, request: Request, spider: Spider | None = None
++    ) -> Request | Response | None:
++        if not self._eligible(request):
++            return None
++
++        validators = self._get_validators(request)
++        if not validators:
++            return None
++        etag, last_modified = validators
++
++        sent = False
++        # Headers already present on the request (set by the spider or by an
++        # earlier middleware) take precedence and are never overwritten.
++        if etag and b"If-None-Match" not in request.headers:
++            request.headers[b"If-None-Match"] = etag.encode()
++            sent = True
++        if last_modified and b"If-Modified-Since" not in request.headers:
++            request.headers[b"If-Modified-Since"] = last_modified.encode()
++            sent = True
++
++        if sent:
++            request.meta[_SENT_META_KEY] = True
++            self.stats.inc_value("conditional_requests/conditional")
++            logger.debug(
++                "Attached conditional headers to %(request)s",
++                {"request": request},
++                extra={"spider": self.crawler.spider},
++            )
++        return None
++
++    @_warn_spider_arg
++    def process_response(
++        self, request: Request, response: Response, spider: Spider | None = None
++    ) -> Request | Response:
++        if not self._eligible(request):
++            return response
++
++        sent = request.meta.pop(_SENT_META_KEY, False)
++
++        if response.status == 304:
++            if sent:
++                self.stats.inc_value("conditional_requests/not_modified")
++                logger.debug(
++                    "Dropping not-modified response for %(request)s",
++                    {"request": request},
++                    extra={"spider": self.crawler.spider},
++                )
++                raise IgnoreRequest(f"Resource not modified (304): {request}")
++            # A 304 that we did not ask for is passed through untouched.
++            return response
++
++        if response.status != 200:
++            return response
++
++        cache_control = b",".join(response.headers.getlist(b"Cache-Control"))
++        if b"no-store" in cache_control.lower():
++            return response
++
++        etag_header = response.headers.get(b"ETag")
++        last_modified_header = response.headers.get(b"Last-Modified")
++        if etag_header is None and last_modified_header is None:
++            return response
++
++        etag = etag_header.decode() if etag_header is not None else None
++        last_modified = (
++            last_modified_header.decode() if last_modified_header is not None else None
++        )
++        self._store_validators(request, etag, last_modified)
++        self.stats.inc_value("conditional_requests/store")
++        logger.debug(
++            "Stored conditional-request validators for %(request)s",
++            {"request": request},
++            extra={"spider": self.crawler.spider},
++        )
++        return response
+diff --git a/scrapy/settings/default_settings.py b/scrapy/settings/default_settings.py
+index b978441..abff960 100644
+--- a/scrapy/settings/default_settings.py
++++ b/scrapy/settings/default_settings.py
+@@ -250,6 +250,8 @@ COMMANDS_MODULE = ""
+ 
+ COMPRESSION_ENABLED = True
+ 
++CONDITIONAL_REQUESTS_ENABLED = False
++
+ CONCURRENT_ITEMS = 100
+ 
+ CONCURRENT_REQUESTS = 16
+@@ -325,6 +327,7 @@ DOWNLOADER_MIDDLEWARES_BASE = {
+     "scrapy.downloadermiddlewares.retry.RetryMiddleware": 550,
+     "scrapy.downloadermiddlewares.redirect.MetaRefreshMiddleware": 580,
+     "scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware": 590,
++    "scrapy.downloadermiddlewares.conditional.ConditionalRequestsMiddleware": 595,
+     "scrapy.downloadermiddlewares.redirect.RedirectMiddleware": 600,
+     "scrapy.downloadermiddlewares.cookies.CookiesMiddleware": 700,
+     "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 750,
+diff --git a/tests/test_downloadermiddleware_conditional.py b/tests/test_downloadermiddleware_conditional.py
+new file mode 100644
+index 0000000..1a6b3ce
+--- /dev/null
++++ b/tests/test_downloadermiddleware_conditional.py
+@@ -0,0 +1,1836 @@
++"""Tests for the conditional-requests downloader middleware.
++
++The middleware under test is
++:class:`scrapy.downloadermiddlewares.conditional.ConditionalRequestsMiddleware`.
++It implements lightweight incremental re-crawling: it stores the ``ETag`` and
++``Last-Modified`` validators of successful responses and turns later requests
++for the same resource into conditional ones, dropping ``304 Not Modified``
++responses before they reach the spider.
++"""
++
++from __future__ import annotations
++
++import os
++import shutil
++import tempfile
++from typing import TYPE_CHECKING, Any
++
++import pytest
++
++from scrapy.downloadermiddlewares.conditional import (
++    CONDITIONAL_METHODS,
++    META_KEY,
++    ConditionalRequestsMiddleware,
++    _DbmValidatorStore,
++    _MemoryValidatorStore,
++)
++from scrapy.exceptions import IgnoreRequest, NotConfigured
++from scrapy.http import Request, Response, TextResponse
++from scrapy.settings.default_settings import DOWNLOADER_MIDDLEWARES_BASE
++from scrapy.spiders import Spider
++from scrapy.utils.test import get_crawler
++
++if TYPE_CHECKING:
++    from scrapy.crawler import Crawler
++
++
++MW_PATH = "scrapy.downloadermiddlewares.conditional.ConditionalRequestsMiddleware"
++
++ETAG = '"v1-etag"'
++LAST_MODIFIED = "Wed, 21 Oct 2015 07:28:00 GMT"
++WEAK_ETAG = 'W/"weak-etag"'
++
++
++class ConditionalSpider(Spider):
++    """Spider used by the tests that need a named spider instance."""
++
++    name = "condtest"
++
++
++def make_crawler(**settings: Any) -> Crawler:
++    """Return a crawler with the middleware enabled plus *settings*."""
++    base: dict[str, Any] = {"CONDITIONAL_REQUESTS_ENABLED": True}
++    base.update(settings)
++    return get_crawler(ConditionalSpider, base)
++
++
++def make_middleware(crawler: Crawler | None = None, **settings: Any) -> ConditionalRequestsMiddleware:
++    """Return a middleware instance built from a (possibly new) crawler."""
++    if crawler is None:
++        crawler = make_crawler(**settings)
++    return ConditionalRequestsMiddleware.from_crawler(crawler)
++
++
++def get_request(url: str = "http://example.com/", **kwargs: Any) -> Request:
++    """Return a GET request for *url*."""
++    return Request(url, **kwargs)
++
++
++def ok_response(
++    request: Request,
++    etag: str | None = ETAG,
++    last_modified: str | None = LAST_MODIFIED,
++    cache_control: str | None = None,
++    status: int = 200,
++) -> Response:
++    """Return a response for *request* carrying the given validators."""
++    headers: dict[str, str] = {}
++    if etag is not None:
++        headers["ETag"] = etag
++    if last_modified is not None:
++        headers["Last-Modified"] = last_modified
++    if cache_control is not None:
++        headers["Cache-Control"] = cache_control
++    return Response(request.url, status=status, headers=headers, body=b"body", request=request)
++
++
++def store_validators(
++    mw: ConditionalRequestsMiddleware,
++    request: Request,
++    etag: str | None = ETAG,
++    last_modified: str | None = LAST_MODIFIED,
++) -> Response:
++    """Feed a 200 response through the middleware so validators get stored."""
++    response = ok_response(request, etag=etag, last_modified=last_modified)
++    return mw.process_response(request, response)
++
++
++class TestNotConfigured:
++    """The middleware must disable itself unless explicitly enabled."""
++
++    def test_default_settings_disable_middleware(self):
++        """With default settings the middleware raises NotConfigured."""
++        crawler = get_crawler(ConditionalSpider, {})
++        with pytest.raises(NotConfigured):
++            ConditionalRequestsMiddleware.from_crawler(crawler)
++
++    def test_explicit_false_disables_middleware(self):
++        """CONDITIONAL_REQUESTS_ENABLED=False raises NotConfigured."""
++        crawler = get_crawler(ConditionalSpider, {"CONDITIONAL_REQUESTS_ENABLED": False})
++        with pytest.raises(NotConfigured):
++            ConditionalRequestsMiddleware.from_crawler(crawler)
++
++    def test_enabled_builds_middleware(self):
++        """CONDITIONAL_REQUESTS_ENABLED=True builds the middleware."""
++        mw = make_middleware()
++        assert isinstance(mw, ConditionalRequestsMiddleware)
++
++    def test_default_settings_flag_is_false(self):
++        """The shipped default for CONDITIONAL_REQUESTS_ENABLED is False."""
++        from scrapy.settings.default_settings import CONDITIONAL_REQUESTS_ENABLED
++
++        assert CONDITIONAL_REQUESTS_ENABLED is False
++
++    def test_middleware_registered_in_base_chain(self):
++        """The middleware is part of DOWNLOADER_MIDDLEWARES_BASE."""
++        assert MW_PATH in DOWNLOADER_MIDDLEWARES_BASE
++
++    def test_middleware_base_priority_is_int(self):
++        """The base priority of the middleware is an integer."""
++        assert isinstance(DOWNLOADER_MIDDLEWARES_BASE[MW_PATH], int)
++
++    def test_middleware_instantiated_by_manager_when_enabled(self):
++        """The downloader middleware manager loads it when enabled."""
++        from scrapy.core.downloader.middleware import DownloaderMiddlewareManager
++
++        crawler = make_crawler()
++        manager = DownloaderMiddlewareManager.from_crawler(crawler)
++        assert any(
++            isinstance(mw, ConditionalRequestsMiddleware) for mw in manager.middlewares
++        )
++
++    def test_middleware_skipped_by_manager_when_disabled(self):
++        """The downloader middleware manager skips it when disabled."""
++        from scrapy.core.downloader.middleware import DownloaderMiddlewareManager
++
++        crawler = get_crawler(ConditionalSpider, {})
++        manager = DownloaderMiddlewareManager.from_crawler(crawler)
++        assert not any(
++            isinstance(mw, ConditionalRequestsMiddleware) for mw in manager.middlewares
++        )
++
++
++class TestProcessRequestNoValidators:
++    """Without stored validators requests must pass through untouched."""
++
++    def test_fresh_request_passes(self):
++        """A request with no stored validators returns None."""
++        mw = make_middleware()
++        assert mw.process_request(get_request()) is None
++
++    def test_fresh_request_gains_no_conditional_headers(self):
++        """A request with no stored validators gets no new headers."""
++        mw = make_middleware()
++        request = get_request()
++        mw.process_request(request)
++        assert b"If-None-Match" not in request.headers
++        assert b"If-Modified-Since" not in request.headers
++
++    def test_fresh_request_does_not_increment_stats(self):
++        """A request with no stored validators does not touch the stats."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        mw.process_request(get_request())
++        assert crawler.stats.get_value("conditional_requests/conditional", 0) == 0
++
++    def test_fresh_request_not_flagged(self):
++        """A request without validators is not flagged as conditional."""
++        mw = make_middleware()
++        request = get_request()
++        mw.process_request(request)
++        assert "_conditional_request_sent" not in request.meta
++
++
++class TestProcessRequestWithValidators:
++    """Stored validators must turn requests into conditional ones."""
++
++    def test_etag_adds_if_none_match(self):
++        """A stored ETag produces an If-None-Match header."""
++        mw = make_middleware()
++        first = get_request()
++        store_validators(mw, first, last_modified=None)
++        second = get_request()
++        assert mw.process_request(second) is None
++        assert second.headers[b"If-None-Match"] == ETAG.encode()
++
++    def test_last_modified_adds_if_modified_since(self):
++        """A stored Last-Modified produces an If-Modified-Since header."""
++        mw = make_middleware()
++        first = get_request()
++        store_validators(mw, first, etag=None)
++        second = get_request()
++        mw.process_request(second)
++        assert second.headers[b"If-Modified-Since"] == LAST_MODIFIED.encode()
++
++    def test_both_validators_add_both_headers(self):
++        """Both stored validators produce both conditional headers."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        second = get_request()
++        mw.process_request(second)
++        assert second.headers[b"If-None-Match"] == ETAG.encode()
++        assert second.headers[b"If-Modified-Since"] == LAST_MODIFIED.encode()
++
++    def test_conditional_request_returns_none(self):
++        """A conditionalized request still passes to the downloader."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        assert mw.process_request(get_request()) is None
++
++    def test_conditional_stat_incremented_once_per_request(self):
++        """The 'conditional' stat counts one per conditionalized request."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        store_validators(mw, get_request())
++        mw.process_request(get_request())
++        mw.process_request(get_request())
++        assert crawler.stats.get_value("conditional_requests/conditional") == 2
++
++    def test_weak_etag_sent_verbatim(self):
++        """Weak ETags are sent back exactly as received."""
++        mw = make_middleware()
++        store_validators(mw, get_request(), etag=WEAK_ETAG)
++        second = get_request()
++        mw.process_request(second)
++        assert second.headers[b"If-None-Match"] == WEAK_ETAG.encode()
++
++    def test_last_modified_sent_verbatim(self):
++        """Last-Modified values are sent back exactly as received."""
++        custom = "Tue, 15 Nov 1994 12:45:26 GMT"
++        mw = make_middleware()
++        store_validators(mw, get_request(), last_modified=custom)
++        second = get_request()
++        mw.process_request(second)
++        assert second.headers[b"If-Modified-Since"] == custom.encode()
++
++    def test_request_flagged_as_conditional(self):
++        """Requests that got headers are flagged in their meta."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        second = get_request()
++        mw.process_request(second)
++        assert second.meta.get("_conditional_request_sent") is True
++
++
++class TestProcessRequestHeaderPrecedence:
++    """Headers set by the user must never be overwritten."""
++
++    def test_user_if_none_match_not_overwritten(self):
++        """An existing If-None-Match header is kept as-is."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        second = get_request(headers={"If-None-Match": '"user-etag"'})
++        mw.process_request(second)
++        assert second.headers[b"If-None-Match"] == b'"user-etag"'
++
++    def test_user_if_modified_since_not_overwritten(self):
++        """An existing If-Modified-Since header is kept as-is."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        second = get_request(headers={"If-Modified-Since": "Thu, 01 Jan 1970 00:00:00 GMT"})
++        mw.process_request(second)
++        assert second.headers[b"If-Modified-Since"] == b"Thu, 01 Jan 1970 00:00:00 GMT"
++
++    def test_missing_header_still_added_when_other_present(self):
++        """Only the missing conditional header is added."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        second = get_request(headers={"If-None-Match": '"user-etag"'})
++        mw.process_request(second)
++        assert second.headers[b"If-None-Match"] == b'"user-etag"'
++        assert second.headers[b"If-Modified-Since"] == LAST_MODIFIED.encode()
++
++    def test_user_header_lookup_is_case_insensitive(self):
++        """Header presence checks are case-insensitive."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        second = get_request(headers={"if-none-match": '"user-etag"'})
++        mw.process_request(second)
++        assert second.headers[b"If-None-Match"] == b'"user-etag"'
++
++    def test_stat_incremented_when_only_one_header_added(self):
++        """Adding even a single header counts as a conditional request."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        store_validators(mw, get_request())
++        second = get_request(headers={"If-None-Match": '"user-etag"'})
++        mw.process_request(second)
++        assert crawler.stats.get_value("conditional_requests/conditional") == 1
++
++    def test_no_stat_when_nothing_added(self):
++        """When all conditional headers were set by the user, no stat is counted."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        store_validators(mw, get_request())
++        second = get_request(
++            headers={
++                "If-None-Match": '"user-etag"',
++                "If-Modified-Since": "Thu, 01 Jan 1970 00:00:00 GMT",
++            }
++        )
++        mw.process_request(second)
++        assert crawler.stats.get_value("conditional_requests/conditional", 0) == 0
++
++    def test_no_flag_when_nothing_added(self):
++        """When all conditional headers were set by the user, no flag is set."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        second = get_request(
++            headers={
++                "If-None-Match": '"user-etag"',
++                "If-Modified-Since": "Thu, 01 Jan 1970 00:00:00 GMT",
++            }
++        )
++        mw.process_request(second)
++        assert "_conditional_request_sent" not in second.meta
++
++
++class TestProcessRequestEligibility:
++    """Only GET/HEAD requests that did not opt out are eligible."""
++
++    @pytest.mark.parametrize("method", ["GET", "HEAD"])
++    def test_supported_methods_get_headers(self, method: str):
++        """GET and HEAD requests are conditionalized."""
++        mw = make_middleware()
++        store_validators(mw, get_request(method=method))
++        second = get_request(method=method)
++        mw.process_request(second)
++        assert b"If-None-Match" in second.headers
++
++    @pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH"])
++    def test_unsupported_methods_skipped(self, method: str):
++        """Non-GET/HEAD requests never get conditional headers."""
++        mw = make_middleware()
++        first = get_request(method=method, body=b"data")
++        # Storing must not happen for these either, so store manually.
++        mw._store_validators(first, ETAG, LAST_MODIFIED)
++        second = get_request(method=method, body=b"data")
++        assert mw.process_request(second) is None
++        assert b"If-None-Match" not in second.headers
++
++    def test_method_check_is_case_insensitive(self):
++        """Lower-case 'get' requests are also eligible."""
++        mw = make_middleware()
++        store_validators(mw, get_request(method="get"))
++        second = get_request(method="get")
++        mw.process_request(second)
++        assert b"If-None-Match" in second.headers
++
++    def test_meta_opt_out_skips_header_injection(self):
++        """meta['conditional_request']=False prevents conditional headers."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        second = get_request(meta={META_KEY: False})
++        assert mw.process_request(second) is None
++        assert b"If-None-Match" not in second.headers
++        assert b"If-Modified-Since" not in second.headers
++
++    def test_meta_opt_out_does_not_increment_stats(self):
++        """Opted-out requests do not touch the 'conditional' stat."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        store_validators(mw, get_request())
++        mw.process_request(get_request(meta={META_KEY: False}))
++        assert crawler.stats.get_value("conditional_requests/conditional", 0) == 0
++
++    def test_meta_true_keeps_behavior(self):
++        """meta['conditional_request']=True keeps the default behavior."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        second = get_request(meta={META_KEY: True})
++        mw.process_request(second)
++        assert b"If-None-Match" in second.headers
++
++    def test_conditional_methods_constant(self):
++        """The supported-method tuple contains GET and HEAD."""
++        assert "GET" in CONDITIONAL_METHODS
++        assert "HEAD" in CONDITIONAL_METHODS
++
++
++class TestProcessResponseStoring:
++    """Validators of successful responses must be stored."""
++
++    def test_200_with_etag_is_stored(self):
++        """A 200 response with an ETag stores that ETag."""
++        mw = make_middleware()
++        request = get_request()
++        mw.process_response(request, ok_response(request, last_modified=None))
++        assert mw._get_validators(request) == (ETAG, None)
++
++    def test_200_with_last_modified_is_stored(self):
++        """A 200 response with Last-Modified stores that value."""
++        mw = make_middleware()
++        request = get_request()
++        mw.process_response(request, ok_response(request, etag=None))
++        assert mw._get_validators(request) == (None, LAST_MODIFIED)
++
++    def test_200_with_both_validators_is_stored(self):
++        """A 200 response with both validators stores both."""
++        mw = make_middleware()
++        request = get_request()
++        mw.process_response(request, ok_response(request))
++        assert mw._get_validators(request) == (ETAG, LAST_MODIFIED)
++
++    def test_store_stat_incremented(self):
++        """Each stored response increments the 'store' stat."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        store_validators(mw, get_request())
++        store_validators(mw, get_request("http://example.com/other"))
++        assert crawler.stats.get_value("conditional_requests/store") == 1 + 1
++
++    def test_response_returned_unchanged(self):
++        """The middleware returns the very same response object."""
++        mw = make_middleware()
++        request = get_request()
++        response = ok_response(request)
++        assert mw.process_response(request, response) is response
++
++    def test_200_without_validators_not_stored(self):
++        """A 200 response without validators stores nothing."""
++        mw = make_middleware()
++        request = get_request()
++        mw.process_response(request, ok_response(request, etag=None, last_modified=None))
++        assert mw._get_validators(request) is None
++
++    def test_200_without_validators_no_stat(self):
++        """A 200 response without validators does not increment 'store'."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        request = get_request()
++        mw.process_response(request, ok_response(request, etag=None, last_modified=None))
++        assert crawler.stats.get_value("conditional_requests/store", 0) == 0
++
++    @pytest.mark.parametrize("status", [201, 204, 301, 302, 404, 500])
++    def test_non_200_responses_not_stored(self, status: int):
++        """Only 200 responses contribute validators."""
++        mw = make_middleware()
++        request = get_request()
++        mw.process_response(request, ok_response(request, status=status))
++        assert mw._get_validators(request) is None
++
++    def test_non_200_response_returned_unchanged(self):
++        """Non-200, non-304 responses pass through untouched."""
++        mw = make_middleware()
++        request = get_request()
++        response = ok_response(request, status=404)
++        assert mw.process_response(request, response) is response
++
++    @pytest.mark.parametrize(
++        "cache_control",
++        [
++            "no-store",
++            "No-Store",
++            "NO-STORE",
++            "no-cache, no-store",
++            "private, no-store, max-age=0",
++        ],
++    )
++    def test_no_store_responses_not_stored(self, cache_control: str):
++        """Cache-Control: no-store prevents storing validators."""
++        mw = make_middleware()
++        request = get_request()
++        mw.process_response(request, ok_response(request, cache_control=cache_control))
++        assert mw._get_validators(request) is None
++
++    def test_no_cache_alone_does_not_prevent_storing(self):
++        """Cache-Control: no-cache still allows storing validators."""
++        mw = make_middleware()
++        request = get_request()
++        mw.process_response(request, ok_response(request, cache_control="no-cache"))
++        assert mw._get_validators(request) == (ETAG, LAST_MODIFIED)
++
++    def test_max_age_alone_does_not_prevent_storing(self):
++        """Cache-Control: max-age still allows storing validators."""
++        mw = make_middleware()
++        request = get_request()
++        mw.process_response(request, ok_response(request, cache_control="max-age=60"))
++        assert mw._get_validators(request) == (ETAG, LAST_MODIFIED)
++
++    def test_post_response_not_stored(self):
++        """Responses to POST requests never contribute validators."""
++        mw = make_middleware()
++        request = get_request(method="POST", body=b"data")
++        mw.process_response(request, ok_response(request))
++        assert mw._get_validators(request) is None
++
++    def test_meta_opt_out_response_not_stored(self):
++        """Responses of opted-out requests never contribute validators."""
++        mw = make_middleware()
++        request = get_request(meta={META_KEY: False})
++        mw.process_response(request, ok_response(request))
++        assert mw._get_validators(request) is None
++
++    def test_new_validators_replace_old_ones(self):
++        """A newer 200 response replaces previously stored validators."""
++        mw = make_middleware()
++        request = get_request()
++        store_validators(mw, request)
++        store_validators(mw, request, etag='"v2-etag"')
++        assert mw._get_validators(request) == ('"v2-etag"', LAST_MODIFIED)
++
++    def test_missing_validator_replaces_old_one_with_none(self):
++        """A 200 without an ETag clears the previously stored ETag."""
++        mw = make_middleware()
++        request = get_request()
++        store_validators(mw, request)
++        store_validators(mw, request, etag=None)
++        assert mw._get_validators(request) == (None, LAST_MODIFIED)
++
++    def test_validators_independent_per_url(self):
++        """Validators are stored per request fingerprint."""
++        mw = make_middleware()
++        first = get_request("http://example.com/a")
++        second = get_request("http://example.com/b")
++        store_validators(mw, first, etag='"etag-a"')
++        store_validators(mw, second, etag='"etag-b"')
++        assert mw._get_validators(first) == ('"etag-a"', LAST_MODIFIED)
++        assert mw._get_validators(second) == ('"etag-b"', LAST_MODIFIED)
++
++    def test_text_response_validators_stored(self):
++        """TextResponse objects are handled like plain responses."""
++        mw = make_middleware()
++        request = get_request()
++        response = TextResponse(
++            request.url,
++            status=200,
++            headers={"ETag": ETAG, "Last-Modified": LAST_MODIFIED},
++            body=b"<html></html>",
++            encoding="utf-8",
++            request=request,
++        )
++        mw.process_response(request, response)
++        assert mw._get_validators(request) == (ETAG, LAST_MODIFIED)
++
++    def test_head_response_validators_stored(self):
++        """Responses to HEAD requests contribute validators."""
++        mw = make_middleware()
++        request = get_request(method="HEAD")
++        mw.process_response(request, ok_response(request))
++        assert mw._get_validators(request) == (ETAG, LAST_MODIFIED)
++
++
++class TestNotModified:
++    """304 responses to middleware-conditionalized requests are dropped."""
++
++    def _prepare(self, crawler: Crawler | None = None):
++        """Return (middleware, conditionalized_request) pair."""
++        mw = make_middleware(crawler)
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        return mw, request
++
++    def test_304_raises_ignore_request(self):
++        """A 304 to a conditional request raises IgnoreRequest."""
++        mw, request = self._prepare()
++        response = Response(request.url, status=304, request=request)
++        with pytest.raises(IgnoreRequest):
++            mw.process_response(request, response)
++
++    def test_304_increments_not_modified_stat(self):
++        """Each dropped 304 increments the 'not_modified' stat."""
++        crawler = make_crawler()
++        mw, request = self._prepare(crawler)
++        response = Response(request.url, status=304, request=request)
++        with pytest.raises(IgnoreRequest):
++            mw.process_response(request, response)
++        assert crawler.stats.get_value("conditional_requests/not_modified") == 1
++
++    def test_304_twice_counts_twice(self):
++        """Two dropped 304 responses count two in the stats."""
++        crawler = make_crawler()
++        for _ in range(2):
++            mw, request = self._prepare(crawler)
++            response = Response(request.url, status=304, request=request)
++            with pytest.raises(IgnoreRequest):
++                mw.process_response(request, response)
++        assert crawler.stats.get_value("conditional_requests/not_modified") == 2
++
++    def test_304_without_conditional_headers_passes_through(self):
++        """A 304 that this middleware did not ask for passes through."""
++        mw = make_middleware()
++        request = get_request()
++        response = Response(request.url, status=304, request=request)
++        assert mw.process_response(request, response) is response
++
++    def test_304_to_user_conditional_request_passes_through(self):
++        """A 304 answering user-set conditional headers passes through."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request(
++            headers={
++                "If-None-Match": '"user-etag"',
++                "If-Modified-Since": "Thu, 01 Jan 1970 00:00:00 GMT",
++            }
++        )
++        mw.process_request(request)
++        response = Response(request.url, status=304, request=request)
++        assert mw.process_response(request, response) is response
++
++    def test_304_passthrough_does_not_increment_stat(self):
++        """A passed-through 304 does not increment 'not_modified'."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        request = get_request()
++        response = Response(request.url, status=304, request=request)
++        mw.process_response(request, response)
++        assert crawler.stats.get_value("conditional_requests/not_modified", 0) == 0
++
++    def test_304_for_opted_out_request_passes_through(self):
++        """A 304 to an opted-out request passes through."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request(meta={META_KEY: False})
++        mw.process_request(request)
++        response = Response(request.url, status=304, request=request)
++        assert mw.process_response(request, response) is response
++
++    def test_conditional_flag_is_consumed(self):
++        """The internal conditional flag is removed by process_response."""
++        mw, request = self._prepare()
++        response = Response(request.url, status=200, request=request)
++        mw.process_response(request, response)
++        assert "_conditional_request_sent" not in request.meta
++
++    def test_304_does_not_store_validators(self):
++        """A dropped 304 never overwrites the stored validators."""
++        mw, request = self._prepare()
++        before = mw._get_validators(request)
++        response = Response(
++            request.url, status=304, headers={"ETag": '"new-etag"'}, request=request
++        )
++        with pytest.raises(IgnoreRequest):
++            mw.process_response(request, response)
++        assert mw._get_validators(request) == before
++
++    def test_304_does_not_increment_store_stat(self):
++        """A dropped 304 does not increment the 'store' stat."""
++        crawler = make_crawler()
++        mw, request = self._prepare(crawler)
++        baseline = crawler.stats.get_value("conditional_requests/store", 0)
++        response = Response(request.url, status=304, request=request)
++        with pytest.raises(IgnoreRequest):
++            mw.process_response(request, response)
++        assert crawler.stats.get_value("conditional_requests/store", 0) == baseline
++
++
++class TestFingerprints:
++    """Validator lookup must key on the request fingerprint."""
++
++    def test_different_urls_have_different_validators(self):
++        """Storing under one URL must not affect another URL."""
++        mw = make_middleware()
++        store_validators(mw, get_request("http://example.com/a"))
++        second = get_request("http://example.com/b")
++        mw.process_request(second)
++        assert b"If-None-Match" not in second.headers
++
++    def test_query_string_is_part_of_fingerprint(self):
++        """Different query strings are different resources."""
++        mw = make_middleware()
++        store_validators(mw, get_request("http://example.com/?a=1"))
++        second = get_request("http://example.com/?a=2")
++        mw.process_request(second)
++        assert b"If-None-Match" not in second.headers
++
++    def test_get_and_head_have_different_fingerprints(self):
++        """The request method is part of the fingerprint."""
++        mw = make_middleware()
++        store_validators(mw, get_request(method="GET"))
++        second = get_request(method="HEAD")
++        mw.process_request(second)
++        assert b"If-None-Match" not in second.headers
++
++    def test_equivalent_requests_share_validators(self):
++        """Two identical GET requests share the same validators."""
++        mw = make_middleware()
++        store_validators(mw, get_request("http://example.com/x"))
++        for _ in range(3):
++            second = get_request("http://example.com/x")
++            mw.process_request(second)
++            assert second.headers[b"If-None-Match"] == ETAG.encode()
++
++
++class TestFullCycle:
++    """End-to-end flows through process_request/process_response."""
++
++    def test_first_fetch_then_conditional_then_304(self):
++        """The canonical incremental flow: store, conditionalize, drop."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++
++        # First crawl: no headers, validators stored.
++        first = get_request()
++        assert mw.process_request(first) is None
++        assert b"If-None-Match" not in first.headers
++        mw.process_response(first, ok_response(first))
++        assert crawler.stats.get_value("conditional_requests/store") == 1
++
++        # Second crawl: conditional headers, 304 dropped.
++        second = get_request()
++        assert mw.process_request(second) is None
++        assert second.headers[b"If-None-Match"] == ETAG.encode()
++        assert crawler.stats.get_value("conditional_requests/conditional") == 1
++        with pytest.raises(IgnoreRequest):
++            mw.process_response(second, Response(second.url, status=304, request=second))
++        assert crawler.stats.get_value("conditional_requests/not_modified") == 1
++
++    def test_changed_resource_updates_validators(self):
++        """A 200 to a conditional request updates the stored validators."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++
++        second = get_request()
++        mw.process_request(second)
++        mw.process_response(second, ok_response(second, etag='"v2"'))
++
++        third = get_request()
++        mw.process_request(third)
++        assert third.headers[b"If-None-Match"] == b'"v2"'
++
++    def test_multiple_urls_full_cycle(self):
++        """The full cycle works independently for several URLs."""
++        mw = make_middleware()
++        urls = [f"http://example.com/{i}" for i in range(5)]
++        for url in urls:
++            store_validators(mw, get_request(url), etag=f'"etag-{url}"')
++        for url in urls:
++            second = get_request(url)
++            mw.process_request(second)
++            assert second.headers[b"If-None-Match"] == f'"etag-{url}"'.encode()
++            with pytest.raises(IgnoreRequest):
++                mw.process_response(
++                    second, Response(url, status=304, request=second)
++                )
++
++
++class TestMemoryValidatorStore:
++    """Unit tests for the in-memory validator store."""
++
++    def test_missing_key_returns_none(self):
++        """Unknown keys return None."""
++        store = _MemoryValidatorStore()
++        assert store.get("nope") is None
++
++    def test_roundtrip(self):
++        """Stored values are returned as-is."""
++        store = _MemoryValidatorStore()
++        store.set("key", ETAG, LAST_MODIFIED)
++        assert store.get("key") == (ETAG, LAST_MODIFIED)
++
++    def test_none_values_roundtrip(self):
++        """None validators survive a round trip."""
++        store = _MemoryValidatorStore()
++        store.set("key", None, LAST_MODIFIED)
++        assert store.get("key") == (None, LAST_MODIFIED)
++        store.set("key", ETAG, None)
++        assert store.get("key") == (ETAG, None)
++
++    def test_overwrite(self):
++        """Storing twice replaces the first value."""
++        store = _MemoryValidatorStore()
++        store.set("key", ETAG, LAST_MODIFIED)
++        store.set("key", '"other"', None)
++        assert store.get("key") == ('"other"', None)
++
++    def test_close_clears_data(self):
++        """Closing the memory store drops its content."""
++        store = _MemoryValidatorStore()
++        store.set("key", ETAG, LAST_MODIFIED)
++        store.close()
++        assert store.get("key") is None
++
++    def test_keys_are_independent(self):
++        """Different keys do not interfere."""
++        store = _MemoryValidatorStore()
++        for i in range(10):
++            store.set(f"key-{i}", f'"etag-{i}"', None)
++        for i in range(10):
++            assert store.get(f"key-{i}") == (f'"etag-{i}"', None)
++
++
++class TestDbmValidatorStore:
++    """Unit tests for the dbm-backed persistent validator store."""
++
++    def setup_method(self):
++        self.tmpdir = tempfile.mkdtemp()
++        self.path = os.path.join(self.tmpdir, "validators")
++
++    def teardown_method(self):
++        shutil.rmtree(self.tmpdir, ignore_errors=True)
++
++    def test_missing_key_returns_none(self):
++        """Unknown keys return None."""
++        store = _DbmValidatorStore(self.path)
++        try:
++            assert store.get("nope") is None
++        finally:
++            store.close()
++
++    def test_roundtrip(self):
++        """Stored values are returned as-is."""
++        store = _DbmValidatorStore(self.path)
++        try:
++            store.set("key", ETAG, LAST_MODIFIED)
++            assert store.get("key") == (ETAG, LAST_MODIFIED)
++        finally:
++            store.close()
++
++    def test_none_values_roundtrip(self):
++        """None validators survive a round trip."""
++        store = _DbmValidatorStore(self.path)
++        try:
++            store.set("key", None, LAST_MODIFIED)
++            assert store.get("key") == (None, LAST_MODIFIED)
++            store.set("key", ETAG, None)
++            assert store.get("key") == (ETAG, None)
++        finally:
++            store.close()
++
++    def test_overwrite(self):
++        """Storing twice replaces the first value."""
++        store = _DbmValidatorStore(self.path)
++        try:
++            store.set("key", ETAG, LAST_MODIFIED)
++            store.set("key", '"other"', None)
++            assert store.get("key") == ('"other"', None)
++        finally:
++            store.close()
++
++    def test_persistence_across_instances(self):
++        """A new store instance on the same path sees old data."""
++        store = _DbmValidatorStore(self.path)
++        store.set("key", ETAG, LAST_MODIFIED)
++        store.close()
++        store2 = _DbmValidatorStore(self.path)
++        try:
++            assert store2.get("key") == (ETAG, LAST_MODIFIED)
++        finally:
++            store2.close()
++
++    def test_creates_parent_directories(self):
++        """Missing parent directories are created automatically."""
++        deep = os.path.join(self.tmpdir, "a", "b", "validators")
++        store = _DbmValidatorStore(deep)
++        try:
++            store.set("key", ETAG, LAST_MODIFIED)
++            assert store.get("key") == (ETAG, LAST_MODIFIED)
++        finally:
++            store.close()
++
++    def test_creates_files_on_disk(self):
++        """The dbm backend materializes files under the given path."""
++        store = _DbmValidatorStore(self.path)
++        store.set("key", ETAG, LAST_MODIFIED)
++        store.close()
++        assert os.listdir(self.tmpdir)
++
++    def test_many_keys(self):
++        """The store handles a realistic number of entries."""
++        store = _DbmValidatorStore(self.path)
++        try:
++            for i in range(50):
++                store.set(f"key-{i}", f'"etag-{i}"', LAST_MODIFIED)
++            for i in range(50):
++                assert store.get(f"key-{i}") == (f'"etag-{i}"', LAST_MODIFIED)
++        finally:
++            store.close()
++
++
++class TestMiddlewarePersistence:
++    """CONDITIONAL_REQUESTS_DIR enables cross-run persistence."""
++
++    def setup_method(self):
++        self.tmpdir = tempfile.mkdtemp()
++
++    def teardown_method(self):
++        shutil.rmtree(self.tmpdir, ignore_errors=True)
++
++    def _middleware_with_dir(self, crawler: Crawler | None = None):
++        """Return a middleware whose spider was opened with a storage dir."""
++        if crawler is None:
++            crawler = make_crawler(CONDITIONAL_REQUESTS_DIR=self.tmpdir)
++        mw = make_middleware(crawler)
++        mw.spider_opened(ConditionalSpider())
++        return mw
++
++    def test_default_storage_is_memory(self):
++        """Without CONDITIONAL_REQUESTS_DIR the memory store is used."""
++        mw = make_middleware()
++        mw.spider_opened(ConditionalSpider())
++        assert isinstance(mw._store, _MemoryValidatorStore)
++
++    def test_storage_dir_switches_to_dbm(self):
++        """With CONDITIONAL_REQUESTS_DIR the dbm store is used."""
++        mw = self._middleware_with_dir()
++        assert isinstance(mw._store, _DbmValidatorStore)
++
++    def test_storage_dir_created_on_spider_open(self):
++        """The storage directory is created when the spider opens."""
++        target = os.path.join(self.tmpdir, "subdir")
++        crawler = make_crawler(CONDITIONAL_REQUESTS_DIR=target)
++        mw = make_middleware(crawler)
++        mw.spider_opened(ConditionalSpider())
++        assert os.path.isdir(target)
++        mw.spider_closed(ConditionalSpider())
++
++    def test_dbm_file_named_after_spider(self):
++        """The dbm file name is derived from the spider name."""
++        mw = self._middleware_with_dir()
++        store_validators(mw, get_request())
++        mw.spider_closed(ConditionalSpider())
++        names = os.listdir(self.tmpdir)
++        assert any(name.startswith("condtest_conditional_requests") for name in names)
++
++    def test_validators_survive_middleware_restart(self):
++        """A new middleware instance reuses validators from a previous run."""
++        mw = self._middleware_with_dir()
++        store_validators(mw, get_request())
++        mw.spider_closed(ConditionalSpider())
++
++        mw2 = self._middleware_with_dir()
++        second = get_request()
++        mw2.process_request(second)
++        assert second.headers[b"If-None-Match"] == ETAG.encode()
++        assert second.headers[b"If-Modified-Since"] == LAST_MODIFIED.encode()
++        mw2.spider_closed(ConditionalSpider())
++
++    def test_validators_survive_new_crawler(self):
++        """Persistence works even across crawler instances."""
++        mw = self._middleware_with_dir()
++        store_validators(mw, get_request())
++        mw.spider_closed(ConditionalSpider())
++
++        crawler2 = make_crawler(CONDITIONAL_REQUESTS_DIR=self.tmpdir)
++        mw2 = self._middleware_with_dir(crawler2)
++        second = get_request()
++        mw2.process_request(second)
++        assert second.headers[b"If-None-Match"] == ETAG.encode()
++        mw2.spider_closed(ConditionalSpider())
++
++    def test_full_cycle_with_persistent_storage(self):
++        """The full incremental flow works with the persistent backend."""
++        mw = self._middleware_with_dir()
++        store_validators(mw, get_request())
++        mw.spider_closed(ConditionalSpider())
++
++        mw2 = self._middleware_with_dir()
++        second = get_request()
++        mw2.process_request(second)
++        assert b"If-None-Match" in second.headers
++        with pytest.raises(IgnoreRequest):
++            mw2.process_response(
++                second, Response(second.url, status=304, request=second)
++            )
++        mw2.spider_closed(ConditionalSpider())
++
++    def test_spider_closed_releases_store(self):
++        """Closing the spider flushes and closes the dbm store."""
++        mw = self._middleware_with_dir()
++        store_validators(mw, get_request())
++        mw.spider_closed(ConditionalSpider())
++        # Reopening must see the data that was written before closing.
++        mw2 = self._middleware_with_dir()
++        assert mw2._get_validators(get_request()) == (ETAG, LAST_MODIFIED)
++        mw2.spider_closed(ConditionalSpider())
++
++    def test_memory_store_does_not_write_files(self):
++        """The memory backend never writes to the storage dir."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        mw.spider_opened(ConditionalSpider())
++        store_validators(mw, get_request())
++        mw.spider_closed(ConditionalSpider())
++        assert not os.path.exists(os.path.join(self.tmpdir, "condtest_conditional_requests.dat"))
++
++    def test_different_spider_names_use_different_files(self):
++        """Each spider gets its own dbm file."""
++
++        class OtherSpider(Spider):
++            name = "othercond"
++
++        crawler = make_crawler(CONDITIONAL_REQUESTS_DIR=self.tmpdir)
++        mw = make_middleware(crawler)
++        mw.spider_opened(ConditionalSpider())
++        store_validators(mw, get_request())
++        mw.spider_closed(ConditionalSpider())
++
++        mw.spider_opened(OtherSpider())
++        second = get_request()
++        mw.process_request(second)
++        assert b"If-None-Match" not in second.headers
++        mw.spider_closed(OtherSpider())
++
++    def test_stats_work_with_persistent_storage(self):
++        """Stats are collected regardless of the storage backend."""
++        crawler = make_crawler(CONDITIONAL_REQUESTS_DIR=self.tmpdir)
++        mw = self._middleware_with_dir(crawler)
++        store_validators(mw, get_request())
++        second = get_request()
++        mw.process_request(second)
++        assert crawler.stats.get_value("conditional_requests/store") == 1
++        assert crawler.stats.get_value("conditional_requests/conditional") == 1
++        mw.spider_closed(ConditionalSpider())
++
++
++class TestCorruptEntries:
++    """Corrupt persistent entries must not break crawls."""
++
++    def setup_method(self):
++        self.tmpdir = tempfile.mkdtemp()
++
++    def teardown_method(self):
++        shutil.rmtree(self.tmpdir, ignore_errors=True)
++
++    def test_corrupt_entry_treated_as_miss(self):
++        """A corrupt dbm value behaves like a missing entry."""
++        path = os.path.join(self.tmpdir, "validators")
++        store = _DbmValidatorStore(path)
++        store.set("key", ETAG, LAST_MODIFIED)
++        # Corrupt the stored JSON directly.
++        store._db[b"key"] = b"not-json{{"
++        try:
++            assert store.get("key") is None
++        finally:
++            store.close()
++
++    def test_corrupt_entry_does_not_raise_on_request(self):
++        """A corrupt entry does not make process_request fail."""
++        crawler = make_crawler(CONDITIONAL_REQUESTS_DIR=self.tmpdir)
++        mw = make_middleware(crawler)
++        mw.spider_opened(ConditionalSpider())
++        store_validators(mw, get_request())
++        # Corrupt whatever was written.
++        for key in list(mw._store._db.keys()):
++            mw._store._db[key] = b"\x00\x01\x02"
++        request = get_request()
++        try:
++            assert mw.process_request(request) is None
++            assert b"If-None-Match" not in request.headers
++        finally:
++            mw.spider_closed(ConditionalSpider())
++
++
++class TestHeaderEdgeCases:
++    """Validator values with special characters must round-trip."""
++
++    def test_etag_with_special_characters(self):
++        """ETags containing quotes and slashes are preserved."""
++        etag = '"a/b\\"c"'
++        mw = make_middleware()
++        store_validators(mw, get_request(), etag=etag)
++        second = get_request()
++        mw.process_request(second)
++        assert second.headers[b"If-None-Match"] == etag.encode()
++
++    def test_long_etag(self):
++        """Very long ETags are preserved."""
++        etag = '"' + "x" * 500 + '"'
++        mw = make_middleware()
++        store_validators(mw, get_request(), etag=etag)
++        second = get_request()
++        mw.process_request(second)
++        assert second.headers[b"If-None-Match"] == etag.encode()
++
++    def test_multiple_etags_in_response_uses_first(self):
++        """The single ETag response header is used as sent."""
++        mw = make_middleware()
++        request = get_request()
++        response = Response(
++            request.url,
++            status=200,
++            headers=[(b"ETag", ETAG.encode())],
++            body=b"body",
++            request=request,
++        )
++        mw.process_response(request, response)
++        second = get_request()
++        mw.process_request(second)
++        assert second.headers[b"If-None-Match"] == ETAG.encode()
++
++    def test_header_values_roundtrip_through_dbm(self):
++        """Validator strings survive JSON serialization in the dbm store."""
++        etag = '"with,comma and space"'
++        crawler = make_crawler(CONDITIONAL_REQUESTS_DIR=tempfile.mkdtemp())
++        self.addCleanup = getattr(self, "addCleanup", None)
++        mw = make_middleware(crawler)
++        mw.spider_opened(ConditionalSpider())
++        try:
++            store_validators(mw, get_request(), etag=etag)
++            second = get_request()
++            mw.process_request(second)
++            assert second.headers[b"If-None-Match"] == etag.encode()
++        finally:
++            mw.spider_closed(ConditionalSpider())
++            shutil.rmtree(crawler.settings.get("CONDITIONAL_REQUESTS_DIR"), ignore_errors=True)
++
++
++class TestMiddlewareChainIntegration:
++    """The middleware must behave correctly inside the real middleware chain."""
++
++    def _manager(self, crawler: Crawler):
++        from scrapy.core.downloader.middleware import DownloaderMiddlewareManager
++
++        if crawler.spider is None:
++            crawler.spider = ConditionalSpider()
++        return DownloaderMiddlewareManager.from_crawler(crawler)
++
++    def test_chain_passes_fresh_request_to_downloader(self):
++        """A fresh request travels the whole chain to the download function."""
++        import asyncio
++
++        crawler = make_crawler()
++        manager = self._manager(crawler)
++        request = get_request()
++        response = ok_response(request)
++
++        async def download_func(req):
++            assert req is request
++            assert b"If-None-Match" not in req.headers
++            return response
++
++        result = asyncio.run(manager.download_async(download_func, request))
++        assert result is response
++
++    def test_chain_stores_validators_from_response(self):
++        """A 200 with validators is stored when going through the chain."""
++        import asyncio
++
++        crawler = make_crawler()
++        manager = self._manager(crawler)
++        request = get_request()
++
++        async def download_func(req):
++            return ok_response(req)
++
++        asyncio.run(manager.download_async(download_func, request))
++        assert crawler.stats.get_value("conditional_requests/store") == 1
++
++    def test_chain_conditionalizes_second_request(self):
++        """The second identical request gets conditional headers in the chain."""
++        import asyncio
++
++        crawler = make_crawler()
++        manager = self._manager(crawler)
++
++        async def first_download(req):
++            return ok_response(req)
++
++        asyncio.run(manager.download_async(first_download, get_request()))
++        assert crawler.stats.get_value("conditional_requests/store") == 1
++
++        seen: dict[str, bytes] = {}
++
++        async def second_download(req):
++            seen["if_none_match"] = req.headers.get(b"If-None-Match", b"")
++            seen["if_modified_since"] = req.headers.get(b"If-Modified-Since", b"")
++            return Response(req.url, status=304, request=req)
++
++        with pytest.raises(IgnoreRequest):
++            asyncio.run(manager.download_async(second_download, get_request()))
++        assert seen["if_none_match"] == ETAG.encode()
++        assert seen["if_modified_since"] == LAST_MODIFIED.encode()
++        assert crawler.stats.get_value("conditional_requests/conditional") == 1
++        assert crawler.stats.get_value("conditional_requests/not_modified") == 1
++
++    def test_chain_does_not_interfere_with_post_requests(self):
++        """POST requests travel the chain without conditional headers."""
++        import asyncio
++
++        crawler = make_crawler()
++        manager = self._manager(crawler)
++        request = get_request(method="POST", body=b"payload")
++
++        async def download_func(req):
++            assert b"If-None-Match" not in req.headers
++            return ok_response(req)
++
++        result = asyncio.run(manager.download_async(download_func, request))
++        assert result.status == 200
++        assert crawler.stats.get_value("conditional_requests/store", 0) == 0
++
++    def test_chain_respects_meta_opt_out(self):
++        """An opted-out request travels the chain without conditional headers."""
++        import asyncio
++
++        crawler = make_crawler()
++        manager = self._manager(crawler)
++
++        async def first_download(req):
++            return ok_response(req)
++
++        asyncio.run(manager.download_async(first_download, get_request()))
++
++        async def second_download(req):
++            assert b"If-None-Match" not in req.headers
++            return ok_response(req)
++
++        result = asyncio.run(
++            manager.download_async(second_download, get_request(meta={META_KEY: False}))
++        )
++        assert result.status == 200
++        assert crawler.stats.get_value("conditional_requests/conditional", 0) == 0
++
++
++class TestSignals:
++    """The middleware must hook into the spider open/close signals."""
++
++    @staticmethod
++    def _connected(sig_name: str, mw: ConditionalRequestsMiddleware) -> bool:
++        """Whether the middleware's handler is connected to the signal."""
++        from pydispatch import dispatcher
++
++        expected = f"ConditionalRequestsMiddleware.{sig_name}"
++        for receivers in dispatcher.connections.values():
++            for receiver_list in receivers.values():
++                for receiver_ref in receiver_list:
++                    if expected in repr(receiver_ref):
++                        return True
++        return False
++
++    def test_spider_opened_connected(self):
++        """from_crawler connects spider_opened to the crawler signals."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        assert self._connected("spider_opened", mw)
++
++    def test_spider_closed_connected(self):
++        """from_crawler connects spider_closed to the crawler signals."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        assert self._connected("spider_closed", mw)
++
++    def test_spider_opened_handler_switches_store(self):
++        """Calling the spider_opened handler enables the dbm store."""
++        tmpdir = tempfile.mkdtemp()
++        try:
++            crawler = make_crawler(CONDITIONAL_REQUESTS_DIR=tmpdir)
++            mw = make_middleware(crawler)
++            assert isinstance(mw._store, _MemoryValidatorStore)
++            mw.spider_opened(ConditionalSpider())
++            assert isinstance(mw._store, _DbmValidatorStore)
++            mw.spider_closed(ConditionalSpider())
++        finally:
++            shutil.rmtree(tmpdir, ignore_errors=True)
++
++    def test_spider_opened_keeps_memory_store_without_dir(self):
++        """Without CONDITIONAL_REQUESTS_DIR, spider_opened keeps memory storage."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        mw.spider_opened(ConditionalSpider())
++        assert isinstance(mw._store, _MemoryValidatorStore)
++        mw.spider_closed(ConditionalSpider())
++
++
++class TestStatsKeys:
++    """The exact stats keys are part of the public contract."""
++
++    def test_all_three_stats_keys_used(self):
++        """A full cycle populates all three documented stats keys."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        with pytest.raises(IgnoreRequest):
++            mw.process_response(
++                request, Response(request.url, status=304, request=request)
++            )
++        stats = crawler.stats.get_stats()
++        assert stats["conditional_requests/store"] == 1
++        assert stats["conditional_requests/conditional"] == 1
++        assert stats["conditional_requests/not_modified"] == 1
++
++    def test_no_unrelated_stats(self):
++        """The middleware only writes to its own stats namespace."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        for key in crawler.stats.get_stats():
++            assert key.startswith("conditional_requests/")
++
++
++class TestUrlHandling:
++    """Fingerprint-related URL behaviors."""
++
++    def test_url_fragment_ignored(self):
++        """Fragments are not part of the fingerprint, validators are shared."""
++        mw = make_middleware()
++        store_validators(mw, get_request("http://example.com/page#section"))
++        second = get_request("http://example.com/page")
++        mw.process_request(second)
++        assert second.headers[b"If-None-Match"] == ETAG.encode()
++
++    def test_different_schemes_are_different_resources(self):
++        """http and https URLs of the same host do not share validators."""
++        mw = make_middleware()
++        store_validators(mw, get_request("http://example.com/"))
++        second = get_request("https://example.com/")
++        mw.process_request(second)
++        assert b"If-None-Match" not in second.headers
++
++    def test_different_ports_are_different_resources(self):
++        """Different ports do not share validators."""
++        mw = make_middleware()
++        store_validators(mw, get_request("http://example.com:8080/"))
++        second = get_request("http://example.com:8081/")
++        mw.process_request(second)
++        assert b"If-None-Match" not in second.headers
++
++    def test_other_headers_preserved_when_adding_conditional(self):
++        """Adding conditional headers keeps existing unrelated headers."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        second = get_request(headers={"User-Agent": "test-agent", "Accept": "*/*"})
++        mw.process_request(second)
++        assert second.headers[b"User-Agent"] == b"test-agent"
++        assert second.headers[b"Accept"] == b"*/*"
++        assert second.headers[b"If-None-Match"] == ETAG.encode()
++
++
++class TestMetaKeyConstant:
++    """The meta key name is part of the public contract."""
++
++    def test_meta_key_value(self):
++        """The opt-out meta key is 'conditional_request'."""
++        assert META_KEY == "conditional_request"
++
++    def test_meta_key_used_for_opt_out(self):
++        """Opt-out works through the documented meta key name."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        second = get_request(meta={"conditional_request": False})
++        mw.process_request(second)
++        assert b"If-None-Match" not in second.headers
++
++
++class TestIgnoreRequestDetails:
++    """The dropped 304 flow must look like a regular IgnoreRequest."""
++
++    def test_ignore_request_message_mentions_url(self):
++        """The IgnoreRequest message identifies the skipped resource."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        response = Response(request.url, status=304, request=request)
++        with pytest.raises(IgnoreRequest) as excinfo:
++            mw.process_response(request, response)
++        assert "http://example.com/" in str(excinfo.value)
++
++    def test_304_response_never_reaches_spider(self):
++        """process_response raises instead of returning the 304 response."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        response = Response(request.url, status=304, request=request)
++        try:
++            result = mw.process_response(request, response)
++        except IgnoreRequest:
++            result = None
++        assert result is None
++
++
++class TestSettingsParsing:
++    """Setting values are parsed the usual Scrapy way."""
++
++    @pytest.mark.parametrize("value", [True, 1, "1", "true", "True"])
++    def test_truthy_values_enable(self, value):
++        """Truthy CONDITIONAL_REQUESTS_ENABLED values enable the middleware."""
++        crawler = get_crawler(ConditionalSpider, {"CONDITIONAL_REQUESTS_ENABLED": value})
++        mw = ConditionalRequestsMiddleware.from_crawler(crawler)
++        assert isinstance(mw, ConditionalRequestsMiddleware)
++
++    @pytest.mark.parametrize("value", [False, 0, "0", "false"])
++    def test_falsy_values_disable(self, value):
++        """Falsy CONDITIONAL_REQUESTS_ENABLED values disable the middleware."""
++        crawler = get_crawler(ConditionalSpider, {"CONDITIONAL_REQUESTS_ENABLED": value})
++        with pytest.raises(NotConfigured):
++            ConditionalRequestsMiddleware.from_crawler(crawler)
++
++    def test_invalid_value_raises(self):
++        """Values outside Scrapy's boolean vocabulary raise ValueError."""
++        crawler = get_crawler(ConditionalSpider, {"CONDITIONAL_REQUESTS_ENABLED": ""})
++        with pytest.raises(ValueError, match="boolean"):
++            ConditionalRequestsMiddleware.from_crawler(crawler)
++
++    def test_empty_storage_dir_means_memory(self):
++        """An empty CONDITIONAL_REQUESTS_DIR keeps the memory backend."""
++        crawler = make_crawler(CONDITIONAL_REQUESTS_DIR="")
++        mw = make_middleware(crawler)
++        mw.spider_opened(ConditionalSpider())
++        assert isinstance(mw._store, _MemoryValidatorStore)
++
++    def test_storage_dir_picked_up_from_settings(self):
++        """The storage dir is read from the settings object."""
++        tmpdir = tempfile.mkdtemp()
++        try:
++            crawler = make_crawler(CONDITIONAL_REQUESTS_DIR=tmpdir)
++            mw = make_middleware(crawler)
++            assert mw._storage_dir == tmpdir
++            mw.spider_opened(ConditionalSpider())
++            assert isinstance(mw._store, _DbmValidatorStore)
++            mw.spider_closed(ConditionalSpider())
++        finally:
++            shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++class TestDbmConcurrency:
++    """The dbm store must survive concurrent access."""
++
++    def setup_method(self):
++        self.tmpdir = tempfile.mkdtemp()
++
++    def teardown_method(self):
++        shutil.rmtree(self.tmpdir, ignore_errors=True)
++
++    def test_concurrent_writes_do_not_corrupt(self):
++        """Concurrent writers leave the store in a consistent state."""
++        import threading
++
++        store = _DbmValidatorStore(os.path.join(self.tmpdir, "validators"))
++        errors: list[Exception] = []
++
++        def worker(index: int) -> None:
++            try:
++                for i in range(25):
++                    store.set(f"key-{index}-{i}", f'"etag-{index}-{i}"', LAST_MODIFIED)
++            except Exception as exc:  # pragma: no cover
++                errors.append(exc)
++
++        threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
++        for thread in threads:
++            thread.start()
++        for thread in threads:
++            thread.join()
++        try:
++            assert not errors
++            for n in range(4):
++                for i in range(25):
++                    assert store.get(f"key-{n}-{i}") == (
++                        f'"etag-{n}-{i}"',
++                        LAST_MODIFIED,
++                    )
++        finally:
++            store.close()
++
++    def test_concurrent_reads_and_writes(self):
++        """Readers never see exceptions while writers are active."""
++        import threading
++
++        store = _DbmValidatorStore(os.path.join(self.tmpdir, "validators"))
++        errors: list[Exception] = []
++
++        def writer() -> None:
++            try:
++                for i in range(50):
++                    store.set("key", f'"etag-{i}"', None)
++            except Exception as exc:  # pragma: no cover
++                errors.append(exc)
++
++        def reader() -> None:
++            try:
++                for _ in range(50):
++                    store.get("key")
++            except Exception as exc:  # pragma: no cover
++                errors.append(exc)
++
++        threads = [threading.Thread(target=writer)] + [
++            threading.Thread(target=reader) for _ in range(3)
++        ]
++        for thread in threads:
++            thread.start()
++        for thread in threads:
++            thread.join()
++        try:
++            assert not errors
++            assert store.get("key") is not None
++        finally:
++            store.close()
++
++
++class TestFlagCleanup:
++    """The internal conditional flag must never leak into later handling."""
++
++    def test_flag_removed_on_200(self):
++        """The flag is consumed when a 200 response arrives."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        assert request.meta.get("_conditional_request_sent") is True
++        mw.process_response(request, ok_response(request))
++        assert "_conditional_request_sent" not in request.meta
++
++    def test_flag_removed_on_error_status(self):
++        """The flag is consumed when an error response arrives."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        response = Response(request.url, status=500, request=request)
++        assert mw.process_response(request, response) is response
++        assert "_conditional_request_sent" not in request.meta
++
++    def test_flag_not_leaked_to_meta_copy(self):
++        """Requests built from a conditionalized request's meta do not inherit
++        a stale flag once the response was processed."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        mw.process_response(request, ok_response(request))
++        followup = get_request(meta=dict(request.meta))
++        assert "_conditional_request_sent" not in followup.meta
++
++
++class TestValidatorUpdateCycle:
++    """Stored validators must track the latest seen response."""
++
++    def test_etag_update_propagates_to_next_request(self):
++        """After an ETag change, the new ETag is sent, not the old one."""
++        mw = make_middleware()
++        store_validators(mw, get_request(), etag='"old"')
++        request = get_request()
++        mw.process_request(request)
++        assert request.headers[b"If-None-Match"] == b'"old"'
++        mw.process_response(request, ok_response(request, etag='"new"'))
++        followup = get_request()
++        mw.process_request(followup)
++        assert followup.headers[b"If-None-Match"] == b'"new"'
++
++    def test_last_modified_update_propagates(self):
++        """After a Last-Modified change, the new value is sent."""
++        older = "Wed, 21 Oct 2015 07:28:00 GMT"
++        newer = "Mon, 02 Jan 2017 10:00:00 GMT"
++        mw = make_middleware()
++        store_validators(mw, get_request(), last_modified=older)
++        request = get_request()
++        mw.process_request(request)
++        mw.process_response(request, ok_response(request, last_modified=newer))
++        followup = get_request()
++        mw.process_request(followup)
++        assert followup.headers[b"If-Modified-Since"] == newer.encode()
++
++    def test_last_modified_only_cycle(self):
++        """A resource with only Last-Modified still cycles correctly."""
++        mw = make_middleware()
++        store_validators(mw, get_request(), etag=None)
++        request = get_request()
++        mw.process_request(request)
++        assert b"If-None-Match" not in request.headers
++        assert request.headers[b"If-Modified-Since"] == LAST_MODIFIED.encode()
++        with pytest.raises(IgnoreRequest):
++            mw.process_response(
++                request, Response(request.url, status=304, request=request)
++            )
++
++    def test_etag_only_cycle(self):
++        """A resource with only an ETag still cycles correctly."""
++        mw = make_middleware()
++        store_validators(mw, get_request(), last_modified=None)
++        request = get_request()
++        mw.process_request(request)
++        assert request.headers[b"If-None-Match"] == ETAG.encode()
++        assert b"If-Modified-Since" not in request.headers
++        with pytest.raises(IgnoreRequest):
++            mw.process_response(
++                request, Response(request.url, status=304, request=request)
++            )
++
++    def test_no_store_response_keeps_old_validators(self):
++        """A no-store response does not wipe previously stored validators."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_response(
++            request, ok_response(request, etag='"ignored"', cache_control="no-store")
++        )
++        assert mw._get_validators(request) == (ETAG, LAST_MODIFIED)
++
++    def test_response_without_validators_keeps_old_ones(self):
++        """A 200 without validators does not wipe previously stored ones."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_response(request, ok_response(request, etag=None, last_modified=None))
++        assert mw._get_validators(request) == (ETAG, LAST_MODIFIED)
++
++
++class TestProcessRequestReturnValue:
++    """process_request must always return None."""
++
++    def test_returns_none_without_validators(self):
++        """No stored validators: None."""
++        mw = make_middleware()
++        assert mw.process_request(get_request()) is None
++
++    def test_returns_none_with_validators(self):
++        """Stored validators: still None (request mutated in place)."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        assert mw.process_request(get_request()) is None
++
++    def test_returns_none_for_opted_out(self):
++        """Opted-out requests: None."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        assert mw.process_request(get_request(meta={META_KEY: False})) is None
++
++    def test_returns_none_for_post(self):
++        """POST requests: None."""
++        mw = make_middleware()
++        assert mw.process_request(get_request(method="POST", body=b"x")) is None
++
++
++class TestIgnoreRequestIntegration:
++    """IgnoreRequest raised by the middleware is handled like any other."""
++
++    def test_ignore_request_is_scrapy_exception(self):
++        """The raised exception is scrapy's own IgnoreRequest."""
++        from scrapy.exceptions import IgnoreRequest as ScrapyIgnoreRequest
++
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        response = Response(request.url, status=304, request=request)
++        with pytest.raises(ScrapyIgnoreRequest):
++            mw.process_response(request, response)
++
++    def test_spider_errback_receives_ignore_request(self):
++        """Through the full chain, the errback receives the IgnoreRequest failure."""
++        import asyncio
++
++        from twisted.python.failure import Failure
++
++        from scrapy.core.downloader.middleware import DownloaderMiddlewareManager
++
++        crawler = make_crawler()
++        crawler.spider = ConditionalSpider()
++        manager = DownloaderMiddlewareManager.from_crawler(crawler)
++
++        async def ok_download(req):
++            return ok_response(req)
++
++        asyncio.run(manager.download_async(ok_download, get_request()))
++
++        async def not_modified_download(req):
++            return Response(req.url, status=304, request=req)
++
++        try:
++            asyncio.run(manager.download_async(not_modified_download, get_request()))
++        except IgnoreRequest as exc:
++            failure = Failure(exc)
++        else:  # pragma: no cover
++            raise AssertionError("IgnoreRequest not raised")
++        assert isinstance(failure.value, IgnoreRequest)
++
++
++class TestDbmFileLayout:
++    """The on-disk layout of the persistent store is part of the contract."""
++
++    def setup_method(self):
++        self.tmpdir = tempfile.mkdtemp()
++
++    def teardown_method(self):
++        shutil.rmtree(self.tmpdir, ignore_errors=True)
++
++    def _open_store(self, crawler: Crawler | None = None):
++        if crawler is None:
++            crawler = make_crawler(CONDITIONAL_REQUESTS_DIR=self.tmpdir)
++        mw = make_middleware(crawler)
++        mw.spider_opened(ConditionalSpider())
++        return mw
++
++    def test_files_created_inside_storage_dir(self):
++        """The dbm files live directly inside CONDITIONAL_REQUESTS_DIR."""
++        mw = self._open_store()
++        store_validators(mw, get_request())
++        mw.spider_closed(ConditionalSpider())
++        assert os.listdir(self.tmpdir)
++
++    def test_file_name_prefix(self):
++        """The dbm file name starts with '<spider name>_conditional_requests'."""
++        mw = self._open_store()
++        store_validators(mw, get_request())
++        mw.spider_closed(ConditionalSpider())
++        expected_prefix = "condtest_conditional_requests"
++        assert any(name.startswith(expected_prefix) for name in os.listdir(self.tmpdir))
++
++    def test_no_other_files_created(self):
++        """Only the dbm files of the spider are created."""
++        mw = self._open_store()
++        store_validators(mw, get_request())
++        mw.spider_closed(ConditionalSpider())
++        for name in os.listdir(self.tmpdir):
++            assert name.startswith("condtest_conditional_requests")
++
++    def test_nested_storage_dir_created(self):
++        """A non-existent storage dir is created recursively."""
++        target = os.path.join(self.tmpdir, "a", "b")
++        crawler = make_crawler(CONDITIONAL_REQUESTS_DIR=target)
++        mw = make_middleware(crawler)
++        mw.spider_opened(ConditionalSpider())
++        store_validators(mw, get_request())
++        mw.spider_closed(ConditionalSpider())
++        assert os.path.isdir(target)
++        assert os.listdir(target)
++
++
++class TestHeaderInjectionDetails:
++    """Details of how conditional headers are injected."""
++
++    def test_headers_object_used_case_insensitively(self):
++        """Reading the injected headers works with any casing."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        assert request.headers[b"if-none-match"] == ETAG.encode()
++        assert request.headers[b"IF-NONE-MATCH"] == ETAG.encode()
++
++    def test_injected_headers_are_bytes(self):
++        """Injected header values are bytes, like any Scrapy header."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        assert isinstance(request.headers[b"If-None-Match"], bytes)
++        assert isinstance(request.headers[b"If-Modified-Since"], bytes)
++
++    def test_injection_does_not_change_method_or_url(self):
++        """Conditionalizing a request mutates only its headers and meta."""
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request(method="GET")
++        url_before = request.url
++        mw.process_request(request)
++        assert request.url == url_before
++        assert request.method == "GET"
++
++    def test_request_without_headers_attribute_populated(self):
++        """A request created without headers gets a proper Headers object."""
++        from scrapy.http import Headers
++
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        request = get_request()
++        mw.process_request(request)
++        assert isinstance(request.headers, Headers)
++
++
++class TestProcessResponseReturnValues:
++    """process_response must return the response in all pass-through cases."""
++
++    def _mw_with_validators(self):
++        mw = make_middleware()
++        store_validators(mw, get_request())
++        return mw
++
++    def test_returns_same_object_for_200(self):
++        """200 responses are returned as the same object."""
++        mw = self._mw_with_validators()
++        request = get_request()
++        response = ok_response(request)
++        assert mw.process_response(request, response) is response
++
++    def test_returns_same_object_for_redirect(self):
++        """Redirect responses are returned as the same object."""
++        mw = self._mw_with_validators()
++        request = get_request()
++        response = Response(request.url, status=302, request=request)
++        assert mw.process_response(request, response) is response
++
++    def test_returns_same_object_for_unrequested_304(self):
++        """Unrequested 304 responses are returned as the same object."""
++        mw = self._mw_with_validators()
++        request = get_request()
++        response = Response(request.url, status=304, request=request)
++        assert mw.process_response(request, response) is response
++
++
++class TestRepeatedCycles:
++    """Repeated store/conditionalize/drop cycles must keep working."""
++
++    def test_ten_cycles(self):
++        """Ten consecutive incremental cycles behave identically."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        for i in range(10):
++            request = get_request()
++            mw.process_request(request)
++            if i == 0:
++                assert b"If-None-Match" not in request.headers
++                mw.process_response(request, ok_response(request))
++            else:
++                assert request.headers[b"If-None-Match"] == ETAG.encode()
++                with pytest.raises(IgnoreRequest):
++                    mw.process_response(
++                        request, Response(request.url, status=304, request=request)
++                    )
++        assert crawler.stats.get_value("conditional_requests/store") == 1
++        assert crawler.stats.get_value("conditional_requests/conditional") == 9
++        assert crawler.stats.get_value("conditional_requests/not_modified") == 9
++
++    def test_stats_start_at_zero(self):
++        """No stats exist before any middleware activity."""
++        crawler = make_crawler()
++        make_middleware(crawler)
++        assert crawler.stats.get_value("conditional_requests/store", 0) == 0
++        assert crawler.stats.get_value("conditional_requests/conditional", 0) == 0
++        assert crawler.stats.get_value("conditional_requests/not_modified", 0) == 0
++
++    def test_passthrough_responses_do_not_touch_stats(self):
++        """Responses that bypass storing never touch the stats."""
++        crawler = make_crawler()
++        mw = make_middleware(crawler)
++        for status in (201, 301, 404, 500):
++            request = get_request(f"http://example.com/{status}")
++            mw.process_response(request, Response(request.url, status=status, request=request))
++        for key in ("store", "conditional", "not_modified"):
++            assert crawler.stats.get_value(f"conditional_requests/{key}", 0) == 0
+diff --git a/tests/test_downloadermiddleware_conditional_crawl.py b/tests/test_downloadermiddleware_conditional_crawl.py
+new file mode 100644
+index 0000000..a8e2147
+--- /dev/null
++++ b/tests/test_downloadermiddleware_conditional_crawl.py
+@@ -0,0 +1,229 @@
++"""End-to-end tests for the conditional-requests middleware.
++
++These tests run a real spider through ``scrapy runspider`` in a subprocess
++against a local HTTP server that honors ``If-None-Match``. The first crawl
++must collect the page and store its validators; the second crawl, using the
++same :setting:`CONDITIONAL_REQUESTS_DIR`, must send conditional headers and
++drop the resulting ``304 Not Modified`` response before it reaches the
++spider.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import pytest
++
++ETAG = '"e2e-etag-v1"'
++LAST_MODIFIED = "Wed, 21 Oct 2015 07:28:00 GMT"
++PAGE_BODY = b"<html><body><h1>hello</h1></body></html>"
++
++SPIDER_CODE = """
++import scrapy
++
++
++class ConditionalSpider(scrapy.Spider):
++    name = "condspider"
++
++    def __init__(self, url, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.start_urls = [url]
++
++    def parse(self, response):
++        yield {"url": response.url, "size": len(response.body)}
++"""
++
++
++class ConditionalHandler(BaseHTTPRequestHandler):
++    """Serve a single page with validators, honoring If-None-Match."""
++
++    seen_if_none_match: list[str | None] = []
++
++    def do_GET(self) -> None:  # noqa: N802
++        inm = self.headers.get("If-None-Match")
++        type(self).seen_if_none_match.append(inm)
++        if inm == ETAG:
++            self.send_response(304)
++            self.send_header("ETag", ETAG)
++            self.end_headers()
++            return
++        self.send_response(200)
++        self.send_header("Content-Type", "text/html")
++        self.send_header("ETag", ETAG)
++        self.send_header("Last-Modified", LAST_MODIFIED)
++        self.end_headers()
++        self.wfile.write(PAGE_BODY)
++
++    def log_message(self, format: str, *args) -> None:  # noqa: A002
++        pass
++
++
++@pytest.fixture()
++def server():
++    """Run the conditional test server on a random local port."""
++    ConditionalHandler.seen_if_none_match = []
++    httpd = ThreadingHTTPServer(("127.0.0.1", 0), ConditionalHandler)
++    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
++    thread.start()
++    try:
++        yield f"http://127.0.0.1:{httpd.server_address[1]}/page"
++    finally:
++        httpd.shutdown()
++        thread.join(timeout=10)
++        httpd.server_close()
++
++
++@pytest.fixture()
++def workdir():
++    """Provide a temporary work directory with a spider module."""
++    tmpdir = tempfile.mkdtemp()
++    try:
++        with open(os.path.join(tmpdir, "cond_spider.py"), "w") as f:
++            f.write(SPIDER_CODE)
++        yield tmpdir
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++def run_spider(workdir: str, url: str, cache_dir: str, output_name: str) -> subprocess.CompletedProcess:
++    """Run the spider once with conditional requests enabled."""
++    output_path = os.path.join(workdir, output_name)
++    cmd = [
++        sys.executable,
++        "-c",
++        "from scrapy.cmdline import execute; execute()",
++        "runspider",
++        os.path.join(workdir, "cond_spider.py"),
++        "-a",
++        f"url={url}",
++        "-s",
++        "CONDITIONAL_REQUESTS_ENABLED=True",
++        "-s",
++        f"CONDITIONAL_REQUESTS_DIR={cache_dir}",
++        "-s",
++        "LOG_LEVEL=INFO",
++        "-o",
++        output_path,
++    ]
++    return subprocess.run(
++        cmd,
++        cwd=workdir,
++        capture_output=True,
++        text=True,
++        timeout=180,
++    )
++
++
++def read_items(workdir: str, output_name: str) -> list[dict]:
++    """Read the JSON lines feed produced by a spider run."""
++    output_path = os.path.join(workdir, output_name)
++    if not os.path.exists(output_path):
++        return []
++    with open(output_path) as f:
++        return [json.loads(line) for line in f if line.strip()]
++
++
++class TestConditionalCrawl:
++    """Full crawl-level behavior of the middleware."""
++
++    def test_first_crawl_collects_page(self, server: str, workdir: str):
++        """The first crawl downloads the page and yields an item."""
++        cache_dir = os.path.join(workdir, "cache")
++        result = run_spider(workdir, server, cache_dir, "out1.jsonl")
++        assert result.returncode == 0, result.stdout + result.stderr
++        items = read_items(workdir, "out1.jsonl")
++        assert len(items) == 1
++        assert items[0]["size"] == len(PAGE_BODY)
++
++    def test_first_crawl_sends_no_conditional_headers(self, server: str, workdir: str):
++        """The first crawl has no validators, so no conditional headers."""
++        cache_dir = os.path.join(workdir, "cache")
++        run_spider(workdir, server, cache_dir, "out1.jsonl")
++        assert ConditionalHandler.seen_if_none_match == [None]
++
++    def test_first_crawl_creates_validator_db(self, server: str, workdir: str):
++        """The first crawl persists validators in the storage dir."""
++        cache_dir = os.path.join(workdir, "cache")
++        run_spider(workdir, server, cache_dir, "out1.jsonl")
++        assert any(
++            name.startswith("condspider_conditional_requests")
++            for name in os.listdir(cache_dir)
++        )
++
++    def test_second_crawl_sends_conditional_headers(self, server: str, workdir: str):
++        """The second crawl sends If-None-Match with the stored ETag."""
++        cache_dir = os.path.join(workdir, "cache")
++        run_spider(workdir, server, cache_dir, "out1.jsonl")
++        run_spider(workdir, server, cache_dir, "out2.jsonl")
++        assert ConditionalHandler.seen_if_none_match == [None, ETAG]
++
++    def test_second_crawl_yields_no_items(self, server: str, workdir: str):
++        """The second crawl drops the 304 response and yields nothing."""
++        cache_dir = os.path.join(workdir, "cache")
++        run_spider(workdir, server, cache_dir, "out1.jsonl")
++        result = run_spider(workdir, server, cache_dir, "out2.jsonl")
++        assert result.returncode == 0, result.stdout + result.stderr
++        assert read_items(workdir, "out2.jsonl") == []
++
++    def test_second_crawl_records_stats(self, server: str, workdir: str):
++        """The second crawl reports the documented stats counters."""
++        cache_dir = os.path.join(workdir, "cache")
++        run_spider(workdir, server, cache_dir, "out1.jsonl")
++        result = run_spider(workdir, server, cache_dir, "out2.jsonl")
++        log = result.stdout + result.stderr
++        assert "'conditional_requests/conditional': 1" in log
++        assert "'conditional_requests/not_modified': 1" in log
++
++    def test_runs_without_storage_dir_keep_working(self, server: str, workdir: str):
++        """Without CONDITIONAL_REQUESTS_DIR a single crawl works normally."""
++        output_path = os.path.join(workdir, "out.jsonl")
++        cmd = [
++            sys.executable,
++            "-c",
++            "from scrapy.cmdline import execute; execute()",
++            "runspider",
++            os.path.join(workdir, "cond_spider.py"),
++            "-a",
++            f"url={server}",
++            "-s",
++            "CONDITIONAL_REQUESTS_ENABLED=True",
++            "-o",
++            output_path,
++        ]
++        result = subprocess.run(
++            cmd, cwd=workdir, capture_output=True, text=True, timeout=180
++        )
++        assert result.returncode == 0, result.stdout + result.stderr
++        assert len(read_items(workdir, "out.jsonl")) == 1
++
++    def test_disabled_by_default(self, server: str, workdir: str):
++        """Without the enabling setting no conditional headers are sent."""
++        cache_dir = os.path.join(workdir, "cache")
++        for output_name in ("out1.jsonl", "out2.jsonl"):
++            output_path = os.path.join(workdir, output_name)
++            cmd = [
++                sys.executable,
++                "-c",
++                "from scrapy.cmdline import execute; execute()",
++                "runspider",
++                os.path.join(workdir, "cond_spider.py"),
++                "-a",
++                f"url={server}",
++                "-s",
++                f"CONDITIONAL_REQUESTS_DIR={cache_dir}",
++                "-o",
++                output_path,
++            ]
++            result = subprocess.run(
++                cmd, cwd=workdir, capture_output=True, text=True, timeout=180
++            )
++            assert result.returncode == 0, result.stdout + result.stderr
++        assert ConditionalHandler.seen_if_none_match == [None, None]
++        assert not os.path.exists(cache_dir)
