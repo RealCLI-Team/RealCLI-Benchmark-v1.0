@@ -10,6 +10,9 @@
 <a href="https://github.com/RealCLI-Team/RealCLI-Benchmark-v1.0">
   <img src="https://img.shields.io/badge/GitHub-RealCLI--Benchmark--v1.0-black" alt="GitHub repository">
 </a>
+<a href="https://realcli-team.github.io/RealCLI-Benchmark-v1.0/">
+  <img src="https://img.shields.io/badge/Leaderboard-live-brightgreen" alt="Leaderboard">
+</a>
 </p>
 
 **Dataset Coming Soon.** We are currently preparing the release of the RealCLI dataset and will make it publicly available soon.
@@ -41,6 +44,12 @@ The benchmark covers system operations, data analysis, software engineering, gam
 - **REALCLI-COLLAB**: a scripted user progressively releases information and introduces collaboration probes during execution.
 
 The collaboration framework covers five dimensions: **Understandability**, **Steerability**, **Observation & Recovery**, **Trust Calibration**, and **Safety & Risk Awareness**.
+
+## 📈 Leaderboard
+
+The paired evaluation results (autonomous execution vs. human–agent collaboration) are available on the live leaderboard:
+
+**[🚀 RealCLI Leaderboard](https://realcli-team.github.io/RealCLI-Benchmark-v1.0/)**
 
 ## 🖼️ Figures
 
