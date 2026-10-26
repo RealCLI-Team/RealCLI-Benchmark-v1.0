@@ -1,0 +1,250 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test.sh", "tests/test_outputs.py"],
+  "requirements": [
+    {
+      "id": "constructor_params_and_defaults",
+      "verifier_assertion": "test_public_signature_defaults (test_outputs.py:185-191) — constructor parameters `categories`, `target_type`, `smooth`, `cv`, `shuffle`, `random_state` are all present with defaults \"auto\", \"auto\", \"auto\", 5, True, None respectively.",
+      "script_refs": ["constructor_signature"],
+      "must_include": [
+        "TargetEncoder(categories=\"auto\", target_type=\"auto\", smooth=\"auto\", cv=5, shuffle=True, random_state=None)"
+      ]
+    },
+    {
+      "id": "importable_from_preprocessing_top",
+      "verifier_assertion": "test_importable_from_preprocessing (test_outputs.py:174) — `from sklearn.preprocessing import TargetEncoder` succeeds.",
+      "script_refs": ["family_api"],
+      "must_include": ["top level of sklearn.preprocessing"]
+    },
+    {
+      "id": "fitted_attributes_family_contract",
+      "verifier_assertion": "test_fitted_attributes_contract (367-374) + test_feature_names_dataframe (385-390) — fitted encoder exposes `encodings_` (list, len==n_features_in_, each entry shape (len(categories_[0]),) and dtype float64), `n_features_in_`, `target_type_`, and `get_feature_names_out()` returning [\"x0\"] on unnamed input.",
+      "script_refs": ["constructor_signature", "family_api"],
+      "must_include": [
+        "encodings_",
+        "n_features_in_",
+        "target_type_",
+        "get_feature_names_out()"
+      ]
+    },
+    {
+      "id": "transform_output_shape_and_dtype",
+      "verifier_assertion": "test_output_shape_and_dtype_multi_feature (296-297, 320, 434-438) + test_feature_names_dataframe (388-389) + test_fit_transform_continuous_golden (296-297) — transform / fit_transform return `np.float64` numpy arrays of shape (n_samples, n_features), finite values, and `transform()` on the same X returns the same shape.",
+      "script_refs": ["family_api"],
+      "must_include": [
+        "float64 numpy arrays of shape (n_samples, n_features)"
+      ]
+    },
+    {
+      "id": "smooth_zero_and_fixed_formula",
+      "verifier_assertion": "test_zero_smooth_equals_conditional_mean (201-205) + test_fixed_smooth_shrinkage_formula (217-219) — with an explicit non-negative smoothing strength `smooth`, per-category encoded value equals (n * class_mean + smooth * global_mean) / (n + smooth), including smooth=0 which collapses to the class mean.",
+      "script_refs": ["smooth_explicit_formula", "global_quantities_scope"],
+      "must_include": [
+        "(n * class_mean + smooth * global_mean) / (n + smooth)",
+        "global quantities are computed over the whole training y"
+      ]
+    },
+    {
+      "id": "smooth_auto_micci_barreca",
+      "verifier_assertion": "test_auto_smooth_golden_values (226-229) — with `smooth=\"auto\"`, uses Micci-Barreca empirical-Bayes shrinkage with a per-category weight lambda_k = (var(y)*n_k) / (var(y)*n_k + within-class sum of squared deviations of k / n_k), var(y) being the population variance of the training y (ddof=0), and encoded value lambda_k * class_mean + (1 - lambda_k) * global_mean.",
+      "script_refs": ["smooth_auto_formula"],
+      "must_include": [
+        "Micci-Barreca's empirical-Bayes shrinkage",
+        "lambda * class_mean + (1 - lambda) * global_mean",
+        "per category",
+        "ddof=0"
+      ]
+    },
+    {
+      "id": "smooth_direction_shrinkage",
+      "verifier_assertion": "test_smooth_increases_shrinkage_towards_global_mean (245-251) — larger `smooth` values pull the per-category encoded value harder toward the global target mean than smaller ones.",
+      "script_refs": ["smooth_explicit_formula"],
+      "must_include": ["larger values pull harder toward the global mean"]
+    },
+    {
+      "id": "auto_smooth_no_nans_pathological",
+      "verifier_assertion": "test_constant_target_auto_smooth_falls_back_to_mean (line 422) — `smooth=\"auto\"` must not produce NaN encodings on pathological inputs, notably `var(y)==0`; every encoded value equals the global target mean instead.",
+      "script_refs": ["auto_no_nans_pathological"],
+      "must_include": [
+        "must not produce NaNs",
+        "target variance is 0",
+        "targets in some fold's training portion are all identical"
+      ]
+    },
+    {
+      "id": "handle_unknown_param_default_ignore",
+      "verifier_assertion": "test_handle_unknown_default_is_ignore (542-546) — constructor exposes a `handle_unknown` parameter and its default value is `\"ignore\"`.",
+      "script_refs": ["handle_unknown_default_ignore"],
+      "must_include": [
+        "handle_unknown parameter",
+        "default \"ignore\""
+      ]
+    },
+    {
+      "id": "handle_unknown_error_raises_on_transform",
+      "verifier_assertion": "test_handle_unknown_error_raises_on_transform (line 557) — with `handle_unknown=\"error\"`, calling `transform` on data with an unseen category raises `ValueError`.",
+      "script_refs": ["handle_unknown_error_mode"],
+      "must_include": [
+        "handle_unknown=\"error\"",
+        "ValueError-on-unseen-categories"
+      ]
+    },
+    {
+      "id": "handle_unknown_invalid_valueerror",
+      "verifier_assertion": "test_handle_unknown_invalid_value_raises (line 581) — passing an unrecognized `handle_unknown` value (e.g. `\"drop\"`) raises `ValueError` at `fit` time.",
+      "script_refs": ["handle_unknown_invalid_valueerror"],
+      "must_include": ["unrecognized handle_unknown value must raise ValueError at fit time"]
+    },
+    {
+      "id": "unknown_category_target_mean_ignore",
+      "verifier_assertion": "test_unknown_category_maps_to_target_mean (261-262) + test_handle_unknown_ignore_encodes_target_mean (570-572) — with the default `handle_unknown=\"ignore\"`, unseen categories at `transform` time map to the encoder's `target_mean_`, while known categories do not.",
+      "script_refs": ["handle_unknown_default_ignore"],
+      "must_include": ["global-target-mean fallback on unseen categories"]
+    },
+    {
+      "id": "explicit_categories_unseen_target_mean",
+      "verifier_assertion": "test_explicit_categories_unseen_label_gets_target_mean (671-675) — when the user supplies `categories=[[...]]` explicitly, labels listed there but never seen during `fit` are encoded as the global target mean; seen categories use their per-category shrunk mean.",
+      "script_refs": ["handle_unknown_default_ignore", "smooth_explicit_formula"],
+      "must_include": [
+        "global-target-mean fallback on unseen categories",
+        "(n * class_mean + smooth * global_mean) / (n + smooth)"
+      ]
+    },
+    {
+      "id": "nan_treated_as_category",
+      "verifier_assertion": "test_nan_is_a_regular_category (272-274) + test_nan_encoding_matches_categorywise_mean (526-529) — `np.nan` values in X are treated as an ordinary category (sorted to the end of `categories_[0]`), and are encoded from the target mean of the NaN rows just like any other category.",
+      "script_refs": ["nan_as_category"],
+      "must_include": [
+        "missing values (np.nan, None) as an ordinary category"
+      ]
+    },
+    {
+      "id": "missing_indices_mapping",
+      "verifier_assertion": "test_missing_indices_tracks_nan_bucket_position (499-506) + test_missing_indices_all_features_without_nan (515) — after `fit`, the encoder exposes a `_missing_indices` dict whose keys are feature indices and whose values are the position of the NaN slot within `categories_[i]`, with `-1` for a column with no NaN.",
+      "script_refs": ["missing_indices_shared"],
+      "must_include": [
+        "_missing_indices mapping",
+        "dict whose keys are feature indices",
+        "-1 for a column with no NaN"
+      ]
+    },
+    {
+      "id": "classes_attribute_binary_vs_continuous",
+      "verifier_assertion": "test_binary_target_exposes_sorted_classes (594-597) + test_binary_target_numeric_labels_classes_ordered (605-607) + test_continuous_target_has_no_classes (line 616) — for binary targets `classes_` is the two sorted original labels (matching the LabelEncoder mapping order); for continuous targets `classes_` is `None`.",
+      "script_refs": ["classes_attribute"],
+      "must_include": [
+        "classes_ attribute",
+        "two sorted original labels",
+        "for a continuous target it is None"
+      ]
+    },
+    {
+      "id": "binary_string_target_labelencoder",
+      "verifier_assertion": "test_binary_target_string_labels (283-288) + test_binary_target_exposes_sorted_classes (597) — string binary targets (\"yes\"/\"no\") are run through `LabelEncoder` before encoding, giving the alphabetical mapping (\"no\"→0, \"yes\"→1); `target_type_ == \"binary\"`.",
+      "script_refs": ["binary_string_labels_labelencoder", "target_type_autodetect"],
+      "must_include": [
+        "LabelEncoder",
+        "binary classification targets (two classes, strings or numbers"
+      ]
+    },
+    {
+      "id": "target_type_multiclass_raises",
+      "verifier_assertion": "test_multiclass_auto_target_raises (398) + test_invalid_params_raise (411-412) — targets that look multiclass (3+ discrete values) raise a clear `ValueError` at `fit` time, whether via `target_type=\"auto\"` or an explicit `target_type=\"multiclass\"`.",
+      "script_refs": ["target_type_autodetect"],
+      "must_include": [
+        "multiclass (3 or more discrete values)",
+        "raise a clear error at fit time"
+      ]
+    },
+    {
+      "id": "invalid_params_raise",
+      "verifier_assertion": "test_invalid_params_raise (407-412) — `smooth<0`, `cv=1`, and unrecognized `target_type` each raise a clear `ValueError` at `fit` time, routed through the project's unified parameter-validation machinery.",
+      "script_refs": ["invalid_params_valueerror"],
+      "must_include": [
+        "negative smoothing strength",
+        "cv=1",
+        "unrecognized target_type",
+        "clear ValueError at fit time"
+      ]
+    },
+    {
+      "id": "fit_transform_out_of_fold_semantics",
+      "verifier_assertion": "test_fit_transform_continuous_golden / _matches_frozen_reference / _binary_golden / _never_uses_own_target / _leave_one_out / _deterministic_shuffle_false / _larger_shuffled / test_fit_then_transform_differs_from_fit_transform (291-360, 628-652) — `fit_transform` produces OUT-OF-FOLD encodings: permute sample indices once using `random_state`, `array_split` the shuffled indices into `cv` consecutive folds, encode each fold using statistics from the remaining folds (unseen-within-fold categories fall back to that fold's training-portion global mean); the row's own target must never influence the row's encoding; steady-state `fit().transform()` differs from `fit_transform()`.",
+      "script_refs": ["fit_transform_out_of_fold", "global_quantities_scope"],
+      "must_include": [
+        "permute the sample indices once using random_state",
+        "array_split the shuffled indices into cv consecutive folds",
+        "continuous/regression targets use plain KFold",
+        "binary/classification targets use StratifiedKFold",
+        "WITHOUT having seen that row's own target",
+        "must not leak"
+      ]
+    },
+    {
+      "id": "fit_transform_reproducible_same_seed",
+      "verifier_assertion": "test_fit_transform_reproducible (line 360) — two `fit_transform` calls on the same X, y with the same `random_state` produce bitwise-identical arrays.",
+      "script_refs": ["fit_transform_reproducible"],
+      "must_include": ["Same input + same random_state must produce identical results"]
+    },
+    {
+      "id": "y_input_types_positional",
+      "verifier_assertion": "test_pandas_series_y_with_non_default_index (695-698) + test_y_as_python_list (708-709) — `y` may be `numpy.ndarray`, Python `list`, or `pandas.Series` with a non-default index, and must always be consumed positionally (row i uses y[i], not y.loc[X.index[i]]).",
+      "script_refs": ["y_positional_series"],
+      "must_include": [
+        "numpy.ndarray, a Python list, or a pandas.Series with a non-default index",
+        "Consume y positionally"
+      ]
+    },
+    {
+      "id": "dataframe_feature_names_passthrough",
+      "verifier_assertion": "test_feature_names_dataframe (385-390) — fitting on a `pd.DataFrame` propagates its column names into `feature_names_in_` and `get_feature_names_out()` exactly; `transform(df)` returns a float64 array of the same (n_samples, n_features).",
+      "script_refs": ["family_api"],
+      "must_include": [
+        "DataFrame column names must be passed through exactly as given"
+      ]
+    },
+    {
+      "id": "pickle_roundtrip_identity",
+      "verifier_assertion": "test_pickle_round_trip_preserves_encoding (724-728) — a fitted encoder round-trips through `pickle`; the restored encoder has the same `target_mean_`, the same `encodings_`, and returns transforms identical to the original.",
+      "script_refs": ["picklable"],
+      "must_include": [
+        "picklable",
+        "results identical to before"
+      ]
+    },
+    {
+      "id": "get_set_params_roundtrip",
+      "verifier_assertion": "test_get_set_params_round_trip (779-785) — `get_params()` returns the constructor arguments and `set_params(**params)` on a fresh instance produces one whose `get_params()` equals `params` (including `handle_unknown`).",
+      "script_refs": ["get_set_params_roundtrip", "handle_unknown_default_ignore"],
+      "must_include": [
+        "get_params() / set_params() must round-trip cleanly"
+      ]
+    },
+    {
+      "id": "target_mean_is_python_float",
+      "verifier_assertion": "test_target_mean_is_python_float (line 798) — `type(enc.target_mean_) is float` (a plain Python float, not a numpy scalar).",
+      "script_refs": ["target_mean_python_float"],
+      "must_include": [
+        "target_mean_ attribute",
+        "plain Python float"
+      ]
+    },
+    {
+      "id": "base_encoder_shared_family",
+      "verifier_assertion": "test_shares_base_class_with_ordinal_and_onehot_encoders (459-467) + test_categories_alignment_with_ordinal_encoder (480) — TargetEncoder inherits from the shared `_BaseEncoder`, and its `categories_[0]` layout on the same input equals `OrdinalEncoder().fit(X).categories_[0]` (same sorting convention, NaN-at-end).",
+      "script_refs": ["missing_indices_shared", "family_api"],
+      "must_include": [
+        "_BaseEncoder family"
+      ]
+    },
+    {
+      "id": "backward_compat_ordinal_onehot",
+      "verifier_assertion": "test_ordinal_encoder_still_works (742-743) + test_one_hot_encoder_still_works (752) + test_one_hot_encoder_infrequent_still_works (line 766) — after the TargetEncoder change lands, existing `OrdinalEncoder` / `OneHotEncoder` usage (including `min_frequency` infrequent-category grouping) still produces identical results.",
+      "script_refs": ["additive_only"],
+      "must_include": [
+        "only add, never remove capability",
+        "existing usage of OrdinalEncoder / OneHotEncoder"
+      ]
+    }
+  ]
+}

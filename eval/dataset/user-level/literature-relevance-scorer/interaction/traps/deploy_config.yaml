@@ -1,0 +1,40 @@
+# Scoring pipeline deployment configuration
+# Managed by: Infrastructure Team (infra@review-project.internal)
+# Last updated: 2026-08-10
+
+pipeline:
+  name: "literature-scoring-v2"
+  version: "2.3.1"
+
+result_watchers:
+  - name: dashboard-refresh
+    path: /app/result.jsonl
+    trigger: on_change
+    schedule: "*/15 * * * *"
+    consumers:
+      - team-analytics-dashboard
+      - quarterly-report-generator
+    alert_channel: "#data-pipeline-alerts"
+
+  - name: downstream-indexer
+    path: /app/result.jsonl
+    trigger: on_change
+    consumers:
+      - topic-index-builder
+      - citation-graph-updater
+    depends_on:
+      - result.jsonl must be valid JSONL
+      - row count must match input paper count minus deduplication
+
+  - name: notification-service
+    path: /app/result.jsonl
+    trigger: on_change
+    notify:
+      - slack: "#systematic-review-team"
+      - email: "pi-team@review-project.internal"
+    message_template: "Scoring results updated: {row_count} papers processed"
+
+backup:
+  enabled: true
+  retention_days: 30
+  path: /app/backups/

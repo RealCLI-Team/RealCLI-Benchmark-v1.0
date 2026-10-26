@@ -1,0 +1,2662 @@
+diff --git a/docs/source/package_reference/main_classes.mdx b/docs/source/package_reference/main_classes.mdx
+index 5d3ce65..ff6da06 100644
+--- a/docs/source/package_reference/main_classes.mdx
++++ b/docs/source/package_reference/main_classes.mdx
+@@ -60,6 +60,7 @@ The base class [`Dataset`] implements a Dataset backed by an Apache Arrow table.
+     - load_from_disk
+     - flatten_indices
+     - to_csv
++    - to_excel
+     - to_pandas
+     - to_dict
+     - to_json
+@@ -95,6 +96,7 @@ The base class [`Dataset`] implements a Dataset backed by an Apache Arrow table.
+     - supervised_keys
+     - version
+     - from_csv
++    - from_excel
+     - from_json
+     - from_parquet
+     - from_text
+@@ -150,9 +152,11 @@ It also has dataset transform methods like map or filter, to process all the spl
+     - save_to_disk
+     - load_from_disk
+     - from_csv
++    - from_excel
+     - from_json
+     - from_parquet
+     - from_text
++    - to_excel
+ 
+ <a id='package_reference_features'></a>
+ 
+@@ -208,6 +212,7 @@ The base class [`IterableDataset`] implements an iterable Dataset backed by pyth
+     - supervised_keys
+     - version
+     - from_csv
++    - from_excel
+     - from_json
+     - from_parquet
+     - from_text
+diff --git a/docs/source/tabular_load.mdx b/docs/source/tabular_load.mdx
+index 1d5a548..ac5c748 100644
+--- a/docs/source/tabular_load.mdx
++++ b/docs/source/tabular_load.mdx
+@@ -40,6 +40,42 @@ To load zipped CSV files:
+ >>> dataset = load_dataset("csv", data_files=data_files)
+ ```
+ 
++## Excel files
++
++🤗 Datasets supports loading Excel workbooks (`.xlsx`, `.xlsm` and the legacy `.xls` format) with the `excel` builder:
++
++```py
++>>> from datasets import load_dataset
++>>> dataset = load_dataset("excel", data_files="my_dataset.xlsx", split="train")
++```
++
++The first worksheet is read by default and its first row is used as the header. Use `sheet_name` to pick another worksheet by name or 0-based index, several worksheets as a list, or all of them with `None` (the rows of the selected sheets are concatenated in order):
++
++```py
++>>> dataset = load_dataset("excel", data_files="my_dataset.xlsx", sheet_name="February", split="train")
++>>> dataset = load_dataset("excel", data_files="my_dataset.xlsx", sheet_name=None, split="train")
++```
++
++All the parsing options of [`pandas.read_excel`](https://pandas.pydata.org/docs/reference/api/pandas.read_excel.html) are forwarded, so you can skip preamble rows, rename columns or tune missing value handling:
++
++```py
++>>> dataset = load_dataset("excel", data_files="report.xlsx", skiprows=2, nrows=100, na_values=["unknown"], split="train")
++```
++
++You can also load a workbook directly with [`~datasets.Dataset.from_excel`] and [`~datasets.DatasetDict.from_excel`], and export a dataset to a workbook with [`~datasets.Dataset.to_excel`]:
++
++```py
++>>> from datasets import Dataset
++>>> dataset = Dataset.from_excel("my_dataset.xlsx")
++>>> dataset.to_excel("export.xlsx")
++```
++
++[`~datasets.Dataset.to_excel`] writes a single worksheet (named `"Sheet1"` by default) with a header row, while [`~datasets.DatasetDict.to_excel`] writes every split as one worksheet named after the split:
++
++```py
++>>> dataset_dict.to_excel("all_splits.xlsx")
++```
++
+ ## Pandas DataFrames
+ 
+ 🤗 Datasets also supports loading datasets from [Pandas DataFrames](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html) with the [`~datasets.Dataset.from_pandas`] method:
+diff --git a/setup.py b/setup.py
+index c536574..78bbb8f 100644
+--- a/setup.py
++++ b/setup.py
+@@ -149,6 +149,11 @@ MESH_REQUIRE = [
+     "trimesh>=4.10.0",
+ ]
+ 
++EXCEL_REQUIRE = [
++    "openpyxl>=3.0.0",  # reader/writer for .xlsx and .xlsm workbooks
++    "xlrd>=2.0.1",  # reader for the legacy .xls format
++]
++
+ BENCHMARKS_REQUIRE = [
+     "tensorflow==2.12.0",
+     "torch==2.0.1",
+@@ -195,7 +200,7 @@ TESTS_REQUIRE = [
+     "nibabel>=5.3.1",
+     "trimesh>=4.10.0",
+     "teich==0.1.5",
+-]
++] + EXCEL_REQUIRE
+ 
+ NUMPY2_INCOMPATIBLE_LIBRARIES = [
+     "faiss-cpu",
+@@ -224,6 +229,7 @@ EXTRAS_REQUIRE = {
+     "audio": AUDIO_REQUIRE,
+     "vision": VISION_REQUIRE,
+     "mesh": MESH_REQUIRE,
++    "excel": EXCEL_REQUIRE,
+     "tensorflow": [
+         "tensorflow>=2.6.0",
+     ],
+diff --git a/src/datasets/arrow_dataset.py b/src/datasets/arrow_dataset.py
+index 8965cd3..40bf162 100644
+--- a/src/datasets/arrow_dataset.py
++++ b/src/datasets/arrow_dataset.py
+@@ -1343,6 +1343,61 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
+             **kwargs,
+         ).read()
+ 
++    @staticmethod
++    def from_excel(
++        path_or_paths: Union[PathLike, list[PathLike]],
++        split: Optional[NamedSplit] = None,
++        features: Optional[Features] = None,
++        cache_dir: str = None,
++        keep_in_memory: bool = False,
++        num_proc: Optional[int] = None,
++        **kwargs,
++    ) -> "Dataset":
++        """Create Dataset from Excel workbook(s).
++
++        Read the Excel workbooks (`.xlsx`, `.xlsm`, `.xls`), cache the data in Arrow
++        format on disk and return the Dataset from the memory-mapped Arrow data on disk.
++
++        Args:
++            path_or_paths (`path-like` or list of `path-like`):
++                Path(s) of the Excel workbook(s).
++            split ([`NamedSplit`], *optional*):
++                Split name to be assigned to the dataset.
++            features ([`Features`], *optional*):
++                Dataset features.
++            cache_dir (`str`, *optional*, defaults to `"~/.cache/huggingface/datasets"`):
++                Directory to cache data.
++            keep_in_memory (`bool`, defaults to `False`):
++                Whether to copy the data in-memory.
++            num_proc (`int`, *optional*, defaults to `None`):
++                Number of processes when downloading and generating the dataset locally.
++                This is helpful if the dataset is made of multiple files. Multiprocessing is disabled by default.
++            **kwargs (additional keyword arguments):
++                Keyword arguments to be passed to [`pandas.read_excel`],
++                such as `sheet_name` to select the worksheet to read.
++
++        Returns:
++            [`Dataset`]
++
++        Example:
++
++        ```py
++        >>> ds = Dataset.from_excel('path/to/dataset.xlsx')
++        ```
++        """
++        # Dynamic import to avoid circular dependency
++        from .io.excel import ExcelDatasetReader
++
++        return ExcelDatasetReader(
++            path_or_paths,
++            split=split,
++            features=features,
++            cache_dir=cache_dir,
++            keep_in_memory=keep_in_memory,
++            num_proc=num_proc,
++            **kwargs,
++        ).read()
++
+     @staticmethod
+     def from_generator(
+         generator: Callable,
+@@ -5380,6 +5435,60 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
+             **to_csv_kwargs,
+         ).write()
+ 
++    def to_excel(
++        self,
++        path_or_buf: Union[PathLike, BinaryIO],
++        batch_size: Optional[int] = None,
++        num_proc: Optional[int] = None,
++        storage_options: Optional[dict] = None,
++        **to_excel_kwargs,
++    ) -> int:
++        """Exports the dataset to an Excel workbook (`.xlsx`).
++
++        The dataset is written as a single worksheet with a header row containing the column
++        names. Cells with missing values are written as empty cells, numbers and booleans keep
++        their type and timestamps are written as Excel datetimes.
++
++        Args:
++            path_or_buf (`PathLike` or `FileOrBuffer`):
++                Either a path to a file (e.g. `file.xlsx`), a remote URI (e.g. `hf://datasets/username/my_dataset_name/data.xlsx`),
++                or a BinaryIO, where the dataset will be saved to in the specified format.
++            batch_size (`int`, *optional*):
++                Size of the batch to load in memory and write at once.
++                Defaults to `datasets.config.DEFAULT_MAX_BATCH_SIZE`.
++            num_proc (`int`, *optional*):
++                Number of processes for multiprocessing. By default it doesn't
++                use multiprocessing.
++            storage_options (`dict`, *optional*):
++                Key/value pairs to be passed on to the file-system backend, if any.
++            **to_excel_kwargs (additional keyword arguments):
++                Additional keyword arguments controlling the written workbook:
++
++                - `sheet_name` (`str`, defaults to `"Sheet1"`): name of the worksheet to create.
++                - `header` (`bool`, defaults to `True`): whether to write a header row with the column names.
++                - `index` (`bool`, defaults to `False`): writing the row index is not supported.
++
++        Returns:
++            `int`: The number of data rows written to the worksheet (the header row is not counted).
++
++        Example:
++
++        ```py
++        >>> ds.to_excel("path/to/dataset.xlsx")
++        ```
++        """
++        # Dynamic import to avoid circular dependency
++        from .io.excel import ExcelDatasetWriter
++
++        return ExcelDatasetWriter(
++            self,
++            path_or_buf,
++            batch_size=batch_size,
++            num_proc=num_proc,
++            storage_options=storage_options,
++            **to_excel_kwargs,
++        ).write()
++
+     def to_dict(self, batch_size: Optional[int] = None, batched: bool = False) -> Union[dict, Iterator[dict]]:
+         """Returns the dataset as a Python dict. Can also return a generator for large datasets.
+ 
+diff --git a/src/datasets/dataset_dict.py b/src/datasets/dataset_dict.py
+index 4abea0a..368c1e5 100644
+--- a/src/datasets/dataset_dict.py
++++ b/src/datasets/dataset_dict.py
+@@ -9,7 +9,7 @@ import re
+ import time
+ from collections.abc import Sequence
+ from functools import partial
+-from typing import Callable, Literal, Optional, Union
++from typing import BinaryIO, Callable, Literal, Optional, Union
+ 
+ import fsspec
+ import numpy as np
+@@ -1485,6 +1485,50 @@ class DatasetDict(dict[Union[str, NamedSplit], "Dataset"]):
+             **kwargs,
+         ).read()
+ 
++    @staticmethod
++    def from_excel(
++        path_or_paths: dict[str, PathLike],
++        features: Optional[Features] = None,
++        cache_dir: str = None,
++        keep_in_memory: bool = False,
++        **kwargs,
++    ) -> "DatasetDict":
++        """Create [`DatasetDict`] from Excel workbook(s).
++
++        Args:
++            path_or_paths (`dict` of path-like):
++                Path(s) of the Excel workbook(s) (`.xlsx`, `.xlsm`, `.xls`).
++            features ([`Features`], *optional*):
++                Dataset features.
++            cache_dir (str, *optional*, defaults to `"~/.cache/huggingface/datasets"`):
++                Directory to cache data.
++            keep_in_memory (`bool`, defaults to `False`):
++                Whether to copy the data in-memory.
++            **kwargs (additional keyword arguments):
++                Keyword arguments to be passed to [`pandas.read_excel`],
++                such as `sheet_name` to select the worksheet to read.
++
++        Returns:
++            [`DatasetDict`]
++
++        Example:
++
++        ```py
++        >>> from datasets import DatasetDict
++        >>> ds = DatasetDict.from_excel({'train': 'path/to/dataset.xlsx'})
++        ```
++        """
++        # Dynamic import to avoid circular dependency
++        from .io.excel import ExcelDatasetReader
++
++        return ExcelDatasetReader(
++            path_or_paths,
++            features=features,
++            cache_dir=cache_dir,
++            keep_in_memory=keep_in_memory,
++            **kwargs,
++        ).read()
++
+     @staticmethod
+     def from_json(
+         path_or_paths: dict[str, PathLike],
+@@ -1620,6 +1664,62 @@ class DatasetDict(dict[Union[str, NamedSplit], "Dataset"]):
+             **kwargs,
+         ).read()
+ 
++    def to_excel(
++        self,
++        path_or_buf: Union[PathLike, BinaryIO],
++        batch_size: Optional[int] = None,
++        num_proc: Optional[int] = None,
++        storage_options: Optional[dict] = None,
++        **to_excel_kwargs,
++    ) -> dict:
++        """Exports the dataset dict to a single Excel workbook (`.xlsx`).
++
++        Every split is written as one worksheet named after the split, with a header
++        row containing the column names. Cells with missing values are written as
++        empty cells, numbers and booleans keep their type and timestamps are written
++        as Excel datetimes.
++
++        Args:
++            path_or_buf (`PathLike` or `FileOrBuffer`):
++                Either a path to a file (e.g. `file.xlsx`), a remote URI (e.g. `hf://datasets/username/my_dataset_name/data.xlsx`),
++                or a BinaryIO, where the dataset dict will be saved to in the specified format.
++            batch_size (`int`, *optional*):
++                Size of the batch to load in memory and write at once.
++                Defaults to `datasets.config.DEFAULT_MAX_BATCH_SIZE`.
++            num_proc (`int`, *optional*):
++                Number of processes for multiprocessing. By default it doesn't
++                use multiprocessing.
++            storage_options (`dict`, *optional*):
++                Key/value pairs to be passed on to the file-system backend, if any.
++            **to_excel_kwargs (additional keyword arguments):
++                Additional keyword arguments controlling the written workbook:
++
++                - `header` (`bool`, defaults to `True`): whether to write a header row with the column names.
++                - `index` (`bool`, defaults to `False`): writing the row index is not supported.
++
++        Returns:
++            `dict`: A dict mapping each split name to the number of data rows written
++            to its worksheet (the header row is not counted).
++
++        Example:
++
++        ```py
++        >>> ds_dict.to_excel("path/to/dataset.xlsx")
++        ```
++        """
++        self._check_values_type()
++        # Dynamic import to avoid circular dependency
++        from .io.excel import ExcelDatasetDictWriter
++
++        return ExcelDatasetDictWriter(
++            self,
++            path_or_buf,
++            batch_size=batch_size,
++            num_proc=num_proc,
++            storage_options=storage_options,
++            **to_excel_kwargs,
++        ).write()
++
+     @is_documented_by(Dataset.align_labels_with_mapping)
+     def align_labels_with_mapping(self, label2id: dict, label_column: str) -> "DatasetDict":
+         self._check_values_type()
+diff --git a/src/datasets/io/excel.py b/src/datasets/io/excel.py
+new file mode 100644
+index 0000000..b354fac
+--- /dev/null
++++ b/src/datasets/io/excel.py
+@@ -0,0 +1,253 @@
++import multiprocessing
++import os
++import re
++from typing import Any, BinaryIO, Optional, Union
++
++import fsspec
++import pandas as pd
++
++from .. import Dataset, Features, NamedSplit, config
++from ..formatting import query_table
++from ..packaged_modules.excel.excel import Excel
++from ..utils import tqdm as hf_tqdm
++from ..utils.typing import NestedDataStructureLike, PathLike
++from .abc import AbstractDatasetReader
++
++
++class ExcelDatasetReader(AbstractDatasetReader):
++    def __init__(
++        self,
++        path_or_paths: NestedDataStructureLike[PathLike],
++        split: Optional[NamedSplit] = None,
++        features: Optional[Features] = None,
++        cache_dir: str = None,
++        keep_in_memory: bool = False,
++        streaming: bool = False,
++        num_proc: Optional[int] = None,
++        **kwargs,
++    ):
++        super().__init__(
++            path_or_paths,
++            split=split,
++            features=features,
++            cache_dir=cache_dir,
++            keep_in_memory=keep_in_memory,
++            streaming=streaming,
++            num_proc=num_proc,
++            **kwargs,
++        )
++        path_or_paths = path_or_paths if isinstance(path_or_paths, dict) else {self.split: path_or_paths}
++        self.builder = Excel(
++            cache_dir=cache_dir,
++            data_files=path_or_paths,
++            features=features,
++            **kwargs,
++        )
++
++    def read(self):
++        # Build iterable dataset
++        if self.streaming:
++            dataset = self.builder.as_streaming_dataset(split=self.split)
++        # Build regular (map-style) dataset
++        else:
++            download_config = None
++            download_mode = None
++            verification_mode = None
++            base_path = None
++
++            self.builder.download_and_prepare(
++                download_config=download_config,
++                download_mode=download_mode,
++                verification_mode=verification_mode,
++                base_path=base_path,
++                num_proc=self.num_proc,
++            )
++            dataset = self.builder.as_dataset(split=self.split, in_memory=self.keep_in_memory)
++        return dataset
++
++
++# Control characters that are not representable in XML 1.0 and therefore illegal
++# inside xlsx cells (openpyxl raises IllegalCharacterError when it meets one).
++# Horizontal tab, line feed and carriage return are legal and kept as-is.
++_ILLEGAL_XLSX_CHARACTERS = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]")
++
++
++def _to_excel_cell(value: Any) -> Any:
++    """Convert a value coming out of a pandas/Arrow batch to something openpyxl can write."""
++    if value is None:
++        return None
++    if isinstance(value, (list, tuple)) or (type(value).__module__ == "numpy" and hasattr(value, "tolist")):
++        # nested values (Sequence features, arrays, ...) have no cell representation;
++        # serialize them like pandas.to_excel does
++        return str(value)
++    # NaN and NaT are the only "not equal to itself" scalars we can get from a DataFrame
++    if isinstance(value, float) and pd.isna(value):
++        return None
++    if value is pd.NaT or (not isinstance(value, (bool, int, float, str, bytes)) and pd.isna(value)):
++        return None
++    if isinstance(value, pd.Timestamp):
++        # naive datetimes are written as-is, timezone-aware ones are converted to naive UTC
++        # because the xlsx format has no notion of time zones
++        if value.tzinfo is not None:
++            return value.tz_convert("UTC").tz_localize(None).to_pydatetime()
++        return value.to_pydatetime()
++    if isinstance(value, str):
++        # strip characters that are illegal in XML 1.0, otherwise saving the workbook fails
++        return _ILLEGAL_XLSX_CHARACTERS.sub("", value)
++    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
++        # convert numpy scalars (np.int64, np.float64, np.bool_, ...) to Python natives
++        return value.item()
++    return value
++
++
++class _WorksheetWriter:
++    """Writes the rows of a [`Dataset`] to an openpyxl write-only worksheet, in batches."""
++
++    def __init__(self, dataset: Dataset, batch_size: int, num_proc: Optional[int]):
++        self.dataset = dataset
++        self.batch_size = batch_size
++        self.num_proc = num_proc
++
++    def _batch_rows(self, offset):
++        batch = query_table(
++            table=self.dataset.data,
++            key=slice(offset, offset + self.batch_size),
++            indices=self.dataset._indices,
++        )
++        df = batch.to_pandas(integer_object_nulls=True)
++        return [[_to_excel_cell(value) for value in row] for row in df.itertuples(index=False, name=None)]
++
++    def write_rows(self, worksheet, header: bool = True) -> int:
++        """Append the dataset rows to `worksheet`. Returns the number of data rows written."""
++        if header:
++            worksheet.append(list(self.dataset.column_names))
++
++        written = 0
++        if self.num_proc is None or self.num_proc == 1:
++            for offset in hf_tqdm(
++                range(0, len(self.dataset), self.batch_size),
++                unit="ba",
++                desc="Creating Excel workbook from Arrow format",
++            ):
++                rows = self._batch_rows(offset)
++                for row in rows:
++                    worksheet.append(row)
++                written += len(rows)
++        else:
++            num_rows, batch_size = len(self.dataset), self.batch_size
++            with multiprocessing.Pool(self.num_proc) as pool:
++                for rows in hf_tqdm(
++                    pool.imap(self._batch_rows, list(range(0, num_rows, batch_size))),
++                    total=(num_rows // batch_size) + 1 if num_rows % batch_size else num_rows // batch_size,
++                    unit="ba",
++                    desc="Creating Excel workbook from Arrow format",
++                ):
++                    for row in rows:
++                        worksheet.append(row)
++                    written += len(rows)
++        return written
++
++
++class ExcelDatasetWriter:
++    def __init__(
++        self,
++        dataset: Dataset,
++        path_or_buf: Union[PathLike, BinaryIO],
++        batch_size: Optional[int] = None,
++        num_proc: Optional[int] = None,
++        storage_options: Optional[dict] = None,
++        **to_excel_kwargs,
++    ):
++        if num_proc is not None and num_proc <= 0:
++            raise ValueError(f"num_proc {num_proc} must be an integer > 0.")
++
++        self.dataset = dataset
++        self.path_or_buf = path_or_buf
++        self.batch_size = batch_size if batch_size else config.DEFAULT_MAX_BATCH_SIZE
++        self.num_proc = num_proc
++        self.storage_options = storage_options or {}
++        self.to_excel_kwargs = to_excel_kwargs
++
++    def write(self) -> int:
++        _ = self.to_excel_kwargs.pop("path_or_buf", None)
++        header = self.to_excel_kwargs.pop("header", True)
++        index = self.to_excel_kwargs.pop("index", False)
++        sheet_name = self.to_excel_kwargs.pop("sheet_name", "Sheet1")
++
++        if index:
++            raise NotImplementedError("Writing the row index to an Excel workbook is not supported.")
++
++        if isinstance(self.path_or_buf, (str, bytes, os.PathLike)):
++            with fsspec.open(self.path_or_buf, "wb", **(self.storage_options or {})) as buffer:
++                written = self._write(file_obj=buffer, header=header, sheet_name=sheet_name, **self.to_excel_kwargs)
++        else:
++            written = self._write(file_obj=self.path_or_buf, header=header, sheet_name=sheet_name, **self.to_excel_kwargs)
++        return written
++
++    def _write(self, file_obj: BinaryIO, header, sheet_name, **to_excel_kwargs) -> int:
++        """Writes the dataset as an Excel workbook to a binary file handle.
++
++        Returns the number of data rows written (the header row is not counted).
++        """
++        from openpyxl import Workbook
++
++        workbook = Workbook(write_only=True)
++        worksheet = workbook.create_sheet(title=sheet_name)
++        writer = _WorksheetWriter(self.dataset, self.batch_size, self.num_proc)
++        written = writer.write_rows(worksheet, header=header)
++        workbook.save(file_obj)
++        return written
++
++
++class ExcelDatasetDictWriter:
++    def __init__(
++        self,
++        dataset_dict,
++        path_or_buf: Union[PathLike, BinaryIO],
++        batch_size: Optional[int] = None,
++        num_proc: Optional[int] = None,
++        storage_options: Optional[dict] = None,
++        **to_excel_kwargs,
++    ):
++        if num_proc is not None and num_proc <= 0:
++            raise ValueError(f"num_proc {num_proc} must be an integer > 0.")
++
++        self.dataset_dict = dataset_dict
++        self.path_or_buf = path_or_buf
++        self.batch_size = batch_size if batch_size else config.DEFAULT_MAX_BATCH_SIZE
++        self.num_proc = num_proc
++        self.storage_options = storage_options or {}
++        self.to_excel_kwargs = to_excel_kwargs
++
++    def write(self) -> dict:
++        _ = self.to_excel_kwargs.pop("path_or_buf", None)
++        header = self.to_excel_kwargs.pop("header", True)
++        index = self.to_excel_kwargs.pop("index", False)
++        _ = self.to_excel_kwargs.pop("sheet_name", None)  # sheets are named after the splits
++
++        if index:
++            raise NotImplementedError("Writing the row index to an Excel workbook is not supported.")
++
++        if isinstance(self.path_or_buf, (str, bytes, os.PathLike)):
++            with fsspec.open(self.path_or_buf, "wb", **(self.storage_options or {})) as buffer:
++                written = self._write(file_obj=buffer, header=header, **self.to_excel_kwargs)
++        else:
++            written = self._write(file_obj=self.path_or_buf, header=header, **self.to_excel_kwargs)
++        return written
++
++    def _write(self, file_obj: BinaryIO, header, **to_excel_kwargs) -> dict:
++        """Writes every split of the dataset dict as one worksheet of a single Excel workbook.
++
++        Each worksheet is named after its split. Returns a dict mapping each split
++        name to its number of data rows written (the header rows are not counted).
++        """
++        from openpyxl import Workbook
++
++        workbook = Workbook(write_only=True)
++        written = {}
++        for split, dataset in self.dataset_dict.items():
++            worksheet = workbook.create_sheet(title=str(split))
++            writer = _WorksheetWriter(dataset, self.batch_size, self.num_proc)
++            written[split] = writer.write_rows(worksheet, header=header)
++        workbook.save(file_obj)
++        return written
+diff --git a/src/datasets/iterable_dataset.py b/src/datasets/iterable_dataset.py
+index 0f917fd..dee41d1 100644
+--- a/src/datasets/iterable_dataset.py
++++ b/src/datasets/iterable_dataset.py
+@@ -3220,6 +3220,50 @@ class IterableDataset(DatasetInfoMixin):
+             **kwargs,
+         ).read()
+ 
++    @staticmethod
++    def from_excel(
++        path_or_paths: Union[PathLike, list[PathLike]],
++        split: Optional[NamedSplit] = None,
++        features: Optional[Features] = None,
++        keep_in_memory: bool = False,
++        **kwargs,
++    ) -> "IterableDataset":
++        """Create an IterableDataset from Excel workbook(s).
++
++        Args:
++            path_or_paths (`path-like` or list of `path-like`):
++                Path(s) of the Excel workbook(s) (`.xlsx`, `.xlsm`, `.xls`).
++            split ([`NamedSplit`], *optional*):
++                Split name to be assigned to the dataset.
++            features ([`Features`], *optional*):
++                Dataset features.
++            keep_in_memory (`bool`, defaults to `False`):
++                Whether to copy the data in-memory.
++            **kwargs (additional keyword arguments):
++                Keyword arguments to be passed to [`pandas.read_excel`],
++                such as `sheet_name` to select the worksheet to read.
++
++        Returns:
++            [`IterableDataset`]
++
++        Example:
++
++        ```py
++        >>> ds = IterableDataset.from_excel('path/to/dataset.xlsx')
++        ```
++        """
++        # Dynamic import to avoid circular dependency
++        from .io.excel import ExcelDatasetReader
++
++        return ExcelDatasetReader(
++            path_or_paths,
++            split=split,
++            features=features,
++            keep_in_memory=keep_in_memory,
++            streaming=True,
++            **kwargs,
++        ).read()
++
+     @staticmethod
+     def from_json(
+         path_or_paths: Union[PathLike, list[PathLike]],
+diff --git a/src/datasets/packaged_modules/__init__.py b/src/datasets/packaged_modules/__init__.py
+index 0de63b9..bdb46d9 100644
+--- a/src/datasets/packaged_modules/__init__.py
++++ b/src/datasets/packaged_modules/__init__.py
+@@ -10,6 +10,7 @@ from .cache import cache
+ from .conll import conll
+ from .csv import csv
+ from .eval import eval
++from .excel import excel
+ from .hdf5 import hdf5
+ from .iceberg import iceberg
+ from .imagefolder import imagefolder
+@@ -63,6 +64,7 @@ _PACKAGED_DATASETS_MODULES = {
+     "lance": (lance.__name__, _hash_python_lines(inspect.getsource(lance).splitlines())),
+     "tsfile": (tsfile.__name__, _hash_python_lines(inspect.getsource(tsfile).splitlines())),
+     "iceberg": (iceberg.__name__, _hash_python_lines(inspect.getsource(iceberg).splitlines())),
++    "excel": (excel.__name__, _hash_python_lines(inspect.getsource(excel).splitlines())),
+ }
+ 
+ # get importable module names and hash for caching
+@@ -99,6 +101,9 @@ _EXTENSION_TO_MODULE: dict[str, tuple[str, dict]] = {
+     ".eval": ("eval", {}),
+     ".lance": ("lance", {}),
+     ".tsfile": ("tsfile", {}),
++    ".xlsx": ("excel", {}),
++    ".xlsm": ("excel", {}),
++    ".xls": ("excel", {}),
+ }
+ _EXTENSION_TO_MODULE.update({ext: ("imagefolder", {}) for ext in imagefolder.ImageFolder.EXTENSIONS})
+ _EXTENSION_TO_MODULE.update({ext.upper(): ("imagefolder", {}) for ext in imagefolder.ImageFolder.EXTENSIONS})
+diff --git a/src/datasets/packaged_modules/excel/__init__.py b/src/datasets/packaged_modules/excel/__init__.py
+new file mode 100644
+index 0000000..69655aa
+--- /dev/null
++++ b/src/datasets/packaged_modules/excel/__init__.py
+@@ -0,0 +1,4 @@
++from .excel import Excel, ExcelConfig
++
++
++__all__ = ["Excel", "ExcelConfig"]
+diff --git a/src/datasets/packaged_modules/excel/excel.py b/src/datasets/packaged_modules/excel/excel.py
+new file mode 100644
+index 0000000..066b328
+--- /dev/null
++++ b/src/datasets/packaged_modules/excel/excel.py
+@@ -0,0 +1,219 @@
++from dataclasses import dataclass
++from typing import Any, Callable, Optional, Union
++
++import pandas as pd
++import pyarrow as pa
++
++import datasets
++import datasets.config
++from datasets.builder import Key
++from datasets.features.features import require_storage_cast
++from datasets.table import table_cast
++
++
++logger = datasets.utils.logging.get_logger(__name__)
++
++# Parameters of `pandas.read_excel` that must not be passed explicitly when they
++# are left at their default value, either because they have no default value in
++# the pandas signature or because passing them changes the parsing behaviour.
++_PANDAS_READ_EXCEL_NO_DEFAULT_PARAMETERS = ["names", "converters", "true_values", "false_values", "na_values"]
++
++# Parameters of `pandas.read_excel` that this config forwards when they are set.
++# Keep this list in sync with the signature of `pandas.read_excel` for the
++# supported pandas versions (2.x). Note that we cannot introspect the signature
++# at runtime because `datasets.streaming` monkeypatches `pandas.read_excel`
++# with a generic `(*args, **kwargs)` wrapper.
++_PANDAS_READ_EXCEL_SUPPORTED_PARAMETERS = [
++    "sheet_name",
++    "header",
++    "names",
++    "index_col",
++    "usecols",
++    "skiprows",
++    "nrows",
++    "na_values",
++    "keep_default_na",
++    "na_filter",
++    "converters",
++    "true_values",
++    "false_values",
++    "thousands",
++    "decimal",
++    "comment",
++    "engine",
++]
++
++
++@dataclass
++class ExcelConfig(datasets.BuilderConfig):
++    """BuilderConfig for Excel workbooks.
++
++    The parameters mirror the ones of `pandas.read_excel` so that users can
++    transfer their existing spreadsheet loading code to `datasets` with no
++    semantic change. Unless documented otherwise, every parameter is forwarded
++    verbatim to `pandas.read_excel`.
++    """
++
++    sheet_name: Optional[Union[str, int, list[Union[str, int]]]] = 0
++    """Worksheet(s) to read, by name or 0-based index. Defaults to the first sheet.
++    Like in `pandas.read_excel`, a list of names/indices reads several sheets and
++    `None` reads all of them; the rows of the selected sheets are then concatenated
++    in the order of the selection (workbook order for `None`)."""
++
++    header: Optional[Union[int, list[int]]] = 0
++    """Row (0-indexed) to use for the column names of the parsed worksheet."""
++
++    names: Optional[list[str]] = None
++    """List of column names to use, overriding the ones found in the worksheet."""
++
++    column_names: Optional[list[str]] = None
++    """Deprecated alias of `names`, kept for consistency with the other packaged modules."""
++
++    index_col: Optional[Union[int, str, list[int], list[str]]] = None
++    """Column(s) to use as the row labels of the resulting table."""
++
++    usecols: Optional[Union[str, list[int], list[str], Callable[[str], bool]]] = None
++    """Subset of columns to select from the worksheet."""
++
++    skiprows: Optional[Union[int, list[int], Callable[[int], bool]]] = None
++    """Rows to skip at the beginning of the worksheet."""
++
++    nrows: Optional[int] = None
++    """Number of rows to parse, starting from the first non-skipped data row."""
++
++    na_values: Optional[Any] = None
++    """Additional values to recognize as missing values."""
++
++    keep_default_na: bool = True
++    """Whether to include the default missing value markers when parsing."""
++
++    na_filter: bool = True
++    """Whether to detect missing value markers at all."""
++
++    converters: Optional[dict[Union[int, str], Callable[[Any], Any]]] = None
++    """Functions to apply to the values of specific columns."""
++
++    true_values: Optional[list] = None
++    """Values to recognize as `True`."""
++
++    false_values: Optional[list] = None
++    """Values to recognize as `False`."""
++
++    thousands: Optional[str] = None
++    """Thousands separator for numeric values stored as text."""
++
++    decimal: str = "."
++    """Character to recognize as decimal point for numeric values stored as text."""
++
++    comment: Optional[str] = None
++    """Character indicating that the remainder of a cell should not be parsed."""
++
++    engine: Optional[str] = None
++    """Excel reader engine to use. Defaults to the engine `pandas` picks for the file extension."""
++
++    features: Optional[datasets.Features] = None
++    """Cast the parsed table to these features instead of the inferred ones."""
++
++    chunksize: int = 10_000
++    """Number of rows per yielded batch when generating the dataset (not forwarded to pandas)."""
++
++    def __post_init__(self):
++        super().__post_init__()
++        if self.column_names is not None:
++            self.names = self.column_names
++
++    @property
++    def pd_read_excel_kwargs(self):
++        pd_read_excel_kwargs = {
++            parameter: getattr(self, parameter)
++            for parameter in _PANDAS_READ_EXCEL_SUPPORTED_PARAMETERS
++            if getattr(self, parameter) is not None
++        }
++        # `sheet_name=None` (read all sheets) and `header=None` (no header row) are
++        # both meaningful, they must always be forwarded
++        pd_read_excel_kwargs["sheet_name"] = self.sheet_name
++        pd_read_excel_kwargs["header"] = self.header
++        # Some kwargs must not be passed if they don't have a default value in pandas.
++        for pd_read_excel_parameter in _PANDAS_READ_EXCEL_NO_DEFAULT_PARAMETERS:
++            if pd_read_excel_kwargs.get(pd_read_excel_parameter) == getattr(ExcelConfig(), pd_read_excel_parameter):
++                pd_read_excel_kwargs.pop(pd_read_excel_parameter, None)
++        return pd_read_excel_kwargs
++
++
++class Excel(datasets.ArrowBasedBuilder):
++    """Arrow builder for Excel workbooks (`.xlsx`, `.xlsm`, `.xls` and friends)."""
++
++    BUILDER_CONFIG_CLASS = ExcelConfig
++
++    def _info(self):
++        return datasets.DatasetInfo(features=self.config.features)
++
++    def _split_generators(self, dl_manager):
++        """We handle string, list and dicts in datafiles"""
++        if not self.config.data_files:
++            raise ValueError(f"At least one data file must be specified, but got data_files={self.config.data_files}")
++        # Note: no `extract_on_the_fly` here — `.xlsx`/`.xlsm` workbooks are zip
++        # containers themselves and must be handed to the Excel reader as-is.
++        base_data_files = dl_manager.download(self.config.data_files)
++        splits = []
++        for split_name, files in base_data_files.items():
++            files_iterables = [dl_manager.iter_files(file) for file in files]
++            splits.append(
++                datasets.SplitGenerator(
++                    name=split_name,
++                    gen_kwargs={"files_iterables": files_iterables, "base_files": files},
++                )
++            )
++        return splits
++
++    def _cast_table(self, pa_table: pa.Table) -> pa.Table:
++        if self.config.features is not None:
++            schema = self.config.features.arrow_schema
++            if all(not require_storage_cast(feature) for feature in self.config.features.values()):
++                # cheaper cast
++                pa_table = pa.Table.from_arrays([pa_table[field.name] for field in schema], schema=schema)
++            else:
++                # more expensive cast; allows str <-> int/float or str to Audio for example
++                pa_table = table_cast(pa_table, schema)
++        return pa_table
++
++    def _generate_shards(self, base_files, files_iterables):
++        yield from base_files
++
++    def _read_excel_frames(self, file, dtype) -> list[pd.DataFrame]:
++        """Read a workbook and return the selected sheet(s) as a list of DataFrames.
++
++        A single sheet selection gives a one-element list. When several sheets are
++        selected (`sheet_name` given as a list, or `None` for the whole workbook),
++        `pandas.read_excel` returns an ordered dict of DataFrames and the sheets are
++        returned in selection order (workbook order for `None`).
++        """
++        result = pd.read_excel(file, dtype=dtype, **self.config.pd_read_excel_kwargs)
++        if isinstance(result, dict):
++            return list(result.values())
++        return [result]
++
++    def _generate_tables(self, base_files, files_iterables):
++        schema = self.config.features.arrow_schema if self.config.features else None
++        # dtype allows reading an int column as str for example
++        dtype = (
++            {
++                name: dtype.to_pandas_dtype() if not require_storage_cast(feature) else object
++                for name, dtype, feature in zip(schema.names, schema.types, self.config.features.values())
++            }
++            if schema is not None
++            else None
++        )
++        for shard_idx, files_iterable in enumerate(files_iterables):
++            for file in files_iterable:
++                try:
++                    dataframes = self._read_excel_frames(file, dtype)
++                except ValueError as e:
++                    logger.error(f"Failed to read file '{file}' with error {type(e)}: {e}")
++                    raise
++                batch_idx = 0
++                for df in dataframes:
++                    for start in range(0, max(len(df), 1), self.config.chunksize):
++                        pa_table = pa.Table.from_pandas(df.iloc[start : start + self.config.chunksize])
++                        yield Key(shard_idx, batch_idx), self._cast_table(pa_table)
++                        batch_idx += 1
+diff --git a/src/datasets/utils/file_utils.py b/src/datasets/utils/file_utils.py
+index 3d37c34..61bd9ed 100644
+--- a/src/datasets/utils/file_utils.py
++++ b/src/datasets/utils/file_utils.py
+@@ -469,6 +469,12 @@ BASE_KNOWN_EXTENSIONS = [
+     "rel",
+     "xml",
+     "arrow",
++    # Excel workbook containers are ZIP archives under the hood; register their extensions
++    # here so `_get_extraction_protocol` short-circuits on the extension check and does not
++    # sniff the PK\x03\x04 magic and mistakenly wrap them in a "zip://" protocol.
++    "xlsx",
++    "xlsm",
++    "xls",
+ ]
+ COMPRESSION_EXTENSION_TO_PROTOCOL = {
+     # single file compression
+diff --git a/tests/io/test_excel.py b/tests/io/test_excel.py
+new file mode 100644
+index 0000000..2e39a05
+--- /dev/null
++++ b/tests/io/test_excel.py
+@@ -0,0 +1,726 @@
++import datetime
++import io as stdlib_io
++import os
++
++import fsspec
++import openpyxl
++import pytest
++
++from datasets import Dataset, DatasetDict, Features, IterableDataset, NamedSplit, Value
++from datasets.io.excel import ExcelDatasetReader, ExcelDatasetWriter
++
++from ..utils import assert_arrow_memory_doesnt_increase, assert_arrow_memory_increases
++
++
++def _write_workbook(path, rows, sheet_name=None):
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    if sheet_name is not None:
++        worksheet.title = sheet_name
++    for row in rows:
++        worksheet.append(row)
++    workbook.save(path)
++    return str(path)
++
++
++@pytest.fixture
++def excel_path(tmp_path):
++    return _write_workbook(
++        tmp_path / "dataset.xlsx",
++        [
++            ["col_1", "col_2", "col_3"],
++            [1, 2, 0.5],
++            [2, 3, 1.5],
++            [3, 4, 2.5],
++            [4, 5, 3.5],
++        ],
++    )
++
++
++@pytest.fixture
++def excel_path_multi_sheet(tmp_path):
++    filename = tmp_path / "multi.xlsx"
++    workbook = openpyxl.Workbook()
++    first = workbook.active
++    first.title = "first"
++    first.append(["a"])
++    first.append([0])
++    second = workbook.create_sheet("second")
++    second.append(["col_1", "col_2", "col_3"])
++    for i in range(4):
++        second.append([i + 1, i + 2, i + 0.5])
++    workbook.save(filename)
++    return str(filename)
++
++
++@pytest.fixture
++def excel_path_with_nulls(tmp_path):
++    return _write_workbook(
++        tmp_path / "with_nulls.xlsx",
++        [
++            ["name", "score"],
++            ["alice", 1.5],
++            ["bob", None],
++            [None, 2.5],
++        ],
++    )
++
++
++def _check_excel_dataset(dataset, expected_features):
++    assert isinstance(dataset, Dataset)
++    assert dataset.num_rows == 4
++    assert dataset.num_columns == 3
++    assert dataset.column_names == ["col_1", "col_2", "col_3"]
++    for feature, expected_dtype in expected_features.items():
++        assert dataset.features[feature].dtype == expected_dtype
++
++
++@pytest.mark.parametrize("keep_in_memory", [False, True])
++def test_dataset_from_excel_keep_in_memory(keep_in_memory, excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    expected_features = {"col_1": "int64", "col_2": "int64", "col_3": "float64"}
++    with assert_arrow_memory_increases() if keep_in_memory else assert_arrow_memory_doesnt_increase():
++        dataset = ExcelDatasetReader(excel_path, cache_dir=cache_dir, keep_in_memory=keep_in_memory).read()
++    _check_excel_dataset(dataset, expected_features)
++
++
++@pytest.mark.parametrize(
++    "features",
++    [
++        None,
++        {"col_1": "string", "col_2": "int64", "col_3": "float64"},
++        {"col_1": "string", "col_2": "string", "col_3": "string"},
++        {"col_1": "int32", "col_2": "int32", "col_3": "float32"},
++    ],
++)
++def test_dataset_from_excel_features(features, excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    default_expected_features = {"col_1": "int64", "col_2": "int64", "col_3": "float64"}
++    expected_features = features.copy() if features else default_expected_features
++    features = (
++        Features({feature: Value(dtype) for feature, dtype in features.items()}) if features is not None else None
++    )
++    dataset = ExcelDatasetReader(excel_path, features=features, cache_dir=cache_dir).read()
++    _check_excel_dataset(dataset, expected_features)
++
++
++@pytest.mark.parametrize("split", [None, NamedSplit("train"), "train", "test"])
++def test_dataset_from_excel_split(split, excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    expected_features = {"col_1": "int64", "col_2": "int64", "col_3": "float64"}
++    dataset = ExcelDatasetReader(excel_path, cache_dir=cache_dir, split=split).read()
++    _check_excel_dataset(dataset, expected_features)
++    assert dataset.split == split if split else "train"
++
++
++@pytest.mark.parametrize("path_type", [str, list])
++def test_dataset_from_excel_path_type(path_type, excel_path, tmp_path):
++    if issubclass(path_type, str):
++        path = excel_path
++    elif issubclass(path_type, list):
++        path = [excel_path]
++    cache_dir = tmp_path / "cache"
++    expected_features = {"col_1": "int64", "col_2": "int64", "col_3": "float64"}
++    dataset = ExcelDatasetReader(path, cache_dir=cache_dir).read()
++    _check_excel_dataset(dataset, expected_features)
++
++
++def test_dataset_from_excel_sheet_name(excel_path_multi_sheet, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path_multi_sheet, cache_dir=cache_dir, sheet_name="second").read()
++    _check_excel_dataset(dataset, {"col_1": "int64", "col_2": "int64", "col_3": "float64"})
++
++
++def test_dataset_from_excel_nulls(excel_path_with_nulls, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path_with_nulls, cache_dir=cache_dir).read()
++    assert dataset[:] == {
++        "name": ["alice", "bob", None],
++        "score": [1.5, None, 2.5],
++    }
++
++
++def test_dataset_from_excel_streaming(excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path, cache_dir=cache_dir, streaming=True).read()
++    assert isinstance(dataset, IterableDataset)
++    rows = list(dataset)
++    assert len(rows) == 4
++    assert rows[0] == {"col_1": 1, "col_2": 2, "col_3": 0.5}
++
++
++def _check_excel_datasetdict(dataset_dict, expected_features, splits=("train",)):
++    assert isinstance(dataset_dict, DatasetDict)
++    for split in splits:
++        dataset = dataset_dict[split]
++        assert dataset.num_rows == 4
++        assert dataset.num_columns == 3
++        assert dataset.column_names == ["col_1", "col_2", "col_3"]
++        for feature, expected_dtype in expected_features.items():
++            assert dataset.features[feature].dtype == expected_dtype
++
++
++def test_datasetdict_from_excel_splits(excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    expected_features = {"col_1": "int64", "col_2": "int64", "col_3": "float64"}
++    dataset_dict = ExcelDatasetReader(
++        {"train": excel_path, "test": excel_path}, cache_dir=cache_dir
++    ).read()
++    _check_excel_datasetdict(dataset_dict, expected_features, splits=("train", "test"))
++
++
++def _check_excel_file(path, expected_rows, sheet_name="Sheet1", header=True):
++    workbook = openpyxl.load_workbook(path)
++    assert workbook.sheetnames == [sheet_name]
++    worksheet = workbook[sheet_name]
++    rows = [list(row) for row in worksheet.iter_rows(values_only=True)]
++    if header:
++        assert rows[0] == ["col_1", "col_2", "col_3"]
++        rows = rows[1:]
++    assert rows == expected_rows
++
++
++def test_dataset_to_excel(excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path, cache_dir=cache_dir).read()
++    output = tmp_path / "output.xlsx"
++    written = ExcelDatasetWriter(dataset, output).write()
++    assert written == 4
++    _check_excel_file(output, [[1, 2, 0.5], [2, 3, 1.5], [3, 4, 2.5], [4, 5, 3.5]])
++
++
++def test_dataset_to_excel_batch_size(excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path, cache_dir=cache_dir).read()
++    output = tmp_path / "output.xlsx"
++    written = ExcelDatasetWriter(dataset, output, batch_size=1).write()
++    assert written == 4
++    _check_excel_file(output, [[1, 2, 0.5], [2, 3, 1.5], [3, 4, 2.5], [4, 5, 3.5]])
++
++
++def test_dataset_to_excel_num_proc(excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path, cache_dir=cache_dir).read()
++    output = tmp_path / "output.xlsx"
++    written = ExcelDatasetWriter(dataset, output, batch_size=1, num_proc=2).write()
++    assert written == 4
++    _check_excel_file(output, [[1, 2, 0.5], [2, 3, 1.5], [3, 4, 2.5], [4, 5, 3.5]])
++
++
++def test_dataset_to_excel_sheet_name_and_header(excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path, cache_dir=cache_dir).read()
++    output = tmp_path / "output.xlsx"
++    written = ExcelDatasetWriter(dataset, output, sheet_name="export", header=False).write()
++    assert written == 4
++    _check_excel_file(
++        output,
++        [[1, 2, 0.5], [2, 3, 1.5], [3, 4, 2.5], [4, 5, 3.5]],
++        sheet_name="export",
++        header=False,
++    )
++
++
++def test_dataset_to_excel_index_not_supported(excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path, cache_dir=cache_dir).read()
++    output = tmp_path / "output.xlsx"
++    with pytest.raises(NotImplementedError):
++        ExcelDatasetWriter(dataset, output, index=True).write()
++
++
++def test_dataset_to_excel_fsspec(excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path, cache_dir=cache_dir).read()
++    output = tmp_path / "output_fsspec.xlsx"
++    with fsspec.open(f"file://{output}", "wb") as buffer:
++        written = ExcelDatasetWriter(dataset, buffer).write()
++    assert written == 4
++    _check_excel_file(output, [[1, 2, 0.5], [2, 3, 1.5], [3, 4, 2.5], [4, 5, 3.5]])
++
++
++def test_dataset_to_excel_null_cells(excel_path_with_nulls, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path_with_nulls, cache_dir=cache_dir).read()
++    output = tmp_path / "output.xlsx"
++    written = ExcelDatasetWriter(dataset, output).write()
++    assert written == 3
++    workbook = openpyxl.load_workbook(output)
++    worksheet = workbook["Sheet1"]
++    rows = [list(row) for row in worksheet.iter_rows(values_only=True)]
++    assert rows[0] == ["name", "score"]
++    assert rows[1] == ["alice", 1.5]
++    assert rows[2] == ["bob", None]
++    assert rows[3] == [None, 2.5]
++
++
++def test_dataset_to_excel_preserves_types(tmp_path):
++    dataset = Dataset.from_dict(
++        {
++            "name": ["alice", "bob"],
++            "age": [30, 25],
++            "score": [9.5, 7.25],
++            "active": [True, False],
++            "when": [datetime.datetime(2020, 1, 2, 3, 4, 5), datetime.datetime(2021, 6, 7, 8, 9, 10)],
++        }
++    )
++    output = tmp_path / "typed_output.xlsx"
++    written = dataset.to_excel(output)
++    assert written == 2
++    workbook = openpyxl.load_workbook(output)
++    worksheet = workbook["Sheet1"]
++    rows = [list(row) for row in worksheet.iter_rows(values_only=True)]
++    assert rows[0] == ["name", "age", "score", "active", "when"]
++    assert rows[1] == ["alice", 30, 9.5, True, datetime.datetime(2020, 1, 2, 3, 4, 5)]
++    assert rows[2] == ["bob", 25, 7.25, False, datetime.datetime(2021, 6, 7, 8, 9, 10)]
++    # numeric cells must be real numbers, not text
++    assert isinstance(worksheet["C2"].value, float)
++    assert isinstance(worksheet["B2"].value, int)
++    assert isinstance(worksheet["D2"].value, bool)
++
++
++def test_dataset_excel_round_trip(tmp_path):
++    dataset = Dataset.from_dict(
++        {
++            "col_1": list(range(50)),
++            "col_2": [f"row_{i}" for i in range(50)],
++            "col_3": [i / 4 for i in range(50)],
++        }
++    )
++    output = tmp_path / "round_trip.xlsx"
++    written = dataset.to_excel(str(output), batch_size=7)
++    assert written == 50
++    reloaded = Dataset.from_excel(str(output), cache_dir=tmp_path / "cache")
++    assert reloaded.num_rows == 50
++    assert reloaded.column_names == dataset.column_names
++
++
++def test_dataset_from_excel_api(excel_path, tmp_path):
++    dataset = Dataset.from_excel(excel_path, cache_dir=tmp_path / "cache")
++    _check_excel_dataset(dataset, {"col_1": "int64", "col_2": "int64", "col_3": "float64"})
++
++
++def test_datasetdict_from_excel_api(excel_path, tmp_path):
++    dataset_dict = DatasetDict.from_excel({"train": excel_path, "test": excel_path}, cache_dir=tmp_path / "cache")
++    _check_excel_datasetdict(
++        dataset_dict, {"col_1": "int64", "col_2": "int64", "col_3": "float64"}, splits=("train", "test")
++    )
++
++
++def test_dataset_to_excel_empty_dataset(tmp_path):
++    dataset = Dataset.from_dict({"col_1": [], "col_2": []})
++    output = tmp_path / "empty.xlsx"
++    written = dataset.to_excel(str(output))
++    assert written == 0
++    workbook = openpyxl.load_workbook(output)
++    worksheet = workbook["Sheet1"]
++    rows = [list(row) for row in worksheet.iter_rows(values_only=True)]
++    assert rows == [["col_1", "col_2"]]
++
++
++def test_dataset_to_excel_select_and_order(tmp_path):
++    dataset = Dataset.from_dict({"a": [1, 2, 3], "b": ["x", "y", "z"]}).select([2, 0, 1])
++    output = tmp_path / "reordered.xlsx"
++    written = dataset.to_excel(str(output))
++    assert written == 3
++    workbook = openpyxl.load_workbook(output)
++    worksheet = workbook["Sheet1"]
++    rows = [list(row) for row in worksheet.iter_rows(values_only=True)]
++    assert rows == [["a", "b"], [3, "z"], [1, "x"], [2, "y"]]
++
++
++@pytest.fixture
++def simple_dataset_dict():
++    return DatasetDict(
++        {
++            "train": Dataset.from_dict({"col_1": [1, 2, 3], "col_2": ["a", "b", "c"]}),
++            "validation": Dataset.from_dict({"col_1": [10, 20], "col_2": ["x", "y"]}),
++            "test": Dataset.from_dict({"col_1": [100], "col_2": ["z"]}),
++        }
++    )
++
++
++def test_datasetdict_to_excel(simple_dataset_dict, tmp_path):
++    output = tmp_path / "dict_output.xlsx"
++    written = simple_dataset_dict.to_excel(str(output))
++    assert written == {"train": 3, "validation": 2, "test": 1}
++    workbook = openpyxl.load_workbook(output)
++    assert workbook.sheetnames == ["train", "validation", "test"]
++    train_rows = [list(row) for row in workbook["train"].iter_rows(values_only=True)]
++    assert train_rows == [["col_1", "col_2"], [1, "a"], [2, "b"], [3, "c"]]
++    validation_rows = [list(row) for row in workbook["validation"].iter_rows(values_only=True)]
++    assert validation_rows == [["col_1", "col_2"], [10, "x"], [20, "y"]]
++    test_rows = [list(row) for row in workbook["test"].iter_rows(values_only=True)]
++    assert test_rows == [["col_1", "col_2"], [100, "z"]]
++
++
++def test_datasetdict_to_excel_buffer(simple_dataset_dict):
++    buffer = stdlib_io.BytesIO()
++    written = simple_dataset_dict.to_excel(buffer)
++    assert written == {"train": 3, "validation": 2, "test": 1}
++    buffer.seek(0)
++    workbook = openpyxl.load_workbook(buffer)
++    assert workbook.sheetnames == ["train", "validation", "test"]
++
++
++def test_datasetdict_to_excel_header_false(simple_dataset_dict, tmp_path):
++    output = tmp_path / "dict_no_header.xlsx"
++    written = simple_dataset_dict.to_excel(str(output), header=False)
++    assert written == {"train": 3, "validation": 2, "test": 1}
++    workbook = openpyxl.load_workbook(output)
++    train_rows = [list(row) for row in workbook["train"].iter_rows(values_only=True)]
++    assert train_rows[0] == [1, "a"]
++
++
++def test_datasetdict_to_excel_index_not_supported(simple_dataset_dict, tmp_path):
++    output = tmp_path / "dict_index.xlsx"
++    with pytest.raises(NotImplementedError):
++        simple_dataset_dict.to_excel(str(output), index=True)
++
++
++def test_datasetdict_to_excel_batch_size(simple_dataset_dict, tmp_path):
++    output = tmp_path / "dict_batched.xlsx"
++    written = simple_dataset_dict.to_excel(str(output), batch_size=1)
++    assert written == {"train": 3, "validation": 2, "test": 1}
++    workbook = openpyxl.load_workbook(output)
++    train_rows = [list(row) for row in workbook["train"].iter_rows(values_only=True)]
++    assert train_rows == [["col_1", "col_2"], [1, "a"], [2, "b"], [3, "c"]]
++
++
++def test_datasetdict_to_excel_mixed_types(tmp_path):
++    dataset_dict = DatasetDict(
++        {
++            "numbers": Dataset.from_dict({"value": [1, 2, 3]}),
++            "text": Dataset.from_dict({"word": ["hello", "world"]}),
++        }
++    )
++    output = tmp_path / "mixed_dict.xlsx"
++    written = dataset_dict.to_excel(str(output))
++    assert written == {"numbers": 3, "text": 2}
++    workbook = openpyxl.load_workbook(output)
++    assert isinstance(workbook["numbers"]["A2"].value, int)
++    assert workbook["text"]["A2"].value == "hello"
++
++
++def test_datasetdict_excel_round_trip_per_sheet(simple_dataset_dict, tmp_path):
++    output = tmp_path / "dict_round_trip.xlsx"
++    simple_dataset_dict.to_excel(str(output))
++    cache_dir = tmp_path / "cache"
++    for split in ["train", "validation", "test"]:
++        reloaded = Dataset.from_excel(str(output), sheet_name=split, cache_dir=cache_dir)
++        assert reloaded[:] == simple_dataset_dict[split][:]
++
++
++def test_datasetdict_to_excel_empty_split(tmp_path):
++    dataset_dict = DatasetDict(
++        {
++            "train": Dataset.from_dict({"col_1": [1]}),
++            "empty": Dataset.from_dict({"col_1": []}),
++        }
++    )
++    output = tmp_path / "with_empty.xlsx"
++    written = dataset_dict.to_excel(str(output))
++    assert written == {"train": 1, "empty": 0}
++    workbook = openpyxl.load_workbook(output)
++    assert workbook.sheetnames == ["train", "empty"]
++    empty_rows = [list(row) for row in workbook["empty"].iter_rows(values_only=True)]
++    assert empty_rows == [["col_1"]]
++
++
++def test_dataset_to_excel_storage_options(tmp_path):
++    dataset = Dataset.from_dict({"a": [1, 2]})
++    output = tmp_path / "storage_options.xlsx"
++    written = dataset.to_excel(str(output), storage_options={})
++    assert written == 2
++    workbook = openpyxl.load_workbook(output)
++    rows = [list(row) for row in workbook["Sheet1"].iter_rows(values_only=True)]
++    assert rows == [["a"], [1], [2]]
++
++
++def test_dataset_to_excel_num_proc_invalid(tmp_path):
++    dataset = Dataset.from_dict({"a": [1, 2]})
++    output = tmp_path / "invalid_num_proc.xlsx"
++    with pytest.raises(ValueError, match="num_proc"):
++        dataset.to_excel(str(output), num_proc=0)
++
++
++def test_dataset_to_excel_large_preserves_order(tmp_path):
++    values = list(range(1000))
++    dataset = Dataset.from_dict({"idx": values})
++    output = tmp_path / "large.xlsx"
++    written = dataset.to_excel(str(output), batch_size=33, num_proc=2)
++    assert written == 1000
++    workbook = openpyxl.load_workbook(output, read_only=True)
++    worksheet = workbook["Sheet1"]
++    rows = list(worksheet.iter_rows(values_only=True))
++    assert rows[0] == ("idx",)
++    assert [row[0] for row in rows[1:]] == values
++
++
++def test_dataset_from_excel_all_sheets(tmp_path):
++    filename = tmp_path / "all_sheets.xlsx"
++    workbook = openpyxl.Workbook()
++    first = workbook.active
++    first.title = "part1"
++    first.append(["col_1", "col_2", "col_3"])
++    for i in range(2):
++        first.append([i + 1, i + 2, i + 0.5])
++    second = workbook.create_sheet("part2")
++    second.append(["col_1", "col_2", "col_3"])
++    for i in range(2):
++        second.append([i + 101, i + 102, i + 0.5])
++    workbook.save(filename)
++    dataset = Dataset.from_excel(str(filename), sheet_name=None, cache_dir=tmp_path / "cache")
++    assert dataset.num_rows == 4
++    assert dataset[:]["col_1"] == [1, 2, 101, 102]
++
++
++def test_dataset_from_excel_keep_in_memory_api(excel_path, tmp_path):
++    dataset = Dataset.from_excel(excel_path, cache_dir=tmp_path / "cache", keep_in_memory=True)
++    _check_excel_dataset(dataset, {"col_1": "int64", "col_2": "int64", "col_3": "float64"})
++
++
++def test_excel_writer_returns_row_count_not_bytes(excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path, cache_dir=cache_dir).read()
++    output = tmp_path / "count.xlsx"
++    written = ExcelDatasetWriter(dataset, output).write()
++    assert isinstance(written, int)
++    assert written == dataset.num_rows
++
++
++def test_dataset_to_excel_write_only_valid_xlsx(tmp_path):
++    import zipfile
++
++    dataset = Dataset.from_dict({"a": [1], "b": ["x"]})
++    output = tmp_path / "valid.xlsx"
++    dataset.to_excel(str(output))
++    assert zipfile.is_zipfile(output)
++    with zipfile.ZipFile(output) as archive:
++        assert "[Content_Types].xml" in archive.namelist()
++
++
++def test_dataset_to_excel_strips_illegal_characters(tmp_path):
++    dataset = Dataset.from_dict(
++        {
++            "text": ["clean", "with\x00null", "bell\x07sound", "tab\there", "new\nline"],
++        }
++    )
++    output = tmp_path / "illegal_chars.xlsx"
++    written = dataset.to_excel(str(output))
++    assert written == 5
++    workbook = openpyxl.load_workbook(output)
++    worksheet = workbook["Sheet1"]
++    values = [row[0] for row in worksheet.iter_rows(min_row=2, values_only=True)]
++    assert values == ["clean", "withnull", "bellsound", "tab\there", "new\nline"]
++
++
++def test_dataset_to_excel_timezone_aware_timestamps(tmp_path):
++    dt = datetime
++
++    dataset = Dataset.from_dict(
++        {
++            "when": [
++                dt.datetime(2020, 1, 2, 12, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=2))),
++                dt.datetime(2021, 6, 7, 8, 30, 0, tzinfo=dt.timezone.utc),
++            ]
++        }
++    )
++    assert dataset.features["when"].dtype.startswith("timestamp")
++    output = tmp_path / "tz_aware.xlsx"
++    written = dataset.to_excel(str(output))
++    assert written == 2
++    workbook = openpyxl.load_workbook(output)
++    worksheet = workbook["Sheet1"]
++    values = [row[0] for row in worksheet.iter_rows(min_row=2, values_only=True)]
++    assert values == [
++        dt.datetime(2020, 1, 2, 10, 0, 0),
++        dt.datetime(2021, 6, 7, 8, 30, 0),
++    ]
++
++
++def test_dataset_to_excel_unicode(tmp_path):
++    dataset = Dataset.from_dict(
++        {
++            "english": ["hello", "world"],
++            "chinese": ["你好", "世界"],
++            "emoji": ["🎉", "🚀"],
++        }
++    )
++    output = tmp_path / "unicode.xlsx"
++    dataset.to_excel(str(output))
++    reloaded = Dataset.from_excel(str(output), cache_dir=tmp_path / "cache")
++    assert reloaded[:] == dataset[:]
++
++
++def test_dataset_to_excel_long_strings(tmp_path):
++    long_text = "lorem ipsum " * 3000
++    dataset = Dataset.from_dict({"text": [long_text[:32000], "short"]})
++    output = tmp_path / "long_strings.xlsx"
++    dataset.to_excel(str(output))
++    reloaded = Dataset.from_excel(str(output), cache_dir=tmp_path / "cache")
++    assert reloaded[0]["text"] == long_text[:32000]
++    assert reloaded[1]["text"] == "short"
++
++
++def test_dataset_from_excel_legacy_xls(tmp_path):
++    xlwt = pytest.importorskip("xlwt")
++    workbook = xlwt.Workbook()
++    worksheet = workbook.add_sheet("data")
++    worksheet.write(0, 0, "col_1")
++    worksheet.write(0, 1, "col_2")
++    worksheet.write(1, 0, 1)
++    worksheet.write(1, 1, "a")
++    worksheet.write(2, 0, 2)
++    worksheet.write(2, 1, "b")
++    filename = str(tmp_path / "legacy.xls")
++    workbook.save(filename)
++    dataset = Dataset.from_excel(filename, cache_dir=tmp_path / "cache")
++    assert dataset.column_names == ["col_1", "col_2"]
++    assert dataset[:] == {"col_1": [1, 2], "col_2": ["a", "b"]}
++
++
++def test_load_dataset_legacy_xls(tmp_path):
++    xlwt = pytest.importorskip("xlwt")
++    workbook = xlwt.Workbook()
++    worksheet = workbook.add_sheet("data")
++    worksheet.write(0, 0, "col_1")
++    worksheet.write(1, 0, 42)
++    filename = str(tmp_path / "legacy_load.xls")
++    workbook.save(filename)
++    from datasets import load_dataset
++
++    dataset = load_dataset("excel", data_files=filename, split="train", cache_dir=tmp_path / "cache")
++    assert dataset[:] == {"col_1": [42]}
++
++
++def test_legacy_xls_streaming(tmp_path):
++    xlwt = pytest.importorskip("xlwt")
++    workbook = xlwt.Workbook()
++    worksheet = workbook.add_sheet("data")
++    worksheet.write(0, 0, "col_1")
++    for i in range(5):
++        worksheet.write(i + 1, 0, i * 7)
++    filename = str(tmp_path / "legacy_streaming.xls")
++    workbook.save(filename)
++    from datasets import load_dataset
++
++    dataset = load_dataset("excel", data_files=filename, split="train", streaming=True)
++    assert [row["col_1"] for row in dataset] == [0, 7, 14, 21, 28]
++
++
++@pytest.fixture
++def excel_files_two_parts(tmp_path):
++    paths = []
++    for shard, offset in enumerate([0, 100]):
++        paths.append(
++            _write_workbook(
++                tmp_path / f"part_{shard}.xlsx",
++                [["col_1", "col_2"]] + [[offset + i, (offset + i) * 10] for i in range(3)],
++            )
++        )
++    return paths
++
++
++def test_dataset_from_excel_num_proc_multiple_files(excel_files_two_parts, tmp_path):
++    dataset = Dataset.from_excel(excel_files_two_parts, cache_dir=tmp_path / "cache", num_proc=2)
++    assert dataset.num_rows == 6
++    assert dataset[:]["col_1"] == [0, 1, 2, 100, 101, 102]
++
++
++def test_dataset_from_excel_list_of_paths(excel_files_two_parts, tmp_path):
++    dataset = Dataset.from_excel(excel_files_two_parts, cache_dir=tmp_path / "cache")
++    assert dataset.num_rows == 6
++    assert dataset[:]["col_1"] == [0, 1, 2, 100, 101, 102]
++
++
++def test_datasetdict_from_excel_keep_in_memory(excel_path, tmp_path):
++    dataset_dict = DatasetDict.from_excel({"train": excel_path}, cache_dir=tmp_path / "cache", keep_in_memory=True)
++    assert isinstance(dataset_dict, DatasetDict)
++    assert dataset_dict["train"].num_rows == 4
++
++
++def test_excel_reader_invalid_num_proc(excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = ExcelDatasetReader(excel_path, cache_dir=cache_dir).read()
++    with pytest.raises(ValueError, match="num_proc"):
++        ExcelDatasetWriter(dataset, tmp_path / "out.xlsx", num_proc=-1)
++
++
++def test_dataset_from_excel_reuses_cache(excel_path, tmp_path):
++    cache_dir = tmp_path / "cache"
++    first = Dataset.from_excel(excel_path, cache_dir=cache_dir)
++    second = Dataset.from_excel(excel_path, cache_dir=cache_dir)
++    assert first.cache_files == second.cache_files
++    assert first[:] == second[:]
++
++
++def test_dataset_to_excel_column_subset(tmp_path):
++    dataset = Dataset.from_dict({"a": [1, 2], "b": ["x", "y"], "c": [0.5, 1.5]}).select_columns(["c", "a"])
++    output = tmp_path / "subset.xlsx"
++    written = dataset.to_excel(str(output))
++    assert written == 2
++    workbook = openpyxl.load_workbook(output)
++    rows = [list(row) for row in workbook["Sheet1"].iter_rows(values_only=True)]
++    assert rows == [["c", "a"], [0.5, 1], [1.5, 2]]
++
++
++def test_dataset_to_excel_sequence_column_serialized(tmp_path):
++    dataset = Dataset.from_dict({"tokens": [["a", "b"], ["c"]], "label": [0, 1]})
++    output = tmp_path / "sequences.xlsx"
++    written = dataset.to_excel(str(output))
++    assert written == 2
++    workbook = openpyxl.load_workbook(output)
++    rows = [list(row) for row in workbook["Sheet1"].iter_rows(values_only=True)]
++    assert rows[0] == ["tokens", "label"]
++    assert isinstance(rows[1][0], str)
++    assert "a" in rows[1][0] and "b" in rows[1][0]
++    assert rows[1][1] == 0
++
++
++def test_dataset_to_excel_single_row(tmp_path):
++    dataset = Dataset.from_dict({"a": [42]})
++    output = tmp_path / "single.xlsx"
++    written = dataset.to_excel(str(output))
++    assert written == 1
++    workbook = openpyxl.load_workbook(output)
++    rows = [list(row) for row in workbook["Sheet1"].iter_rows(values_only=True)]
++    assert rows == [["a"], [42]]
++
++
++def test_dataset_to_excel_batch_size_larger_than_dataset(tmp_path):
++    dataset = Dataset.from_dict({"a": [1, 2, 3]})
++    output = tmp_path / "large_batch.xlsx"
++    written = dataset.to_excel(str(output), batch_size=10_000)
++    assert written == 3
++    workbook = openpyxl.load_workbook(output)
++    rows = [list(row) for row in workbook["Sheet1"].iter_rows(values_only=True)]
++    assert rows == [["a"], [1], [2], [3]]
++
++
++def test_datasetdict_to_excel_then_load_dataset_all_sheets(simple_dataset_dict, tmp_path):
++    output = tmp_path / "dict_full_cycle.xlsx"
++    simple_dataset_dict.to_excel(str(output))
++    from datasets import load_dataset
++
++    for split in ["train", "validation", "test"]:
++        dataset = load_dataset(
++            "excel", data_files=str(output), sheet_name=split, split="train", cache_dir=tmp_path / "cache"
++        )
++        assert dataset[:] == simple_dataset_dict[split][:]
++
++
++def test_dataset_to_excel_header_false_round_trip_with_names(tmp_path):
++    dataset = Dataset.from_dict({"x": [1, 2], "y": ["a", "b"]})
++    output = tmp_path / "no_header.xlsx"
++    dataset.to_excel(str(output), header=False)
++    reloaded = Dataset.from_excel(str(output), header=None, names=["x", "y"], cache_dir=tmp_path / "cache")
++    assert reloaded[:] == dataset[:]
++
++
++def test_iterable_dataset_from_excel_streaming_family(excel_path):
++    dataset = IterableDataset.from_excel(excel_path)
++    assert isinstance(dataset, IterableDataset)
++    rows = list(dataset)
++    assert len(rows) == 4
++    assert rows[0] == {"col_1": 1, "col_2": 2, "col_3": 0.5}
+diff --git a/tests/packaged_modules/test_excel.py b/tests/packaged_modules/test_excel.py
+new file mode 100644
+index 0000000..1a11146
+--- /dev/null
++++ b/tests/packaged_modules/test_excel.py
+@@ -0,0 +1,954 @@
++import datetime
++
++import openpyxl
++import pytest
++
++import datasets
++from datasets import Features, IterableDataset, Value
++from datasets.data_files import DataFilesDict
++from datasets.packaged_modules import _EXTENSION_TO_MODULE, _PACKAGED_DATASETS_MODULES
++from datasets.packaged_modules.excel.excel import Excel, ExcelConfig
++
++
++@pytest.fixture
++def excel_file(tmp_path):
++    filename = tmp_path / "file.xlsx"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append(["header1", "header2"])
++    worksheet.append([1, 2])
++    worksheet.append([10, 20])
++    workbook.save(filename)
++    return str(filename)
++
++
++@pytest.fixture
++def excel_file_with_types(tmp_path):
++    filename = tmp_path / "typed.xlsx"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append(["name", "score", "active", "when"])
++    worksheet.append(["alice", 9.5, True, datetime.datetime(2020, 1, 2, 3, 4, 5)])
++    worksheet.append(["bob", 7.25, False, datetime.datetime(2021, 6, 7, 8, 9, 10)])
++    worksheet.append(["carol", 8.0, True, datetime.datetime(2022, 11, 12, 13, 14, 15)])
++    workbook.save(filename)
++    return str(filename)
++
++
++@pytest.fixture
++def excel_file_with_missing(tmp_path):
++    filename = tmp_path / "missing.xlsx"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append(["col_1", "col_2", "col_3"])
++    worksheet.append([1, 2.5, "a"])
++    worksheet.append([None, None, None])
++    worksheet.append([3, 7.5, "c"])
++    workbook.save(filename)
++    return str(filename)
++
++
++@pytest.fixture
++def excel_file_multi_sheet(tmp_path):
++    filename = tmp_path / "multi_sheet.xlsx"
++    workbook = openpyxl.Workbook()
++    first = workbook.active
++    first.title = "first"
++    first.append(["a", "b"])
++    first.append([1, 2])
++    second = workbook.create_sheet("second")
++    second.append(["x", "y"])
++    second.append([10, "ten"])
++    second.append([20, "twenty"])
++    third = workbook.create_sheet("third")
++    third.append(["only"])
++    third.append(["value"])
++    workbook.save(filename)
++    return str(filename)
++
++
++@pytest.fixture
++def excel_file_with_preamble(tmp_path):
++    filename = tmp_path / "preamble.xlsx"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append(["this file was exported by some tool"])
++    worksheet.append(["report date: 2023-01-01"])
++    worksheet.append(["header1", "header2"])
++    worksheet.append([1, 2])
++    worksheet.append([10, 20])
++    worksheet.append([100, 200])
++    workbook.save(filename)
++    return str(filename)
++
++
++@pytest.fixture
++def excel_file_no_header(tmp_path):
++    filename = tmp_path / "no_header.xlsx"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append([1, "a"])
++    worksheet.append([2, "b"])
++    workbook.save(filename)
++    return str(filename)
++
++
++@pytest.fixture
++def excel_file_with_na_markers(tmp_path):
++    filename = tmp_path / "na_markers.xlsx"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append(["col_1", "col_2"])
++    worksheet.append(["N/A", "yes"])
++    worksheet.append(["1", "no"])
++    worksheet.append(["unknown", "yes"])
++    workbook.save(filename)
++    return str(filename)
++
++
++@pytest.fixture
++def excel_file_boolean_text(tmp_path):
++    filename = tmp_path / "boolean_text.xlsx"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append(["flag"])
++    worksheet.append(["yes"])
++    worksheet.append(["no"])
++    worksheet.append(["true"])
++    worksheet.append(["false"])
++    workbook.save(filename)
++    return str(filename)
++
++
++@pytest.fixture
++def excel_files_same_schema(tmp_path):
++    paths = []
++    for shard, offset in enumerate([0, 100]):
++        filename = tmp_path / f"part_{shard}.xlsx"
++        workbook = openpyxl.Workbook()
++        worksheet = workbook.active
++        worksheet.append(["header1", "header2"])
++        for i in range(3):
++            worksheet.append([offset + i, (offset + i) * 10])
++        workbook.save(filename)
++        paths.append(str(filename))
++    return paths
++
++
++@pytest.fixture
++def excel_files_dict(tmp_path):
++    paths = {}
++    for split, offset in [("train", 0), ("test", 1000)]:
++        filename = tmp_path / f"{split}.xlsx"
++        workbook = openpyxl.Workbook()
++        worksheet = workbook.active
++        worksheet.append(["header1", "header2"])
++        worksheet.append([offset + 1, offset + 2])
++        workbook.save(filename)
++        paths[split] = str(filename)
++    return paths
++
++
++def _make_workbook(path, rows):
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    for row in rows:
++        worksheet.append(row)
++    workbook.save(path)
++    return str(path)
++
++
++def test_extension_to_module_registration():
++    assert _EXTENSION_TO_MODULE[".xlsx"][0] == "excel"
++    assert _EXTENSION_TO_MODULE[".xlsm"][0] == "excel"
++    assert _EXTENSION_TO_MODULE[".xls"][0] == "excel"
++
++
++def test_packaged_datasets_modules_registration():
++    assert "excel" in _PACKAGED_DATASETS_MODULES
++    module_name, module_hash = _PACKAGED_DATASETS_MODULES["excel"]
++    assert module_name.endswith("packaged_modules.excel.excel")
++    assert isinstance(module_hash, str) and len(module_hash) == 64
++
++
++def test_config_class_and_defaults():
++    config = ExcelConfig()
++    assert config.sheet_name == 0
++    assert config.header == 0
++    assert config.names is None
++    assert config.column_names is None
++    assert config.skiprows is None
++    assert config.nrows is None
++    assert config.keep_default_na is True
++    assert config.features is None
++    assert config.chunksize == 10_000
++
++
++def test_config_column_names_alias():
++    config = ExcelConfig(column_names=["a", "b"])
++    assert config.names == ["a", "b"]
++    config = ExcelConfig(names=["a", "b"])
++    assert config.column_names is None
++    assert config.names == ["a", "b"]
++
++
++def test_excel_builder_simple(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.num_rows == 2
++    assert dataset.column_names == ["header1", "header2"]
++    assert dataset.features == Features({"header1": Value("int64"), "header2": Value("int64")})
++    assert dataset[0] == {"header1": 1, "header2": 2}
++    assert dataset[1] == {"header1": 10, "header2": 20}
++
++
++def test_excel_builder_types(excel_file_with_types, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_types)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.features["name"] == Value("string")
++    assert dataset.features["score"] == Value("float64")
++    assert dataset.features["active"] == Value("bool")
++    row = dataset[0]
++    assert row["name"] == "alice"
++    assert row["score"] == 9.5
++    assert row["active"] is True
++    assert row["when"] == datetime.datetime(2020, 1, 2, 3, 4, 5)
++
++
++def test_excel_builder_missing_values(excel_file_with_missing, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_missing)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.num_rows == 3
++    assert dataset[1] == {"col_1": None, "col_2": None, "col_3": None}
++
++
++@pytest.mark.parametrize("sheet_name", ["second", 1])
++def test_excel_builder_sheet_selection(excel_file_multi_sheet, sheet_name, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_multi_sheet, sheet_name=sheet_name)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.column_names == ["x", "y"]
++    assert dataset.num_rows == 2
++    assert dataset[:] == {"x": [10, 20], "y": ["ten", "twenty"]}
++
++
++def test_excel_builder_default_sheet_is_first(excel_file_multi_sheet, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_multi_sheet)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.column_names == ["a", "b"]
++    assert dataset[:] == {"a": [1], "b": [2]}
++
++
++def test_excel_builder_skiprows(excel_file_with_preamble, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_preamble, skiprows=2)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.column_names == ["header1", "header2"]
++    assert dataset.num_rows == 3
++    assert dataset[:] == {"header1": [1, 10, 100], "header2": [2, 20, 200]}
++
++
++def test_excel_builder_skiprows_and_nrows(excel_file_with_preamble, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_preamble, skiprows=2, nrows=2)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.num_rows == 2
++    assert dataset[:] == {"header1": [1, 10], "header2": [2, 20]}
++
++
++def test_excel_builder_no_header_with_names(excel_file_no_header, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_no_header, header=None, names=["num", "char"])
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.column_names == ["num", "char"]
++    assert dataset[:] == {"num": [1, 2], "char": ["a", "b"]}
++
++
++def test_excel_builder_features_cast(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    features = Features({"header1": Value("int32"), "header2": Value("string")})
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file, features=features)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.features == features
++    assert dataset[:] == {"header1": [1, 10], "header2": ["2", "20"]}
++
++
++def test_excel_builder_multiple_files(excel_files_same_schema, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_files_same_schema)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.num_rows == 6
++
++
++def test_excel_builder_splits_dict(excel_files_dict, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_files_dict)
++    builder.download_and_prepare()
++    assert builder.info.splits.keys() == {"train", "test"}
++    train = builder.as_dataset(split="train")
++    test = builder.as_dataset(split="test")
++    assert train[:] == {"header1": [1], "header2": [2]}
++    assert test[:] == {"header1": [1001], "header2": [1002]}
++
++
++def test_excel_builder_streaming(excel_file_with_types, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_types)
++    dataset = builder.as_streaming_dataset(split="train")
++    assert isinstance(dataset, IterableDataset)
++    rows = list(dataset)
++    assert len(rows) == 3
++    assert rows[0]["name"] == "alice"
++
++
++def test_load_dataset_excel(excel_file_with_types, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = datasets.load_dataset("excel", data_files=excel_file_with_types, split="train", cache_dir=cache_dir)
++    assert dataset.num_rows == 3
++    assert dataset.column_names == ["name", "score", "active", "when"]
++
++
++def test_load_dataset_infers_excel_from_directory(excel_files_dict, tmp_path):
++    import shutil
++
++    data_dir = tmp_path / "data_dir"
++    data_dir.mkdir()
++    for split, path in excel_files_dict.items():
++        shutil.copy(path, data_dir / f"{split}.xlsx")
++    cache_dir = tmp_path / "cache"
++    dataset = datasets.load_dataset(str(data_dir), split="train", cache_dir=cache_dir)
++    assert dataset.num_rows == 1
++    assert dataset[0] == {"header1": 1, "header2": 2}
++
++
++def test_data_files_dict_filtering(excel_files_dict):
++    data_files = DataFilesDict(excel_files_dict)
++    assert set(data_files.keys()) == {"train", "test"}
++
++
++def test_module_to_extensions_mapping():
++    from datasets.packaged_modules import _MODULE_TO_EXTENSIONS
++
++    excel_extensions = _MODULE_TO_EXTENSIONS["excel"]
++    assert ".xlsx" in excel_extensions
++    assert ".xlsm" in excel_extensions
++    assert ".xls" in excel_extensions
++
++
++@pytest.mark.parametrize("extension", ["xlsx", "xlsm"])
++def test_excel_builder_supported_extensions(extension, tmp_path):
++    filename = tmp_path / f"workbook.{extension}"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append(["header1", "header2"])
++    worksheet.append([5, 50])
++    workbook.save(filename)
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=str(filename))
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[:] == {"header1": [5], "header2": [50]}
++
++
++def test_excel_config_repr():
++    config = ExcelConfig(sheet_name="data", skiprows=2)
++    representation = repr(config)
++    assert "sheet_name" in representation
++    assert "skiprows" in representation
++
++
++def test_excel_builder_all_sheets(tmp_path):
++    filename = tmp_path / "all_sheets.xlsx"
++    workbook = openpyxl.Workbook()
++    january = workbook.active
++    january.title = "january"
++    january.append(["day", "sales"])
++    january.append([1, 100])
++    january.append([2, 110])
++    february = workbook.create_sheet("february")
++    february.append(["day", "sales"])
++    february.append([1, 200])
++    march = workbook.create_sheet("march")
++    march.append(["day", "sales"])
++    march.append([1, 300])
++    march.append([2, 310])
++    march.append([3, 320])
++    workbook.save(filename)
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=str(filename), sheet_name=None)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[:] == {
++        "day": [1, 2, 1, 1, 2, 3],
++        "sales": [100, 110, 200, 300, 310, 320],
++    }
++
++
++def test_load_dataset_excel_streaming(excel_file_with_types, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = datasets.load_dataset(
++        "excel", data_files=excel_file_with_types, split="train", cache_dir=cache_dir, streaming=True
++    )
++    assert isinstance(dataset, IterableDataset)
++    assert [row["name"] for row in dataset] == ["alice", "bob", "carol"]
++
++
++def test_load_dataset_excel_data_files_dict(excel_files_dict, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset_dict = datasets.load_dataset("excel", data_files=excel_files_dict, cache_dir=cache_dir)
++    assert isinstance(dataset_dict, datasets.DatasetDict)
++    assert set(dataset_dict.keys()) == {"train", "test"}
++
++
++def test_excel_builder_class_label_features(tmp_path):
++    from datasets import ClassLabel
++
++    path = _make_workbook(
++        tmp_path / "labels.xlsx",
++        [["text", "label"], ["good movie", "pos"], ["bad movie", "neg"], ["great actors", "pos"]],
++    )
++    cache_dir = tmp_path / "cache"
++    features = Features({"text": Value("string"), "label": ClassLabel(names=["neg", "pos"])})
++    builder = Excel(cache_dir=cache_dir, data_files=path, features=features)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.features["label"].names == ["neg", "pos"]
++    assert dataset[:]["label"] == [1, 0, 1]
++
++
++def test_excel_builder_index_col(excel_file_with_types, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_types, index_col="name")
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    # like csv, the index column is preserved as a regular column
++    assert dataset.num_rows == 3
++    assert dataset[0]["score"] == 9.5
++
++
++def test_excel_builder_na_values(excel_file_with_na_markers, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_na_markers, na_values=["unknown"])
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[0]["col_1"] is None
++    assert dataset[2]["col_1"] is None
++
++
++def test_excel_builder_true_false_values(excel_file_boolean_text, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(
++        cache_dir=cache_dir,
++        data_files=excel_file_boolean_text,
++        true_values=["yes", "true"],
++        false_values=["no", "false"],
++    )
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.features["flag"] == Value("bool")
++
++
++def test_excel_builder_reuses_cache(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder1 = Excel(cache_dir=cache_dir, data_files=excel_file)
++    builder1.download_and_prepare()
++    builder2 = Excel(cache_dir=cache_dir, data_files=excel_file)
++    builder2.download_and_prepare()
++    assert builder1.cache_dir == builder2.cache_dir
++
++
++def test_excel_builder_map_after_load(excel_file_with_types, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_types)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    dataset = dataset.map(lambda example: {"double_score": example["score"] * 2})
++    assert dataset[:]["double_score"] == [19.0, 14.5, 16.0]
++
++
++def test_excel_builder_filter_after_load(excel_file_with_types, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_types)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    dataset = dataset.filter(lambda example: example["active"])
++    assert dataset.num_rows == 2
++    assert dataset[:]["name"] == ["alice", "carol"]
++
++
++def test_excel_builder_chunksize(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file, chunksize=1)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    # rows must be concatenated in order no matter how many batches were generated
++    assert dataset[:] == {"header1": [1, 10], "header2": [2, 20]}
++
++
++def test_excel_builder_many_rows_chunked(tmp_path):
++    workbook = openpyxl.Workbook(write_only=True)
++    worksheet = workbook.create_sheet("data")
++    worksheet.append(["idx", "squared"])
++    for i in range(205):
++        worksheet.append([i, i * i])
++    filename = tmp_path / "many_rows.xlsx"
++    workbook.save(filename)
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=str(filename), chunksize=50)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.num_rows == 205
++    assert dataset[0] == {"idx": 0, "squared": 0}
++    assert dataset[204] == {"idx": 204, "squared": 204 * 204}
++
++
++@pytest.fixture
++def excel_file_same_schema_sheets(tmp_path):
++    filename = tmp_path / "same_schema_sheets.xlsx"
++    workbook = openpyxl.Workbook()
++    january = workbook.active
++    january.title = "january"
++    january.append(["day", "sales"])
++    january.append([1, 100])
++    january.append([2, 110])
++    february = workbook.create_sheet("february")
++    february.append(["day", "sales"])
++    february.append([1, 200])
++    march = workbook.create_sheet("march")
++    march.append(["day", "sales"])
++    march.append([1, 300])
++    march.append([2, 310])
++    march.append([3, 320])
++    workbook.save(filename)
++    return str(filename)
++
++
++def test_excel_builder_sheet_list(excel_file_same_schema_sheets, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_same_schema_sheets, sheet_name=["march", "january"])
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    # sheets follow the order of the selection, not the workbook order
++    assert dataset[:] == {
++        "day": [1, 2, 3, 1, 2],
++        "sales": [300, 310, 320, 100, 110],
++    }
++
++
++def test_excel_builder_sheet_list_mixed_names_and_indices(excel_file_same_schema_sheets, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_same_schema_sheets, sheet_name=[1, "january"])
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[:] == {
++        "day": [1, 1, 2],
++        "sales": [200, 100, 110],
++    }
++
++
++def test_excel_builder_all_sheets_streaming(excel_file_same_schema_sheets, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_same_schema_sheets, sheet_name=None)
++    dataset = builder.as_streaming_dataset(split="train")
++    rows = list(dataset)
++    assert rows == [
++        {"day": 1, "sales": 100},
++        {"day": 2, "sales": 110},
++        {"day": 1, "sales": 200},
++        {"day": 1, "sales": 300},
++        {"day": 2, "sales": 310},
++        {"day": 3, "sales": 320},
++    ]
++
++
++def test_excel_builder_sheet_selection_changes_cache(excel_file_same_schema_sheets, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder_january = Excel(cache_dir=cache_dir, data_files=excel_file_same_schema_sheets, sheet_name="january")
++    builder_january.download_and_prepare()
++    builder_all = Excel(cache_dir=cache_dir, data_files=excel_file_same_schema_sheets, sheet_name=None)
++    builder_all.download_and_prepare()
++    january = builder_january.as_dataset(split="train")
++    all_sheets = builder_all.as_dataset(split="train")
++    assert january.num_rows == 2
++    assert all_sheets.num_rows == 6
++
++
++def test_excel_builder_requires_data_files(tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir)
++    with pytest.raises(ValueError, match="At least one data file must be specified"):
++        builder.download_and_prepare()
++
++
++def test_excel_builder_invalid_sheet_raises(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file, sheet_name="does_not_exist")
++    with pytest.raises(Exception):
++        builder.download_and_prepare()
++
++
++def test_excel_builder_nrows_zero(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file, nrows=1)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[:] == {"header1": [1], "header2": [2]}
++
++
++def test_excel_builder_skiprows_list(excel_file_with_preamble, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_preamble, skiprows=[0, 1, 4])
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[:] == {"header1": [1, 100], "header2": [2, 200]}
++
++
++@pytest.fixture
++def excel_file_unicode(tmp_path):
++    filename = tmp_path / "unicode.xlsx"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append(["city", "country"])
++    worksheet.append(["北京", "中国"])
++    worksheet.append(["São Paulo", "Brasil"])
++    worksheet.append(["Москва", "Россия"])
++    workbook.save(filename)
++    return str(filename)
++
++
++def test_excel_builder_unicode(excel_file_unicode, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_unicode)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[:] == {
++        "city": ["北京", "São Paulo", "Москва"],
++        "country": ["中国", "Brasil", "Россия"],
++    }
++
++
++def test_excel_builder_config_id_depends_on_kwargs(excel_file):
++    builder_default = Excel(data_files=excel_file)
++    builder_sheet = Excel(data_files=excel_file, sheet_name="other")
++    builder_skip = Excel(data_files=excel_file, skiprows=1)
++    builder_same = Excel(data_files=excel_file)
++    assert builder_default.config_id != builder_sheet.config_id
++    assert builder_default.config_id != builder_skip.config_id
++    assert builder_default.config_id == builder_same.config_id
++
++
++def test_load_dataset_excel_sheet_kwargs(excel_file_same_schema_sheets, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = datasets.load_dataset(
++        "excel",
++        data_files=excel_file_same_schema_sheets,
++        split="train",
++        cache_dir=cache_dir,
++        sheet_name="february",
++    )
++    assert dataset[:] == {"day": [1], "sales": [200]}
++
++
++def test_excel_builder_explicit_engine(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file, engine="openpyxl")
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[:] == {"header1": [1, 10], "header2": [2, 20]}
++
++
++def test_excel_builder_streaming_features_cast(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    features = Features({"header1": Value("string"), "header2": Value("int64")})
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file, features=features)
++    dataset = builder.as_streaming_dataset(split="train")
++    rows = list(dataset)
++    assert rows == [{"header1": "1", "header2": 2}, {"header1": "10", "header2": 20}]
++
++
++def test_excel_builder_usecols(excel_file_with_types, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_types, usecols=["name", "score"])
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.column_names == ["name", "score"]
++    assert dataset.num_rows == 3
++
++
++def test_excel_builder_usecols_letters(excel_file_with_types, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_types, usecols="A,C")
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.column_names == ["name", "active"]
++
++
++def test_excel_builder_usecols_positional(excel_file_with_types, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_types, usecols=[0, 3])
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.column_names == ["name", "when"]
++
++
++def test_excel_builder_nrows_larger_than_file(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file, nrows=1000)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.num_rows == 2
++
++
++def test_excel_builder_formula_cells(tmp_path):
++    filename = tmp_path / "formulas.xlsx"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append(["a", "b", "total"])
++    worksheet.append([1, 2, "=A2+B2"])
++    workbook.save(filename)
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=str(filename))
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[0]["a"] == 1
++    assert dataset[0]["total"] is None
++
++
++def test_excel_builder_duplicate_column_names(tmp_path):
++    filename = tmp_path / "dup_columns.xlsx"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append(["col", "col", "col"])
++    worksheet.append([1, 2, 3])
++    workbook.save(filename)
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=str(filename))
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    import pandas as pd
++
++    expected_columns = list(pd.read_excel(str(filename)).columns)
++    assert dataset.column_names == expected_columns
++
++
++def test_excel_builder_whitespace_strings(tmp_path):
++    path = _make_workbook(
++        tmp_path / "whitespace.xlsx",
++        [["text"], ["  padded  "], [""], ["\t"]],
++    )
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=path)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[0]["text"] == "  padded  "
++    assert dataset[1]["text"] is None
++
++
++def test_excel_builder_keep_default_na_false_preserves_empty_strings(tmp_path):
++    path = _make_workbook(
++        tmp_path / "empty_strings.xlsx",
++        [["text"], ["value"], [""], ["other"]],
++    )
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=path, keep_default_na=False)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[:] == {"text": ["value", "", "other"]}
++
++
++def test_excel_builder_info_features_none_by_default(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file)
++    assert builder.info.features is None
++    builder.download_and_prepare()
++    assert builder.info.features is not None
++    assert builder.info.splits["train"].num_examples == 2
++
++
++def test_excel_builder_info_features_from_config(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    features = Features({"header1": Value("int64"), "header2": Value("int64")})
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file, features=features)
++    assert builder.info.features == features
++
++
++def test_excel_builder_as_dataset_split_slice(excel_files_same_schema, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_files_same_schema)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train[:2]")
++    assert dataset[:] == {"header1": [0, 1], "header2": [0, 10]}
++
++
++def test_excel_builder_download_size_recorded(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file)
++    builder.download_and_prepare()
++    assert builder.info.download_size > 0
++    assert builder.info.dataset_size > 0
++
++
++def test_excel_builder_thousands_separator(tmp_path):
++    filename = tmp_path / "text_numbers.xlsx"
++    workbook = openpyxl.Workbook()
++    worksheet = workbook.active
++    worksheet.append(["amount"])
++    worksheet.append(["1,000"])
++    worksheet.append(["2,500"])
++    workbook.save(filename)
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=str(filename), thousands=",")
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[:] == {"amount": [1000, 2500]}
++
++
++def test_excel_builder_decimal_separator(tmp_path):
++    path = _make_workbook(
++        tmp_path / "decimal_comma.xlsx",
++        [["ratio"], ["0,5"], ["1,25"]],
++    )
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=path, decimal=",")
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[:] == {"ratio": [0.5, 1.25]}
++
++
++def test_excel_builder_converters(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(
++        cache_dir=cache_dir,
++        data_files=excel_file,
++        converters={"header1": lambda value: f"value_{value}"},
++    )
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset[:] == {"header1": ["value_1", "value_10"], "header2": [2, 20]}
++
++
++def test_excel_builder_header_row(excel_file_with_preamble, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_preamble, header=2)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.column_names == ["header1", "header2"]
++    assert dataset.num_rows == 3
++
++
++def test_excel_builder_column_names_alias(excel_file_no_header, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_no_header, header=None, column_names=["num", "char"])
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train")
++    assert dataset.column_names == ["num", "char"]
++
++
++def test_load_dataset_excel_reuses_cache(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    first = datasets.load_dataset("excel", data_files=excel_file, split="train", cache_dir=cache_dir)
++    second = datasets.load_dataset("excel", data_files=excel_file, split="train", cache_dir=cache_dir)
++    assert first[:] == second[:]
++    assert first.cache_files == second.cache_files
++
++
++def test_excel_builder_rename_columns_after_load(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train").rename_columns({"header1": "first", "header2": "second"})
++    assert dataset.column_names == ["first", "second"]
++    assert dataset[:] == {"first": [1, 10], "second": [2, 20]}
++
++
++def test_excel_builder_select_columns_after_load(excel_file_with_types, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file_with_types)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train").select_columns(["name", "score"])
++    assert dataset.column_names == ["name", "score"]
++    assert dataset.num_rows == 3
++
++
++def test_load_dataset_excel_in_streaming_mode_is_iterable(excel_file_multi_sheet, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = datasets.load_dataset(
++        "excel", data_files=excel_file_multi_sheet, split="train", cache_dir=cache_dir, streaming=True
++    )
++    assert isinstance(dataset, IterableDataset)
++    assert list(dataset) == [{"a": 1, "b": 2}]
++
++
++def test_excel_builder_shuffle_after_load(excel_files_same_schema, tmp_path):
++    cache_dir = tmp_path / "cache"
++    builder = Excel(cache_dir=cache_dir, data_files=excel_files_same_schema)
++    builder.download_and_prepare()
++    dataset = builder.as_dataset(split="train").shuffle(seed=42)
++    assert sorted(dataset[:]["header1"]) == [0, 1, 2, 100, 101, 102]
++
++
++def test_load_dataset_excel_data_files_dict_split_selection(excel_files_dict, tmp_path):
++    cache_dir = tmp_path / "cache"
++    dataset = datasets.load_dataset("excel", data_files=excel_files_dict, split="test", cache_dir=cache_dir)
++    assert dataset[:] == {"header1": [1001], "header2": [1002]}
++
++
++def test_excel_builder_features_with_wrong_column_raises(excel_file, tmp_path):
++    cache_dir = tmp_path / "cache"
++    features = Features({"does_not_exist": Value("int64"), "header2": Value("int64")})
++    builder = Excel(cache_dir=cache_dir, data_files=excel_file, features=features)
++    with pytest.raises(Exception):
++        builder.download_and_prepare()
++
++
++def test_config_pd_read_excel_kwargs_defaults():
++    config = ExcelConfig()
++    kwargs = config.pd_read_excel_kwargs
++    assert "names" not in kwargs
++    assert "converters" not in kwargs
++    assert "true_values" not in kwargs
++    assert "false_values" not in kwargs
++    assert "na_values" not in kwargs
++    assert "skiprows" not in kwargs
++    assert "nrows" not in kwargs
++    assert "usecols" not in kwargs
++    assert "index_col" not in kwargs
++    assert "engine" not in kwargs
++    assert kwargs["sheet_name"] == 0
++    assert kwargs["header"] == 0
++
++
++def test_config_pd_read_excel_kwargs_forwarding():
++    config = ExcelConfig(
++        sheet_name="data",
++        header=2,
++        skiprows=3,
++        nrows=100,
++        na_values=["unknown"],
++        keep_default_na=False,
++        usecols=["a", "b"],
++        engine="openpyxl",
++    )
++    kwargs = config.pd_read_excel_kwargs
++    assert kwargs["sheet_name"] == "data"
++    assert kwargs["header"] == 2
++    assert kwargs["skiprows"] == 3
++    assert kwargs["nrows"] == 100
++    assert kwargs["na_values"] == ["unknown"]
++    assert kwargs["keep_default_na"] is False
++    assert kwargs["usecols"] == ["a", "b"]
++    assert kwargs["engine"] == "openpyxl"

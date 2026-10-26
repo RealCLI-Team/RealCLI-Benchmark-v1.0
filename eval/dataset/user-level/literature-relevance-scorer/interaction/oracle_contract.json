@@ -1,0 +1,169 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test.sh"],
+  "requirements": [
+    {
+      "id": "result_file_exists",
+      "verifier_assertion": "test.sh checks that /app/result.jsonl exists",
+      "script_refs": ["opening", "slice_cli"],
+      "must_include": ["/app/result.jsonl"]
+    },
+    {
+      "id": "output_key_set",
+      "verifier_assertion": "Each row must have exactly the keys: doi, score, subtopic, matched_categories, abstract_missing, status, reason",
+      "script_refs": ["slice_output_format"],
+      "must_include": ["doi", "score", "subtopic", "matched_categories", "abstract_missing", "status", "reason"]
+    },
+    {
+      "id": "row_count_match",
+      "verifier_assertion": "Number of output rows must match expected count (valid deduplicated + errors)",
+      "script_refs": ["slice_dedup", "slice_error_records", "slice_ordering"],
+      "must_include": ["deduplicate", "error"]
+    },
+    {
+      "id": "doi_match",
+      "verifier_assertion": "Each row's doi must match expected value in expected order",
+      "script_refs": ["slice_dedup", "slice_ordering", "slice_error_records"],
+      "must_include": ["doi", "score descending"]
+    },
+    {
+      "id": "score_numeric_match",
+      "verifier_assertion": "Each valid row's score must be numeric and match expected value within 1e-9",
+      "script_refs": ["slice_scoring", "slice_rounding"],
+      "must_include": ["base_score", "min_score", "max_score"]
+    },
+    {
+      "id": "score_1_decimal",
+      "verifier_assertion": "Score must be rounded to exactly 1 decimal place",
+      "script_refs": ["slice_rounding"],
+      "must_include": ["1 decimal place", "round-half-up", "ROUND_HALF_UP"]
+    },
+    {
+      "id": "error_score_null",
+      "verifier_assertion": "Error records must have score=null (None in JSON)",
+      "script_refs": ["slice_error_records"],
+      "must_include": ["score=null"]
+    },
+    {
+      "id": "subtopic_match",
+      "verifier_assertion": "Each row's subtopic must match expected value",
+      "script_refs": ["slice_subtopic"],
+      "must_include": ["subtopic_score_threshold", "default_subtopic"]
+    },
+    {
+      "id": "matched_categories_match",
+      "verifier_assertion": "Each row's matched_categories must match expected sorted list",
+      "script_refs": ["slice_matched_categories"],
+      "must_include": ["ascending lexicographic order"]
+    },
+    {
+      "id": "abstract_missing_match",
+      "verifier_assertion": "Each row's abstract_missing must match expected boolean",
+      "script_refs": ["slice_missing_abstract"],
+      "must_include": ["null", "absent", "empty", "whitespace-only"]
+    },
+    {
+      "id": "status_reason_match",
+      "verifier_assertion": "Each row's status and reason must match expected values",
+      "script_refs": ["slice_error_records"],
+      "must_include": ["missing_doi", "missing_title"]
+    },
+    {
+      "id": "a2_boundary_score",
+      "verifier_assertion": "doi 10.1000/a2 must have score=5.0 (raw 4.95 rounded half-up)",
+      "script_refs": ["slice_rounding", "slice_scoring"],
+      "must_include": ["4.95", "5.0", "round-half-up"]
+    },
+    {
+      "id": "a2_subtopic",
+      "verifier_assertion": "doi 10.1000/a2 must have subtopic='风险識別與評估' (score exactly meets threshold)",
+      "script_refs": ["slice_subtopic"],
+      "must_include": ["subtopic_score_threshold"]
+    },
+    {
+      "id": "a2_abstract_missing",
+      "verifier_assertion": "doi 10.1000/a2 must have abstract_missing=true (empty string abstract)",
+      "script_refs": ["slice_missing_abstract"],
+      "must_include": ["empty"]
+    },
+    {
+      "id": "a3_score",
+      "verifier_assertion": "doi 10.1000/a3 must have score=4.0",
+      "script_refs": ["slice_scoring"],
+      "must_include": ["base_score"]
+    },
+    {
+      "id": "a3_subtopic_empty",
+      "verifier_assertion": "doi 10.1000/a3 must have subtopic='' (below threshold)",
+      "script_refs": ["slice_subtopic"],
+      "must_include": ["subtopic_score_threshold"]
+    },
+    {
+      "id": "a1_clamp",
+      "verifier_assertion": "doi 10.1000/a1 must have score=10.0 (clamped to max_score)",
+      "script_refs": ["slice_scoring"],
+      "must_include": ["max_score"]
+    },
+    {
+      "id": "a1_dedup",
+      "verifier_assertion": "doi 10.1000/a1 must appear exactly once (deduplicated)",
+      "script_refs": ["slice_dedup"],
+      "must_include": ["doi", "longest"]
+    },
+    {
+      "id": "a7_kept",
+      "verifier_assertion": "doi 10.1000/a7 (near-duplicate title, distinct doi) must be present",
+      "script_refs": ["slice_dedup"],
+      "must_include": ["exact doi"]
+    },
+    {
+      "id": "a10_subtopic_default",
+      "verifier_assertion": "doi 10.1000/a10 must have subtopic='综述与框架' (default_subtopic) and score=8.5",
+      "script_refs": ["slice_subtopic", "slice_scoring"],
+      "must_include": ["default_subtopic"]
+    },
+    {
+      "id": "a8_null_abstract",
+      "verifier_assertion": "doi 10.1000/a8 must have abstract_missing=true and status=ok (null abstract still scored)",
+      "script_refs": ["slice_missing_abstract"],
+      "must_include": ["null"]
+    },
+    {
+      "id": "error_reasons",
+      "verifier_assertion": "Error records must have exactly reasons [missing_doi, missing_title] sorted",
+      "script_refs": ["slice_error_records"],
+      "must_include": ["missing_doi", "missing_title"]
+    },
+    {
+      "id": "error_fields_reset",
+      "verifier_assertion": "Error records must have score=null, subtopic='', matched_categories=[], abstract_missing=false",
+      "script_refs": ["slice_error_records"],
+      "must_include": ["score=null", "subtopic=''", "matched_categories=[]", "abstract_missing=false"]
+    },
+    {
+      "id": "errors_after_valid",
+      "verifier_assertion": "All error records must come after all valid records in the output",
+      "script_refs": ["slice_ordering"],
+      "must_include": ["Error records come after all valid records"]
+    },
+    {
+      "id": "no_leaked_paths",
+      "verifier_assertion": "Output must not contain http://, https://, /Users/, C:\\, /home/",
+      "script_refs": ["slice_output_format"],
+      "must_include": ["non-ASCII characters not escaped"],
+      "forbidden_anywhere": ["http://", "https://", "/Users/", "/home/"]
+    },
+    {
+      "id": "cli_interface",
+      "verifier_assertion": "Program run as: python solution.py --input /app/inputs --output /app/result.jsonl",
+      "script_refs": ["slice_cli"],
+      "must_include": ["--input", "--output", "/app/inputs", "/app/result.jsonl"]
+    },
+    {
+      "id": "general_engine",
+      "verifier_assertion": "Must be a general rule engine driven by rubric.json, not hard-coded",
+      "script_refs": ["slice_engine_constraint"],
+      "must_include": ["rubric.json"]
+    }
+  ]
+}

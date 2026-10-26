@@ -1,0 +1,263 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test.sh"],
+  "requirements": [
+    {
+      "id": "r_ars_r_present",
+      "verifier_assertion": "test.sh:50 requires /app/ars.R to exist as a regular file.",
+      "script_refs": ["s_deliverables"],
+      "must_include": ["/app/ars.R"]
+    },
+    {
+      "id": "r_results_tsv_present",
+      "verifier_assertion": "test.sh:51 requires /app/results.tsv to exist as a regular file.",
+      "script_refs": ["s_deliverables", "s_results_tsv"],
+      "must_include": ["/app/results.tsv"]
+    },
+    {
+      "id": "r_batch_entrypoint",
+      "verifier_assertion": "Instruction: `Rscript /app/ars.R` performs the batch run; the RVER heredoc verifies results.tsv is produced by that run.",
+      "script_refs": ["s_deliverables"],
+      "must_include": ["Rscript /app/ars.R", "performs the batch run"]
+    },
+    {
+      "id": "r_source_no_side_effects",
+      "verifier_assertion": "test.sh:77-79 sources ars.R from a scratch directory and asserts (a) sourcing returned success, (b) no new files landed in that directory as a side effect.",
+      "script_refs": ["s_deliverables"],
+      "must_include": [
+        "loadable with `source(\"/app/ars.R\")` without any side effects",
+        "no sampling, printing, or file writes at source time"
+      ]
+    },
+    {
+      "id": "r_exports_ars_test",
+      "verifier_assertion": "test.sh:82-97 negative-path RNEG block calls `ars(...)` after sourcing; ars.R must export a function named `ars`. Instruction also mandates a `test()` export.",
+      "script_refs": ["s_deliverables"],
+      "must_include": ["export at least the functions `ars()` and `test()`"]
+    },
+    {
+      "id": "r_input_paths_cases",
+      "verifier_assertion": "test.sh:52 and RVER file.path(app, \"inputs/data/cases.tsv\") anchor the cases fixture at /app/inputs/data/cases.tsv with tab separator and header row.",
+      "script_refs": ["s_input_paths"],
+      "must_include": ["/app/inputs/data/cases.tsv", "tab-separated with a header row"]
+    },
+    {
+      "id": "r_input_paths_overrides",
+      "verifier_assertion": "test.sh:53 and RVER file.path(app, \"inputs/data/overrides.tsv\") anchor the overrides fixture at /app/inputs/data/overrides.tsv.",
+      "script_refs": ["s_input_paths", "s_overrides"],
+      "must_include": ["/app/inputs/data/overrides.tsv"]
+    },
+    {
+      "id": "r_cases_columns",
+      "verifier_assertion": "RVER accesses cs$case_id / cs$family / cs$params / cs$support / cs$n / cs$mean_tol / cs$sd_tol and reads cases.tsv with colClasses=character and strip.white=FALSE — those columns must exist in that order.",
+      "script_refs": ["s_input_paths"],
+      "must_include": ["case_id", "family", "params", "support", "n", "mean_tol", "sd_tol", "initial_points"]
+    },
+    {
+      "id": "r_family_densities",
+      "verifier_assertion": "RVER dens() switch dispatches on family ∈ {gamma, weibull, exp, normal, logistic, beta} with specific density formulas per family; the sampled values are checked against those exact target densities via numerical integration of the moments.",
+      "script_refs": ["s_family_densities"],
+      "must_include": [
+        "gamma",
+        "weibull",
+        "exp",
+        "normal",
+        "logistic",
+        "beta",
+        "gamma ∝ x^(shape-1)*exp(-rate*x)",
+        "weibull ∝ x^(shape-1)*exp(-(x/scale)^shape)",
+        "exp ∝ exp(-rate*x)",
+        "normal ∝ exp(-(x-mean)^2/(2*sd^2))",
+        "beta ∝ x^(a-1)*(1-x)^(b-1)"
+      ]
+    },
+    {
+      "id": "r_params_format",
+      "verifier_assertion": "RVER pparse() splits `params` on `;` and each entry on `=`. `params` must be a `;`-separated list of `key=value` pairs.",
+      "script_refs": ["s_params_format"],
+      "must_include": ["`;`-separated list of `key=value` pairs"]
+    },
+    {
+      "id": "r_support_format",
+      "verifier_assertion": "RVER strsplit(sup, \",\", fixed=TRUE) then as.numeric — support is `lo,hi`. Test.sh:82-97 also passes c(0, Inf) to ars(), so ±Inf endpoints must be accepted.",
+      "script_refs": ["s_support_format"],
+      "must_include": ["`support` is `lo,hi`", "Inf", "-Inf"]
+    },
+    {
+      "id": "r_n_and_tol_types",
+      "verifier_assertion": "RVER coerces n via as.integer and compares abs(sm-tm$mean) > mt / abs(ss-tm$sd) > st for tolerances; instruction requires positive integer n and positive-real tolerances.",
+      "script_refs": ["s_n_and_tol"],
+      "must_include": ["positive integer sample count", "positive reals"]
+    },
+    {
+      "id": "r_initial_points_optional",
+      "verifier_assertion": "Instruction says empty initial_points is valid; cases.tsv rows like `gamma_a` and `exp_a` have empty initial_points and are still expected to PASS.",
+      "script_refs": ["s_initial_points", "s_invalid_row"],
+      "must_include": ["empty (empty means the sampler chooses its own starting abscissae)", "An empty `initial_points` is valid"]
+    },
+    {
+      "id": "r_overrides_semantics",
+      "verifier_assertion": "RVER applies overrides only when the trimmed column value is non-empty, and matches on exact ov$case_id[i] == cs$case_id[j]. Instruction: override wins on match; matching is exact string.",
+      "script_refs": ["s_overrides"],
+      "must_include": [
+        "case_id, n, mean_tol, sd_tol",
+        "override values replace the ones in cases.tsv",
+        "exact `case_id` string",
+        "no trimming",
+        "case-sensitive"
+      ]
+    },
+    {
+      "id": "r_dedup_last_wins",
+      "verifier_assertion": "RVER `cs <- cs[!duplicated(cs$case_id, fromLast=TRUE), , drop=FALSE]` — keep last exact-id occurrence. Test.sh:200-201 asserts n_samples for dupc == 4000 (the last of two `dupc` rows).",
+      "script_refs": ["s_dedup_rule", "s_anchor_values"],
+      "must_include": ["de-duplicate by keeping the LAST occurrence"]
+    },
+    {
+      "id": "r_dedup_whitespace_case_distinct",
+      "verifier_assertion": "RVER lines 160-161 assert both `dupc` and ` dupc` (with leading space) appear in results — near-duplicate case_ids differing by whitespace are distinct rows and must all be processed.",
+      "script_refs": ["s_dedup_rule", "s_anchor_values"],
+      "must_include": [
+        "differ only by surrounding whitespace or by letter case are DISTINCT",
+        "all processed"
+      ]
+    },
+    {
+      "id": "r_invalid_row_error",
+      "verifier_assertion": "RVER `invalid <- miss(fam)||miss(par)||miss(sup)||miss(nn)` → status must be ERROR with n_samples=0 and sample_mean/sd = NA and no sample file present. Test.sh:202-203 anchors bad_missing → ERROR (empty family).",
+      "script_refs": ["s_invalid_row", "s_status_semantics", "s_anchor_values"],
+      "must_include": [
+        "missing any required field (`family`, `params`, `support`, `n`)",
+        "status is `ERROR`",
+        "produces no sample file"
+      ]
+    },
+    {
+      "id": "r_ars_signature_negative_path",
+      "verifier_assertion": "test.sh:82-97 requires ars() to raise R errors for: n=-3 (non-positive), n=3.5 (non-integer), support c(5,1) (reversed), support c(NA,1) (non-finite), logf=42 (non-function callback).",
+      "script_refs": ["s_ars_signature"],
+      "must_include": [
+        "`ars(logf, n, support, initial_points = NULL)`",
+        "non-positive or non-integer `n`",
+        "reversed or non-finite `support`",
+        "non-function density callback"
+      ]
+    },
+    {
+      "id": "r_ars_positive_path",
+      "verifier_assertion": "test.sh:94-95 asserts `s <- ars(lf, 40, c(0, Inf))` returns 40 finite values all strictly > 0 for the gamma(shape=2, rate=1) log density.",
+      "script_refs": ["s_ars_signature", "s_sample_files"],
+      "must_include": [
+        "exactly `n` lines",
+        "one finite numeric value per line",
+        "every value inside the `support` interval `[lo, hi]`"
+      ]
+    },
+    {
+      "id": "r_ars_logconcave_gate",
+      "verifier_assertion": "test.sh:92-93 asserts ars() errors on `bimodal <- function(x) log(exp(-(x-2)^2/0.2)+exp(-(x+2)^2/0.2))`. RVER logconcave() classifies beta a=0.5 b=0.5 as non-log-concave, so ncv must land as status ERROR. Test.sh:204-205 anchors ncv → ERROR.",
+      "script_refs": ["s_logconcave_gate", "s_status_semantics", "s_anchor_values"],
+      "must_include": [
+        "raise an R error for a target that is not log-concave",
+        "status is `ERROR`",
+        "no sample file",
+        "the other cases are still processed"
+      ]
+    },
+    {
+      "id": "r_results_header_exact",
+      "verifier_assertion": "RVER `if (!identical(names(res), c(\"case_id\",\"status\",\"n_samples\",\"sample_mean\",\"sample_sd\"))) stop2` — header must be exactly these five column names in this order, tab-separated (read.delim with sep=\"\\t\").",
+      "script_refs": ["s_results_tsv"],
+      "must_include": [
+        "header exactly `case_id\\tstatus\\tn_samples\\tsample_mean\\tsample_sd`",
+        "tab-separated"
+      ]
+    },
+    {
+      "id": "r_results_sort_radix",
+      "verifier_assertion": "RVER `if (!identical(res$case_id, res$case_id[order(res$case_id, method=\"radix\")])) stop2` — rows sorted by case_id via method=\"radix\" (byte-order, NOT locale).",
+      "script_refs": ["s_results_tsv"],
+      "must_include": ["sorted by `case_id` in ASCENDING BYTE order", "not locale order"]
+    },
+    {
+      "id": "r_row_count_matches_resolved",
+      "verifier_assertion": "RVER `if (nrow(res) != nrow(cs)) stop2` — results.tsv row count must equal the resolved cases count (post-dedup, per instruction).",
+      "script_refs": ["s_dedup_rule", "s_results_tsv"],
+      "must_include": ["one row per resolved case"]
+    },
+    {
+      "id": "r_status_enum",
+      "verifier_assertion": "RVER asserts r$status ∈ {PASS, FAIL, ERROR} implicitly (specific comparisons for each). ERROR fields checked: n_samples==0, upper(sample_mean)==\"NA\", upper(sample_sd)==\"NA\", no sample file. Valid case: status==\"PASS\", n_samples==nval, sample file finite in support, mean/sd within tol.",
+      "script_refs": ["s_status_semantics"],
+      "must_include": [
+        "`PASS`, `FAIL`, `ERROR`",
+        "sample mean AND sample sd are both within `mean_tol` / `sd_tol`",
+        "target's TRUE mean and sd on the support",
+        "FAIL = valid case out of tolerance",
+        "ERROR = invalid row or non-log-concave target",
+        "`n_samples`=0",
+        "`sample_mean`=NA",
+        "`sample_sd`=NA"
+      ]
+    },
+    {
+      "id": "r_sample_file_content",
+      "verifier_assertion": "RVER reads case_<cid>_samples.txt with readLines + as.numeric and asserts length==nval, all is.finite, and all in [support[1], support[2]]; for invalid rows RVER asserts the sample file does NOT exist.",
+      "script_refs": ["s_sample_files", "s_invalid_row"],
+      "must_include": [
+        "/app/case_<case_id>_samples.txt",
+        "exactly `n` lines",
+        "one finite numeric value per line",
+        "every value inside the `support` interval `[lo, hi]`"
+      ]
+    },
+    {
+      "id": "r_reproducibility_seed",
+      "verifier_assertion": "Instruction: `set.seed(20260812)` before the batch run so results are reproducible. Test.sh runs the same seed-driven Rscript twice (solution then RVER retrieves the outputs) and expects them to be consistent.",
+      "script_refs": ["s_reproducibility"],
+      "must_include": ["`set.seed(20260812)`", "before the batch run"]
+    },
+    {
+      "id": "r_numeric_formatting",
+      "verifier_assertion": "Instruction: numeric fields printed with 6 digits after the decimal; n_samples is an integer. RVER's `as.integer(r$n_samples)` and `as.numeric(r$sample_mean)` succeed only if these formats are respected.",
+      "script_refs": ["s_numeric_format"],
+      "must_include": [
+        "6 digits after the decimal point",
+        "`n_samples` is an integer"
+      ]
+    },
+    {
+      "id": "r_genuine_sampling",
+      "verifier_assertion": "RVER computes numerical-integration ground-truth mean/sd and tolerance-checks sample mean/sd — hard-coded / constant outputs will not pass because the sample must be a real draw from the target for arbitrary families. Instruction: sampling must be genuine, not precomputed constants.",
+      "script_refs": ["s_genuine_sampling"],
+      "must_include": [
+        "draw random values from every specified family via rejection sampling",
+        "rather than emitting precomputed constants"
+      ]
+    },
+    {
+      "id": "r_output_hygiene",
+      "verifier_assertion": "test.sh:69-72 grep-scan on results.tsv and case_*_samples.txt for URLs / IPs / /home/* / /root/ / token / api[_-]?key — any hit fails the verifier.",
+      "script_refs": ["s_output_hygiene"],
+      "must_include": [
+        "absolute host paths",
+        "user names",
+        "IP addresses",
+        "URLs",
+        "tokens"
+      ]
+    },
+    {
+      "id": "r_wbl_override_anchor",
+      "verifier_assertion": "test.sh:198-199 `if (as.integer(res$n_samples[res$case_id == \"wbl\"]) != 7000L) stop2(\"override n not applied for wbl\")` — the anchor for override semantics.",
+      "script_refs": ["s_anchor_values", "s_overrides"],
+      "must_include": ["`wbl` gets its `n` bumped to 7000 by the override"]
+    },
+    {
+      "id": "r_dupc_dedup_anchor",
+      "verifier_assertion": "test.sh:200-201 `if (as.integer(res$n_samples[res$case_id == \"dupc\"]) != 4000L) stop2(\"dedup winner (last occurrence) not used for dupc\")` — anchor for dedup last-wins.",
+      "script_refs": ["s_anchor_values", "s_dedup_rule"],
+      "must_include": ["two exact-string duplicates of `dupc`", "LAST occurrence (n=4000)"]
+    }
+  ]
+}

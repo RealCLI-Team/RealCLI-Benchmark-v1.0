@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# 验证离线最小 chroot 交付物的最终状态。
+# 契约来源：instruction.md、inputs/docs/delivery-runbook.md、inputs/docs/manifest-schema.md。
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+resolve_task_root() {
+  for candidate in "${TASK_ROOT:-}" /app /workspace "$(cd "$SCRIPT_DIR/.." && pwd)" "$(pwd)"; do
+    [ -n "$candidate" ] || continue
+    if [ -d "$candidate/inputs" ] || [ -d "$candidate/outputs" ] || [ -d "$candidate/output" ] || [ -f "$candidate/task.toml" ] || [ -d "$candidate/rootfs" ] || [ -f "$candidate/Makefile" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  cd "$SCRIPT_DIR/.." && pwd
+}
+TASK_ROOT="$(resolve_task_root)"
+cd "$TASK_ROOT"
+ROOT="$TASK_ROOT"
+ROOT_DIR="$TASK_ROOT"
+task_root="$TASK_ROOT"
+HERE="$SCRIPT_DIR"
+script_dir="$SCRIPT_DIR"
+
+
+REPO="inputs/local-rpm-repo"
+META="$REPO/repodata/packages.json"
+KEY="inputs/RPM-GPG-KEY-local"
+PKGLIST="inputs/pkg-list.txt"
+OUT="outputs"
+
+fail=0
+err(){ echo "FAIL: $*" >&2; fail=1; }
+note(){ echo "  - $*"; }
+
+# ---------- 0) 产物存在性 ----------
+for f in chroot manifest.json checksums.sha256 offline-chroot.tar.gz rpm-signature-report.txt; do
+  [ -e "$OUT/$f" ] || err "missing output: outputs/$f"
+done
+[ -d "$OUT/chroot" ] || err "outputs/chroot is not a directory"
+if [ "$fail" -ne 0 ]; then echo "TESTS FAILED (missing outputs)"; exit 1; fi
+
+# ---------- 1) 计算期望的安装闭包（独立重算，不依赖任何实现细节） ----------
+TRUST_FP="$(grep -i '^Fingerprint:' "$KEY" | head -n1 | sed 's/.*: *//; s/[[:space:]]//g')"
+[ -n "$TRUST_FP" ] || err "cannot read trusted fingerprint"
+
+# python 计算闭包，施加签名门禁
+EXPECTED_NEVRA="$(python3 - "$META" "$PKGLIST" "$TRUST_FP" <<'PY'
+import json,sys,re
+meta=json.load(open(sys.argv[1]))
+roots=[]
+for line in open(sys.argv[2]):
+    s=line.strip()
+    if not s or s.startswith('#'): continue
+    roots.append(re.sub(r'\s','',s))
+trust=sys.argv[3]
+by={p['name']:p for p in meta['packages']}
+def nevra(p): return f"{p['name']}-{p['version']}-{p['release']}.{p['arch']}"
+seen=set(); q=list(roots); out=[]
+while q:
+    n=q.pop(0)
+    if n in seen: continue
+    seen.add(n)
+    p=by.get(n)
+    if p is None: sys.exit("missing "+n)
+    fp=p.get('sigfp') or ""
+    if fp!=trust:  # unsigned or bad sig must not enter closure
+        sys.exit("untrusted in closure "+n)
+    out.append(nevra(p))
+    for d in p.get('requires',[]):
+        if d not in seen: q.append(d)
+for x in sorted(out): print(x)
+PY
+)"
+if [ -z "$EXPECTED_NEVRA" ]; then err "could not compute expected closure"; fi
+EXP_COUNT="$(printf '%s\n' "$EXPECTED_NEVRA" | grep -c . || true)"
+note "expected closure size: $EXP_COUNT"
+
+# ---------- 2) manifest.json 结构与内容 ----------
+if ! jq -e . "$OUT/manifest.json" >/dev/null 2>&1; then
+  err "manifest.json is not valid JSON"
+else
+  [ "$(jq -r '.repo' "$OUT/manifest.json")" = "local" ] || err "manifest.repo != local"
+
+  # total_packages 等于期望闭包大小
+  TP="$(jq -r '.total_packages' "$OUT/manifest.json")"
+  [ "$TP" = "$EXP_COUNT" ] || err "manifest.total_packages=$TP, expected $EXP_COUNT"
+
+  # total_packages == sum(group.count) == sum(len(packages))
+  SUMC="$(jq '[.groups[].count] | add // 0' "$OUT/manifest.json")"
+  [ "$SUMC" = "$TP" ] || err "sum(group.count)=$SUMC != total_packages=$TP"
+  SUMP="$(jq '[.groups[].packages | length] | add // 0' "$OUT/manifest.json")"
+  [ "$SUMP" = "$TP" ] || err "sum(len(packages))=$SUMP != total_packages=$TP"
+  # 每组 count == 其 packages 长度
+  jq -e 'all(.groups[]; .count == (.packages|length))' "$OUT/manifest.json" >/dev/null \
+    || err "some group.count != len(packages)"
+
+  # groups 按 group 名升序
+  GORD="$(jq -r '[.groups[].group] | (. == (sort)) ' "$OUT/manifest.json")"
+  [ "$GORD" = "true" ] || err "groups not sorted by group name ascending"
+
+  # 每组内 packages 按 nevra 升序
+  jq -e 'all(.groups[]; (.packages|map(.nevra)) == (.packages|map(.nevra)|sort))' \
+    "$OUT/manifest.json" >/dev/null || err "packages within a group not sorted by nevra"
+
+  # manifest 内 nevra 集合 == 期望闭包
+  GOT_NEVRA="$(jq -r '.groups[].packages[].nevra' "$OUT/manifest.json" | LC_ALL=C sort)"
+  if ! diff <(printf '%s\n' "$EXPECTED_NEVRA") <(printf '%s\n' "$GOT_NEVRA") >/dev/null; then
+    err "manifest nevra set != expected closure"
+    note "expected: $(printf '%s ' $EXPECTED_NEVRA)"
+    note "got:      $(printf '%s ' $GOT_NEVRA)"
+  fi
+
+  # 每个元素仅含 nevra/size/sigfp 三键，且 size 为整数、sigfp 为 40 位大写 hex
+  jq -e 'all(.groups[].packages[]; (keys|sort)==["nevra","sigfp","size"])' \
+    "$OUT/manifest.json" >/dev/null || err "package objects must have exactly nevra,size,sigfp"
+  jq -e 'all(.groups[].packages[]; (.size|type)=="number" and (.size==(.size|floor)))' \
+    "$OUT/manifest.json" >/dev/null || err "size must be integer"
+  jq -e 'all(.groups[].packages[]; (.sigfp|test("^[0-9A-F]{40}$")))' \
+    "$OUT/manifest.json" >/dev/null || err "sigfp must be 40-hex uppercase"
+
+  # size/sigfp 与仓库元数据一致
+  while IFS= read -r row; do
+    nv="${row%%$'\t'*}"; rest="${row#*$'\t'}"; sz="${rest%%$'\t'*}"; fp="${rest#*$'\t'}"
+    exp="$(jq -r --arg nv "$nv" '.packages[] | select("\(.name)-\(.version)-\(.release).\(.arch)"==$nv) | "\(.size)\t\(.sigfp)"' "$META")"
+    [ "$exp" = "$sz"$'\t'"$fp" ] || err "manifest size/sigfp mismatch for $nv (got $sz/$fp, meta $exp)"
+  done < <(jq -r '.groups[].packages[] | "\(.nevra)\t\(.size)\t\(.sigfp)"' "$OUT/manifest.json")
+fi
+
+# ---------- 3) rpm-signature-report.txt ----------
+# 覆盖仓库全部包，按 nevra 升序，状态值合法
+EXP_REPORT="$(jq -r --arg t "$TRUST_FP" '
+  .packages | map({nevra:"\(.name)-\(.version)-\(.release).\(.arch)", sigfp}) | sort_by(.nevra)[]
+  | .nevra + " " + (if (.sigfp==null or .sigfp=="") then "NOKEY" elif .sigfp==$t then "gpg OK" else "FAILED" end)
+' "$META")"
+if ! diff <(printf '%s\n' "$EXP_REPORT") "$OUT/rpm-signature-report.txt" >/dev/null; then
+  err "rpm-signature-report.txt does not match expected per-package status"
+fi
+# 安装进 chroot 的包（期望闭包）在报告中必须为 gpg OK
+while IFS= read -r nv; do
+  st="$(grep -F "$nv " "$OUT/rpm-signature-report.txt" | head -n1 | sed "s/^$nv //")"
+  [ "$st" = "gpg OK" ] || err "installed package not 'gpg OK' in report: $nv ($st)"
+done < <(printf '%s\n' "$EXPECTED_NEVRA")
+# 不得有空白指纹条目（即报告里所有行都有明确状态，没有 trailing 空状态）
+grep -nE ' $' "$OUT/rpm-signature-report.txt" >/dev/null && err "report has blank/trailing status"
+
+# ---------- 4) checksums.sha256 与 chroot 实际文件三方一致 ----------
+ACTUAL="$(cd "$OUT" && find chroot -type f | LC_ALL=C sort)"
+ACTUAL_N="$(printf '%s\n' "$ACTUAL" | grep -c . || true)"
+CSUM_N="$(grep -c . "$OUT/checksums.sha256" || true)"
+[ "$CSUM_N" = "$ACTUAL_N" ] || err "checksums line count ($CSUM_N) != chroot file count ($ACTUAL_N)"
+
+# checksums 路径列与实际文件集合一致（以 chroot/ 前缀）
+CSUM_PATHS="$(sed -E 's/^[0-9a-f]+[[:space:]]+//' "$OUT/checksums.sha256" | LC_ALL=C sort)"
+if ! diff <(printf '%s\n' "$ACTUAL") <(printf '%s\n' "$CSUM_PATHS") >/dev/null; then
+  err "checksums path set != chroot file set"
+fi
+# 重新计算所有哈希必须匹配
+if ! ( cd "$OUT" && sha256sum -c --quiet checksums.sha256 >/dev/null 2>&1 ); then
+  err "sha256sum -c failed: hashes do not match chroot files"
+fi
+# 零字节文件必须出现在 checksums 中（不得跳过）
+ZERO="$(cd "$OUT" && find chroot -type f -size 0 | LC_ALL=C sort)"
+if [ -n "$ZERO" ]; then
+  while IFS= read -r z; do
+    grep -qF "  $z" "$OUT/checksums.sha256" || err "zero-byte file missing from checksums: $z"
+  done < <(printf '%s\n' "$ZERO")
+  note "zero-byte files covered: $(printf '%s\n' "$ZERO" | grep -c .)"
+fi
+
+# ---------- 5) 归档解压后可 chroot 执行 /bin/bash ----------
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+if ! tar -xzf "$OUT/offline-chroot.tar.gz" -C "$TMP" 2>/dev/null; then
+  err "cannot extract offline-chroot.tar.gz"
+else
+  [ -x "$TMP/bin/bash" ] || err "extracted archive has no executable /bin/bash"
+  if [ "$(id -u)" = "0" ]; then
+    OUT_MSG="$(chroot "$TMP" /bin/bash -c 'echo OK' 2>/dev/null || true)"
+    [ "$OUT_MSG" = "OK" ] || err "chroot . /bin/bash -c 'echo OK' did not print OK (got: '$OUT_MSG')"
+  else
+    # 非 root 无法 chroot；退而做基本可执行性检查。动态链接的 bash
+    # 只要依赖被打进 chroot 也可以满足交付要求，因此这里不强制静态链接。
+    if ! "$TMP/bin/bash" -c 'echo OK' 2>/dev/null | grep -qx OK; then
+      err "/bin/bash from archive cannot run standalone"
+    fi
+    head -c4 "$TMP/bin/bash" | grep -q $'\x7fELF' || err "/bin/bash is not an ELF binary"
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "TESTS FAILED"
+  exit 1
+fi
+echo "ALL TESTS PASSED"

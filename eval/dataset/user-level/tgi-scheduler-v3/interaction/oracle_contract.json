@@ -1,0 +1,109 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "instance_id": "tgi-scheduler-v3",
+  "source_files": ["tests/test_outputs.py"],
+  "requirements": [
+    {
+      "id": "R1_v3_proto_path_and_package",
+      "verifier_assertion": "The v3 proto file must exist at /app/proto/v3/generate.proto and contain the exact `package generate.v3;` declaration (test_outputs.py L349-353).",
+      "script_refs": ["s1_v3_proto_path"],
+      "must_include": ["/app/proto/v3/generate.proto", "generate.v3", "server/Makefile", "must be exact"]
+    },
+    {
+      "id": "R2_v3_proto_service_and_rpcs",
+      "verifier_assertion": "The v3 proto must retain `service TextGenerationService` and every RPC (Info, ServiceDiscovery, ClearCache, FilterBatch, Warmup, Prefill, Decode, Health) exactly as v2, with message definitions identical for now (test_outputs.py L355-358).",
+      "script_refs": ["s2_v3_proto_service_rpcs"],
+      "must_include": ["service TextGenerationService", "Info", "ServiceDiscovery", "ClearCache", "FilterBatch", "Warmup", "Prefill", "Decode", "Health", "identical"]
+    },
+    {
+      "id": "R3_client_v2_v3_modules",
+      "verifier_assertion": "The text-generation-client crate must expose `text_generation_client::v2` and `text_generation_client::v3` modules, each re-exporting Client, ShardedClient, and that version's proto types Batch/CachedBatch/Request/NextTokenChooserParameters/StoppingCriteriaParameters/Generation/GrammarType (test_outputs.py L384, L391-409 compile probe).",
+      "script_refs": ["s3_client_modules"],
+      "must_include": ["text_generation_client::v2", "text_generation_client::v3", "Client", "ShardedClient", "Batch", "CachedBatch", "Request", "NextTokenChooserParameters", "StoppingCriteriaParameters", "Generation", "GrammarType"]
+    },
+    {
+      "id": "R4_shared_shardinfo_struct",
+      "verifier_assertion": "The client crate root must expose a `ShardInfo` struct with fields requires_padding, dtype, device_type, window_size, speculate, converted from each version's InfoResponse (test_outputs.py L393-399 default-construct check).",
+      "script_refs": ["s4_shared_shardinfo"],
+      "must_include": ["ShardInfo", "requires_padding", "dtype", "device_type", "window_size", "speculate", "InfoResponse"]
+    },
+    {
+      "id": "R5_shared_health_trait",
+      "verifier_assertion": "The client crate root must expose an async `Health` trait with `device_health` and `model_health` methods, implemented by both v2::ShardedClient and v3::ShardedClient (test_outputs.py L384-390 compile probe).",
+      "script_refs": ["s5_shared_health_trait"],
+      "must_include": ["Health", "device_health", "model_health", "Prefill", "liveness probe"]
+    },
+    {
+      "id": "R6_infer_module_and_scheduler_trait",
+      "verifier_assertion": "Router-side inference code (health checks, queueing, batching) moves into an `infer` module split by protocol version; queueing/batching is abstracted behind a `Scheduler` trait taking validated requests plus concurrency permits and returning a streaming response channel.",
+      "script_refs": ["s6_infer_module_scheduler_trait"],
+      "must_include": ["infer", "Scheduler", "validated requests", "concurrency permits", "streaming response channel"]
+    },
+    {
+      "id": "R7_scheduler_v2_impl_unchanged",
+      "verifier_assertion": "The v2 Scheduler implementation must keep the existing behavior completely unchanged — v2 client plus existing queue logic (test_outputs.py L521-525 v2 stack behavior identical).",
+      "script_refs": ["s7_scheduler_v2_impl"],
+      "must_include": ["v2 client", "existing queue logic", "unchanged"]
+    },
+    {
+      "id": "R8_scheduler_v3_impl_converts_at_boundary",
+      "verifier_assertion": "The v3 Scheduler implementation must go through the v3 client and convert validated request parameters into v3 proto types at the queue boundary, including the JSON/Regex enum mapping for grammar; batching, concatenation, stop conditions stay consistent (test_outputs.py L453-459 v3 stack behavior).",
+      "script_refs": ["s8_scheduler_v3_impl"],
+      "must_include": ["v3 client", "validated request parameters", "v3 proto types", "queue boundary", "JSON/Regex enum mapping", "grammar"]
+    },
+    {
+      "id": "R9_startup_auto_negotiation_logs",
+      "verifier_assertion": "At startup the router tries v3 first against --master-shard-uds-path; on success it logs `Using scheduler V3` at info level; on failure it falls back to v2 and logs `Using scheduler V2`. Log literals must be exact (test_outputs.py L443, L511).",
+      "script_refs": ["s9_startup_negotiation"],
+      "must_include": ["--master-shard-uds-path", "Using scheduler V3", "Using scheduler V2", "info level", "fall back"]
+    },
+    {
+      "id": "R10_no_extra_config",
+      "verifier_assertion": "The same router binary must handle either shard generation with no extra configuration — the protocol version is auto-detected at startup, not a new CLI flag or env var.",
+      "script_refs": ["s17_no_extra_config", "s9_startup_negotiation"],
+      "must_include": ["no extra configuration", "auto-detect at startup", "same router binary"]
+    },
+    {
+      "id": "R11_init_sequence_move",
+      "verifier_assertion": "The scattered initialization sequence in main (connect to shards, clear the cache, fetch shard info, warmup) moves into the server startup flow.",
+      "script_refs": ["s10_init_sequence_move"],
+      "must_include": ["connect to shards", "clear the cache", "fetch shard info", "warmup", "server startup flow"]
+    },
+    {
+      "id": "R12_warmup_cap_when_reported",
+      "verifier_assertion": "When the shard reports a max_batch_total_tokens limit via warmup, use the reported value; warn if --max-batch-total-tokens is also passed; exit with an error when --max-total-tokens exceeds the shard-reported limit (test_outputs.py L497-502 /info returns 4096; L552-556 non-zero exit within 90s).",
+      "script_refs": ["s11_warmup_cap_reported"],
+      "must_include": ["reported value", "--max-batch-total-tokens", "warn", "--max-total-tokens", "exit with an error"]
+    },
+    {
+      "id": "R13_warmup_cap_fallback_16000",
+      "verifier_assertion": "When the shard does not report a warmup cap, fall back to max(16000, --max-total-tokens, --max-batch-prefill-tokens); `/info` reports 16000 on v2 shard with no cap (test_outputs.py L531-532).",
+      "script_refs": ["s12_warmup_cap_fallback"],
+      "must_include": ["16000", "--max-total-tokens", "--max-batch-prefill-tokens", "fall back to the maximum"]
+    },
+    {
+      "id": "R14_health_endpoint_semantics",
+      "verifier_assertion": "`/health` semantics are unchanged: use the liveness probe (model_health) until there is a successful generation record, then switch to the lightweight device_health (test_outputs.py L494 200).",
+      "script_refs": ["s13_health_endpoint_semantics"],
+      "must_include": ["/health", "liveness probe", "model_health", "successful generation record", "device_health"]
+    },
+    {
+      "id": "R15_compat_floor_http_api",
+      "verifier_assertion": "Existing HTTP API semantics (/generate, /generate_stream, /health, /info, /tokenize, etc.) must not change; behavior on old v2 shards must be exactly the same as today (test_outputs.py L521-532 v2 stack matches contract).",
+      "script_refs": ["s14_compat_floor"],
+      "must_include": ["/generate", "/generate_stream", "/health", "/info", "/tokenize", "must not change", "exactly the same"]
+    },
+    {
+      "id": "R16_tests_and_workspace_build",
+      "verifier_assertion": "The existing router and client unit tests must keep passing; every crate in the workspace must pass `cargo build` (test_outputs.py L297-300 cargo build --workspace; L430-433 cargo test router+client).",
+      "script_refs": ["s14_compat_floor", "s15_workspace_build"],
+      "must_include": ["existing router and client unit tests must keep passing", "cargo build", "workspace"]
+    },
+    {
+      "id": "R17_integration_verification",
+      "verifier_assertion": "Beyond cargo build/test being green, actually run the router integration-style once against a v2-only shard and once against a v3-only shard (a minimal gRPC stub is fine): confirm warmup completes, the startup log reflects the selected protocol, and /generate + /generate_stream produce results normally (test_outputs.py L305-341 fixtures, L443 and L511).",
+      "script_refs": ["s16_integration_verification"],
+      "must_include": ["minimal gRPC stub", "warmup completes", "startup logs", "selected protocol", "/generate", "/generate_stream"]
+    }
+  ]
+}

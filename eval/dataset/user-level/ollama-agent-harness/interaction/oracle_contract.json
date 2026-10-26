@@ -1,0 +1,142 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "instance_id": "ollama-agent-harness",
+  "source_files": [
+    "instruction.md",
+    "tests/test.sh",
+    "tests/test_outputs.py"
+  ],
+  "notes": "Maps the frozen verifier's exact-string assertions to the script text (info_slices) that carries the same information to the agent. The covering invariant: the agent never sees instruction.md, so every reward-affecting literal the verifier checks must be reachable from the opening + info_slices.",
+  "requirements": [
+    {
+      "id": "req_deliverables",
+      "verifier_assertion": "Repo delivers packages agent, agent/tools, api client methods, and retires the --experimental flags with a clean go build ./...",
+      "script_refs": ["slice_deliverables"],
+      "must_include": [
+        "a new package `agent`",
+        "a new subpackage `agent/tools` with built-in tools bash / read / edit / web_search / web_fetch",
+        "`--experimental`, `--experimental-yolo`, `--experimental-websearch`",
+        "`go build ./...` must stay clean"
+      ]
+    },
+    {
+      "id": "req_event_wire_values",
+      "verifier_assertion": "Event type constants carry the exact wire values message_delta, tool_started, run_finished, etc.",
+      "script_refs": ["slice_events"],
+      "must_include": [
+        "message_delta, thinking_delta, tool_call_detected, tool_started, tool_finished, compaction_started, compaction_progress, compacted, compaction_skipped, run_finished, error",
+        "EventMessageDelta EventType = \"message_delta\"",
+        "one non-empty RunID that persists throughout"
+      ]
+    },
+    {
+      "id": "req_registry_contract",
+      "verifier_assertion": "Registry.Names() is lexicographic, Tools() sorts by name with Type function, Execute errors 'unknown tool: <name>'.",
+      "script_refs": ["slice_registry"],
+      "must_include": [
+        "Names() []string (lexicographic order)",
+        "each item's Type is always \"function\"",
+        "\"unknown tool: <name>\""
+      ]
+    },
+    {
+      "id": "req_run_validation",
+      "verifier_assertion": "Run rejects nil Client and empty Model with the exact messages.",
+      "script_refs": ["slice_runloop_1"],
+      "must_include": [
+        "agent session requires a chat client",
+        "agent session requires a model",
+        "when Format == \"json\", put the JSON string \"json\" into api.ChatRequest.Format"
+      ]
+    },
+    {
+      "id": "req_runloop_errors",
+      "verifier_assertion": "Budget overflow, 5xx retry, unknown-tool and round-limit messages match verbatim.",
+      "script_refs": ["slice_runloop_2", "slice_runloop_3"],
+      "must_include": [
+        "prompt is too large for the current context (~<estimate>/<window> tokens).",
+        "Your previous response caused an error: <error>",
+        "at most 2 retries for consecutive 5xx",
+        "Error: unknown tool: <name>",
+        "tool round limit reached after <n> rounds; send another message to continue"
+      ]
+    },
+    {
+      "id": "req_approval_messages",
+      "verifier_assertion": "Approval aggregation and the no-prompter / denied Reason strings match verbatim.",
+      "script_refs": ["slice_approval_semantics"],
+      "must_include": [
+        "aggregated into ONE PromptApproval",
+        "Tool execution requires approval, but no approval prompter is available.",
+        "Tool execution denied.",
+        "Tools that don't require approval must never trigger PromptApproval"
+      ]
+    },
+    {
+      "id": "req_compaction_constants",
+      "verifier_assertion": "Compaction canonical constants and helper signatures match verbatim.",
+      "script_refs": ["slice_compaction_format"],
+      "must_include": [
+        "CompactionSummaryMessagePrefix = \"Conversation summary:\\n\"",
+        "CompactionToolName = \"summary\"",
+        "CompactionToolCallID = \"ollama_compaction\"",
+        "options[\"num_ctx\"] takes priority over configured"
+      ]
+    },
+    {
+      "id": "req_compaction_semantics",
+      "verifier_assertion": "Compaction trigger, window resolution, summary system prompt, and post-compaction error match.",
+      "script_refs": ["slice_compaction_semantics", "slice_compaction_writeback"],
+      "must_include": [
+        "history is still too large after compaction (~<estimate>/<window> tokens).",
+        "Summarize the archived part of an Ollama agent conversation.",
+        "content `Conversation summary:\\n<summary>`",
+        "prompt_eval / estimate / force / tool_output"
+      ]
+    },
+    {
+      "id": "req_api_web_methods",
+      "verifier_assertion": "api WebSearch/WebFetch request/response types with exact JSON tags and client method names.",
+      "script_refs": ["slice_api_additions"],
+      "must_include": [
+        "Query string `json:\"query\"`; MaxResults int `json:\"max_results,omitempty\"`",
+        "func (c *Client) WebSearchExperimental(ctx context.Context, req *WebSearchRequest) (*WebSearchResponse, error)",
+        "func (c *Client) WebFetchExperimental(ctx context.Context, req *WebFetchRequest) (*WebFetchResponse, error)"
+      ]
+    },
+    {
+      "id": "req_tools_names_sentinels",
+      "verifier_assertion": "Tool Name() values, required schema params, and web auth sentinel errors match verbatim.",
+      "script_refs": ["slice_tools_pkg"],
+      "must_include": [
+        "Their Name() are bash, read, edit, web_search, web_fetch respectively",
+        "ErrWebSearchAuthRequired (\"web search requires authentication\")",
+        "ErrWebFetchAuthRequired (\"web fetch requires authentication\")",
+        "detect with errors.Is"
+      ]
+    },
+    {
+      "id": "req_tool_bash_read_edit",
+      "verifier_assertion": "bash/read/edit output contracts and error strings match verbatim.",
+      "script_refs": ["slice_tool_bash", "slice_tool_read_edit"],
+      "must_include": [
+        "refusing to run unsafe command:",
+        "absolute paths are not allowed",
+        "old_text matched <n> times in <path>; set replace_all to true to replace every match",
+        "Updated <path> (<n> replacement[s]).",
+        "Exit code: <n>"
+      ]
+    },
+    {
+      "id": "req_tool_web_output",
+      "verifier_assertion": "web_search/web_fetch output format strings match verbatim, and self-test scope.",
+      "script_refs": ["slice_tool_web"],
+      "must_include": [
+        "No results found for query: <query>",
+        "Search results for: <query>",
+        "No content could be extracted from the page.",
+        "go test ./agent/... ./api ./cmd"
+      ]
+    }
+  ]
+}

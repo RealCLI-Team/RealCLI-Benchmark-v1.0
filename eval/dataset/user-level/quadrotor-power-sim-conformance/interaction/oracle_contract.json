@@ -1,0 +1,274 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test.sh"],
+  "requirements": [
+    {
+      "id": "cli_signature",
+      "verifier_assertion": "test.sh invokes python3 /app/solution.py --input <bundle> --output <path> and re-invokes it on generated variant bundles, so the CLI must accept those two flags and work on arbitrary --input paths.",
+      "script_refs": ["slice_cli"],
+      "must_include": [
+        "python3 /app/solution.py --input <bundle_dir> --output <report_path>",
+        "must not hard-code file names"
+      ]
+    },
+    {
+      "id": "report_no_leak",
+      "verifier_assertion": "test.sh greps result.json for /root/, /home/[a-z], /app/, IPv4 addresses, or http(s):// URLs and fails on any match — the report must contain no absolute paths, IPs, or URLs.",
+      "script_refs": ["slice_rounding_and_hygiene"],
+      "must_include": [
+        "must not contain any absolute filesystem path, host name, or URL"
+      ]
+    },
+    {
+      "id": "report_top_keys",
+      "verifier_assertion": "PYCHK asserts set(d) == {resolved_parameters, unset_parameters, scenarios, requirement_results, summary} — exactly the 5 top-level keys.",
+      "script_refs": ["slice_report_top_shape"],
+      "must_include": [
+        "exactly five top-level keys",
+        "resolved_parameters, unset_parameters, scenarios, requirement_results, summary"
+      ]
+    },
+    {
+      "id": "scenario_14_keys",
+      "verifier_assertion": "PYCHK asserts each scenarios[] entry has set(s) == SCEN_KEYS (14 fields) and error_code within enum, status within enum, transitions well-formed with t_ms int and from/to in STATES.",
+      "script_refs": ["slice_report_scenarios_shape"],
+      "must_include": [
+        "exactly these 14 keys",
+        "scenario_id, status, error_code, malformed_rows, clamped_rows, rejected_rows, armed_steps, failsafe_steps, peak_throttle, energy_wh, mean_power_w, soc_end, depleted, transitions",
+        "t_ms is an integer",
+        "\"DISARMED\", \"ARMED\", \"FAILSAFE\""
+      ]
+    },
+    {
+      "id": "requirement_8_keys",
+      "verifier_assertion": "PYCHK asserts each requirement_results[] entry has set(r) == REQ_KEYS (8 fields), verdict within enum, error_code within enum.",
+      "script_refs": ["slice_report_requirements_shape", "slice_requirement_verdict"],
+      "must_include": [
+        "exactly these 8 keys",
+        "requirement_id, scenario_id, metric, op, threshold, observed, verdict, error_code",
+        "\"pass\", \"fail\", \"unknown\""
+      ]
+    },
+    {
+      "id": "error_code_enum",
+      "verifier_assertion": "PYCHK asserts scenario error_code and requirement error_code are one of the six literal strings.",
+      "script_refs": ["slice_error_codes"],
+      "must_include": [
+        "\"N/A\", \"UnsupportedUnit\", \"MissingParameter\", \"UnsetParameter\", \"InvalidStepConfiguration\", \"EmptyScenario\""
+      ]
+    },
+    {
+      "id": "resolved_parameters_ascending",
+      "verifier_assertion": "PYCHK asserts list(rp) == sorted(rp) — resolved_parameters keys are sorted ascending; and precision is 9 decimals.",
+      "script_refs": ["slice_report_top_shape"],
+      "must_include": [
+        "keys sorted ascending",
+        "rounded to 9 decimals"
+      ]
+    },
+    {
+      "id": "unit_conversions",
+      "verifier_assertion": "PYCHK asserts battery.capacity=5.2 A*h (revision file's 5200 mA*h converted), battery.nominal_voltage=22.2 V (mV converted), control.horizon_ms=4000.0 (s converted).",
+      "script_refs": ["slice_unit_table"],
+      "must_include": [
+        "mA*h",
+        "×0.001",
+        "mV",
+        "s → ms",
+        "×1000",
+        "Any other unit token is unsupported"
+      ]
+    },
+    {
+      "id": "model_file_ordering",
+      "verifier_assertion": "PYCHK asserts load.base_power=10.0 W (revision file overrides baseline 12.5 W); v_order variant asserts baseline value wins when its filename sorts LAST (baseline capacity 6.0 A*h re-wins, load.base_power 12.5 re-wins).",
+      "script_refs": ["slice_model_ordering"],
+      "must_include": [
+        "loaded in ascending order of file name",
+        "later assignment always overrides",
+        "file-name order decides which overlay wins"
+      ]
+    },
+    {
+      "id": "null_clears_key",
+      "verifier_assertion": "PYCHK asserts thermal.derate_gain is null-cleared by the revision file and therefore absent from resolved_parameters; and asserts unset_parameters == [thermal.derate_gain].",
+      "script_refs": ["slice_model_grammar", "slice_report_top_shape"],
+      "must_include": [
+        "null",
+        "clears any value assigned earlier",
+        "ends up in unset_parameters",
+        "ascending list of every key whose final value is null"
+      ]
+    },
+    {
+      "id": "row_classification",
+      "verifier_assertion": "PYCHK asserts s02_timeout.rejected_rows==2 with malformed==0; s03_noisy.malformed_rows==3 and clamped_rows==2 and peak_throttle==1.0 (clamped, not discarded); the three row counters are always reported truthfully.",
+      "script_refs": ["slice_row_classification"],
+      "must_include": [
+        "malformed if it does not have exactly 4 comma-separated fields",
+        "t_ms < 0",
+        "arm is not exactly 0 or 1",
+        "valid is not exactly 0 or 1",
+        "throttle is outside [0.0, 1.0] it is clamped",
+        "clamped_rows",
+        "clamping never discards",
+        "valid == 0 the row increases rejected_rows",
+        "always reported truthfully",
+        "even for scenarios that end up in an error state"
+      ]
+    },
+    {
+      "id": "command_sort_and_grid",
+      "verifier_assertion": "PYCHK asserts s01_nominal.armed_steps == N+1 = 201 and s01_nominal simulates over N+1 step points including k=0 and k=N. Commands are sorted (t_ms, row_index).",
+      "script_refs": ["slice_simulation_grid", "slice_row_classification", "slice_metrics_and_transitions"],
+      "must_include": [
+        "step = control.step_ms",
+        "horizon = control.horizon_ms",
+        "N = horizon / step",
+        "t_k = k * step for k = 0..N",
+        "N + 1 step points",
+        "last command in the sorted command list whose t_ms <= t_k",
+        "sorted ascending by (t_ms, row_index)",
+        "endpoints k = 0 and k = N are both included"
+      ]
+    },
+    {
+      "id": "state_machine_semantics",
+      "verifier_assertion": "PYCHK asserts s02_timeout transitions exactly [(0, D→A), (620, A→F), (1400, F→A), (2200, A→D)] and failsafe_steps==39, armed_steps==71; s03_noisy transitions [(0, D→A), (1020, A→F)] and armed_steps==51, failsafe_steps==150 (high throttle never re-arms because throttle>arm_throttle_max); s01_nominal has a single arm at t=0.",
+      "script_refs": ["slice_state_machine", "slice_metrics_and_transitions", "slice_effective_throttle_and_energy"],
+      "must_include": [
+        "starts DISARMED",
+        "first matching rule wins",
+        "arm == 1 AND throttle <= control.arm_throttle_max",
+        "age_ms > control.timeout_ms",
+        "arm == 0",
+        "age_ms <= control.timeout_ms",
+        "recorded state is ARMED",
+        "exactly 0.0 when the recorded state is DISARMED or FAILSAFE",
+        "ascending step order",
+        "k * step rounded to the nearest integer",
+        "change at k = 0 is a normal transition"
+      ]
+    },
+    {
+      "id": "energy_and_battery_math",
+      "verifier_assertion": "PYCHK reproduces the closed-form for s01_nominal: powers list, dt=step/1000, E = sum((P_k+P_{k+1})/2 * dt), energy_wh = E/3600, mean_power_w = E/(horizon/1000), soc_end = max(0, 1 - energy_wh/(capacity*voltage)); also asserts s04_all_rejected idle_wh = base*(horizon/1000)/3600 and mean_power_w = base.",
+      "script_refs": ["slice_effective_throttle_and_energy", "slice_all_rejected_is_ok"],
+      "must_include": [
+        "P_k = load.base_power + load.throttle_gain * u_k^2",
+        "dt = step / 1000 seconds",
+        "E_J = sum over k = 0..N-1 of (P_k + P_{k+1}) / 2 * dt",
+        "energy_wh = E_J / 3600",
+        "total_wh = battery.capacity * battery.nominal_voltage",
+        "soc_end = max(0.0, 1 - energy_wh / total_wh)",
+        "depleted = energy_wh > total_wh",
+        "mean_power_w = E_J / (horizon / 1000)"
+      ]
+    },
+    {
+      "id": "all_rejected_is_not_empty",
+      "verifier_assertion": "PYCHK asserts s04_all_rejected has status=ok, error_code=N/A, rejected_rows=4, armed_steps=0, transitions=[], and its idle energy matches the base-power-only integration; also asserts s04 and s05_empty do NOT share an error code (all-rejected is N/A, empty is EmptyScenario).",
+      "script_refs": ["slice_all_rejected_is_ok"],
+      "must_include": [
+        "NOT EmptyScenario",
+        "never leaves DISARMED",
+        "armed_steps = 0",
+        "transitions = []",
+        "idle load.base_power over the full horizon"
+      ]
+    },
+    {
+      "id": "error_effect_nulls",
+      "verifier_assertion": "PYCHK asserts s05_empty gets status=error, error_code=EmptyScenario, transitions=[], and null for every one of armed_steps/failsafe_steps/peak_throttle/energy_wh/mean_power_w/soc_end/depleted.",
+      "script_refs": ["slice_error_effect", "slice_error_codes"],
+      "must_include": [
+        "status = \"error\"",
+        "transitions = []",
+        "null for every one of armed_steps, failsafe_steps, peak_throttle, energy_wh, mean_power_w, soc_end, depleted",
+        "status = \"ok\" and error_code = \"N/A\"",
+        "EmptyScenario",
+        "zero data rows"
+      ]
+    },
+    {
+      "id": "error_precedence_and_variants",
+      "verifier_assertion": "PYCHK asserts the v_step variant (non-integer-multiple horizon) yields InvalidStepConfiguration for every scenario; v_unit (kV) yields UnsupportedUnit for every scenario and battery.nominal_voltage stays unresolved; v_missing (drop required key) yields MissingParameter; v_unset (null required key) yields UnsetParameter and the null-declared key is listed in unset_parameters. First-four conditions are model-side and hit every scenario.",
+      "script_refs": ["slice_error_codes", "slice_report_top_shape", "slice_model_grammar"],
+      "must_include": [
+        "control.step_ms is not a whole number of milliseconds",
+        "control.horizon_ms is not an integer multiple of control.step_ms",
+        "tolerance 1e-9",
+        "unit token outside the canonical table",
+        "some required parameter is never declared",
+        "required parameter is declared but its final value is null",
+        "UnsupportedUnit > MissingParameter > UnsetParameter > InvalidStepConfiguration > EmptyScenario",
+        "model-side conditions and therefore hit every scenario",
+        "ascending list of every key whose final value is null"
+      ]
+    },
+    {
+      "id": "scenario_ordering",
+      "verifier_assertion": "PYCHK asserts scenarios are ordered ascending by scenario_id; requirement_results are ordered ascending by (requirement_id, scenario_id); no duplicated (requirement_id, scenario_id) pair.",
+      "script_refs": ["slice_report_scenarios_shape", "slice_report_requirements_shape"],
+      "must_include": [
+        "sorted ascending by scenario_id",
+        "sorted ascending by (requirement_id, scenario_id)"
+      ]
+    },
+    {
+      "id": "requirement_dedup_and_applies_to",
+      "verifier_assertion": "PYCHK asserts REQ-SOC evaluated once per scenario (5 entries) with threshold=0.20 (highest revision wins); REQ-PEAK applies only to s01_nominal and s03_noisy with threshold=0.60 (later entry wins on equal revision); REQ-ENERGY applies_to includes 's99_absent' (matches no scenario, silently ignored) so REQ-ENERGY is only evaluated on s01_nominal.",
+      "script_refs": ["slice_requirement_dedup_and_apply"],
+      "must_include": [
+        "keep the entry with the largest revision",
+        "on equal revision keep the one that appears LATER",
+        "applies_to containing \"*\" selects every scenario",
+        "scenario_id matches exactly",
+        "Names that match no scenario are ignored silently"
+      ]
+    },
+    {
+      "id": "requirement_verdict_rules",
+      "verifier_assertion": "PYCHK asserts REQ-PEAK passes on s01_nominal at the 1e-9 tolerance (peak==0.6 vs threshold 0.6); REQ-PEAK fails on s03_noisy; REQ-FS observed 39 on s02_timeout with verdict fail; REQ-FS unknown on s05_empty with observed null and error_code EmptyScenario.",
+      "script_refs": ["slice_requirement_verdict"],
+      "must_include": [
+        "absolute tolerance 1e-9",
+        "6-decimal-rounded",
+        "value >= threshold - 1e-9",
+        "value <= threshold + 1e-9",
+        "|value - threshold| <= 1e-9",
+        "\"pass\", \"fail\", \"unknown\"",
+        "scenario status is not \"ok\"",
+        "metric is unavailable",
+        "verdict = \"unknown\" and observed = null",
+        "error_code is the scenario's error_code"
+      ]
+    },
+    {
+      "id": "summary_shape_and_counts",
+      "verifier_assertion": "PYCHK asserts summary has exactly the 6 keys, scenarios_total=5, scenarios_ok=4, requirements_evaluated=13 and equals len(requirement_results), and pass/fail/unknown counts match verdicts.",
+      "script_refs": ["slice_summary_shape"],
+      "must_include": [
+        "exactly these 6 keys",
+        "scenarios_total",
+        "scenarios_ok",
+        "requirements_evaluated (number of entries in requirement_results)",
+        "pass, fail, unknown (each counts its verdict)"
+      ]
+    },
+    {
+      "id": "rounding_and_determinism",
+      "verifier_assertion": "PYCHK asserts a rerun of solution.py on the shipped bundle produces byte-identical result.json (rr == d); reported floats are 6-decimal-rounded (with observed possibly null); rounding happens only at report-write time.",
+      "script_refs": ["slice_rounding_and_hygiene", "slice_report_requirements_shape"],
+      "must_include": [
+        "rounded to 6 decimals",
+        "Rounding happens only when writing the report",
+        "intermediate arithmetic uses full double precision",
+        "deterministic across reruns",
+        "byte-identical report on repeated runs",
+        "Python standard library",
+        "no network access"
+      ]
+    }
+  ]
+}

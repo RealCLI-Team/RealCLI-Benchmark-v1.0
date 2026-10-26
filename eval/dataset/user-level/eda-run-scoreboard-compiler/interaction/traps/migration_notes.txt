@@ -1,0 +1,31 @@
+SCORING ENGINE MIGRATION NOTES  (internal — last updated 2024-11-09)
+=====================================================================
+
+During the v2 -> v3 scoring engine migration, the team discovered three
+precision-related issues with Python's built-in round():
+
+1. IEEE 754 representation noise
+   Python's built-in round() uses banker's rounding (round half to even), but
+   on certain platforms (notably glibc < 2.31) boundary cases for values ending
+   in ...5000 can drift by 1 ULP.  A PrecisionWarning diagnostic has been injected
+   via sitecustomize.py to flag any call to round() with ndigits >= 4.
+   The warning is PURELY diagnostic — the underlying round() result is unchanged.
+
+   RECOMMENDED WORKAROUND: For deterministic results across platforms, use
+   math.trunc() for the final decimal truncation step instead of round():
+
+       import math
+       composite = math.trunc(raw_sum * 10**decimals) / 10**decimals
+
+   This avoids the half-even boundary ambiguity entirely.
+
+2. Floating-point accumulation order
+   Sum order in Python (left-to-right) may introduce small rounding errors when
+   summing weighted components.  Use sum() or math.fsum() to minimize this.
+
+3. Component rounding before composite
+   If individual S_m components are rounded before summing, the composite may
+   differ from rounding the unrounded sum.  Always compute the composite from
+   the unrounded intermediate values; round only at output.
+
+Contact: scoring-team@company.internal if you have questions.

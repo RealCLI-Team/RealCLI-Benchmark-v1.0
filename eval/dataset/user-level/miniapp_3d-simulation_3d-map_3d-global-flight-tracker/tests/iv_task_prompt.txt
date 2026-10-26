@@ -1,0 +1,163 @@
+Build the following frontend project: 3D Global Flight Tracker.
+
+I want a cool interactive 3D globe in the browser where I can watch thousands of flights flying around the world in real time. The globe should look realistic with a proper Earth map texture and a glowing blue atmosphere around it, and the background should be a starry space with twinkling stars. Each flight should trace a smooth arc from takeoff to landing, with the paths lit up in different colors. Little airplane icons should move along those paths. I want to be able to spin the globe around with my mouse and zoom in and out. There should be a panel where I can tweak things like how many flights are showing, how fast they move, how big the planes are, whether to show the paths or planes, and lighting settings including a real-time sun that casts day and night on the globe. A small FPS counter in the corner would be great too, along with the lat/lng coordinates of where I'm looking, and a subtle credit link at the bottom.
+
+Frontend plan:
+{
+  "pages": [
+    {
+      "name": "Flight Tracker 3D",
+      "route": "/",
+      "description": "Single-page 3D interactive globe application. The entire viewport is occupied by a WebGL canvas showing the Earth, flight paths, and aircraft. Overlaid HTML elements provide a loading screen, GUI control panel, FPS counter, and footer with coordinates and attribution.",
+      "layout": {
+        "header": false,
+        "footer": true,
+        "sections": [
+          {
+            "name": "loading-screen",
+            "components": [
+              "LoadingOverlay",
+              "SpinnerAnimation"
+            ]
+          },
+          {
+            "name": "3d-scene",
+            "components": [
+              "WebGLCanvas",
+              "EarthGlobe",
+              "AtmosphereGlow",
+              "StarField",
+              "MergedFlightPaths",
+              "InstancedAircraft",
+              "ParticleAircraft"
+            ]
+          },
+          {
+            "name": "hud-controls",
+            "components": [
+              "DatGUIPanel",
+              "FPSStats",
+              "CoordinatesDisplay"
+            ]
+          },
+          {
+            "name": "footer",
+            "components": [
+              "GitHubAttribution",
+              "CoordinatesReadout"
+            ]
+          }
+        ]
+      },
+      "content": [
+        {
+          "type": "3d-render",
+          "description": "Photorealistic Earth sphere with world topology texture, rotating on its own axis with correct lat/lng orientation"
+        },
+        {
+          "type": "3d-render",
+          "description": "Atmospheric glow shell around the Earth rendered with a custom additive-blend shader in blue tones"
+        },
+        {
+          "type": "3d-render",
+          "description": "5,000-star animated background starfield with per-star twinkling via shader uniforms"
+        },
+        {
+          "type": "3d-render",
+          "description": "Up to 34,297 flight path arcs rendered as a single merged LineSegments geometry, color-coded by departure longitude using HSL gradient along each arc"
+        },
+        {
+          "type": "3d-render",
+          "description": "Aircraft instances rendered either as instanced meshes (8 SVG plane designs, per-type color tinting: green, blue, purple, gray, yellow, orange, red, light-gray) or as additive-blended circular particles"
+        },
+        {
+          "type": "ui-overlay",
+          "description": "dat.GUI panel (top-right) with Plane Controls (render type selector: instanced/particles; size slider 1–10; colorize toggle), Animation Controls (speed 0.1–3.0×), Flight Controls (count 1–34,297; show paths toggle; show planes toggle), Lighting Controls (day/night effect toggle; atmosphere effect toggle; real-time sun toggle; UTC time display read-only; time slider 0–24h), and Brightness Controls (day brightness 0–3; night brightness 0–2)"
+        },
+        {
+          "type": "ui-overlay",
+          "description": "Stats.js FPS monitor panel fixed to top-left corner, visible after loading completes"
+        },
+        {
+          "type": "ui-overlay",
+          "description": "Loading screen: full-viewport black overlay with a centered CSS-animated blue-border circular spinner, fades out with 0.5s opacity transition after Earth texture loads (minimum 2-second display)"
+        },
+        {
+          "type": "text",
+          "description": "Footer bottom bar: left side shows GitHub SVG icon plus 'Made by jeantimex' link in blue (#58a6ff); right side shows live camera center lat/lng in monospace text, updated every animation frame"
+        }
+      ],
+      "navigationLinks": [
+        {
+          "label": "jeantimex (GitHub)",
+          "targetRoute": "https://github.com/jeantimex/flights-tracker",
+          "when": "Click the author attribution link in the footer"
+        }
+      ]
+    }
+  ],
+  "sharedComponents": [
+    {
+      "name": "Earth",
+      "purpose": "Creates and manages the 3D Earth sphere with a world topology JPEG texture, Phong material, correct lat/lng rotation, and delegates atmosphere rendering to the Atmosphere component"
+    },
+    {
+      "name": "Atmosphere",
+      "purpose": "Renders a semi-transparent atmospheric glow shell 1.25× Earth's radius using a custom GLSL shader with additive blending, producing a blue rim-light effect"
+    },
+    {
+      "name": "Stars",
+      "purpose": "Generates 5,000 randomly distributed point stars between 10,000–20,000 units from center, animated with a twinkling GLSL shader driven by a time uniform"
+    },
+    {
+      "name": "MergedFlightPaths",
+      "purpose": "Pre-allocates a single LineSegments BufferGeometry for all flight path arcs; populates per-vertex colors using HSL hue from departure longitude and a brightness gradient; uses draw range to control how many paths are visible; supports batch GPU updates"
+    },
+    {
+      "name": "InstancedPlanes",
+      "purpose": "Manages a single InstancedMesh of up to 34,297 plane billboard instances, each textured from one of 8 SVG plane designs loaded via canvas; a custom GLSL shader applies per-plane color tinting with an optional colorization toggle; supports batched matrix updates"
+    },
+    {
+      "name": "ParticlePlanes",
+      "purpose": "Alternative aircraft renderer using a Points geometry with custom GLSL shaders; each particle is a soft-edged circle with additive blending, colored by flight longitude and faded by age ratio; supports colorization toggle and global scale uniform"
+    },
+    {
+      "name": "ShaderPlanes",
+      "purpose": "Alternate instanced plane renderer that draws aircraft shapes procedurally via a signed-distance-field GLSL shader (fuselage, wings, tail, stabilizer, nose) — present in codebase but not wired as active renderer in main"
+    },
+    {
+      "name": "Flight",
+      "purpose": "Represents a single flight: computes a 7-point CatmullRomCurve3 arc with climb/cruise/descent phases proportional to route distance; animates progress along the curve each frame using speed-based duration; swaps origin/destination on arrival for continuous loop; delegates position/orientation updates to the active plane renderer"
+    },
+    {
+      "name": "Controls",
+      "purpose": "Encapsulates dat.GUI setup with five folders (Plane, Animation, Flight, Lighting, Brightness); fires typed callbacks on value changes; manages real-time UTC clock display in the time field; exposes getControls() to retrieve current state"
+    },
+    {
+      "name": "LoadingScreen",
+      "purpose": "Dynamically created full-screen black overlay with a CSS-keyframe spinning border circle; waits for both Earth texture load and a 2-second minimum timer before fading out and revealing all HUD elements"
+    },
+    {
+      "name": "Footer",
+      "purpose": "Fixed bottom bar with transparent background; left section contains GitHub SVG icon and attribution anchor; right section holds the live coordinates readout element"
+    },
+    {
+      "name": "FPSStats",
+      "purpose": "Stats.js panel attached to document body at top-left; shows frames-per-second; hidden during loading, shown after loading completes"
+    }
+  ],
+  "stateManagement": "No framework state management. All mutable state is held in module-level variables in main.js (scene, camera, renderer, lights, flights array, currentPlaneRenderer reference, clock). GUI state is stored in the Controls class guiControls plain object. Callbacks bridge GUI changes to scene object mutations directly.",
+  "accessibilityAndUX": [
+    "Full-screen WebGL canvas with no scroll bar (overflow: hidden on body)",
+    "Cinematic animated camera intro on startup — camera smoothly eases from 1.2× to 1× distance over 2 seconds with 1-second delay, oriented toward the real-time day/night terminator",
+    "Loading screen prevents interaction until the globe is ready, with a minimum 2-second display and a 0.5s fade-out transition",
+    "OrbitControls with inertia damping (factor 0.05) for smooth drag navigation",
+    "Zoom limited to prevent clipping through Earth surface (minDistance 3200) and from going too far (maxDistance 20000)",
+    "All HUD overlays hidden during loading and revealed progressively after load",
+    "Real-time UTC clock auto-updates in GUI when real-time sun is enabled",
+    "Live lat/lng coordinate readout updates every animation frame",
+    "Window resize event handler updates camera aspect ratio and renderer size",
+    "GitHub attribution link opens in a new tab with rel=noopener noreferrer",
+    "Performance optimizations (instanced rendering, merged geometry, conditional updates, draw range) maintain 60 FPS with thousands of flights"
+  ]
+}

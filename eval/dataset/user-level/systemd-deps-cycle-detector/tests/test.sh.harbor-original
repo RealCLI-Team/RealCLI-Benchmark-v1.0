@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+resolve_task_root() {
+  for candidate in "${TASK_ROOT:-}" /app /workspace "$(cd "$SCRIPT_DIR/.." && pwd)" "$(pwd)"; do
+    [ -n "$candidate" ] || continue
+    if [ -d "$candidate/inputs" ] || [ -d "$candidate/outputs" ] || [ -d "$candidate/output" ] || [ -f "$candidate/task.toml" ] || [ -d "$candidate/rootfs" ] || [ -f "$candidate/Makefile" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  cd "$SCRIPT_DIR/.." && pwd
+}
+TASK_ROOT="$(resolve_task_root)"
+cd "$TASK_ROOT"
+ROOT="$TASK_ROOT"
+ROOT_DIR="$TASK_ROOT"
+task_root="$TASK_ROOT"
+HERE="$SCRIPT_DIR"
+script_dir="$SCRIPT_DIR"
+
+
+fail() { echo "FAIL: $1" >&2; exit 1; }
+
+[[ -f outputs/deps.dot ]] || fail "outputs/deps.dot missing"
+[[ -f outputs/cycles.json ]] || fail "outputs/cycles.json missing"
+
+python3 - <<'PY'
+import json, re, sys
+from pathlib import Path
+
+root = Path.cwd()
+dot = (root / "outputs" / "deps.dot").read_text(encoding="utf-8")
+cj = json.loads((root / "outputs" / "cycles.json").read_text(encoding="utf-8"))
+
+# Parse deps.txt to build expected
+edges_expected = set()
+units_expected = set()
+fwd = {}
+for raw in (root / "inputs" / "deps.txt").read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or ":" not in line:
+        continue
+    unit, rest = line.split(":", 1)
+    unit = unit.strip()
+    if not unit:
+        continue
+    units_expected.add(unit)
+    fwd.setdefault(unit, set())
+    for m in re.finditer(r"(After|Requires)=([^\s]+)", rest):
+        for v in m.group(2).split(","):
+            v = v.strip()
+            if v:
+                units_expected.add(v)
+                fwd.setdefault(v, set())
+                edges_expected.add((v, unit))
+                fwd[v].add(unit)
+
+# Validate DOT header
+if not re.search(r"digraph\s+\w+\s*\{", dot):
+    print("FAIL: deps.dot missing digraph header", file=sys.stderr); sys.exit(1)
+if "}" not in dot:
+    print("FAIL: deps.dot missing closing brace", file=sys.stderr); sys.exit(1)
+
+# Extract nodes and edges from DOT
+edge_re = re.compile(r'"([^"]+)"\s*->\s*"([^"]+)"')
+dot_edges = set((m.group(1), m.group(2)) for m in edge_re.finditer(dot))
+
+# Extract quoted node identifiers (both from node decls and edges endpoints)
+node_tokens = set(re.findall(r'"([^"]+)"', dot))
+
+missing_nodes = units_expected - node_tokens
+if missing_nodes:
+    print(f"FAIL: dot missing nodes: {sorted(missing_nodes)}", file=sys.stderr); sys.exit(1)
+
+# Node set equality: only expected units may appear as identifiers
+extra_nodes = node_tokens - units_expected
+if extra_nodes:
+    print(f"FAIL: dot has unexpected node names: {sorted(extra_nodes)}", file=sys.stderr); sys.exit(1)
+
+if dot_edges != edges_expected:
+    only_dot = dot_edges - edges_expected
+    only_exp = edges_expected - dot_edges
+    print(f"FAIL: edge mismatch. only_in_dot={sorted(only_dot)} only_in_expected={sorted(only_exp)}", file=sys.stderr)
+    sys.exit(1)
+
+if len(dot_edges) != len(edges_expected):
+    print("FAIL: edge count mismatch", file=sys.stderr); sys.exit(1)
+
+# Validate cycles.json structure
+if not isinstance(cj, dict) or "cycles" not in cj:
+    print("FAIL: cycles.json must have top-level 'cycles'", file=sys.stderr); sys.exit(1)
+if not isinstance(cj["cycles"], list):
+    print("FAIL: cycles must be a list", file=sys.stderr); sys.exit(1)
+
+# Compute reference cycles
+import sys as _sys
+_sys.setrecursionlimit(10000)
+
+def tarjan(graph):
+    idx = 0; stack=[]; on=set(); ind={}; low={}; out=[]
+    def sc(v, idx):
+        ind[v]=idx; low[v]=idx; idx+=1; stack.append(v); on.add(v)
+        for w in graph.get(v,()):
+            if w not in ind:
+                idx = sc(w, idx)
+                low[v]=min(low[v], low[w])
+            elif w in on:
+                low[v]=min(low[v], ind[w])
+        if low[v]==ind[v]:
+            comp=[]
+            while True:
+                w=stack.pop(); on.discard(w); comp.append(w)
+                if w==v: break
+            out.append(comp)
+        return idx
+    for v in list(graph):
+        if v not in ind:
+            idx = sc(v, idx)
+    return out
+
+sccs = tarjan(fwd)
+ref_cycles = []
+
+def find_in_scc(nodes, graph):
+    ns=set(nodes)
+    sub={n: sorted([m for m in graph[n] if m in ns]) for n in nodes}
+    found=[]
+    blocked=set(); B={n:set() for n in nodes}; stack=[]
+    def unblock(u):
+        blocked.discard(u)
+        while B[u]:
+            w=B[u].pop()
+            if w in blocked: unblock(w)
+    def circuit(v,s,comp):
+        f=False; stack.append(v); blocked.add(v)
+        for w in sub[v]:
+            if w not in comp: continue
+            if w==s:
+                found.append(list(stack)); f=True
+            elif w not in blocked:
+                if circuit(w,s,comp): f=True
+        if f: unblock(v)
+        else:
+            for w in sub[v]:
+                if w in comp and v not in B[w]:
+                    B[w].add(v)
+        stack.pop()
+        return f
+    remaining=set(nodes)
+    for s in sorted(nodes):
+        if s not in remaining: continue
+        comp=remaining.copy(); blocked=set(); B={n:set() for n in comp}; stack=[]
+        circuit(s,s,comp); remaining.discard(s)
+    return found
+
+for comp in sccs:
+    if len(comp)==1:
+        n=comp[0]
+        if n in fwd.get(n,()):
+            ref_cycles.append([n])
+        continue
+    for c in find_in_scc(comp, fwd):
+        ref_cycles.append(c)
+
+def norm(c):
+    i=min(range(len(c)), key=lambda k:c[k])
+    return tuple(c[i:]+c[:i])
+
+ref_set = set(norm(c) for c in ref_cycles)
+got_set = set()
+for c in cj["cycles"]:
+    if not isinstance(c, list) or not all(isinstance(x,str) for x in c):
+        print("FAIL: each cycle must be a list of strings", file=sys.stderr); sys.exit(1)
+    if len(c)==0:
+        print("FAIL: empty cycle entry", file=sys.stderr); sys.exit(1)
+    # Check it starts with lexicographically smallest
+    mn = min(c)
+    if c[0] != mn:
+        print(f"FAIL: cycle not rotated to lex-min start: {c}", file=sys.stderr); sys.exit(1)
+    got_set.add(tuple(c))
+
+if got_set != ref_set:
+    only_got = got_set - ref_set
+    only_ref = ref_set - got_set
+    print(f"FAIL: cycles mismatch. only_in_output={sorted(only_got)} only_in_expected={sorted(only_ref)}", file=sys.stderr)
+    sys.exit(1)
+
+print("OK")
+PY
+
+echo "PASS"

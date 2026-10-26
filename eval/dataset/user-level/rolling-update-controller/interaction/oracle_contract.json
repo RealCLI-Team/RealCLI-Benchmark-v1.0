@@ -1,0 +1,185 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "instance_id": "rolling-update-controller",
+  "source_files": [
+    "instruction.md",
+    "tests/test_outputs.py"
+  ],
+  "requirements": [
+    {
+      "id": "revision_identity",
+      "verifier_assertion": "check_revision_identity: revision_id() is ordering-independent, changes with image, and drives ==/!=",
+      "script_refs": [
+        "s2_revision"
+      ],
+      "must_include": [
+        "independent of dict key order",
+        "changes when a substantive config change",
+        "Equality between Revisions is decided by revision_id()"
+      ]
+    },
+    {
+      "id": "policy_validation",
+      "verifier_assertion": "check_policy_validation: missing image, unknown strategy, and batch_size<1 raise RevisionError",
+      "script_refs": [
+        "s2_revision",
+        "s3_policy"
+      ],
+      "must_include": [
+        "missing image must raise RevisionError",
+        "an unknown strategy must raise RevisionError",
+        "batch_size must be >= 1, otherwise raise RevisionError"
+      ]
+    },
+    {
+      "id": "initial_rollout",
+      "verifier_assertion": "check_initial_rollout: a first rollout brings up exactly `replicas` containers on the target image",
+      "script_refs": [
+        "s6_rollout",
+        "s4_controller_ctor"
+      ],
+      "must_include": [
+        "A first rollout brings up exactly the requested replica count on the target image",
+        "create_host_config -> create_container -> start"
+      ]
+    },
+    {
+      "id": "plan_pure_idempotent",
+      "verifier_assertion": "check_plan_is_pure_and_idempotent: plan() has no side effects and a settled service re-plans to a no-op",
+      "script_refs": [
+        "s5_plan"
+      ],
+      "must_include": [
+        "it must not create or delete any container",
+        "the plan is a do-nothing plan",
+        "plan.is_noop is a boolean attribute"
+      ]
+    },
+    {
+      "id": "rolling_batches",
+      "verifier_assertion": "check_rolling_batches: 4 replicas at batch_size 2 -> 2 batches; rollout preserves count and ends on new image",
+      "script_refs": [
+        "s5_plan",
+        "s6_rollout"
+      ],
+      "must_include": [
+        "4 replicas at batch_size 2 rolling yields 2",
+        "the final replica count is preserved"
+      ]
+    },
+    {
+      "id": "health_triggers_rollback",
+      "verifier_assertion": "check_health_triggers_rollback: unhealthy new revision -> RolloutFailed(rolled_back=True) and service left on only the old revision at original count",
+      "script_refs": [
+        "s7_health_rollback"
+      ],
+      "must_include": [
+        "unhealthy after health_attempts probes",
+        "the service runs ONLY the old revision with the original replica count",
+        "the raised RolloutFailed has rolled_back True"
+      ]
+    },
+    {
+      "id": "no_auto_rollback",
+      "verifier_assertion": "check_no_auto_rollback: with auto_rollback off a failed rollout is not reverted and rolled_back is False",
+      "script_refs": [
+        "s7_health_rollback"
+      ],
+      "must_include": [
+        "If auto_rollback is off, the failure is raised as-is with no restoration and rolled_back is False"
+      ]
+    },
+    {
+      "id": "blue_green_ordering",
+      "verifier_assertion": "check_blue_green_ordering: promote step present, all creates before promote, removes after promote",
+      "script_refs": [
+        "s8_bluegreen_recreate"
+      ],
+      "must_include": [
+        "all create steps come before the promote",
+        "the old replicas are removed only after the promote",
+        "A blue/green plan must contain exactly one promote step"
+      ]
+    },
+    {
+      "id": "recreate_ordering",
+      "verifier_assertion": "check_recreate: every remove comes before any create and it ends on the new image",
+      "script_refs": [
+        "s8_bluegreen_recreate"
+      ],
+      "must_include": [
+        "every remove comes before any create"
+      ]
+    },
+    {
+      "id": "canary_success",
+      "verifier_assertion": "check_canary_success: canary plan contains analyze; a passing canary migrates the whole fleet",
+      "script_refs": [
+        "s9_canary"
+      ],
+      "must_include": [
+        "A canary plan must contain an analyze step",
+        "migrate the remaining replicas like a rolling update"
+      ]
+    },
+    {
+      "id": "canary_rejection",
+      "verifier_assertion": "check_canary_rejection_rolls_back: a failing canary raises RolloutFailed and leaves the old revision",
+      "script_refs": [
+        "s9_canary"
+      ],
+      "must_include": [
+        "with auto_rollback on, rolls back to the old version",
+        "leaving the service on the old revision"
+      ]
+    },
+    {
+      "id": "canary_metric_thresholds",
+      "verifier_assertion": "check_canary_metric_thresholds: comparisons evaluated; fail-fast gives intervals_run==1; MetricCheck and Comparison exported",
+      "script_refs": [
+        "s10_metrics"
+      ],
+      "must_include": [
+        "comparison in lt/le/gt/ge",
+        "failing on the first interval gives intervals_run == 1",
+        "MetricCheck and Comparison are importable from the top level"
+      ]
+    },
+    {
+      "id": "explicit_rollback_history",
+      "verifier_assertion": "check_explicit_rollback_and_history: history records transitions; current() is latest; rollback_steps(steps=1) reverts",
+      "script_refs": [
+        "s11_history"
+      ],
+      "must_include": [
+        "hist.entries() is a method returning the entries, each with entry.image",
+        "hist.current() is a",
+        "rollback_steps(steps=1)"
+      ]
+    },
+    {
+      "id": "scaling",
+      "verifier_assertion": "check_scaling: scale() changes count without changing image; plan_scale to current count is a no-op",
+      "script_refs": [
+        "s12_scale"
+      ],
+      "must_include": [
+        "adjust the replica count to count WITHOUT changing the version",
+        "already being at the target count is a no-op",
+        "retires the largest-index replicas first"
+      ]
+    },
+    {
+      "id": "spec_loader",
+      "verifier_assertion": "check_spec_loader: RolloutSpec parses/validates; canary_slots>replicas and canary-on-non-canary raise RevisionError",
+      "script_refs": [
+        "s13_spec"
+      ],
+      "must_include": [
+        "canary_slots must not exceed replicas",
+        "only the canary strategy may carry a canary evaluation block",
+        "self-contradictory manifests raise RevisionError"
+      ]
+    }
+  ]
+}

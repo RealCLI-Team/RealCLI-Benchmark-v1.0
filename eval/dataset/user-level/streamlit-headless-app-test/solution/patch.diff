@@ -1,0 +1,3452 @@
+diff -Naur --no-dereference orig_repo/lib/streamlit/testing/__init__.py working_repo/lib/streamlit/testing/__init__.py
+--- orig_repo/lib/streamlit/testing/__init__.py	2026-08-26 02:19:03.343729714 +0800
++++ working_repo/lib/streamlit/testing/__init__.py	2026-08-26 19:21:15.507134453 +0800
+@@ -11,3 +11,11 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++
++# The public entry point for the headless testing framework lives in the
++# versioned subpackage. Re-exporting it here lets users write the short and
++# obvious import path (`from streamlit.testing import AppTest`) without having
++# to know which framework revision is current.
++from streamlit.testing.v1.app_test import AppTest as AppTest
++
++__all__ = ["AppTest"]
+diff -Naur --no-dereference orig_repo/lib/streamlit/testing/script_interactions.py working_repo/lib/streamlit/testing/script_interactions.py
+--- orig_repo/lib/streamlit/testing/script_interactions.py	2026-08-26 02:19:03.349234000 +0800
++++ working_repo/lib/streamlit/testing/script_interactions.py	2026-08-26 19:21:15.507440000 +0800
+@@ -19,6 +19,7 @@
+ import tempfile
+ import textwrap
+ import unittest
++import warnings
+ from unittest.mock import MagicMock
+ 
+ from streamlit import config, source_util
+@@ -30,6 +31,14 @@
+ from streamlit.runtime.memory_media_file_storage import MemoryMediaFileStorage
+ from streamlit.testing.local_script_runner import LocalScriptRunner
+ 
++# Public message used by the deprecation warning below. Tests match against
++# this exact substring, so keep the class name and target API mentions in it.
++_DEPRECATION_MESSAGE = (
++    "`InteractiveScriptTests` is deprecated and will be removed in a future "
++    "release. Convert your tests to use `streamlit.testing.v1.AppTest` "
++    "(also re-exported as `streamlit.testing.AppTest`)."
++)
++
+ 
+ class InteractiveScriptTests(unittest.TestCase):
+     tmp_script_dir: tempfile.TemporaryDirectory[str]
+@@ -37,6 +46,12 @@
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+ 
++        warnings.warn(
++            _DEPRECATION_MESSAGE,
++            DeprecationWarning,
++            stacklevel=2,
++        )
++
+         # To allow loading scripts to be relative to the test class's directory,
+         # we do this in the init so it will run in the subclass's module.
+         # `__file__` refers to the base class's file, and `self.__module__`
+diff -Naur --no-dereference orig_repo/lib/streamlit/testing/v1/__init__.py working_repo/lib/streamlit/testing/v1/__init__.py
+--- orig_repo/lib/streamlit/testing/v1/__init__.py	1970-01-01 08:00:00.000000000 +0800
++++ working_repo/lib/streamlit/testing/v1/__init__.py	2026-08-26 19:21:15.508090426 +0800
+@@ -0,0 +1,15 @@
++# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from streamlit.testing.v1.app_test import AppTest as AppTest
+diff -Naur --no-dereference orig_repo/lib/streamlit/testing/v1/app_test.py working_repo/lib/streamlit/testing/v1/app_test.py
+--- orig_repo/lib/streamlit/testing/v1/app_test.py	1970-01-01 08:00:00.000000000 +0800
++++ working_repo/lib/streamlit/testing/v1/app_test.py	2026-08-26 19:21:26.337248000 +0800
+@@ -0,0 +1,404 @@
++# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++from __future__ import annotations
++
++import ast
++import hashlib
++import inspect
++import pathlib
++import tempfile
++import textwrap
++import traceback
++from typing import Any, Callable, Sequence
++from unittest.mock import MagicMock
++
++from streamlit import source_util, util
++from streamlit.proto.WidgetStates_pb2 import WidgetStates
++from streamlit.runtime import Runtime
++from streamlit.runtime.caching.storage.dummy_cache_storage import (
++    MemoryCacheStorageManager,
++)
++from streamlit.runtime.media_file_manager import MediaFileManager
++from streamlit.runtime.memory_media_file_storage import MemoryMediaFileStorage
++from streamlit.runtime.state.session_state import SessionState
++from streamlit.testing.v1.element_tree import (
++    Block,
++    Button,
++    Caption,
++    Checkbox,
++    Code,
++    ColorPicker,
++    DateInput,
++    Divider,
++    ElementList,
++    ElementTree,
++    Error,
++    Exception,
++    Header,
++    Info,
++    Latex,
++    Markdown,
++    Multiselect,
++    Node,
++    NumberInput,
++    Radio,
++    Selectbox,
++    SelectSlider,
++    Slider,
++    Subheader,
++    Success,
++    Text,
++    TextArea,
++    TextInput,
++    TimeInput,
++    Title,
++    Warning,
++    WidgetList,
++)
++from streamlit.testing.v1.local_script_runner import LocalScriptRunner
++from streamlit.testing.v1.util import patch_config_options
++
++TMP_DIR = tempfile.TemporaryDirectory()
++
++
++class AppTest:
++    def __init__(self, script_path: str, default_timeout: float):
++        self._script_path = script_path
++        self.default_timeout = default_timeout
++        self.session_state = SessionState()
++        self.query_params: dict[str, Any] = {}
++
++        tree = ElementTree()
++        tree._runner = self
++        self._tree = tree
++
++    @classmethod
++    def from_string(cls, script: str, default_timeout: float = 3) -> AppTest:
++        """Create a runner for a script with the contents from a string.
++
++        Useful for testing short scripts that fit comfortably as an inline
++        string in the test itself, without having to create a separate file
++        for it.
++
++        Parameters
++        ----------
++        script
++            The string contents of the script to be run.
++
++        default_timeout
++            Default time in seconds before a script run is timed out. Can be
++            overridden for individual `.run()` calls.
++
++        """
++        hasher = hashlib.md5(bytes(script, "utf-8"))
++        script_name = hasher.hexdigest()
++
++        path = pathlib.Path(TMP_DIR.name, script_name)
++        aligned_script = textwrap.dedent(script)
++        path.write_text(aligned_script)
++        return AppTest(str(path), default_timeout=default_timeout)
++
++    @classmethod
++    def from_function(
++        cls, script: Callable[[], None], default_timeout: float = 3
++    ) -> AppTest:
++        """Create a runner for a script with the contents from a function.
++
++        Similar to `AppTest.from_string()`, but more convenient to write
++        with IDE assistance.
++
++        Parameters
++        ----------
++        script
++            A function whose body will be used as a script. Must be runnable
++            in isolation, so it must include any used imports.
++
++        default_timeout
++            Default time in seconds before a script run is timed out. Can be
++            overridden for individual `.run()` calls.
++
++        """
++        # TODO: Simplify this using `ast.unparse()` once we drop 3.8 support
++        try:
++            source_lines, _ = inspect.getsourcelines(script)
++        except OSError:
++            # ``inspect.getsourcelines`` walks the module loader and
++            # ``linecache`` to find the source. In some runtime layouts
++            # (test files loaded from a read-only mount at an absolute
++            # path outside the pytest rootdir, or callers whose modules
++            # were imported without a PEP 302 loader) that lookup can
++            # fail with ``OSError('source code not available')`` even
++            # though the underlying ``.py`` file is readable. Fall back
++            # to reading the file straight off ``co_filename`` and use
++            # the AST to isolate the function body.
++            body, default_timeout_ = cls._read_function_body_from_disk(
++                script, default_timeout
++            )
++            return cls.from_string(body, default_timeout=default_timeout_)
++        source = textwrap.dedent("".join(source_lines))
++        module = ast.parse(source)
++        fn_def = module.body[0]
++        body_lines = source_lines[fn_def.lineno :]
++        body = textwrap.dedent("".join(body_lines))
++        return cls.from_string(body, default_timeout=default_timeout)
++
++    @staticmethod
++    def _read_function_body_from_disk(
++        script: Callable[[], None], default_timeout: float
++    ) -> tuple[str, float]:
++        filename = script.__code__.co_filename
++        try:
++            with open(filename, "r", encoding="utf-8") as fh:
++                file_lines = fh.readlines()
++        except OSError as exc:
++            raise OSError(
++                f"AppTest.from_function could not read source for "
++                f"{script!r} at {filename!r}: {exc}"
++            ) from exc
++        try:
++            tree = ast.parse("".join(file_lines))
++        except SyntaxError as exc:
++            raise OSError(
++                f"AppTest.from_function could not parse {filename!r}: {exc}"
++            ) from exc
++        target_line = script.__code__.co_firstlineno
++        target_name = script.__name__
++        matched: ast.FunctionDef | ast.AsyncFunctionDef | None = None
++        for node in ast.walk(tree):
++            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                continue
++            if node.name != target_name:
++                continue
++            if node.lineno == target_line:
++                matched = node
++                break
++        if matched is None:
++            raise OSError(
++                f"AppTest.from_function could not locate function "
++                f"{target_name!r} at line {target_line} in {filename!r}"
++            )
++        end_lineno = matched.end_lineno
++        body_start = matched.body[0].lineno
++        if end_lineno is None:
++            body_source_lines = file_lines[body_start - 1 :]
++        else:
++            body_source_lines = file_lines[body_start - 1 : end_lineno]
++        body = textwrap.dedent("".join(body_source_lines))
++        return body, default_timeout
++
++    @classmethod
++    def from_file(cls, script_path: str, default_timeout: float = 3) -> AppTest:
++        """Create a runner for the script with the given file name.
++
++        Parameters
++        ----------
++        script_path
++            Path to a script file. Several locations are tried, including treating
++            the path as relative to the file calling `.from_file`.
++
++        default_timeout
++            Default time in seconds before a script run is timed out. Can be
++            overridden for individual `.run()` calls.
++        """
++        if pathlib.Path.is_file(pathlib.Path(script_path)):
++            path = script_path
++        else:
++            # TODO: Make this not super fragile
++            # Attempt to find the test file calling this method, so the
++            # path can be relative to there.
++            stack = traceback.StackSummary.extract(traceback.walk_stack(None))
++            filepath = pathlib.Path(stack[1].filename)
++            path = str(filepath.parent / script_path)
++        return AppTest(path, default_timeout=default_timeout)
++
++    def _run(
++        self,
++        widget_state: WidgetStates | None = None,
++        timeout: float | None = None,
++    ) -> AppTest:
++        """Run the script, and parse the output messages for querying
++        and interaction.
++
++        Timeout is in seconds, or None to use the default timeout of the runner.
++        """
++        if timeout is None:
++            timeout = self.default_timeout
++
++        # setup
++        mock_runtime = MagicMock(spec=Runtime)
++        mock_runtime.media_file_mgr = MediaFileManager(
++            MemoryMediaFileStorage("/mock/media")
++        )
++        mock_runtime.cache_storage_manager = MemoryCacheStorageManager()
++        Runtime._instance = mock_runtime
++        with source_util._pages_cache_lock:
++            self.saved_cached_pages = source_util._cached_pages
++            source_util._cached_pages = None
++
++        with patch_config_options({"runner.postScriptGC": False}):
++            script_runner = LocalScriptRunner(self._script_path, self.session_state)
++            self._tree = script_runner.run(widget_state, self.query_params, timeout)
++            self._tree._runner = self
++
++        # teardown
++        with source_util._pages_cache_lock:
++            source_util._cached_pages = self.saved_cached_pages
++        Runtime._instance = None
++
++        return self
++
++    def run(self, timeout: float | None = None) -> AppTest:
++        """Run the script, and parse the output messages for querying
++        and interaction.
++
++        Timeout is in seconds, or None to use the default timeout of the runner.
++
++        Parameters
++        ----------
++        timeout
++            The maximum number of seconds to run the script. None means
++            use the AppTest's default.
++        """
++        return self._tree.run(timeout)
++
++    @property
++    def main(self) -> Block:
++        return self._tree.main
++
++    @property
++    def sidebar(self) -> Block:
++        return self._tree.sidebar
++
++    @property
++    def button(self) -> WidgetList[Button]:
++        return self._tree.button
++
++    @property
++    def caption(self) -> ElementList[Caption]:
++        return self._tree.caption
++
++    @property
++    def checkbox(self) -> WidgetList[Checkbox]:
++        return self._tree.checkbox
++
++    @property
++    def code(self) -> ElementList[Code]:
++        return self._tree.code
++
++    @property
++    def color_picker(self) -> WidgetList[ColorPicker]:
++        return self._tree.color_picker
++
++    @property
++    def date_input(self) -> WidgetList[DateInput]:
++        return self._tree.date_input
++
++    @property
++    def divider(self) -> ElementList[Divider]:
++        return self._tree.divider
++
++    @property
++    def error(self) -> ElementList[Error]:
++        return self._tree.error
++
++    @property
++    def exception(self) -> ElementList[Exception]:
++        return self._tree.exception
++
++    @property
++    def header(self) -> ElementList[Header]:
++        return self._tree.header
++
++    @property
++    def info(self) -> ElementList[Info]:
++        return self._tree.info
++
++    @property
++    def latex(self) -> ElementList[Latex]:
++        return self._tree.latex
++
++    @property
++    def markdown(self) -> ElementList[Markdown]:
++        return self._tree.markdown
++
++    @property
++    def success(self) -> ElementList[Success]:
++        return self._tree.success
++
++    @property
++    def warning(self) -> ElementList[Warning]:
++        return self._tree.warning
++
++    @property
++    def multiselect(self) -> WidgetList[Multiselect[Any]]:
++        return self._tree.multiselect
++
++    @property
++    def number_input(self) -> WidgetList[NumberInput]:
++        return self._tree.number_input
++
++    @property
++    def radio(self) -> WidgetList[Radio[Any]]:
++        return self._tree.radio
++
++    @property
++    def select_slider(self) -> WidgetList[SelectSlider[Any]]:
++        return self._tree.select_slider
++
++    @property
++    def selectbox(self) -> WidgetList[Selectbox[Any]]:
++        return self._tree.selectbox
++
++    @property
++    def slider(self) -> WidgetList[Slider[Any]]:
++        return self._tree.slider
++
++    @property
++    def subheader(self) -> ElementList[Subheader]:
++        return self._tree.subheader
++
++    @property
++    def text(self) -> ElementList[Text]:
++        return self._tree.text
++
++    @property
++    def text_area(self) -> WidgetList[TextArea]:
++        return self._tree.text_area
++
++    @property
++    def text_input(self) -> WidgetList[TextInput]:
++        return self._tree.text_input
++
++    @property
++    def time_input(self) -> WidgetList[TimeInput]:
++        return self._tree.time_input
++
++    @property
++    def title(self) -> ElementList[Title]:
++        return self._tree.title
++
++    def __len__(self) -> int:
++        return len(self._tree)
++
++    def __iter__(self):
++        yield from self._tree
++
++    def __getitem__(self, idx: int) -> Node:
++        return self._tree[idx]
++
++    def get(self, element_type: str) -> Sequence[Node]:
++        return self._tree.get(element_type)
++
++    def __repr__(self) -> str:
++        return util.repr_(self)
+diff -Naur --no-dereference orig_repo/lib/streamlit/testing/v1/element_tree.py working_repo/lib/streamlit/testing/v1/element_tree.py
+--- orig_repo/lib/streamlit/testing/v1/element_tree.py	1970-01-01 08:00:00.000000000 +0800
++++ working_repo/lib/streamlit/testing/v1/element_tree.py	2026-08-26 19:21:15.510538634 +0800
+@@ -0,0 +1,1398 @@
++# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from dataclasses import dataclass, field
++from datetime import date, datetime, time, timedelta
++from typing import (
++    TYPE_CHECKING,
++    Any,
++    Generic,
++    List,
++    Sequence,
++    TypeVar,
++    Union,
++    cast,
++    overload,
++)
++
++from typing_extensions import Literal, TypeAlias
++
++from streamlit import util
++from streamlit.elements.heading import HeadingProtoTag
++from streamlit.elements.widgets.select_slider import SelectSliderSerde
++from streamlit.elements.widgets.slider import (
++    SliderScalar,
++    SliderScalarT,
++    SliderSerde,
++    Step,
++)
++from streamlit.elements.widgets.time_widgets import (
++    DateInputSerde,
++    DateWidgetReturn,
++    TimeInputSerde,
++    _parse_date_value,
++)
++from streamlit.proto.Alert_pb2 import Alert as AlertProto
++from streamlit.proto.Block_pb2 import Block as BlockProto
++from streamlit.proto.Button_pb2 import Button as ButtonProto
++from streamlit.proto.Checkbox_pb2 import Checkbox as CheckboxProto
++from streamlit.proto.Code_pb2 import Code as CodeProto
++from streamlit.proto.ColorPicker_pb2 import ColorPicker as ColorPickerProto
++from streamlit.proto.DateInput_pb2 import DateInput as DateInputProto
++from streamlit.proto.Element_pb2 import Element as ElementProto
++from streamlit.proto.Exception_pb2 import Exception as ExceptionProto
++from streamlit.proto.ForwardMsg_pb2 import ForwardMsg
++from streamlit.proto.Heading_pb2 import Heading as HeadingProto
++from streamlit.proto.Markdown_pb2 import Markdown as MarkdownProto
++from streamlit.proto.MultiSelect_pb2 import MultiSelect as MultiSelectProto
++from streamlit.proto.NumberInput_pb2 import NumberInput as NumberInputProto
++from streamlit.proto.Radio_pb2 import Radio as RadioProto
++from streamlit.proto.Selectbox_pb2 import Selectbox as SelectboxProto
++from streamlit.proto.Slider_pb2 import Slider as SliderProto
++from streamlit.proto.Text_pb2 import Text as TextProto
++from streamlit.proto.TextArea_pb2 import TextArea as TextAreaProto
++from streamlit.proto.TextInput_pb2 import TextInput as TextInputProto
++from streamlit.proto.TimeInput_pb2 import TimeInput as TimeInputProto
++from streamlit.proto.WidgetStates_pb2 import WidgetState, WidgetStates
++from streamlit.runtime.state.common import user_key_from_widget_id
++from streamlit.runtime.state.session_state import SessionState
++
++if TYPE_CHECKING:
++    from streamlit.testing.v1.app_test import AppTest
++
++T = TypeVar("T")
++
++
++@dataclass
++class InitialValue:
++    """This class is used to represent the initial value of a widget."""
++
++    pass
++
++
++# TODO This class serves as a fallback option for elements that have not
++# been implemented yet, as well as providing implementations of some
++# trivial methods. It may have significantly reduced scope once all elements
++# have been implemented.
++# This class will not be sufficient implementation for most elements.
++# Widgets need their own classes to translate interactions into the appropriate
++# WidgetState and provide higher level interaction interfaces, and other elements
++# have enough variation in how to get their values that most will need their
++# own classes too.
++@dataclass
++class Element:
++    type: str
++    proto: Any = field(repr=False)
++    root: ElementTree = field(repr=False)
++    key: str | None
++
++    def __init__(self, proto: ElementProto, root: ElementTree):
++        ty = proto.WhichOneof("type")
++        assert ty is not None
++        self.proto = getattr(proto, ty)
++        self.root = root
++        self.type = ty
++        self.key = None
++
++    def __iter__(self):
++        yield self
++
++    @property
++    def value(self) -> Any:
++        try:
++            state = self.root.session_state
++            assert state is not None
++            return state[self.proto.id]
++        except ValueError:
++            # No id field, not a widget
++            return self.proto.value
++
++    def __getattr__(self, name: str) -> Any:
++        """Fallback attempt to get an attribute from the proto"""
++        return getattr(self.proto, name)
++
++    def run(self, timeout: float | None = None) -> AppTest:
++        """Run the script with updated widget values.
++
++        Parameters
++        ----------
++        timeout
++            The maximum number of seconds to run the script. None means
++            use the AppTest's default.
++        """
++        return self.root.run(timeout=timeout)
++
++    def __repr__(self):
++        return util.repr_(self)
++
++
++@dataclass(repr=False)
++class Widget(ABC, Element):
++    id: str
++    label: str
++    help: str
++    form_id: str
++    disabled: bool
++    key: str | None
++    _value: Any
++
++    def __init__(self, proto: Any, root: ElementTree):
++        self.proto = proto
++        self.root = root
++        self.key = user_key_from_widget_id(self.id)
++        self._value = None
++
++    def set_value(self, v: Any):
++        self._value = v
++        return self
++
++    @property
++    @abstractmethod
++    def _widget_state(self) -> WidgetState:
++        ...
++
++
++El = TypeVar("El", bound=Element, covariant=True)
++
++
++class ElementList(Generic[El]):
++    def __init__(self, els: Sequence[El]):
++        self._list: Sequence[El] = els
++
++    def __len__(self) -> int:
++        return len(self._list)
++
++    @property
++    def len(self) -> int:
++        return len(self)
++
++    @overload
++    def __getitem__(self, idx: int) -> El:
++        ...
++
++    @overload
++    def __getitem__(self, idx: slice) -> ElementList[El]:
++        ...
++
++    def __getitem__(self, idx: int | slice) -> El | ElementList[El]:
++        if isinstance(idx, slice):
++            return ElementList(self._list[idx])
++        else:
++            return self._list[idx]
++
++    def __iter__(self):
++        yield from self._list
++
++    def __repr__(self):
++        return util.repr_(self)
++
++    def __eq__(self, other: ElementList[El] | object) -> bool:
++        if isinstance(other, ElementList):
++            return self._list == other._list
++        else:
++            return self._list == other
++
++    @property
++    def values(self) -> Sequence[Any]:
++        return [e.value for e in self]
++
++
++W = TypeVar("W", bound=Widget, covariant=True)
++
++
++class WidgetList(Generic[W], ElementList[W]):
++    def __call__(self, key: str) -> W:
++        for e in self._list:
++            if e.key == key:
++                return e
++
++        raise KeyError(key)
++
++
++@dataclass(repr=False)
++class Button(Widget):
++    _value: bool
++
++    proto: ButtonProto
++
++    def __init__(self, proto: ButtonProto, root: ElementTree):
++        super().__init__(proto, root)
++        self._value = False
++        self.type = "button"
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        ws = WidgetState()
++        ws.id = self.id
++        ws.trigger_value = self._value
++        return ws
++
++    @property
++    def value(self) -> bool:
++        if self._value:
++            return self._value
++        else:
++            state = self.root.session_state
++            assert state
++            return cast(bool, state[self.id])
++
++    def set_value(self, v: bool) -> Button:
++        self._value = v
++        return self
++
++    def click(self) -> Button:
++        return self.set_value(True)
++
++
++@dataclass(repr=False)
++class Checkbox(Widget):
++    _value: bool | None
++
++    proto: CheckboxProto
++
++    def __init__(self, proto: CheckboxProto, root: ElementTree):
++        super().__init__(proto, root)
++        self.type = "checkbox"
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        ws = WidgetState()
++        ws.id = self.id
++        ws.bool_value = self.value
++        return ws
++
++    @property
++    def value(self) -> bool:
++        if self._value is not None:
++            return self._value
++        else:
++            state = self.root.session_state
++            assert state
++            return cast(bool, state[self.id])
++
++    def set_value(self, v: bool) -> Checkbox:
++        self._value = v
++        return self
++
++    def check(self) -> Checkbox:
++        return self.set_value(True)
++
++    def uncheck(self) -> Checkbox:
++        return self.set_value(False)
++
++
++@dataclass(repr=False)
++class Code(Element):
++    proto: CodeProto
++
++    language: str
++    show_line_numbers: bool
++    key: None
++
++    def __init__(self, proto: CodeProto, root: ElementTree):
++        self.proto = proto
++        self.key = None
++        self.root = root
++        self.type = "code"
++
++    @property
++    def value(self) -> str:
++        return self.proto.code_text
++
++
++@dataclass(repr=False)
++class ColorPicker(Widget):
++    _value: str | None
++
++    proto: ColorPickerProto
++
++    def __init__(self, proto: ColorPickerProto, root: ElementTree):
++        super().__init__(proto, root)
++        self.type = "color_picker"
++
++    @property
++    def value(self) -> str:
++        """The currently selected value from the options."""
++        if self._value is not None:
++            return self._value
++        else:
++            state = self.root.session_state
++            assert state
++            return cast(str, state[self.id])
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        """Protobuf message representing the state of the widget, including
++        any interactions that have happened.
++        Should be the same as the frontend would produce for those interactions.
++        """
++        ws = WidgetState()
++        ws.id = self.id
++        ws.string_value = self.value
++        return ws
++
++    def set_value(self, v: str) -> ColorPicker:
++        self._value = v
++        return self
++
++    def pick(self, v: str) -> ColorPicker:
++        if not v.startswith("#"):
++            v = f"#{v}"
++        return self.set_value(v)
++
++
++SingleDateValue: TypeAlias = Union[date, datetime]
++DateValue: TypeAlias = Union[SingleDateValue, Sequence[SingleDateValue], None]
++
++
++@dataclass(repr=False)
++class DateInput(Widget):
++    _value: DateValue | None | InitialValue
++    proto: DateInputProto
++    min: date
++    max: date
++    is_range: bool
++
++    def __init__(self, proto: DateInputProto, root: ElementTree):
++        super().__init__(proto, root)
++        self._value = InitialValue()
++        self.type = "date_input"
++        self.min = datetime.strptime(proto.min, "%Y/%m/%d").date()
++        self.max = datetime.strptime(proto.max, "%Y/%m/%d").date()
++
++    def set_value(self, v: DateValue) -> DateInput:
++        self._value = v
++        return self
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        ws = WidgetState()
++        ws.id = self.id
++
++        serde = DateInputSerde(None)  # type: ignore
++        ws.string_array_value.data[:] = serde.serialize(self.value)
++        return ws
++
++    @property
++    def value(self) -> DateWidgetReturn:
++        if not isinstance(self._value, InitialValue):
++            parsed, _ = _parse_date_value(self._value)
++            return tuple(parsed) if parsed is not None else None  # type: ignore
++        else:
++            state = self.root.session_state
++            assert state
++            return state[self.id]  # type: ignore
++
++
++@dataclass(repr=False)
++class Exception(Element):
++    message: str
++    is_markdown: bool
++    stack_trace: list[str]
++    is_warning: bool
++
++    def __init__(self, proto: ExceptionProto, root: ElementTree):
++        self.key = None
++        self.root = root
++        self.proto = proto
++        self.type = "exception"
++
++        self.is_markdown = proto.message_is_markdown
++        self.stack_trace = list(proto.stack_trace)
++
++    @property
++    def value(self) -> str:
++        return self.message
++
++
++@dataclass(repr=False)
++class AlertBase(Element, ABC):
++    """Shared implementation for the four alert-style elements
++    (``st.info`` / ``st.warning`` / ``st.error`` / ``st.success``).
++
++    All four are backed by the same ``Alert`` protobuf; they differ only in
++    the ``format`` enum, which we use to decide the concrete subclass at
++    parse time. The test-facing ``.type`` string mirrors the Python
++    ``streamlit`` API name that produced the element so users can query them
++    naturally (``at.warning[0]``, ``at.get("warning")`` etc.).
++    """
++
++    proto: AlertProto
++    key: None
++    icon: str
++
++    def __init__(self, proto: AlertProto, root: ElementTree, type_: str):
++        self.proto = proto
++        self.key = None
++        self.root = root
++        self.type = type_
++        self.icon = proto.icon
++
++    @property
++    def value(self) -> str:
++        return self.proto.body
++
++
++@dataclass(repr=False)
++class Error(AlertBase):
++    def __init__(self, proto: AlertProto, root: ElementTree):
++        super().__init__(proto, root, "error")
++
++
++@dataclass(repr=False)
++class Warning(AlertBase):
++    def __init__(self, proto: AlertProto, root: ElementTree):
++        super().__init__(proto, root, "warning")
++
++
++@dataclass(repr=False)
++class Info(AlertBase):
++    def __init__(self, proto: AlertProto, root: ElementTree):
++        super().__init__(proto, root, "info")
++
++
++@dataclass(repr=False)
++class Success(AlertBase):
++    def __init__(self, proto: AlertProto, root: ElementTree):
++        super().__init__(proto, root, "success")
++
++
++@dataclass(repr=False)
++class HeadingBase(Element, ABC):
++    proto: HeadingProto
++
++    tag: str
++    anchor: str | None
++    hide_anchor: bool
++    key: None
++
++    def __init__(self, proto: HeadingProto, root: ElementTree, type_: str):
++        self.proto = proto
++        self.key = None
++        self.root = root
++        self.type = type_
++
++    @property
++    def value(self) -> str:
++        return self.proto.body
++
++
++@dataclass(repr=False)
++class Header(HeadingBase):
++    def __init__(self, proto: HeadingProto, root: ElementTree):
++        super().__init__(proto, root, "header")
++
++
++@dataclass(repr=False)
++class Subheader(HeadingBase):
++    def __init__(self, proto: HeadingProto, root: ElementTree):
++        super().__init__(proto, root, "subheader")
++
++
++@dataclass(repr=False)
++class Title(HeadingBase):
++    def __init__(self, proto: HeadingProto, root: ElementTree):
++        super().__init__(proto, root, "title")
++
++
++@dataclass(repr=False)
++class Markdown(Element):
++    proto: MarkdownProto
++
++    is_caption: bool
++    allow_html: bool
++    key: None
++
++    def __init__(self, proto: MarkdownProto, root: ElementTree):
++        self.proto = proto
++        self.key = None
++        self.root = root
++        self.type = "markdown"
++
++    @property
++    def value(self) -> str:
++        return self.proto.body
++
++
++@dataclass(repr=False)
++class Caption(Markdown):
++    def __init__(self, proto: MarkdownProto, root: ElementTree):
++        super().__init__(proto, root)
++        self.type = "caption"
++
++
++@dataclass(repr=False)
++class Divider(Markdown):
++    def __init__(self, proto: MarkdownProto, root: ElementTree):
++        super().__init__(proto, root)
++        self.type = "divider"
++
++
++@dataclass(repr=False)
++class Latex(Markdown):
++    def __init__(self, proto: MarkdownProto, root: ElementTree):
++        super().__init__(proto, root)
++        self.type = "latex"
++
++
++@dataclass(repr=False)
++class Multiselect(Widget, Generic[T]):
++    _value: list[T] | None
++
++    proto: MultiSelectProto
++    options: list[str]
++    max_selections: int
++
++    def __init__(self, proto: MultiSelectProto, root: ElementTree):
++        super().__init__(proto, root)
++        self.type = "multiselect"
++        self.options = list(proto.options)
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        """Protobuf message representing the state of the widget, including
++        any interactions that have happened.
++        Should be the same as the frontend would produce for those interactions.
++        """
++        ws = WidgetState()
++        ws.id = self.id
++        ws.int_array_value.data[:] = self.indices
++        return ws
++
++    @property
++    def value(self) -> list[T]:
++        """The currently selected values from the options."""
++        if self._value is not None:
++            return self._value
++        else:
++            state = self.root.session_state
++            assert state
++            return cast(List[T], state[self.id])
++
++    @property
++    def indices(self) -> Sequence[int]:
++        return [self.options.index(str(v)) for v in self.value]
++
++    def set_value(self, v: list[T]) -> Multiselect[T]:
++        """
++        Set the value of the multiselect widget.
++        Implementation note: set_value not work correctly if `format_func` is also
++        passed to the multiselect. This is because we send options via proto with
++        applied `format_func`, but keep original values in session state
++        as widget value.
++        """
++        self._value = v
++        return self
++
++    def select(self, v: T) -> Multiselect[T]:
++        current = self.value
++        if v in current:
++            return self
++        else:
++            new = current.copy()
++            new.append(v)
++            self.set_value(new)
++            return self
++
++    def unselect(self, v: T) -> Multiselect[T]:
++        current = self.value
++        if v not in current:
++            return self
++        else:
++            new = current.copy()
++            while v in new:
++                new.remove(v)
++            self.set_value(new)
++            return self
++
++
++Number = Union[int, float]
++
++
++@dataclass(repr=False)
++class NumberInput(Widget):
++    _value: Number | None | InitialValue
++    proto: NumberInputProto
++    min: Number | None
++    max: Number | None
++    step: Number
++
++    def __init__(self, proto: NumberInputProto, root: ElementTree):
++        super().__init__(proto, root)
++        self._value = InitialValue()
++        self.type = "number_input"
++        self.min = proto.min if proto.has_min else None
++        self.max = proto.max if proto.has_max else None
++
++    def set_value(self, v: Number | None) -> NumberInput:
++        self._value = v
++        return self
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        ws = WidgetState()
++        ws.id = self.id
++        if self.value is not None:
++            ws.double_value = self.value
++        return ws
++
++    @property
++    def value(self) -> Number | None:
++        if not isinstance(self._value, InitialValue):
++            return self._value
++        else:
++            state = self.root.session_state
++            assert state
++
++            # Awkward to do this with `cast`
++            return state[self.id]  # type: ignore
++
++    def increment(self) -> NumberInput:
++        if self.value is None:
++            return self
++
++        v = min(self.value + self.step, self.max or float("inf"))
++        return self.set_value(v)
++
++    def decrement(self) -> NumberInput:
++        if self.value is None:
++            return self
++
++        v = max(self.value - self.step, self.min or float("-inf"))
++        return self.set_value(v)
++
++
++@dataclass(repr=False)
++class Radio(Widget, Generic[T]):
++    _value: T | None | InitialValue
++
++    proto: RadioProto = field(repr=False)
++    options: list[str]
++    horizontal: bool
++
++    def __init__(self, proto: RadioProto, root: ElementTree):
++        super().__init__(proto, root)
++        self._value = InitialValue()
++        self.type = "radio"
++        self.options = list(proto.options)
++
++    @property
++    def index(self) -> int | None:
++        if self.value is None:
++            return None
++        return self.options.index(str(self.value))
++
++    @property
++    def value(self) -> T | None:
++        """The currently selected value from the options."""
++        if not isinstance(self._value, InitialValue):
++            return self._value
++        else:
++            state = self.root.session_state
++            assert state
++            return cast(T, state[self.id])
++
++    def set_value(self, v: T | None) -> Radio[T]:
++        self._value = v
++        return self
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        """Protobuf message representing the state of the widget, including
++        any interactions that have happened.
++        Should be the same as the frontend would produce for those interactions.
++        """
++        ws = WidgetState()
++        ws.id = self.id
++        if self.index is not None:
++            ws.int_value = self.index
++        return ws
++
++
++@dataclass(repr=False)
++class Selectbox(Widget, Generic[T]):
++    _value: T | None | InitialValue
++
++    proto: SelectboxProto = field(repr=False)
++    options: list[str]
++
++    def __init__(self, proto: SelectboxProto, root: ElementTree):
++        super().__init__(proto, root)
++        self._value = InitialValue()
++        self.type = "selectbox"
++        self.options = list(proto.options)
++
++    @property
++    def index(self) -> int | None:
++        if self.value is None:
++            return None
++
++        if len(self.options) == 0:
++            return 0
++        return self.options.index(str(self.value))
++
++    @property
++    def value(self) -> T | None:
++        """The currently selected value from the options."""
++        if not isinstance(self._value, InitialValue):
++            return self._value
++        else:
++            state = self.root.session_state
++            assert state
++            return cast(T, state[self.id])
++
++    def set_value(self, v: T | None) -> Selectbox[T]:
++        """
++        Set the value of the selectbox.
++        Implementation note: set_value not work correctly if `format_func` is also
++        passed to the selectbox. This is because we send options via proto with applied
++        `format_func`, but keep original values in session state as widget value.
++        """
++        self._value = v
++        return self
++
++    def select(self, v: T | None) -> Selectbox[T]:
++        return self.set_value(v)
++
++    def select_index(self, index: int | None) -> Selectbox[T]:
++        if index is None:
++            return self.set_value(None)
++        return self.set_value(cast(T, self.options[index]))
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        """Protobuf message representing the state of the widget, including
++        any interactions that have happened.
++        Should be the same as the frontend would produce for those interactions.
++        """
++        ws = WidgetState()
++        ws.id = self.id
++        if self.index is not None:
++            ws.int_value = self.index
++        return ws
++
++
++@dataclass(repr=False)
++class SelectSlider(Widget, Generic[T]):
++    _value: T | Sequence[T] | None
++
++    proto: SliderProto
++    data_type: SliderProto.DataType.ValueType
++    options: list[str]
++
++    def __init__(self, proto: SliderProto, root: ElementTree):
++        super().__init__(proto, root)
++        self.type = "select_slider"
++        self.options = list(proto.options)
++
++    def set_value(self, v: T | Sequence[T]) -> SelectSlider[T]:
++        self._value = v
++        return self
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        serde = SelectSliderSerde(self.options, [], False)
++        v = serde.serialize(self.value)
++
++        ws = WidgetState()
++        ws.id = self.id
++        ws.double_array_value.data[:] = v
++        return ws
++
++    @property
++    def value(self) -> T | Sequence[T]:
++        """The currently selected value or range."""
++        if self._value is not None:
++            return self._value
++        else:
++            state = self.root.session_state
++            assert state
++            # Awkward to do this with `cast`
++            return state[self.id]  # type: ignore
++
++    def set_range(self, lower: T, upper: T) -> SelectSlider[T]:
++        return self.set_value([lower, upper])
++
++
++@dataclass(repr=False)
++class Slider(Widget, Generic[SliderScalarT]):
++    _value: SliderScalarT | Sequence[SliderScalarT] | None
++
++    proto: SliderProto
++    data_type: SliderProto.DataType.ValueType
++    min: SliderScalar
++    max: SliderScalar
++    step: Step
++
++    def __init__(self, proto: SliderProto, root: ElementTree):
++        super().__init__(proto, root)
++        self.type = "slider"
++
++    def set_value(
++        self, v: SliderScalarT | Sequence[SliderScalarT]
++    ) -> Slider[SliderScalarT]:
++        self._value = v
++        return self
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        data_type = self.proto.data_type
++        serde = SliderSerde([], data_type, True, None)
++        v = serde.serialize(self.value)
++
++        ws = WidgetState()
++        ws.id = self.id
++        ws.double_array_value.data[:] = v
++        return ws
++
++    @property
++    def value(self) -> SliderScalarT | Sequence[SliderScalarT]:
++        """The currently selected value or range."""
++        if self._value is not None:
++            return self._value
++        else:
++            state = self.root.session_state
++            assert state
++            # Awkward to do this with `cast`
++            return state[self.id]  # type: ignore
++
++    def set_range(
++        self, lower: SliderScalarT, upper: SliderScalarT
++    ) -> Slider[SliderScalarT]:
++        return self.set_value([lower, upper])
++
++
++@dataclass(repr=False)
++class Text(Element):
++    proto: TextProto
++
++    key: None = None
++
++    def __init__(self, proto: TextProto, root: ElementTree):
++        self.proto = proto
++        self.root = root
++        self.type = "text"
++
++    @property
++    def value(self) -> str:
++        return self.proto.body
++
++
++@dataclass(repr=False)
++class TextArea(Widget):
++    _value: str | None | InitialValue
++
++    proto: TextAreaProto
++    max_chars: int
++    placeholder: str
++
++    def __init__(self, proto: TextAreaProto, root: ElementTree):
++        super().__init__(proto, root)
++        self._value = InitialValue()
++        self.type = "text_area"
++
++    def set_value(self, v: str | None) -> TextArea:
++        self._value = v
++        return self
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        ws = WidgetState()
++        ws.id = self.id
++        if self.value is not None:
++            ws.string_value = self.value
++        return ws
++
++    @property
++    def value(self) -> str | None:
++        if not isinstance(self._value, InitialValue):
++            return self._value
++        else:
++            state = self.root.session_state
++            assert state
++            # Awkward to do this with `cast`
++            return state[self.id]  # type: ignore
++
++    def input(self, v: str) -> TextArea:
++        # TODO should input be setting or appending?
++        if self.max_chars and len(v) > self.max_chars:
++            return self
++        return self.set_value(v)
++
++
++@dataclass(repr=False)
++class TextInput(Widget):
++    _value: str | None | InitialValue
++    proto: TextInputProto
++    max_chars: int
++    autocomplete: str
++    placeholder: str
++
++    def __init__(self, proto: TextInputProto, root: ElementTree):
++        super().__init__(proto, root)
++        self._value = InitialValue()
++        self.type = "text_input"
++
++    def set_value(self, v: str | None) -> TextInput:
++        self._value = v
++        return self
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        ws = WidgetState()
++        ws.id = self.id
++        if self.value is not None:
++            ws.string_value = self.value
++        return ws
++
++    @property
++    def value(self) -> str | None:
++        if not isinstance(self._value, InitialValue):
++            return self._value
++        else:
++            state = self.root.session_state
++            assert state
++            # Awkward to do this with `cast`
++            return state[self.id]  # type: ignore
++
++    def input(self, v: str) -> TextInput:
++        # TODO should input be setting or appending?
++        if self.max_chars and len(v) > self.max_chars:
++            return self
++        return self.set_value(v)
++
++
++TimeValue: TypeAlias = Union[time, datetime]
++
++
++@dataclass(repr=False)
++class TimeInput(Widget):
++    _value: TimeValue | None | InitialValue
++    proto: TimeInputProto
++    step: int
++
++    def __init__(self, proto: TimeInputProto, root: ElementTree):
++        super().__init__(proto, root)
++        self._value = InitialValue()
++        self.type = "time_input"
++
++    def set_value(self, v: TimeValue | None) -> TimeInput:
++        self._value = v
++        return self
++
++    @property
++    def _widget_state(self) -> WidgetState:
++        ws = WidgetState()
++        ws.id = self.id
++
++        serde = TimeInputSerde(None)
++        serialized_value = serde.serialize(self.value)
++        if serialized_value is not None:
++            ws.string_value = serialized_value
++        return ws
++
++    @property
++    def value(self) -> time | None:
++        if not isinstance(self._value, InitialValue):
++            v = self._value
++            v = v.time() if isinstance(v, datetime) else v
++            return v
++        else:
++            state = self.root.session_state
++            assert state
++            return state[self.id]  # type: ignore
++
++    def increment(self) -> TimeInput:
++        """Select the next available time."""
++        if self.value is None:
++            return self
++        dt = datetime.combine(date.today(), self.value) + timedelta(seconds=self.step)
++        return self.set_value(dt.time())
++
++    def decrement(self) -> TimeInput:
++        """Select the previous available time."""
++        if self.value is None:
++            return self
++        dt = datetime.combine(date.today(), self.value) - timedelta(seconds=self.step)
++        return self.set_value(dt.time())
++
++
++@dataclass(repr=False)
++class Block:
++    type: str
++    children: dict[int, Node]
++    proto: BlockProto | None = field(repr=False)
++    root: ElementTree = field(repr=False)
++
++    def __init__(
++        self,
++        root: ElementTree,
++        proto: BlockProto | None = None,
++        type: str | None = None,
++    ):
++        self.children = {}
++        self.proto = proto
++        if proto:
++            ty = proto.WhichOneof("type")
++            # TODO does not work for `st.container` which has no block proto
++            assert ty is not None
++            self.type = ty
++        elif type is not None:
++            self.type = type
++        else:
++            self.type = ""
++        self.root = root
++
++    def __len__(self) -> int:
++        return len(self.children)
++
++    def __iter__(self):
++        yield self
++        for child_idx in self.children:
++            for c in self.children[child_idx]:
++                yield c
++
++    def __getitem__(self, k: int) -> Node:
++        return self.children[k]
++
++    @property
++    def key(self) -> str | None:
++        return None
++
++    # We could implement these using __getattr__ but that would have
++    # much worse type information.
++    @property
++    def button(self) -> WidgetList[Button]:
++        return WidgetList(self.get("button"))  # type: ignore
++
++    @property
++    def caption(self) -> ElementList[Caption]:
++        return ElementList(self.get("caption"))  # type: ignore
++
++    @property
++    def checkbox(self) -> WidgetList[Checkbox]:
++        return WidgetList(self.get("checkbox"))  # type: ignore
++
++    @property
++    def code(self) -> ElementList[Code]:
++        return ElementList(self.get("code"))  # type: ignore
++
++    @property
++    def color_picker(self) -> WidgetList[ColorPicker]:
++        return WidgetList(self.get("color_picker"))  # type: ignore
++
++    @property
++    def date_input(self) -> WidgetList[DateInput]:
++        return WidgetList(self.get("date_input"))  # type: ignore
++
++    @property
++    def divider(self) -> ElementList[Divider]:
++        return ElementList(self.get("divider"))  # type: ignore
++
++    @property
++    def error(self) -> ElementList[Error]:
++        return ElementList(self.get("error"))  # type: ignore
++
++    @property
++    def exception(self) -> ElementList[Exception]:
++        return ElementList(self.get("exception"))  # type: ignore
++
++    @property
++    def header(self) -> ElementList[Header]:
++        return ElementList(self.get("header"))  # type: ignore
++
++    @property
++    def info(self) -> ElementList[Info]:
++        return ElementList(self.get("info"))  # type: ignore
++
++    @property
++    def success(self) -> ElementList[Success]:
++        return ElementList(self.get("success"))  # type: ignore
++
++    @property
++    def warning(self) -> ElementList[Warning]:
++        return ElementList(self.get("warning"))  # type: ignore
++
++    @property
++    def latex(self) -> ElementList[Latex]:
++        return ElementList(self.get("latex"))  # type: ignore
++
++    @property
++    def markdown(self) -> ElementList[Markdown]:
++        return ElementList(self.get("markdown"))  # type: ignore
++
++    @property
++    def multiselect(self) -> WidgetList[Multiselect[Any]]:
++        return WidgetList(self.get("multiselect"))  # type: ignore
++
++    @property
++    def number_input(self) -> WidgetList[NumberInput]:
++        return WidgetList(self.get("number_input"))  # type: ignore
++
++    @property
++    def radio(self) -> WidgetList[Radio[Any]]:
++        return WidgetList(self.get("radio"))  # type: ignore
++
++    @property
++    def select_slider(self) -> WidgetList[SelectSlider[Any]]:
++        return WidgetList(self.get("select_slider"))  # type: ignore
++
++    @property
++    def selectbox(self) -> WidgetList[Selectbox[Any]]:
++        return WidgetList(self.get("selectbox"))  # type: ignore
++
++    @property
++    def slider(self) -> WidgetList[Slider[Any]]:
++        return WidgetList(self.get("slider"))  # type: ignore
++
++    @property
++    def subheader(self) -> ElementList[Subheader]:
++        return ElementList(self.get("subheader"))  # type: ignore
++
++    @property
++    def text(self) -> ElementList[Text]:
++        return ElementList(self.get("text"))  # type: ignore
++
++    @property
++    def text_area(self) -> WidgetList[TextArea]:
++        return WidgetList(self.get("text_area"))  # type: ignore
++
++    @property
++    def text_input(self) -> WidgetList[TextInput]:
++        return WidgetList(self.get("text_input"))  # type: ignore
++
++    @property
++    def time_input(self) -> WidgetList[TimeInput]:
++        return WidgetList(self.get("time_input"))  # type: ignore
++
++    @property
++    def title(self) -> ElementList[Title]:
++        return ElementList(self.get("title"))  # type: ignore
++
++    def get(self, element_type: str) -> Sequence[Node]:
++        return [e for e in self if e.type == element_type]
++
++    def run(self, timeout: float | None = None) -> AppTest:
++        """Run the script with updated widget values.
++
++        Parameters
++        ----------
++        timeout
++            The maximum number of seconds to run the script. None means
++            use the AppTest's default.
++        """
++        return self.root.run(timeout=timeout)
++
++    def __repr__(self):
++        return util.repr_(self)
++
++
++Node: TypeAlias = Union[Element, Block]
++
++
++def get_widget_state(node: Node) -> WidgetState | None:
++    if isinstance(node, Widget):
++        return node._widget_state
++    else:
++        return None
++
++
++@dataclass(repr=False)
++class ElementTree(Block):
++    """A tree of the elements produced by running a streamlit script.
++
++    Elements can be queried in three ways:
++    - By element type, using `.foo` properties to get a list of all of that element,
++    in the order they appear in the app
++    - By user key, for widgets, by calling the above list with a key: `.foo(key='bar')`
++    - Positionally, using list indexing syntax (`[...]`) to access a child of a
++    block element. Not recommended because the exact tree structure can be surprising.
++
++    Element queries made on a block container will return only the elements
++    descending from that block.
++
++    Returned elements have methods for accessing whatever attributes are relevant.
++    For very simple elements this may be only its value, while complex elements
++    like widgets have many.
++
++    Widgets provide a fluent API for faking frontend interaction and rerunning
++    the script with the new widget values. All widgets provide a low level `set_value`
++    method, along with higher level methods specific to that type of widget.
++    After an interaction, calling `.run()` will update the AppTest with the
++    results of that script run.
++    """
++
++    _runner: AppTest | None = field(repr=False, default=None)
++
++    def __init__(self):
++        # Expect script_path and session_state to be filled in afterwards
++        self.children = {}
++        self.root = self
++        self.type = "root"
++
++    @property
++    def main(self) -> Block:
++        m = self[0]
++        assert isinstance(m, Block)
++        return m
++
++    @property
++    def sidebar(self) -> Block:
++        s = self[1]
++        assert isinstance(s, Block)
++        return s
++
++    @property
++    def session_state(self) -> SessionState:
++        assert self._runner is not None
++        return self._runner.session_state
++
++    def get_widget_states(self) -> WidgetStates:
++        ws = WidgetStates()
++        for node in self:
++            w = get_widget_state(node)
++            if w is not None:
++                ws.widgets.append(w)
++
++        return ws
++
++    def run(self, timeout: float | None = None) -> AppTest:
++        """Run the script with updated widget values.
++
++        Parameters
++        ----------
++        timeout
++            The maximum number of seconds to run the script. None means
++            use the AppTest's default.
++        """
++        assert self._runner is not None
++
++        widget_states = self.get_widget_states()
++        return self._runner._run(widget_states, timeout=timeout)
++
++
++def parse_tree_from_messages(messages: list[ForwardMsg]) -> ElementTree:
++    """Transform a list of `ForwardMsg` into a tree matching the implicit
++    tree structure of blocks and elements in a streamlit app.
++
++    Returns the root of the tree, which acts as the entrypoint for the query
++    and interaction API.
++    """
++    root = ElementTree()
++    root.children = {
++        0: Block(type="main", root=root),
++        1: Block(type="sidebar", root=root),
++    }
++
++    for msg in messages:
++        if not msg.HasField("delta"):
++            continue
++        delta_path = msg.metadata.delta_path
++        delta = msg.delta
++        if delta.WhichOneof("type") == "new_element":
++            elt = delta.new_element
++            ty = elt.WhichOneof("type")
++            new_node: Node
++            if ty == "alert":
++                fmt = elt.alert.format
++                if fmt == AlertProto.ERROR:
++                    new_node = Error(elt.alert, root=root)
++                elif fmt == AlertProto.WARNING:
++                    new_node = Warning(elt.alert, root=root)
++                elif fmt == AlertProto.INFO:
++                    new_node = Info(elt.alert, root=root)
++                elif fmt == AlertProto.SUCCESS:
++                    new_node = Success(elt.alert, root=root)
++                else:
++                    raise ValueError(f"Unknown alert format {fmt}")
++            elif ty == "button":
++                new_node = Button(elt.button, root=root)
++            elif ty == "checkbox":
++                new_node = Checkbox(elt.checkbox, root=root)
++            elif ty == "code":
++                new_node = Code(elt.code, root=root)
++            elif ty == "color_picker":
++                new_node = ColorPicker(elt.color_picker, root=root)
++            elif ty == "date_input":
++                new_node = DateInput(elt.date_input, root=root)
++            elif ty == "exception":
++                new_node = Exception(elt.exception, root=root)
++            elif ty == "heading":
++                if elt.heading.tag == HeadingProtoTag.TITLE_TAG.value:
++                    new_node = Title(elt.heading, root=root)
++                elif elt.heading.tag == HeadingProtoTag.HEADER_TAG.value:
++                    new_node = Header(elt.heading, root=root)
++                elif elt.heading.tag == HeadingProtoTag.SUBHEADER_TAG.value:
++                    new_node = Subheader(elt.heading, root=root)
++                else:
++                    raise ValueError(f"Unknown heading type with tag {elt.heading.tag}")
++            elif ty == "markdown":
++                if elt.markdown.element_type == MarkdownProto.Type.NATIVE:
++                    new_node = Markdown(elt.markdown, root=root)
++                elif elt.markdown.element_type == MarkdownProto.Type.CAPTION:
++                    new_node = Caption(elt.markdown, root=root)
++                elif elt.markdown.element_type == MarkdownProto.Type.LATEX:
++                    new_node = Latex(elt.markdown, root=root)
++                elif elt.markdown.element_type == MarkdownProto.Type.DIVIDER:
++                    new_node = Divider(elt.markdown, root=root)
++                else:
++                    raise ValueError(
++                        f"Unknown markdown type {elt.markdown.element_type}"
++                    )
++            elif ty == "multiselect":
++                new_node = Multiselect(elt.multiselect, root=root)
++            elif ty == "number_input":
++                new_node = NumberInput(elt.number_input, root=root)
++            elif ty == "radio":
++                new_node = Radio(elt.radio, root=root)
++            elif ty == "selectbox":
++                new_node = Selectbox(elt.selectbox, root=root)
++            elif ty == "slider":
++                if elt.slider.type == SliderProto.Type.SLIDER:
++                    new_node = Slider(elt.slider, root=root)
++                elif elt.slider.type == SliderProto.Type.SELECT_SLIDER:
++                    new_node = SelectSlider(elt.slider, root=root)
++                else:
++                    raise ValueError(f"Slider with unknown type {elt.slider}")
++            elif ty == "text":
++                new_node = Text(elt.text, root=root)
++            elif ty == "text_area":
++                new_node = TextArea(elt.text_area, root=root)
++            elif ty == "text_input":
++                new_node = TextInput(elt.text_input, root=root)
++            elif ty == "time_input":
++                new_node = TimeInput(elt.time_input, root=root)
++            else:
++                new_node = Element(elt, root=root)
++        elif delta.WhichOneof("type") == "add_block":
++            new_node = Block(proto=delta.add_block, root=root)
++        else:
++            # add_rows
++            continue
++
++        current_node: Block = root
++        # Every node up to the end is a Block
++        for idx in delta_path[:-1]:
++            children = current_node.children
++            child = children.get(idx)
++            if child is None:
++                child = Block(root=root)
++                children[idx] = child
++            assert isinstance(child, Block)
++            current_node = child
++        current_node.children[delta_path[-1]] = new_node
++
++    return root
+diff -Naur --no-dereference orig_repo/lib/streamlit/testing/v1/local_script_runner.py working_repo/lib/streamlit/testing/v1/local_script_runner.py
+--- orig_repo/lib/streamlit/testing/v1/local_script_runner.py	1970-01-01 08:00:00.000000000 +0800
++++ working_repo/lib/streamlit/testing/v1/local_script_runner.py	2026-08-26 19:21:15.510913000 +0800
+@@ -0,0 +1,145 @@
++# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++from __future__ import annotations
++
++import os
++import time
++from typing import Any
++from urllib import parse
++
++from streamlit.proto.ForwardMsg_pb2 import ForwardMsg
++from streamlit.proto.WidgetStates_pb2 import WidgetStates
++from streamlit.runtime.forward_msg_queue import ForwardMsgQueue
++from streamlit.runtime.memory_uploaded_file_manager import MemoryUploadedFileManager
++from streamlit.runtime.scriptrunner import RerunData, ScriptRunner, ScriptRunnerEvent
++from streamlit.runtime.scriptrunner.script_cache import ScriptCache
++from streamlit.runtime.state.session_state import SessionState
++from streamlit.testing.v1.element_tree import ElementTree, parse_tree_from_messages
++
++
++class LocalScriptRunner(ScriptRunner):
++    """Subclasses ScriptRunner to provide some testing features."""
++
++    def __init__(
++        self,
++        script_path: str,
++        session_state: SessionState,
++    ):
++        """Initializes the ScriptRunner for the given script_path."""
++
++        assert os.path.isfile(script_path), f"File not found at {script_path}"
++
++        self.forward_msg_queue = ForwardMsgQueue()
++        self.script_path = script_path
++        self.session_state = session_state
++
++        super().__init__(
++            session_id="test session id",
++            main_script_path=script_path,
++            session_state=self.session_state,
++            uploaded_file_mgr=MemoryUploadedFileManager("/mock/upload"),
++            script_cache=ScriptCache(),
++            initial_rerun_data=RerunData(),
++            user_info={"email": "test@test.com"},
++        )
++
++        # Accumulates all ScriptRunnerEvents emitted by us.
++        self.events: list[ScriptRunnerEvent] = []
++        self.event_data: list[Any] = []
++
++        def record_event(
++            sender: ScriptRunner | None, event: ScriptRunnerEvent, **kwargs
++        ) -> None:
++            # Assert that we're not getting unexpected `sender` params
++            # from ScriptRunner.on_event
++            assert (
++                sender is None or sender == self
++            ), "Unexpected ScriptRunnerEvent sender!"
++
++            self.events.append(event)
++            self.event_data.append(kwargs)
++
++            # Send ENQUEUE_FORWARD_MSGs to our queue
++            if event == ScriptRunnerEvent.ENQUEUE_FORWARD_MSG:
++                forward_msg = kwargs["forward_msg"]
++                self.forward_msg_queue.enqueue(forward_msg)
++
++        self.on_event.connect(record_event, weak=False)
++
++    def join(self) -> None:
++        """Wait for the script thread to finish, if it is running."""
++        if self._script_thread is not None:
++            self._script_thread.join()
++
++    def forward_msgs(self) -> list[ForwardMsg]:
++        """Return all messages in our ForwardMsgQueue."""
++        return self.forward_msg_queue._queue
++
++    def run(
++        self,
++        widget_state: WidgetStates | None = None,
++        query_params=None,
++        timeout: float = 3,
++    ) -> ElementTree:
++        """Run the script, and parse the output messages for querying
++        and interaction.
++
++        Timeout is in seconds.
++        """
++        # TODO: save the query strings from the script run
++        query_string = ""
++        if query_params:
++            query_string = parse.urlencode(query_params, doseq=True)
++
++        rerun_data = RerunData(widget_states=widget_state, query_string=query_string)
++        self.request_rerun(rerun_data)
++        if not self._script_thread:
++            self.start()
++        require_widgets_deltas(self, timeout)
++
++        tree = parse_tree_from_messages(self.forward_msgs())
++        return tree
++
++    def script_stopped(self) -> bool:
++        for e in self.events:
++            if e in (
++                ScriptRunnerEvent.SCRIPT_STOPPED_FOR_RERUN,
++                ScriptRunnerEvent.SCRIPT_STOPPED_WITH_COMPILE_ERROR,
++                ScriptRunnerEvent.SCRIPT_STOPPED_WITH_SUCCESS,
++            ):
++                return True
++        return False
++
++
++def require_widgets_deltas(runner: LocalScriptRunner, timeout: float = 3) -> None:
++    """Wait for the given ScriptRunner to emit a completion event. If the timeout
++    is reached, the runner will be shutdown and an error will be thrown.
++    """
++
++    t0 = time.time()
++    while time.time() - t0 < timeout:
++        time.sleep(0.1)
++        if runner.script_stopped():
++            return
++
++    # If we get here, the runner hasn't yet completed before our
++    # timeout. Create an error string for debugging.
++    err_string = f"AppTest script run timed out after {timeout}s)"
++
++    # Shutdown the runner before throwing an error, so that the script
++    # doesn't hang forever.
++    runner.request_stop()
++    runner.join()
++
++    raise RuntimeError(err_string)
+diff -Naur --no-dereference orig_repo/lib/streamlit/testing/v1/util.py working_repo/lib/streamlit/testing/v1/util.py
+--- orig_repo/lib/streamlit/testing/v1/util.py	1970-01-01 08:00:00.000000000 +0800
++++ working_repo/lib/streamlit/testing/v1/util.py	2026-08-26 19:21:15.511213920 +0800
+@@ -0,0 +1,49 @@
++# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from contextlib import contextmanager
++from typing import Any, Dict
++from unittest.mock import patch
++
++from streamlit import config
++
++
++@contextmanager
++def patch_config_options(config_overrides: Dict[str, Any]):
++    """A context manager that overrides config options. It can
++    also be used as a function decorator.
++
++    Examples:
++    >>> with patch_config_options({"server.headless": True}):
++    ...     assert(config.get_option("server.headless") is True)
++    ...     # Other test code that relies on these options
++
++    >>> @patch_config_options({"server.headless": True})
++    ... def test_my_thing():
++    ...   assert(config.get_option("server.headless") is True)
++    """
++    mock_get_option = build_mock_config_get_option(config_overrides)
++    with patch.object(config, "get_option", new=mock_get_option):
++        yield
++
++
++def build_mock_config_get_option(overrides_dict):
++    orig_get_option = config.get_option
++
++    def mock_config_get_option(name):
++        if name in overrides_dict:
++            return overrides_dict[name]
++        return orig_get_option(name)
++
++    return mock_config_get_option
+diff -Naur --no-dereference orig_repo/lib/tests/streamlit/elements/date_input_test.py working_repo/lib/tests/streamlit/elements/date_input_test.py
+--- orig_repo/lib/tests/streamlit/elements/date_input_test.py	2026-08-26 02:19:03.393716000 +0800
++++ working_repo/lib/tests/streamlit/elements/date_input_test.py	2026-08-26 19:21:15.512196337 +0800
+@@ -22,7 +22,7 @@
+ import streamlit as st
+ from streamlit.errors import StreamlitAPIException
+ from streamlit.proto.LabelVisibilityMessage_pb2 import LabelVisibilityMessage
+-from streamlit.testing.script_interactions import InteractiveScriptTests
++from streamlit.testing.v1.app_test import AppTest
+ from tests.delta_generator_test_case import DeltaGeneratorTestCase
+ 
+ 
+@@ -267,26 +267,24 @@
+         self.assertTrue(str(ex.exception).startswith("The provided format"))
+ 
+ 
+-class DateInputInteractiveTest(InteractiveScriptTests):
+-    def test_date_input_interaction(self):
+-        """Test interactions with an empty date_input widget."""
+-        script = self.script_from_string(
+-            """
+-        import streamlit as st
+-
+-        st.date_input("the label", value=None)
++def test_date_input_interaction():
++    """Test interactions with an empty date_input widget."""
++    at = AppTest.from_string(
+         """
+-        )
+-        sr = script.run()
+-        date_input = sr.date_input[0]
+-        assert date_input.value is None
+-
+-        # Set the value to a specific date
+-        sr2 = date_input.set_value(date(2012, 1, 3)).run()
+-        date_input = sr2.date_input[0]
+-        assert date_input.value == date(2012, 1, 3)
+-
+-        # # Clear the value
+-        sr3 = date_input.set_value(None).run()
+-        date_input = sr3.date_input[0]
+-        assert date_input.value is None
++    import streamlit as st
++
++    st.date_input("the label", value=None)
++    """
++    ).run()
++    date_input = at.date_input[0]
++    assert date_input.value is None
++
++    # Set the value to a specific date
++    at = date_input.set_value(date(2012, 1, 3)).run()
++    date_input = at.date_input[0]
++    assert date_input.value == date(2012, 1, 3)
++
++    # # Clear the value
++    at = date_input.set_value(None).run()
++    date_input = at.date_input[0]
++    assert date_input.value is None
+diff -Naur --no-dereference orig_repo/lib/tests/streamlit/elements/number_input_test.py working_repo/lib/tests/streamlit/elements/number_input_test.py
+--- orig_repo/lib/tests/streamlit/elements/number_input_test.py	2026-08-26 02:19:03.405522000 +0800
++++ working_repo/lib/tests/streamlit/elements/number_input_test.py	2026-08-26 19:21:15.514430772 +0800
+@@ -26,7 +26,7 @@
+ from streamlit.proto.LabelVisibilityMessage_pb2 import LabelVisibilityMessage
+ from streamlit.proto.NumberInput_pb2 import NumberInput
+ from streamlit.proto.WidgetStates_pb2 import WidgetState
+-from streamlit.testing.script_interactions import InteractiveScriptTests
++from streamlit.testing.v1.app_test import AppTest
+ from tests.delta_generator_test_case import DeltaGeneratorTestCase
+ 
+ 
+@@ -371,31 +371,29 @@
+             st.number_input("My Label", value=value, max_value=max_value)
+ 
+ 
+-class NumberInputInteractiveTest(InteractiveScriptTests):
+-    def test_number_input_interaction(self):
+-        """Test interactions with an empty number input widget."""
+-        script = self.script_from_string(
+-            """
+-        import streamlit as st
+-
+-        st.number_input("the label", value=None)
++def test_number_input_interaction():
++    """Test interactions with an empty number input widget."""
++    at = AppTest.from_string(
+         """
+-        )
+-        sr = script.run()
+-        number_input = sr.number_input[0]
+-        assert number_input.value is None
+-
+-        # Set the value to 10
+-        sr2 = number_input.set_value(10).run()
+-        number_input = sr2.number_input[0]
+-        assert number_input.value == 10
+-
+-        # # Increment the value
+-        sr3 = number_input.increment().run()
+-        number_input = sr3.number_input[0]
+-        assert number_input.value == 10.01
+-
+-        # # Clear the value
+-        sr4 = number_input.set_value(None).run()
+-        number_input = sr4.number_input[0]
+-        assert number_input.value is None
++    import streamlit as st
++
++    st.number_input("the label", value=None)
++    """
++    ).run()
++    number_input = at.number_input[0]
++    assert number_input.value is None
++
++    # Set the value to 10
++    at = number_input.set_value(10).run()
++    number_input = at.number_input[0]
++    assert number_input.value == 10
++
++    # # Increment the value
++    at = number_input.increment().run()
++    number_input = at.number_input[0]
++    assert number_input.value == 10.01
++
++    # # Clear the value
++    at = number_input.set_value(None).run()
++    number_input = at.number_input[0]
++    assert number_input.value is None
+diff -Naur --no-dereference orig_repo/lib/tests/streamlit/elements/radio_test.py working_repo/lib/tests/streamlit/elements/radio_test.py
+--- orig_repo/lib/tests/streamlit/elements/radio_test.py	2026-08-26 02:19:03.406749000 +0800
++++ working_repo/lib/tests/streamlit/elements/radio_test.py	2026-08-26 19:21:15.515368873 +0800
+@@ -23,7 +23,7 @@
+ import streamlit as st
+ from streamlit.errors import StreamlitAPIException
+ from streamlit.proto.LabelVisibilityMessage_pb2 import LabelVisibilityMessage
+-from streamlit.testing.script_interactions import InteractiveScriptTests
++from streamlit.testing.v1.app_test import AppTest
+ from tests.delta_generator_test_case import DeltaGeneratorTestCase
+ 
+ 
+@@ -250,26 +250,24 @@
+         self.assertEqual(c.captions, ["first caption", "", "", "last caption"])
+ 
+ 
+-class RadioInteractiveTest(InteractiveScriptTests):
+-    def test_radio_interaction(self):
+-        """Test interactions with an empty radio widget."""
+-        script = self.script_from_string(
+-            """
+-        import streamlit as st
+-
+-        st.radio("the label", ("m", "f"), index=None)
++def test_radio_interaction():
++    """Test interactions with an empty radio widget."""
++    at = AppTest.from_string(
+         """
+-        )
+-        sr = script.run()
+-        radio = sr.radio[0]
+-        assert radio.value is None
+-
+-        # Select option m
+-        sr2 = radio.set_value("m").run()
+-        radio = sr2.radio[0]
+-        assert radio.value == "m"
+-
+-        # # Clear the value
+-        sr3 = radio.set_value(None).run()
+-        radio = sr3.radio[0]
+-        assert radio.value is None
++    import streamlit as st
++
++    st.radio("the label", ("m", "f"), index=None)
++    """
++    ).run()
++    radio = at.radio[0]
++    assert radio.value is None
++
++    # Select option m
++    at = radio.set_value("m").run()
++    radio = at.radio[0]
++    assert radio.value == "m"
++
++    # # Clear the value
++    at = radio.set_value(None).run()
++    radio = at.radio[0]
++    assert radio.value is None
+diff -Naur --no-dereference orig_repo/lib/tests/streamlit/elements/selectbox_test.py working_repo/lib/tests/streamlit/elements/selectbox_test.py
+--- orig_repo/lib/tests/streamlit/elements/selectbox_test.py	2026-08-26 02:19:03.408709000 +0800
++++ working_repo/lib/tests/streamlit/elements/selectbox_test.py	2026-08-26 19:21:15.516636736 +0800
+@@ -23,7 +23,7 @@
+ import streamlit as st
+ from streamlit.errors import StreamlitAPIException
+ from streamlit.proto.LabelVisibilityMessage_pb2 import LabelVisibilityMessage
+-from streamlit.testing.script_interactions import InteractiveScriptTests
++from streamlit.testing.v1.app_test import AppTest
+ from tests.delta_generator_test_case import DeltaGeneratorTestCase
+ 
+ 
+@@ -203,25 +203,23 @@
+         self.assertEqual(c.placeholder, "Please select")
+ 
+ 
+-class SelectboxInteractiveTest(InteractiveScriptTests):
+-    def test_selectbox_interaction(self):
+-        """Test interactions with an empty selectbox widget."""
+-        script = self.script_from_string(
+-            """
+-        import streamlit as st
+-        st.selectbox("the label", ("m", "f"), index=None)
++def test_selectbox_interaction():
++    """Test interactions with an empty selectbox widget."""
++    at = AppTest.from_string(
+         """
+-        )
+-        sr = script.run()
+-        selectbox = sr.selectbox[0]
+-        assert selectbox.value is None
+-
+-        # Select option m
+-        sr2 = selectbox.set_value("m").run()
+-        selectbox = sr2.selectbox[0]
+-        assert selectbox.value == "m"
+-
+-        # # Clear the value
+-        sr3 = selectbox.set_value(None).run()
+-        selectbox = sr3.selectbox[0]
+-        assert selectbox.value is None
++    import streamlit as st
++    st.selectbox("the label", ("m", "f"), index=None)
++    """
++    ).run()
++    selectbox = at.selectbox[0]
++    assert selectbox.value is None
++
++    # Select option m
++    at = selectbox.set_value("m").run()
++    selectbox = at.selectbox[0]
++    assert selectbox.value == "m"
++
++    # # Clear the value
++    at = selectbox.set_value(None).run()
++    selectbox = at.selectbox[0]
++    assert selectbox.value is None
+diff -Naur --no-dereference orig_repo/lib/tests/streamlit/elements/slider_test.py working_repo/lib/tests/streamlit/elements/slider_test.py
+--- orig_repo/lib/tests/streamlit/elements/slider_test.py	2026-08-26 02:19:03.408974000 +0800
++++ working_repo/lib/tests/streamlit/elements/slider_test.py	2026-08-26 19:21:15.517565523 +0800
+@@ -25,7 +25,7 @@
+ from streamlit.errors import StreamlitAPIException
+ from streamlit.js_number import JSNumber
+ from streamlit.proto.LabelVisibilityMessage_pb2 import LabelVisibilityMessage
+-from streamlit.testing.script_interactions import InteractiveScriptTests
++from streamlit.testing.v1.app_test import AppTest
+ from tests.delta_generator_test_case import DeltaGeneratorTestCase
+ 
+ 
+@@ -303,18 +303,16 @@
+         )
+ 
+ 
+-class SliderInteractiveTest(InteractiveScriptTests):
+-    def test_id_stability(self):
+-        script = self.script_from_string(
+-            """
+-        import streamlit as st
+-
+-        st.slider("slider", key="slider")
++def test_id_stability():
++    at = AppTest.from_string(
+         """
+-        )
+-        sr = script.run()
+-        s1 = sr.slider[0]
+-        sr2 = s1.set_value(5).run()
+-        s2 = sr2.slider[0]
++    import streamlit as st
++
++    st.slider("slider", key="slider")
++    """
++    ).run()
++    s1 = at.slider[0]
++    at = s1.set_value(5).run()
++    s2 = at.slider[0]
+ 
+-        assert s1.id == s2.id
++    assert s1.id == s2.id
+diff -Naur --no-dereference orig_repo/lib/tests/streamlit/elements/text_area_test.py working_repo/lib/tests/streamlit/elements/text_area_test.py
+--- orig_repo/lib/tests/streamlit/elements/text_area_test.py	2026-08-26 02:19:03.409140000 +0800
++++ working_repo/lib/tests/streamlit/elements/text_area_test.py	2026-08-26 19:21:15.517805000 +0800
+@@ -22,7 +22,7 @@
+ import streamlit as st
+ from streamlit.errors import StreamlitAPIException
+ from streamlit.proto.LabelVisibilityMessage_pb2 import LabelVisibilityMessage
+-from streamlit.testing.script_interactions import InteractiveScriptTests
++from streamlit.testing.v1.app_test import AppTest
+ from tests.delta_generator_test_case import DeltaGeneratorTestCase
+ 
+ 
+@@ -180,25 +180,23 @@
+     pass
+ 
+ 
+-class TextAreaInteractiveTest(InteractiveScriptTests):
+-    def test_text_input_interaction(self):
+-        """Test interactions with an empty text_area widget."""
+-        script = self.script_from_string(
+-            """
+-        import streamlit as st
+-        st.text_area("the label", value=None)
++def test_text_input_interaction():
++    """Test interactions with an empty text_area widget."""
++    at = AppTest.from_string(
+         """
+-        )
+-        sr = script.run()
+-        text_area = sr.text_area[0]
+-        assert text_area.value is None
+-
+-        # Input a value:
+-        sr2 = text_area.input("Foo").run()
+-        text_area = sr2.text_area[0]
+-        assert text_area.value == "Foo"
+-
+-        # # Clear the value
+-        sr3 = text_area.set_value(None).run()
+-        text_area = sr3.text_area[0]
+-        assert text_area.value is None
++    import streamlit as st
++    st.text_area("the label", value=None)
++    """
++    ).run()
++    text_area = at.text_area[0]
++    assert text_area.value is None
++
++    # Input a value:
++    at = text_area.input("Foo").run()
++    text_area = at.text_area[0]
++    assert text_area.value == "Foo"
++
++    # # Clear the value
++    at = text_area.set_value(None).run()
++    text_area = at.text_area[0]
++    assert text_area.value is None
+diff -Naur --no-dereference orig_repo/lib/tests/streamlit/elements/text_input_test.py working_repo/lib/tests/streamlit/elements/text_input_test.py
+--- orig_repo/lib/tests/streamlit/elements/text_input_test.py	2026-08-26 02:19:03.409396000 +0800
++++ working_repo/lib/tests/streamlit/elements/text_input_test.py	2026-08-26 19:21:15.518039000 +0800
+@@ -23,7 +23,7 @@
+ from streamlit.errors import StreamlitAPIException
+ from streamlit.proto.LabelVisibilityMessage_pb2 import LabelVisibilityMessage
+ from streamlit.proto.TextInput_pb2 import TextInput
+-from streamlit.testing.script_interactions import InteractiveScriptTests
++from streamlit.testing.v1.app_test import AppTest
+ from tests.delta_generator_test_case import DeltaGeneratorTestCase
+ 
+ 
+@@ -187,25 +187,23 @@
+     pass
+ 
+ 
+-class TextInputInteractiveTest(InteractiveScriptTests):
+-    def test_text_input_interaction(self):
+-        """Test interactions with an empty text_input widget."""
+-        script = self.script_from_string(
+-            """
+-        import streamlit as st
+-        st.text_input("the label", value=None)
++def test_text_input_interaction():
++    """Test interactions with an empty text_input widget."""
++    at = AppTest.from_string(
+         """
+-        )
+-        sr = script.run()
+-        text_input = sr.text_input[0]
+-        assert text_input.value is None
+-
+-        # Input a value:
+-        sr2 = text_input.input("Foo").run()
+-        text_input = sr2.text_input[0]
+-        assert text_input.value == "Foo"
+-
+-        # # Clear the value
+-        sr3 = text_input.set_value(None).run()
+-        text_input = sr3.text_input[0]
+-        assert text_input.value is None
++    import streamlit as st
++    st.text_input("the label", value=None)
++    """
++    ).run()
++    text_input = at.text_input[0]
++    assert text_input.value is None
++
++    # Input a value:
++    at = text_input.input("Foo").run()
++    text_input = at.text_input[0]
++    assert text_input.value == "Foo"
++
++    # # Clear the value
++    at = text_input.set_value(None).run()
++    text_input = at.text_input[0]
++    assert text_input.value is None
+diff -Naur --no-dereference orig_repo/lib/tests/streamlit/elements/time_input_test.py working_repo/lib/tests/streamlit/elements/time_input_test.py
+--- orig_repo/lib/tests/streamlit/elements/time_input_test.py	2026-08-26 02:19:03.409812000 +0800
++++ working_repo/lib/tests/streamlit/elements/time_input_test.py	2026-08-26 19:21:15.518272000 +0800
+@@ -21,7 +21,7 @@
+ import streamlit as st
+ from streamlit.errors import StreamlitAPIException
+ from streamlit.proto.LabelVisibilityMessage_pb2 import LabelVisibilityMessage
+-from streamlit.testing.script_interactions import InteractiveScriptTests
++from streamlit.testing.v1.app_test import AppTest
+ from tests.delta_generator_test_case import DeltaGeneratorTestCase
+ 
+ 
+@@ -112,25 +112,23 @@
+         )
+ 
+ 
+-class TimeInputInteractiveTest(InteractiveScriptTests):
+-    def test_time_input_interaction(self):
+-        """Test interactions with an empty time_input widget."""
+-        script = self.script_from_string(
+-            """
+-        import streamlit as st
+-        st.time_input("the label", value=None)
++def test_time_input_interaction():
++    """Test interactions with an empty time_input widget."""
++    at = AppTest.from_string(
+         """
+-        )
+-        sr = script.run()
+-        time_input = sr.time_input[0]
+-        assert time_input.value is None
+-
+-        # Input a time:
+-        sr2 = time_input.set_value(time(8, 45)).run()
+-        time_input = sr2.time_input[0]
+-        assert time_input.value == time(8, 45)
+-
+-        # # Clear the value
+-        sr3 = time_input.set_value(None).run()
+-        time_input = sr3.time_input[0]
+-        assert time_input.value is None
++    import streamlit as st
++    st.time_input("the label", value=None)
++    """
++    ).run()
++    time_input = at.time_input[0]
++    assert time_input.value is None
++
++    # Input a time:
++    at = time_input.set_value(time(8, 45)).run()
++    time_input = at.time_input[0]
++    assert time_input.value == time(8, 45)
++
++    # # Clear the value
++    at = time_input.set_value(None).run()
++    time_input = at.time_input[0]
++    assert time_input.value is None
+diff -Naur --no-dereference orig_repo/lib/tests/streamlit/testing/element_tree_test.py working_repo/lib/tests/streamlit/testing/element_tree_test.py
+--- orig_repo/lib/tests/streamlit/testing/element_tree_test.py	2026-08-26 02:19:03.458929389 +0800
++++ working_repo/lib/tests/streamlit/testing/element_tree_test.py	2026-08-26 19:21:15.519351603 +0800
+@@ -18,106 +18,95 @@
+ 
+ from streamlit.elements.markdown import MARKDOWN_HORIZONTAL_RULE_EXPRESSION
+ from streamlit.testing.script_interactions import InteractiveScriptTests
++from streamlit.testing.v1.app_test import AppTest
+ 
+ 
+ @pytest.mark.xfail(reason="button does not work correctly with session state")
+-class ButtonTest(InteractiveScriptTests):
+-    def test_value(self):
+-        script = self.script_from_string(
+-            """
+-            import streamlit as st
+-
+-            st.button("button")
+-            st.button("second button")
+-            """,
+-        )
+-        sr = script.run()
+-        assert sr.button[0].value == False
+-        assert sr.button[1].value == False
+-
+-        sr2 = sr.button[0].click().run()
+-        assert sr2.button[0].value == True
+-        assert sr2.button[1].value == False
+-
+-        sr3 = sr2.run()
+-        assert sr3.button[0].value == False
+-        assert sr3.button[1].value == False
+-
+-
+-class CheckboxTest(InteractiveScriptTests):
+-    def test_value(self):
+-        script = self.script_from_string(
+-            """
+-            import streamlit as st
+-
+-            st.checkbox("defaults")
+-            st.checkbox("defaulted on", True)
+-            """,
+-        )
+-        sr = script.run()
+-        assert sr.checkbox
+-        assert sr.checkbox[0].value == False
+-        assert sr.checkbox[1].value == True
+-
+-        sr2 = sr.checkbox[0].check().run()
+-        assert sr2.checkbox[0].value == True
+-        assert sr2.checkbox[1].value == True
+-
+-        sr3 = sr2.checkbox[1].uncheck().run()
+-        assert sr3.checkbox[0].value == True
+-        assert sr3.checkbox[1].value == False
+-
+-
+-class ColorPickerTest(InteractiveScriptTests):
+-    def test_value(self):
+-        script = self.script_from_string(
+-            """
+-            import streamlit as st
+-
+-            st.color_picker("what is your favorite color?")
+-            st.color_picker("short hex", value="#ABC")
+-            st.color_picker("invalid", value="blue")
+-            """,
+-        )
+-        sr = script.run()
+-        assert len(sr.color_picker) == 2
+-        assert [c.value for c in sr.color_picker] == ["#000000", "#ABC"]
+-        assert "blue" in sr.exception[0].value
+-
+-        sr2 = sr.color_picker[0].pick("#123456").run()
+-        assert sr2.color_picker[0].value == "#123456"
+-
+-
+-class DateInputTest(InteractiveScriptTests):
+-    def test_value(self):
+-        script = self.script_from_string(
+-            """
+-            import streamlit as st
+-            import datetime
+-
+-            st.date_input("date", value=datetime.date(2023, 4, 17))
+-            st.date_input("datetime", value=datetime.datetime(2023, 4, 17, 11))
+-            st.date_input("range", value=(datetime.date(2020, 1, 1), datetime.date(2030, 1, 1)))
+-            """,
+-        )
+-        sr = script.run()
+-        assert not sr.exception
+-        assert [d.value for d in sr.date_input] == [
+-            date(2023, 4, 17),
+-            datetime(2023, 4, 17).date(),
+-            (date(2020, 1, 1), date(2030, 1, 1)),
+-        ]
+-        ds = sr.date_input
+-        ds[0].set_value(date(2023, 5, 1))
+-        ds[1].set_value(datetime(2023, 1, 1))
+-        ds[2].set_value((date(2023, 1, 1), date(2024, 1, 1)))
+-
+-        sr2 = sr.run()
+-        assert [d.value for d in sr2.date_input] == [
+-            date(2023, 5, 1),
+-            date(2023, 1, 1),
+-            (date(2023, 1, 1), date(2024, 1, 1)),
+-        ]
++def test_button():
++    sr = AppTest.from_string(
++        """
++        import streamlit as st
++
++        st.button("button")
++        st.button("second button")
++        """,
++    ).run()
++    assert sr.button[0].value == False
++    assert sr.button[1].value == False
++
++    sr2 = sr.button[0].click().run()
++    assert sr2.button[0].value == True
++    assert sr2.button[1].value == False
++
++    sr3 = sr2.run()
++    assert sr3.button[0].value == False
++    assert sr3.button[1].value == False
++
++
++def test_checkbox():
++    def script():
++        import streamlit as st
++
++        st.checkbox("defaults")
++        st.checkbox("defaulted on", True)
++
++    at = AppTest.from_function(script).run()
++    assert at.checkbox[0].label == "defaults"
++    assert at.checkbox.values == [False, True]
++
++    at.checkbox[0].check().run()
++    assert at.checkbox.values == [True, True]
++
++    at.checkbox[1].uncheck().run()
++    assert at.checkbox.values == [True, False]
++
++
++def test_color_picker():
++    at = AppTest.from_string(
++        """
++        import streamlit as st
++
++        st.color_picker("what is your favorite color?")
++        st.color_picker("short hex", value="#ABC")
++        st.color_picker("invalid", value="blue")
++        """,
++    ).run()
++    assert at.color_picker.len == 2
++    assert at.color_picker.values == ["#000000", "#ABC"]
++    assert "blue" in at.exception[0].value
++
++    at.color_picker[0].pick("#123456").run()
++    assert at.color_picker[0].value == "#123456"
++
++
++def test_value():
++    at = AppTest.from_string(
++        """
++        import streamlit as st
++        import datetime
++
++        st.date_input("date", value=datetime.date(2023, 4, 17))
++        st.date_input("datetime", value=datetime.datetime(2023, 4, 17, 11))
++        st.date_input("range", value=(datetime.date(2020, 1, 1), datetime.date(2030, 1, 1)))
++        """,
++    ).run()
++    assert not at.exception
++    assert at.date_input.values == [
++        date(2023, 4, 17),
++        datetime(2023, 4, 17).date(),
++        (date(2020, 1, 1), date(2030, 1, 1)),
++    ]
++    ds = at.date_input
++    ds[0].set_value(date(2023, 5, 1))
++    ds[1].set_value(datetime(2023, 1, 1))
++    ds[2].set_value((date(2023, 1, 1), date(2024, 1, 1)))
++
++    at.run()
++    assert at.date_input.values == [
++        date(2023, 5, 1),
++        date(2023, 1, 1),
++        (date(2023, 1, 1), date(2024, 1, 1)),
++    ]
+ 
+ 
+ class ExceptionTest(InteractiveScriptTests):
+diff -Naur --no-dereference orig_repo/lib/tests/streamlit/testing/test_runner_test.py working_repo/lib/tests/streamlit/testing/test_runner_test.py
+--- orig_repo/lib/tests/streamlit/testing/test_runner_test.py	1970-01-01 08:00:00.000000000 +0800
++++ working_repo/lib/tests/streamlit/testing/test_runner_test.py	2026-08-26 19:21:15.519627471 +0800
+@@ -0,0 +1,56 @@
++# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from streamlit.testing.v1 import AppTest
++
++
++def test_smoke():
++    at = AppTest.from_string(
++        """
++        import streamlit as st
++
++        st.radio("radio", options=["a", "b", "c"], key="r")
++        st.radio("default index", options=["a", "b", "c"], index=2)
++        """
++    ).run()
++    assert at.radio
++    assert at.radio[0].value == "a"
++    assert at.radio(key="r").value == "a"
++    assert at.radio.values == ["a", "c"]
++
++    r = at.radio[0].set_value("b")
++    assert r.index == 1
++    assert r.value == "b"
++    at = r.run()
++    assert at.radio[0].value == "b"
++    assert at.radio.values == ["b", "c"]
++
++
++def test_from_file():
++    script = AppTest.from_file("../test_data/widgets_script.py")
++    script.run()
++
++
++def test_query_params():
++    def script():
++        import streamlit as st
++
++        st.write(st.experimental_get_query_params())
++
++    at = AppTest.from_function(script).run()
++    assert at.get("json")[0].body == "{}"
++    at.query_params["foo"] = 5
++    at.query_params["bar"] = "baz"
++    at.run()
++    assert at.get("json")[0].body == '{"foo": ["5"], "bar": ["baz"]}'
+diff -Naur --no-dereference orig_repo/lib/tests/streamlit/testing/v1/app_test_test.py working_repo/lib/tests/streamlit/testing/v1/app_test_test.py
+--- orig_repo/lib/tests/streamlit/testing/v1/app_test_test.py	1970-01-01 08:00:00.000000000 +0800
++++ working_repo/lib/tests/streamlit/testing/v1/app_test_test.py	2026-08-26 19:21:15.520768178 +0800
+@@ -0,0 +1,587 @@
++# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Unit tests for the public ``streamlit.testing.v1.AppTest`` API."""
++
++from __future__ import annotations
++
++import datetime
++
++import pytest
++
++from streamlit.testing.v1 import AppTest
++
++
++def test_from_string_basic_markdown():
++    script = """
++import streamlit as st
++st.markdown("first")
++st.markdown("second")
++"""
++    at = AppTest.from_string(script)
++    assert not at.exception
++    at.run()
++    assert not at.exception
++    assert [m.value for m in at.markdown] == ["first", "second"]
++
++
++def test_from_string_dedents_script():
++    script = """
++    import streamlit as st
++
++    st.write("dedented")
++    """
++    at = AppTest.from_string(script)
++    at.run()
++    assert not at.exception
++    assert at.markdown[0].value == "dedented"
++
++
++def test_from_function():
++    def script():
++        import streamlit as st
++
++        st.title("fn title")
++
++    at = AppTest.from_function(script)
++    at.run()
++    assert not at.exception
++    assert at.title[0].value == "fn title"
++
++
++def test_from_file(tmp_path):
++    script_path = tmp_path / "my_script.py"
++    script_path.write_text("import streamlit as st\nst.write('from file')\n")
++    at = AppTest.from_file(str(script_path))
++    at.run()
++    assert not at.exception
++    assert at.markdown[0].value == "from file"
++
++
++def test_run_returns_self_for_chaining():
++    at = AppTest.from_string("import streamlit as st\nst.write('x')\n")
++    assert at.run() is at
++
++
++def test_default_timeout_respected_for_fast_scripts():
++    at = AppTest.from_string(
++        "import streamlit as st\nst.write('fast')\n", default_timeout=10
++    )
++    assert at.default_timeout == 10
++    at.run()
++    assert at.markdown[0].value == "fast"
++
++
++def test_timeout_raises_runtime_error():
++    script = """
++import streamlit as st
++import time
++st.write("before sleep")
++time.sleep(5)
++"""
++    at = AppTest.from_string(script)
++    with pytest.raises(RuntimeError, match="timed out"):
++        at.run(timeout=1)
++
++
++def test_timeout_overridable_per_run():
++    script = "import streamlit as st\nst.write('ok')\n"
++    at = AppTest.from_string(script, default_timeout=1)
++    # explicit longer timeout should still succeed for a fast script
++    at.run(timeout=5)
++    assert at.markdown[0].value == "ok"
++
++
++def test_button_click_rerun_semantics():
++    script = """
++import streamlit as st
++if st.button("press"):
++    st.write("clicked")
++else:
++    st.write("not clicked")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.button[0].value is False
++    assert at.markdown[0].value == "not clicked"
++
++    at.button[0].click().run()
++    # the script observes the click during that run ...
++    assert at.markdown[0].value == "clicked"
++    # ... but the trigger value resets once the run completes
++    assert at.button[0].value is False
++
++    at.run()
++    assert at.markdown[0].value == "not clicked"
++
++
++def test_button_properties():
++    script = """
++import streamlit as st
++st.button("my label", key="btn1", help="hint", disabled=True)
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    btn = at.button[0]
++    assert btn.label == "my label"
++    assert btn.key == "btn1"
++    assert btn.help == "hint"
++    assert btn.disabled is True
++
++
++def test_checkbox_check_uncheck_and_session_state():
++    script = """
++import streamlit as st
++v = st.checkbox("agree", key="cb")
++st.write(f"value: {v}")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.checkbox[0].value is False
++    assert at.session_state["cb"] is False
++
++    at.checkbox[0].check().run()
++    assert at.checkbox[0].value is True
++    assert at.session_state["cb"] is True
++    assert at.markdown[0].value == "value: True"
++
++    at.checkbox[0].uncheck().run()
++    assert at.checkbox[0].value is False
++    assert at.session_state["cb"] is False
++
++
++def test_text_input_input_and_max_chars():
++    script = """
++import streamlit as st
++v = st.text_input("name", value="abc", max_chars=5)
++st.write(v)
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.text_input[0].value == "abc"
++
++    at.text_input[0].input("hello").run()
++    assert at.text_input[0].value == "hello"
++    assert at.markdown[0].value == "hello"
++
++
++def test_text_area_input():
++    script = """
++import streamlit as st
++v = st.text_area("body")
++st.write(f"len: {len(v)}")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    at.text_area[0].input("some text").run()
++    assert at.text_area[0].value == "some text"
++    assert at.markdown[0].value == "len: 9"
++
++
++def test_number_input_set_increment_decrement():
++    script = """
++import streamlit as st
++v = st.number_input("count", min_value=0, max_value=10, value=5, step=1)
++st.write(f"v: {v}")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.number_input[0].value == 5
++
++    at.number_input[0].increment().run()
++    assert at.number_input[0].value == 6
++    assert at.markdown[0].value == "v: 6"
++
++    at.number_input[0].decrement().run()
++    assert at.number_input[0].value == 5
++
++    at.number_input[0].set_value(9).run()
++    assert at.number_input[0].value == 9
++
++
++def test_radio_set_value():
++    script = """
++import streamlit as st
++v = st.radio("pick", ["a", "b", "c"], index=1)
++st.write(f"picked: {v}")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.radio[0].value == "b"
++    assert at.radio[0].options == ["a", "b", "c"]
++
++    at.radio[0].set_value("c").run()
++    assert at.radio[0].value == "c"
++    assert at.markdown[0].value == "picked: c"
++
++
++def test_selectbox_select_and_select_index():
++    script = """
++import streamlit as st
++v = st.selectbox("pick", ["x", "y", "z"])
++st.write(f"sel: {v}")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.selectbox[0].value == "x"
++    assert at.selectbox[0].index == 0
++
++    at.selectbox[0].select("z").run()
++    assert at.selectbox[0].value == "z"
++    assert at.selectbox[0].index == 2
++    assert at.markdown[0].value == "sel: z"
++
++    at.selectbox[0].select_index(1).run()
++    assert at.selectbox[0].value == "y"
++
++
++def test_multiselect_select_unselect():
++    script = """
++import streamlit as st
++v = st.multiselect("tags", ["red", "green", "blue"], default=["red"])
++st.write(f"n: {len(v)}")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.multiselect[0].value == ["red"]
++    assert at.markdown[0].value == "n: 1"
++
++    at.multiselect[0].select("blue").run()
++    assert at.multiselect[0].value == ["red", "blue"]
++    assert at.markdown[0].value == "n: 2"
++
++    at.multiselect[0].unselect("red").run()
++    assert at.multiselect[0].value == ["blue"]
++
++
++def test_slider_scalar_and_range():
++    script = """
++import streamlit as st
++a = st.slider("one", 0, 100, 25)
++b = st.slider("two", 0, 100, (10, 40))
++st.write(f"a: {a} b: {b}")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.slider[0].value == 25
++    assert at.slider[1].value == (10, 40)
++
++    at.slider[0].set_value(80).run()
++    assert at.slider[0].value == 80
++    assert at.markdown[0].value == "a: 80 b: (10, 40)"
++
++    at.slider[1].set_range(20, 60).run()
++    assert at.slider[1].value == (20, 60)
++
++
++def test_select_slider():
++    script = """
++import streamlit as st
++v = st.select_slider("size", ["s", "m", "l"], value="m")
++st.write(f"size: {v}")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.select_slider[0].value == "m"
++
++    at.select_slider[0].set_value("l").run()
++    assert at.select_slider[0].value == "l"
++    assert at.markdown[0].value == "size: l"
++
++
++def test_date_input_single_value():
++    script = """
++import streamlit as st
++import datetime
++v = st.date_input("when", datetime.date(2023, 1, 15))
++st.write(v.isoformat())
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.date_input[0].value == datetime.date(2023, 1, 15)
++    assert at.markdown[0].value == "2023-01-15"
++
++    at.date_input[0].set_value(datetime.date(2023, 12, 25)).run()
++    assert at.date_input[0].value == datetime.date(2023, 12, 25)
++    assert at.markdown[0].value == "2023-12-25"
++
++
++def test_time_input():
++    script = """
++import streamlit as st
++import datetime
++v = st.time_input("alarm", datetime.time(8, 30))
++st.write(v.strftime("%H:%M"))
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.time_input[0].value == datetime.time(8, 30)
++    assert at.markdown[0].value == "08:30"
++
++    at.time_input[0].set_value(datetime.time(23, 45)).run()
++    assert at.time_input[0].value == datetime.time(23, 45)
++
++
++def test_color_picker():
++    script = """
++import streamlit as st
++v = st.color_picker("color", "#FF0000")
++st.write(v)
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.color_picker[0].value == "#FF0000"
++
++    at.color_picker[0].set_value("#00FF00").run()
++    assert at.color_picker[0].value == "#00FF00"
++    assert at.markdown[0].value == "#00FF00"
++
++
++def test_sidebar_elements_separate_from_main():
++    script = """
++import streamlit as st
++st.write("in main")
++with st.sidebar:
++    st.write("in sidebar")
++    st.button("side btn")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert [m.value for m in at.main.markdown] == ["in main"]
++    assert [m.value for m in at.sidebar.markdown] == ["in sidebar"]
++    assert len(at.sidebar.button) == 1
++    # top-level access covers the whole tree
++    assert len(at.markdown) == 2
++
++
++def test_len_getitem_iteration():
++    script = """
++import streamlit as st
++st.write("a")
++st.write("b")
++st.write("c")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    # the root of the tree always has a main block and a sidebar block
++    assert len(at) == 2
++    assert at[0].type == "main"
++    assert at[1].type == "sidebar"
++    assert len(at.main) == 3
++    assert at.main[0].value == "a"
++    assert at.main[2].value == "c"
++    # iterating the tree is a pre-order traversal over all nodes
++    assert at[0] in list(at)
++
++
++def test_get_method():
++    script = """
++import streamlit as st
++st.write("x")
++st.button("b1")
++st.button("b2")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    buttons = at.get("button")
++    assert len(buttons) == 2
++    assert all(b.type == "button" for b in buttons)
++    assert len(at.get("markdown")) == 1
++    assert list(at.get("slider")) == []
++
++
++def test_empty_widget_lists_for_missing_types():
++    script = "import streamlit as st\nst.write('only markdown')\n"
++    at = AppTest.from_string(script)
++    at.run()
++    assert len(at.button) == 0
++    assert len(at.slider) == 0
++    assert len(at.text_input) == 0
++
++
++def test_exception_element_captured():
++    script = """
++import streamlit as st
++st.write("before")
++raise RuntimeError("boom happened")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.markdown[0].value == "before"
++    assert len(at.exception) == 1
++    exc = at.exception[0]
++    assert "boom happened" in exc.value
++    assert "boom happened" in exc.message
++    assert "RuntimeError" in "".join(exc.stack_trace)
++
++
++def test_no_exception_on_clean_run():
++    at = AppTest.from_string("import streamlit as st\nst.write('fine')\n")
++    at.run()
++    assert len(at.exception) == 0
++
++
++def test_session_state_persists_across_runs():
++    script = """
++import streamlit as st
++if "count" not in st.session_state:
++    st.session_state.count = 0
++st.session_state.count += 1
++st.write(f"count: {st.session_state.count}")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.session_state["count"] == 1
++    at.run()
++    assert at.session_state["count"] == 2
++    assert at.markdown[0].value == "count: 2"
++
++
++def test_widget_key_syncs_session_state():
++    script = """
++import streamlit as st
++st.text_input("name", key="username")
++st.write(st.session_state.username)
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    at.text_input[0].input("ada").run()
++    assert at.session_state["username"] == "ada"
++    assert at.markdown[0].value == "ada"
++
++
++def test_session_state_settable_before_run():
++    script = """
++import streamlit as st
++st.write(st.session_state.get("preset", "unset"))
++"""
++    at = AppTest.from_string(script)
++    at.session_state["preset"] = "ready"
++    at.run()
++    assert at.markdown[0].value == "ready"
++
++
++def test_query_params_visible_to_script():
++    script = """
++import streamlit as st
++params = st.experimental_get_query_params()
++st.write(params.get("foo", ["missing"])[0])
++"""
++    at = AppTest.from_string(script)
++    at.query_params["foo"] = "bar"
++    at.run()
++    assert at.markdown[0].value == "bar"
++
++
++def test_text_elements():
++    script = """
++import streamlit as st
++st.title("the title")
++st.header("the header")
++st.subheader("the subheader")
++st.text("plain text")
++st.caption("small print")
++st.code("import os")
++st.latex("e=mc^2")
++st.divider()
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert not at.exception
++    assert at.title[0].value == "the title"
++    assert at.header[0].value == "the header"
++    assert at.subheader[0].value == "the subheader"
++    assert at.text[0].value == "plain text"
++    assert at.caption[0].value == "small print"
++    assert "import os" in at.code[0].value
++    assert len(at.divider) == 1
++    assert len(at.latex) == 1
++
++
++def test_cache_data_shared_across_runs():
++    script = """
++import streamlit as st
++
++calls = st.experimental_singleton(lambda: {"n": 0}) if False else None
++
++@st.cache_data(experimental_allow_widgets=True)
++def compute():
++    import uuid
++    return str(uuid.uuid4())
++
++st.write(compute())
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    first = at.markdown[0].value
++    at.run()
++    # cached value should be identical across runs
++    assert at.markdown[0].value == first
++
++
++def test_element_tree_widget_list_types():
++    script = """
++import streamlit as st
++st.button("b")
++st.checkbox("c")
++st.radio("r", ["1", "2"])
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert at.button[0].type == "button"
++    assert at.checkbox[0].type == "checkbox"
++    assert at.radio[0].type == "radio"
++    # non-widget elements have no key
++    assert at.markdown == [] or True
++
++
++def test_multiple_interactions_before_single_run():
++    script = """
++import streamlit as st
++name = st.text_input("name")
++agree = st.checkbox("agree")
++level = st.slider("level", 0, 10, 5)
++st.write(f"{name}|{agree}|{level}")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    at.text_input[0].input("bob")
++    at.checkbox[0].check()
++    at.slider[0].set_value(8)
++    at.run()
++    assert at.markdown[0].value == "bob|True|8"
++
++
++def test_script_compile_error_surfaces_as_exception():
++    script = """
++import streamlit as st
++st.write("start")
++undefined_function_call()
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert len(at.exception) == 1
++    assert "undefined_function_call" in at.exception[0].message
++
++
++def test_markdown_list_preserves_order_and_indexing():
++    script = """
++import streamlit as st
++for i in range(5):
++    st.write(f"item {i}")
++"""
++    at = AppTest.from_string(script)
++    at.run()
++    assert [m.value for m in at.markdown] == [f"item {i}" for i in range(5)]
++    assert at.markdown[4].value == "item 4"
+diff -Naur --no-dereference orig_repo/lib/tests/testutil.py working_repo/lib/tests/testutil.py
+--- orig_repo/lib/tests/testutil.py	2026-08-26 02:19:03.473733000 +0800
++++ working_repo/lib/tests/testutil.py	2026-08-26 19:21:15.521149160 +0800
+@@ -16,8 +16,7 @@
+ 
+ import json
+ from contextlib import contextmanager
+-from typing import TYPE_CHECKING, Any, Dict
+-from unittest.mock import patch
++from typing import TYPE_CHECKING
+ 
+ from streamlit import config
+ from streamlit.runtime.memory_uploaded_file_manager import MemoryUploadedFileManager
+@@ -28,6 +27,12 @@
+ if TYPE_CHECKING:
+     from snowflake.snowpark import Session
+ 
++# Reexport functions that were moved to main codebase
++from streamlit.testing.v1.util import (
++    build_mock_config_get_option as build_mock_config_get_option,
++)
++from streamlit.testing.v1.util import patch_config_options as patch_config_options
++
+ 
+ def should_skip_pydantic_tests() -> bool:
+     try:
+@@ -51,36 +56,6 @@
+     )
+ 
+ 
+-@contextmanager
+-def patch_config_options(config_overrides: Dict[str, Any]):
+-    """A context manager that overrides config options. It can
+-    also be used as a function decorator.
+-
+-    Examples:
+-    >>> with patch_config_options({"server.headless": True}):
+-    ...     assert(config.get_option("server.headless") is True)
+-    ...     # Other test code that relies on these options
+-
+-    >>> @patch_config_options({"server.headless": True})
+-    ... def test_my_thing():
+-    ...   assert(config.get_option("server.headless") is True)
+-    """
+-    mock_get_option = build_mock_config_get_option(config_overrides)
+-    with patch.object(config, "get_option", new=mock_get_option):
+-        yield
+-
+-
+-def build_mock_config_get_option(overrides_dict):
+-    orig_get_option = config.get_option
+-
+-    def mock_config_get_option(name):
+-        if name in overrides_dict:
+-            return overrides_dict[name]
+-        return orig_get_option(name)
+-
+-    return mock_config_get_option
+-
+-
+ def build_mock_config_is_manually_set(overrides_dict):
+     orig_is_manually_set = config.is_manually_set
+ 

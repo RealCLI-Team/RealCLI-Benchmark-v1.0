@@ -1,0 +1,184 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test_outputs.py"],
+  "requirements": [
+    {
+      "id": "R1_parse_roundtrip_pg_oracle",
+      "verifier_assertion": "For each PG_CASES / ORACLE_CASES pair, parse_one(sql, read=dialect).sql(dialect) == expected AND parse_one(expected, read=dialect).sql(dialect) == expected — both PG (RECURSIVE required) and Oracle (RECURSIVE optional) round-trip preserved with keyword case and whitespace normalized. Covers tests/test_outputs.py lines 173, 175, 181, 182.",
+      "script_refs": ["task_overview", "valid_forms_must_parse", "generation_stability"],
+      "must_include": [
+        "SEARCH DEPTH FIRST BY id, link SET ordercol",
+        "SEARCH BREADTH FIRST BY id DESC, link ASC NULLS FIRST SET ordercol",
+        "CYCLE id, link SET is_cycle TO 'Y' DEFAULT 'N' USING path",
+        "SEARCH DEPTH FIRST BY id SET ordercol CYCLE id SET is_cycle TO 'Y' DEFAULT 'N' USING path",
+        "parse, output as-is, and transpile",
+        "idempotent",
+        "Keyword case"
+      ]
+    },
+    {
+      "id": "R2_normalization_case_whitespace",
+      "verifier_assertion": "NORMALIZATION_CASES: parse_one(sql, read=dialect).sql(dialect) == expected where sql uses lowercase keywords / extra whitespace and expected is the canonical uppercased-single-spaced form. Covers tests/test_outputs.py line 194.",
+      "script_refs": ["generation_stability"],
+      "must_include": [
+        "idempotent",
+        "Keyword case",
+        "redundant whitespace",
+        "uppercase keywords"
+      ]
+    },
+    {
+      "id": "R3_cross_dialect_transpile",
+      "verifier_assertion": "TRANSPILE_CASES: expression.sql(write_dialect) == expected for read/write combinations across postgres, oracle, snowflake, duckdb, mysql, tsql, bigquery — including RECURSIVE preservation (with TSQL as exception dropping RECURSIVE), NULLS-position normalization consistent with each dialect's ORDER BY handling (MySQL/TSQL simulate via CASE WHEN col IS NULL THEN 1 ELSE 0 END), BigQuery CTE-alias push-down to inner SELECT, and SEARCH/CYCLE clauses never dropped. Additionally test_transpile_api asserts sqlglot.transpile(pg->snowflake) returns the expected preserved-clauses list. Covers tests/test_outputs.py lines 189, 205.",
+      "script_refs": ["transpile_recursive_keyword", "transpile_nulls_normalization", "transpile_bigquery_and_preserve_across_dialects"],
+      "must_include": [
+        "`RECURSIVE` keyword",
+        "preserved exactly as parsed",
+        "TSQL",
+        "doesn't support the `RECURSIVE` keyword",
+        "CASE WHEN col IS NULL THEN 1 ELSE 0 END",
+        "SEARCH and CYCLE clauses",
+        "preserved as-is",
+        "BigQuery",
+        "CTE column alias lists"
+      ]
+    },
+    {
+      "id": "R4_invalid_forms_raise_parseerror",
+      "verifier_assertion": "test_invalid_syntax_raises iterates INVALID_CASES with pytest.raises(ParseError): each SEARCH/CYCLE illegal shape (SEARCH missing DEPTH/BREADTH, DIAGONAL kind, missing sequence column after SET, CYCLE missing detection column, CYCLE missing mark column, CYCLE TO without DEFAULT or reverse, CYCLE missing constant, CYCLE USING without path column, CYCLE appearing before SEARCH) must raise ParseError. Covers the pytest.raises assertion at tests/test_outputs.py lines 214-216 for all 12 INVALID_CASES.",
+      "script_refs": ["illegal_forms_must_raise", "ordering_rule", "silent_drop_full_form_hazard"],
+      "must_include": [
+        "must raise `ParseError`",
+        "TO` without `DEFAULT",
+        "`DEFAULT` without `TO`",
+        "USING with no path column",
+        "no sequence column after SET",
+        "missing `DEPTH` / `BREADTH`",
+        "SEARCH DIAGONAL FIRST",
+        "SEARCH first and CYCLE second",
+        "reverse order"
+      ]
+    },
+    {
+      "id": "R5_qualify_preserves_and_qualifies_synth_cols",
+      "verifier_assertion": "test_qualify_preserves_clauses: qualify(parse_one(sql), schema, dialect).sql(dialect) == expected exact-string, where the expected output uses double-quoted identifiers, keeps SEARCH DEPTH FIRST / CYCLE / SET / USING clauses, and treats ordercol / is_cycle / path as CTE-output columns qualifiable as `sg.ordercol` etc. test_qualify_extended_lineage: for each fragment in ('\"sg\".\"ordercol\"', '\"sg\".\"is_cycle\"', '\"sg\".\"path\"'), fragment must appear in qualified text. Covers tests/test_outputs.py lines 225, 338.",
+      "script_refs": ["qualify_synthesized_columns", "synthesized_output_columns_method"],
+      "must_include": [
+        "qualify optimizer",
+        "sqlglot.optimizer.qualify.qualify",
+        "ordercol",
+        "is_cycle",
+        "path",
+        "`SELECT *` expansion",
+        "resolver column attribution",
+        "pushdown_projections"
+      ]
+    },
+    {
+      "id": "R6_select_star_expansion_order",
+      "verifier_assertion": "test_qualify_star_expands_with_synthesized: after qualify, projected_names on outer SELECT * of a WITH RECURSIVE sg(id,link) with SEARCH SET ordercol and CYCLE SET is_cycle ... USING path must equal ['id', 'link', 'ordercol', 'is_cycle', 'path'] (declared original columns first, then synthesized in stable order: SEARCH sequence, CYCLE mark, USING path). Covers tests/test_outputs.py line 357.",
+      "script_refs": ["synthesized_output_columns_method", "qualify_synthesized_columns"],
+      "must_include": [
+        "id, link, ordercol, is_cycle, path",
+        "CTE's original columns first",
+        "synthesized columns appended after",
+        "SEARCH sequence column first",
+        "CYCLE mark column",
+        "USING path column"
+      ]
+    },
+    {
+      "id": "R7_ast_shape_search_cycle",
+      "verifier_assertion": "test_ast_shape_search_and_cycle: after parsing a full-form PG query, tree.find(exp.With) yields a With whose args['search'] isinstance exp.RecursiveWithSearch (kind == 'DEPTH', expressions is a 2-element list of exp.Ordered with sort_keys[0].desc is True, sort_keys[1].desc is False and sort_keys[1].nulls_first is True; expression.name == 'ordercol'); args['cycle'] isinstance exp.RecursiveWithCycle (expressions is a list, [c.name for c in expressions] == ['id', 'link']; expression.name == 'is_cycle'; to.to_py() == 'Y'; default.to_py() == 'N'; using.name == 'path'). Covers tests/test_outputs.py lines 242, 246, 247, 249, 252, 254, 255, 256, 257, 259, 261, 262, 264, 265, 266, 267.",
+      "script_refs": ["ast_arg_layout", "deliverables_ast_tests_and_grammar_reference"],
+      "must_include": [
+        "exp.RecursiveWithSearch",
+        "exp.RecursiveWithCycle",
+        "args[\"search\"]",
+        "args[\"cycle\"]",
+        "kind",
+        "\"DEPTH\"",
+        "\"BREADTH\"",
+        "normalized to uppercase",
+        "exp.Ordered",
+        "desc",
+        "nulls_first",
+        "detection column list",
+        "mark column produced by SET",
+        "TO` value",
+        "DEFAULT` value",
+        "USING` path column"
+      ]
+    },
+    {
+      "id": "R8_synthesized_output_columns_method",
+      "verifier_assertion": "test_ast_synthesized_output_columns: exp.With.synthesized_output_columns() and last exp.CTE.synthesized_output_columns() return, in stable order, ['ordercol', 'is_cycle', 'path'] with both SEARCH+CYCLE+USING; ['ordercol'] with only SEARCH; ['is_cycle'] with only CYCLE and no USING; [] with neither clause (ordinary recursive CTEs unaffected). Covers tests/test_outputs.py lines 283, 286, 296, 306, 316.",
+      "script_refs": ["synthesized_output_columns_method"],
+      "must_include": [
+        "synthesized_output_columns()",
+        "exp.With",
+        "exp.CTE",
+        "['ordercol']",
+        "['is_cycle']",
+        "returns `[]`",
+        "ordinary recursive CTEs must not be affected",
+        "SEARCH sequence column first",
+        "CYCLE mark column",
+        "USING path column"
+      ]
+    },
+    {
+      "id": "R9_full_optimize_preserves_clauses",
+      "verifier_assertion": "test_full_optimize_does_not_break: sqlglot.optimizer.optimize on WITH RECURSIVE ... SEARCH DEPTH FIRST BY id SET ordercol CYCLE id SET is_cycle TO 'Y' DEFAULT 'N' USING path SELECT sg.ordercol, sg.is_cycle FROM sg ORDER BY sg.ordercol must not raise; and the emitted PG text must contain 'SEARCH DEPTH FIRST BY', 'CYCLE', 'SET \"ordercol\"', 'USING \"path\"'. Covers tests/test_outputs.py lines 375, 376, 377, 378.",
+      "script_refs": ["qualify_synthesized_columns"],
+      "must_include": [
+        "sqlglot.optimizer.optimize",
+        "`SEARCH` and `CYCLE` clauses must still be present",
+        "ordercol",
+        "path"
+      ]
+    },
+    {
+      "id": "R10_backward_compat_existing_regressions",
+      "verifier_assertion": "test_backward_compat_existing_recursive_cte: existing narrow-form cases in the repo (single sort key without direction; CYCLE with no TO/DEFAULT but with USING; BREADTH FIRST single sort key) must still parse and generate identically — no regression from the extension. Covers tests/test_outputs.py line 405.",
+      "script_refs": ["generation_stability"],
+      "must_include": [
+        "TestPostgres.test_recursive_cte",
+        "Narrow syntax",
+        "single sort key without an explicit direction",
+        "must not regress"
+      ]
+    },
+    {
+      "id": "R11_programmatic_ast_construction",
+      "verifier_assertion": "test_build_ast_programmatically: exp.RecursiveWithSearch(kind='DEPTH', expressions=[Ordered(id, desc=True, nulls_first=True), Ordered(link, desc=False, nulls_first=True)], expression=id('ordercol')) and exp.RecursiveWithCycle(expressions=[id('id'), id('link')], expression=id('is_cycle'), to=Literal 'Y', default=Literal 'N', using=id('path')) attached to exp.With(recursive=True, search=..., cycle=...) — generated PG SQL exactly equals the expected full-form string. Covers tests/test_outputs.py line 444.",
+      "script_refs": ["ast_arg_layout", "deliverables_ast_tests_and_grammar_reference"],
+      "must_include": [
+        "downstream code must be able to build these nodes explicitly",
+        "not only via string parsing",
+        "exp.RecursiveWithSearch",
+        "exp.RecursiveWithCycle",
+        "kind",
+        "expressions",
+        "expression",
+        "to",
+        "default",
+        "using"
+      ]
+    },
+    {
+      "id": "R12_deliverables_modules_and_dialect_tests",
+      "verifier_assertion": "The instruction requires that the fix touches every relevant module (parser, generator, optimizer qualify / subquery-elimination / pushdown_projections), and that new automated test cases in the style of TestPostgres / TestOracle are added to tests/dialects/test_postgres.py and tests/dialects/test_oracle.py covering normal parse+generate, cross-dialect transpile, illegal syntax raising, qualify preserving clauses and handling synthesized columns. Grammar authority is PG + Oracle manuals for `recursive subquery factoring / recursive query`. This is a deliverables clause behind the concrete assertions above and does not have a direct assertion line, but is echoed by every module-visible test above and by test_recursive_cte regression coverage.",
+      "script_refs": ["deliverables_ast_tests_and_grammar_reference", "task_overview"],
+      "must_include": [
+        "parsing, generation, optimizer qualify / subquery elimination / pushdown_projections",
+        "tests/dialects/test_postgres.py",
+        "tests/dialects/test_oracle.py",
+        "TestPostgres",
+        "TestOracle",
+        "recursive subquery factoring",
+        "PostgreSQL and Oracle manuals"
+      ]
+    }
+  ]
+}

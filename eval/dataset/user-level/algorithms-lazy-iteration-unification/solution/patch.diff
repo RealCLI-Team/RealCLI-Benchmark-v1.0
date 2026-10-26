@@ -1,0 +1,4972 @@
+diff --git a/README.md b/README.md
+index 28d3252..407e0f4 100644
+--- a/README.md
++++ b/README.md
+@@ -120,6 +120,74 @@ print(knuth_morris_pratt("abxabcabcaby", "abcaby"))
+ python -m pytest tests/
+ ```
+ 
++## Lazy Iteration Convention
++
++Enumeration-style APIs — functions that produce multiple independent
++result items where each item can be computed without computing the rest
++— return **single-pass lazy iterators**, not materialized lists. This
++keeps memory usage independent of the result count and lets callers
++stop early when they only need the first few results.
++
++```python
++from algorithms.backtracking import permute, subsets
++
++# Results are streamed one at a time:
++it = permute([1, 2, 3])
++print(next(it))        # [1, 2, 3]
++print(next(it))        # [2, 1, 3]
++
++# Materialize explicitly when a list is really needed:
++print(list(subsets([1, 2, 3])))
++# [[1, 2, 3], [1, 2], [1, 3], [1], [2, 3], [2], [3], []]
++```
++
++The convention applies across categories, for example:
++
++- **Backtracking**: `subsets`, `subsets_v2`, `subsets_unique`,
++  `combination_sum`, `generate_parenthesis_v1` / `_v2`,
++  `generate_abbreviations`, `add_operators`, `array_sum_combinations`,
++  `unique_array_sum_combinations`, `get_factors`,
++  `recursive_get_factors`, `find_words`, `letter_combinations`,
++  `permute`, `permute_recursive`, `permute_unique`,
++  `palindromic_substrings`
++- **Tree**: `inorder` / `preorder` / `postorder` (iterative and `_rec`
++  variants), `level_order`, `zigzag_level`, `binary_tree_paths`,
++  `path_sum` / `path_sum2` / `path_sum3`, `left_view`, `right_view`
++- **Array**: `missing_ranges`, `summarize_ranges`, `delete_nth`,
++  `delete_nth_naive`, `three_sum`, `limit`, `flatten`
++- **String**: `fizzbuzz`, `fizzbuzz_with_helper_func`, `word_squares`,
++  `match_symbol`, `match_symbol_1`
++- **Matrix**: `spiral_traversal`
++- **Heap / Queue**: `max_sliding_window` (both implementations)
++- **Graph**: `get_factors`, `get_factors_iterative1`,
++  `get_factors_iterative2`
++- **Math**: `gen_strobogrammatic`
++- **Bit Manipulation**: `subsets`
++- **Set**: `find_keyboard_row`
++
++APIs whose first result inherently requires the whole computation —
++sorting algorithms, `merge_intervals`, `top_1`, `group_anagrams`,
++`find_all_cliques`, `k_closest`, `top_view`, `bottom_view` — keep
++returning materialized containers.
++
++Backward compatibility notes:
++
++- Historical `*_iter` variants (`permute_iter`,
++  `palindromic_substrings_iter`, `flatten_iter`) remain available and
++  behave as aliases of their now-lazy counterparts.
++- The legacy two-argument accumulator forms still work:
++  `inorder_rec(root, acc)`, `preorder_rec(root, acc)`,
++  `postorder_rec(root, acc)` and `flatten(items, acc)` fill the
++  provided list and return it.
++- Argument validation that raised eagerly before (for example
++  `fizzbuzz(0)` raising `ValueError`, or `max_sliding_window` with a
++  non-positive window size) still raises at call time, before any
++  consumption.
++- Both `max_sliding_window` implementations share the same edge-case
++  semantics: a window larger than the input yields no results, a
++  window exactly the input size yields a single maximum, and a
++  non-positive window size raises `ValueError`.
++
+ ## Project Structure
+ 
+ ```
+diff --git a/algorithms/array/delete_nth.py b/algorithms/array/delete_nth.py
+index f548fde..3cb6b00 100644
+--- a/algorithms/array/delete_nth.py
++++ b/algorithms/array/delete_nth.py
+@@ -18,49 +18,51 @@ Complexity:
+ from __future__ import annotations
+ 
+ import collections
++from collections.abc import Iterator
+ 
+ 
+-def delete_nth_naive(array: list[int], n: int) -> list[int]:
+-    """Keep at most n copies of each element using naive counting.
++def delete_nth_naive(array: list[int], n: int) -> Iterator[int]:
++    """Yield elements, keeping at most n copies of each, using naive counting.
++
++    Elements are produced lazily as the input is scanned.
+ 
+     Args:
+         array: Source list of integers.
+         n: Maximum number of allowed occurrences per element.
+ 
+-    Returns:
+-        New list with each element appearing at most n times.
++    Yields:
++        Each element at most n times, in input order.
+ 
+     Examples:
+-        >>> delete_nth_naive([1, 2, 3, 1, 2, 1, 2, 3], 2)
++        >>> list(delete_nth_naive([1, 2, 3, 1, 2, 1, 2, 3], 2))
+         [1, 2, 3, 1, 2, 3]
+     """
+-    result = []
++    kept: list[int] = []
+     for num in array:
+-        if result.count(num) < n:
+-            result.append(num)
+-    return result
++        if kept.count(num) < n:
++            kept.append(num)
++            yield num
++
+ 
++def delete_nth(array: list[int], n: int) -> Iterator[int]:
++    """Yield elements, keeping at most n copies of each, using a hash table.
+ 
+-def delete_nth(array: list[int], n: int) -> list[int]:
+-    """Keep at most n copies of each element using a hash table.
++    Elements are produced lazily as the input is scanned.
+ 
+     Args:
+         array: Source list of integers.
+         n: Maximum number of allowed occurrences per element.
+ 
+-    Returns:
+-        New list with each element appearing at most n times.
++    Yields:
++        Each element at most n times, in input order.
+ 
+     Examples:
+-        >>> delete_nth([1, 2, 3, 1, 2, 1, 2, 3], 2)
++        >>> list(delete_nth([1, 2, 3, 1, 2, 1, 2, 3], 2))
+         [1, 2, 3, 1, 2, 3]
+     """
+-    result = []
+     counts = collections.defaultdict(int)
+ 
+     for element in array:
+         if counts[element] < n:
+-            result.append(element)
+             counts[element] += 1
+-
+-    return result
++            yield element
+diff --git a/algorithms/array/flatten.py b/algorithms/array/flatten.py
+index 4c6b53d..f2f6a6f 100644
+--- a/algorithms/array/flatten.py
++++ b/algorithms/array/flatten.py
+@@ -17,33 +17,44 @@ from collections.abc import Generator, Iterable
+ from typing import Any
+ 
+ 
+-def flatten(input_arr: Iterable[Any], output_arr: list[Any] | None = None) -> list[Any]:
+-    """Recursively flatten a nested iterable into a single list.
++def flatten(input_arr: Iterable[Any], output_arr: list[Any] | None = None):
++    """Lazily flatten a nested iterable, yielding one element at a time.
+ 
+     Args:
+         input_arr: A potentially nested iterable to flatten.
+-        output_arr: Accumulator list for recursive calls (internal use).
++        output_arr: Legacy accumulator list. When provided, it is filled
++            with the flat elements and returned (backward compatibility
++            with the historical two-argument form).
+ 
+     Returns:
+-        A flat list containing all leaf elements.
++        An iterator over the flat leaf elements, or the filled
++        ``output_arr`` list when one is passed.
+ 
+     Examples:
+-        >>> flatten([2, 1, [3, [4, 5], 6], 7, [8]])
++        >>> list(flatten([2, 1, [3, [4, 5], 6], 7, [8]]))
+         [2, 1, 3, 4, 5, 6, 7, 8]
+     """
+-    if output_arr is None:
+-        output_arr = []
++    if output_arr is not None:
++        output_arr.extend(_flatten_gen(input_arr))
++        return output_arr
++    return _flatten_gen(input_arr)
++
++
++def _flatten_gen(input_arr: Iterable[Any]) -> Generator[Any, None, None]:
++    """Yield the leaf elements of a nested iterable, one at a time."""
+     for element in input_arr:
+         if not isinstance(element, str) and isinstance(element, Iterable):
+-            flatten(element, output_arr)
++            yield from _flatten_gen(element)
+         else:
+-            output_arr.append(element)
+-    return output_arr
++            yield element
+ 
+ 
+ def flatten_iter(iterable: Iterable[Any]) -> Generator[Any, None, None]:
+     """Lazily flatten a nested iterable, yielding one element at a time.
+ 
++    Kept as a backward-compatible alias of :func:`flatten`, which is
++    itself lazy.
++
+     Args:
+         iterable: A potentially nested iterable to flatten.
+ 
+@@ -54,8 +65,4 @@ def flatten_iter(iterable: Iterable[Any]) -> Generator[Any, None, None]:
+         >>> list(flatten_iter([2, 1, [3, [4, 5], 6], 7, [8]]))
+         [2, 1, 3, 4, 5, 6, 7, 8]
+     """
+-    for element in iterable:
+-        if not isinstance(element, str) and isinstance(element, Iterable):
+-            yield from flatten_iter(element)
+-        else:
+-            yield element
++    yield from _flatten_gen(iterable)
+diff --git a/algorithms/array/limit.py b/algorithms/array/limit.py
+index ae8ed73..60fef3e 100644
+--- a/algorithms/array/limit.py
++++ b/algorithms/array/limit.py
+@@ -8,37 +8,41 @@ Reference: https://en.wikipedia.org/wiki/Clipping_(signal_processing)
+ 
+ Complexity:
+     Time:  O(n)
+-    Space: O(n)
++    Space: O(1) auxiliary (values are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
++
+ 
+ def limit(
+     array: list[int],
+     min_lim: int | None = None,
+     max_lim: int | None = None,
+-) -> list[int]:
+-    """Return elements of array that fall within [min_lim, max_lim].
++) -> Iterator[int]:
++    """Yield elements of array that fall within [min_lim, max_lim], lazily.
+ 
+     Args:
+         array: Source list of integers.
+         min_lim: Minimum value (inclusive). Defaults to the array minimum.
+         max_lim: Maximum value (inclusive). Defaults to the array maximum.
+ 
+-    Returns:
+-        A new list containing only values within the specified range.
++    Yields:
++        Values within the specified range, in input order.
+ 
+     Examples:
+-        >>> limit([1, 2, 3, 4, 5], 2, 4)
++        >>> list(limit([1, 2, 3, 4, 5], 2, 4))
+         [2, 3, 4]
+     """
+     if len(array) == 0:
+-        return array
++        return
+ 
+     if min_lim is None:
+         min_lim = min(array)
+     if max_lim is None:
+         max_lim = max(array)
+ 
+-    return list(filter(lambda x: min_lim <= x <= max_lim, array))
++    for value in array:
++        if min_lim <= value <= max_lim:
++            yield value
+diff --git a/algorithms/array/missing_ranges.py b/algorithms/array/missing_ranges.py
+index c41492b..7062b86 100644
+--- a/algorithms/array/missing_ranges.py
++++ b/algorithms/array/missing_ranges.py
+@@ -8,38 +8,39 @@ Reference: https://leetcode.com/problems/missing-ranges/
+ 
+ Complexity:
+     Time:  O(n)
+-    Space: O(n) for the result list
++    Space: O(1) auxiliary (ranges are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def missing_ranges(array: list[int], low: int, high: int) -> list[tuple[int, int]]:
+-    """Find gaps between low and high not covered by elements in array.
++
++def missing_ranges(array: list[int], low: int, high: int) -> Iterator[tuple[int, int]]:
++    """Yield gaps between low and high not covered by elements in array.
++
++    Ranges are produced lazily as the sorted input is scanned.
+ 
+     Args:
+         array: Sorted list of integers within [low, high].
+         low: Lower bound of the expected range (inclusive).
+         high: Upper bound of the expected range (inclusive).
+ 
+-    Returns:
+-        List of (start, end) tuples representing missing ranges.
++    Yields:
++        (start, end) tuples representing missing ranges.
+ 
+     Examples:
+-        >>> missing_ranges([3, 5], 1, 10)
++        >>> list(missing_ranges([3, 5], 1, 10))
+         [(1, 2), (4, 4), (6, 10)]
+     """
+-    result = []
+     start = low
+ 
+     for num in array:
+         if num == start:
+             start += 1
+         elif num > start:
+-            result.append((start, num - 1))
++            yield (start, num - 1)
+             start = num + 1
+ 
+     if start <= high:
+-        result.append((start, high))
+-
+-    return result
++        yield (start, high)
+diff --git a/algorithms/array/summarize_ranges.py b/algorithms/array/summarize_ranges.py
+index 392f13a..7aaf596 100644
+--- a/algorithms/array/summarize_ranges.py
++++ b/algorithms/array/summarize_ranges.py
+@@ -8,37 +8,37 @@ Reference: https://leetcode.com/problems/summary-ranges/
+ 
+ Complexity:
+     Time:  O(n)
+-    Space: O(n) for the result list
++    Space: O(1) auxiliary (ranges are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def summarize_ranges(array: list[int]) -> list[tuple[int, ...]]:
+-    """Summarize consecutive runs in a sorted array as (start, end) tuples.
++
++def summarize_ranges(array: list[int]) -> Iterator[tuple[int, ...]]:
++    """Yield consecutive runs in a sorted array as (start, end) tuples.
++
++    Ranges are produced lazily as the sorted input is scanned.
+ 
+     Args:
+         array: Sorted list of unique integers.
+ 
+-    Returns:
+-        List of (start, end) tuples for each consecutive range.
++    Yields:
++        (start, end) tuples for each consecutive range.
+ 
+     Examples:
+-        >>> summarize_ranges([0, 1, 2, 4, 5, 7])
++        >>> list(summarize_ranges([0, 1, 2, 4, 5, 7]))
+         [(0, 2), (4, 5), (7, 7)]
+     """
+-    result = []
+     if len(array) == 0:
+-        return []
+-    if len(array) == 1:
+-        return [(array[0], array[0])]
++        return
+     iterator = iter(array)
+     start = end = next(iterator)
+     for num in iterator:
+         if num - end == 1:
+             end = num
+         else:
+-            result.append((start, end))
++            yield (start, end)
+             start = end = num
+-    result.append((start, end))
+-    return result
++    yield (start, end)
+diff --git a/algorithms/array/three_sum.py b/algorithms/array/three_sum.py
+index 3893e03..82984a0 100644
+--- a/algorithms/array/three_sum.py
++++ b/algorithms/array/three_sum.py
+@@ -8,26 +8,30 @@ Reference: https://leetcode.com/problems/3sum/
+ 
+ Complexity:
+     Time:  O(n^2)
+-    Space: O(n) for the result set
++    Space: O(1) auxiliary (triplets are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def three_sum(array: list[int]) -> set[tuple[int, int, int]]:
+-    """Find all unique triplets in the array that sum to zero.
++
++def three_sum(array: list[int]) -> Iterator[tuple[int, int, int]]:
++    """Yield all unique triplets in the array that sum to zero.
++
++    Triplets are produced lazily, one at a time, as the two-pointer
++    scan proceeds over the sorted array.
+ 
+     Args:
+         array: List of integers to search.
+ 
+-    Returns:
+-        Set of sorted tuples, each containing three integers summing to zero.
++    Yields:
++        Sorted tuples, each containing three integers summing to zero.
+ 
+     Examples:
+-        >>> three_sum([-1, 0, 1, 2, -1, -4]) == {(-1, 0, 1), (-1, -1, 2)}
++        >>> set(three_sum([-1, 0, 1, 2, -1, -4])) == {(-1, 0, 1), (-1, -1, 2)}
+         True
+     """
+-    result = set()
+     array.sort()
+     for i in range(len(array) - 2):
+         if i > 0 and array[i] == array[i - 1]:
+@@ -40,7 +44,7 @@ def three_sum(array: list[int]) -> set[tuple[int, int, int]]:
+             elif current_sum < 0:
+                 left += 1
+             else:
+-                result.add((array[i], array[left], array[right]))
++                yield (array[i], array[left], array[right])
+ 
+                 while left < right and array[left] == array[left + 1]:
+                     left += 1
+@@ -50,4 +54,3 @@ def three_sum(array: list[int]) -> set[tuple[int, int, int]]:
+ 
+                 left += 1
+                 right -= 1
+-    return result
+diff --git a/algorithms/backtracking/add_operators.py b/algorithms/backtracking/add_operators.py
+index 67373ac..8ed1ab6 100644
+--- a/algorithms/backtracking/add_operators.py
++++ b/algorithms/backtracking/add_operators.py
+@@ -14,51 +14,51 @@ Complexity:
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def add_operators(digits: str, target: int) -> list[str]:
+-    """Return all expressions formed by inserting +, -, * that equal target.
++
++def add_operators(digits: str, target: int) -> Iterator[str]:
++    """Yield all expressions formed by inserting +, -, * that equal target.
++
++    Expressions are produced lazily, one at a time.
+ 
+     Args:
+         digits: A string containing only digits 0-9.
+         target: The target integer value.
+ 
+-    Returns:
+-        A list of valid expression strings.
++    Yields:
++        Valid expression strings.
+ 
+     Examples:
+-        >>> add_operators("123", 6)
++        >>> list(add_operators("123", 6))
+         ['1+2+3', '1*2*3']
+     """
+-    result: list[str] = []
+     if not digits:
+-        return result
+-    _dfs(result, "", digits, target, 0, 0, 0)
+-    return result
++        return
++    yield from _dfs("", digits, target, 0, 0, 0)
+ 
+ 
+ def _dfs(
+-    result: list[str],
+     path: str,
+     digits: str,
+     target: int,
+     position: int,
+     evaluated: int,
+     multed: int,
+-) -> None:
++) -> Iterator[str]:
+     """Depth-first search helper that builds expressions recursively."""
+     if position == len(digits):
+         if target == evaluated:
+-            result.append(path)
++            yield path
+         return
+     for i in range(position, len(digits)):
+         if i != position and digits[position] == "0":
+             break
+         current = int(digits[position : i + 1])
+         if position == 0:
+-            _dfs(result, path + str(current), digits, target, i + 1, current, current)
++            yield from _dfs(path + str(current), digits, target, i + 1, current, current)
+         else:
+-            _dfs(
+-                result,
++            yield from _dfs(
+                 path + "+" + str(current),
+                 digits,
+                 target,
+@@ -66,8 +66,7 @@ def _dfs(
+                 evaluated + current,
+                 current,
+             )
+-            _dfs(
+-                result,
++            yield from _dfs(
+                 path + "-" + str(current),
+                 digits,
+                 target,
+@@ -75,8 +74,7 @@ def _dfs(
+                 evaluated - current,
+                 -current,
+             )
+-            _dfs(
+-                result,
++            yield from _dfs(
+                 path + "*" + str(current),
+                 digits,
+                 target,
+diff --git a/algorithms/backtracking/array_sum_combinations.py b/algorithms/backtracking/array_sum_combinations.py
+index 9b83f47..680480d 100644
+--- a/algorithms/backtracking/array_sum_combinations.py
++++ b/algorithms/backtracking/array_sum_combinations.py
+@@ -8,12 +8,13 @@ Reference: https://en.wikipedia.org/wiki/Subset_sum_problem
+ 
+ Complexity:
+     Time:  O(n^3) brute-force product of three arrays
+-    Space: O(k) where k is the number of valid combinations
++    Space: O(1) auxiliary beyond the combination under construction (results are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
+ import itertools
++from collections.abc import Iterator
+ from functools import partial
+ 
+ 
+@@ -22,10 +23,11 @@ def array_sum_combinations(
+     array_b: list[int],
+     array_c: list[int],
+     target: int,
+-) -> list[list[int]]:
+-    """Find all combinations of one element per array that sum to target.
++) -> Iterator[list[int]]:
++    """Yield all combinations of one element per array that sum to target.
+ 
+-    Uses backtracking to enumerate valid combinations, allowing duplicates.
++    Uses backtracking to enumerate valid combinations lazily, allowing
++    duplicates.
+ 
+     Args:
+         array_a: First array of integers.
+@@ -33,11 +35,11 @@ def array_sum_combinations(
+         array_c: Third array of integers.
+         target: The desired sum.
+ 
+-    Returns:
+-        A list of three-element lists that sum to target.
++    Yields:
++        Three-element lists that sum to target.
+ 
+     Examples:
+-        >>> array_sum_combinations([1], [2], [3], 6)
++        >>> list(array_sum_combinations([1], [2], [3], 6))
+         [[1, 2, 3]]
+     """
+     arrays = [array_a, array_b, array_c]
+@@ -51,28 +53,16 @@ def array_sum_combinations(
+     def _get_candidates(constructed_so_far: list[int]) -> list[int]:
+         return arrays[len(constructed_so_far)]
+ 
+-    def _backtrack(
+-        constructed_so_far: list[int] | None = None,
+-        result: list[list[int]] | None = None,
+-    ) -> None:
+-        if constructed_so_far is None:
+-            constructed_so_far = []
+-        if result is None:
+-            result = []
++    def _backtrack(constructed_so_far: list[int]) -> Iterator[list[int]]:
+         should_stop, reached_target = _is_complete(constructed_so_far)
+         if should_stop:
+             if reached_target:
+-                result.append(constructed_so_far)
++                yield constructed_so_far
+             return
+-        candidates = _get_candidates(constructed_so_far)
+-        for candidate in candidates:
+-            constructed_so_far.append(candidate)
+-            _backtrack(constructed_so_far[:], result)
+-            constructed_so_far.pop()
++        for candidate in _get_candidates(constructed_so_far):
++            yield from _backtrack(constructed_so_far + [candidate])
+ 
+-    result: list[list[int]] = []
+-    _backtrack([], result)
+-    return result
++    yield from _backtrack([])
+ 
+ 
+ def unique_array_sum_combinations(
+@@ -80,11 +70,11 @@ def unique_array_sum_combinations(
+     array_b: list[int],
+     array_c: list[int],
+     target: int,
+-) -> list[tuple[int, ...]]:
+-    """Find unique combinations of one element per array that sum to target.
++) -> Iterator[tuple[int, ...]]:
++    """Yield unique combinations of one element per array that sum to target.
+ 
+-    Uses itertools.product and filters by target sum, returning only unique
+-    tuples.
++    Uses itertools.product and filters by target sum, yielding only unique
++    tuples. Duplicates are suppressed with a running seen-set.
+ 
+     Args:
+         array_a: First array of integers.
+@@ -92,8 +82,8 @@ def unique_array_sum_combinations(
+         array_c: Third array of integers.
+         target: The desired sum.
+ 
+-    Returns:
+-        A list of unique tuples that sum to target.
++    Yields:
++        Unique tuples that sum to target.
+ 
+     Examples:
+         >>> sorted(unique_array_sum_combinations([1, 2], [2, 3], [3, 4], 6))
+@@ -108,11 +98,10 @@ def unique_array_sum_combinations(
+ 
+     product = itertools.product(array_a, array_b, array_c)
+     func = partial(_check_sum, target)
+-    sums = list(itertools.starmap(func, product))
++    sums = itertools.starmap(func, product)
+ 
+     seen: set[tuple[int, ...]] = set()
+     for is_match, values in sums:
+         if is_match and values not in seen:
+             seen.add(values)
+-
+-    return list(seen)
++            yield values
+diff --git a/algorithms/backtracking/combination_sum.py b/algorithms/backtracking/combination_sum.py
+index 7eb1435..b662d83 100644
+--- a/algorithms/backtracking/combination_sum.py
++++ b/algorithms/backtracking/combination_sum.py
+@@ -14,25 +14,28 @@ Complexity:
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def combination_sum(candidates: list[int], target: int) -> list[list[int]]:
+-    """Find all unique combinations of candidates that sum to target.
++
++def combination_sum(candidates: list[int], target: int) -> Iterator[list[int]]:
++    """Yield all unique combinations of candidates that sum to target.
++
++    Combinations are produced lazily, one at a time, so callers can
++    stop early without paying for the full search space.
+ 
+     Args:
+         candidates: A list of distinct positive integers.
+         target: The target sum.
+ 
+-    Returns:
+-        A list of lists, each containing a valid combination.
++    Yields:
++        Lists, each containing a valid combination.
+ 
+     Examples:
+-        >>> combination_sum([2, 3, 6, 7], 7)
++        >>> list(combination_sum([2, 3, 6, 7], 7))
+         [[2, 2, 3], [7]]
+     """
+-    result: list[list[int]] = []
+     candidates.sort()
+-    _dfs(candidates, target, 0, [], result)
+-    return result
++    yield from _dfs(candidates, target, 0, [])
+ 
+ 
+ def _dfs(
+@@ -40,13 +43,12 @@ def _dfs(
+     target: int,
+     index: int,
+     path: list[int],
+-    result: list[list[int]],
+-) -> None:
++) -> Iterator[list[int]]:
+     """Depth-first search helper for building combinations."""
+     if target < 0:
+         return
+     if target == 0:
+-        result.append(path)
++        yield path
+         return
+     for i in range(index, len(nums)):
+-        _dfs(nums, target - nums[i], i, path + [nums[i]], result)
++        yield from _dfs(nums, target - nums[i], i, path + [nums[i]])
+diff --git a/algorithms/backtracking/factor_combinations.py b/algorithms/backtracking/factor_combinations.py
+index a38120e..c14598d 100644
+--- a/algorithms/backtracking/factor_combinations.py
++++ b/algorithms/backtracking/factor_combinations.py
+@@ -13,43 +13,46 @@ Complexity:
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def get_factors(number: int) -> list[list[int]]:
+-    """Return all factor combinations of number using iteration.
++
++def get_factors(number: int) -> Iterator[list[int]]:
++    """Yield all factor combinations of number using iteration.
++
++    Factorizations are produced lazily, one at a time, from an explicit
++    work stack.
+ 
+     Args:
+         number: A positive integer.
+ 
+-    Returns:
+-        A list of lists, each containing a valid factorization.
++    Yields:
++        Lists, each containing a valid factorization.
+ 
+     Examples:
+-        >>> get_factors(12)
++        >>> list(get_factors(12))
+         [[2, 6], [3, 4], [2, 2, 3]]
+     """
+     todo: list[tuple[int, int, list[int]]] = [(number, 2, [])]
+-    combinations: list[list[int]] = []
+     while todo:
+         remaining, divisor, partial = todo.pop()
+         while divisor * divisor <= remaining:
+             if remaining % divisor == 0:
+-                combinations.append(partial + [divisor, remaining // divisor])
++                yield partial + [divisor, remaining // divisor]
+                 todo.append((remaining // divisor, divisor, partial + [divisor]))
+             divisor += 1
+-    return combinations
+ 
+ 
+-def recursive_get_factors(number: int) -> list[list[int]]:
+-    """Return all factor combinations of number using recursion.
++def recursive_get_factors(number: int) -> Iterator[list[int]]:
++    """Yield all factor combinations of number using recursion.
+ 
+     Args:
+         number: A positive integer.
+ 
+-    Returns:
+-        A list of lists, each containing a valid factorization.
++    Yields:
++        Lists, each containing a valid factorization.
+ 
+     Examples:
+-        >>> recursive_get_factors(12)
++        >>> list(recursive_get_factors(12))
+         [[2, 6], [2, 2, 3], [3, 4]]
+     """
+ 
+@@ -57,15 +60,11 @@ def recursive_get_factors(number: int) -> list[list[int]]:
+         remaining: int,
+         divisor: int,
+         partial: list[int],
+-        combinations: list[list[int]],
+-    ) -> list[list[int]]:
++    ) -> Iterator[list[int]]:
+         while divisor * divisor <= remaining:
+             if remaining % divisor == 0:
+-                combinations.append(partial + [divisor, remaining // divisor])
+-                _factor(
+-                    remaining // divisor, divisor, partial + [divisor], combinations
+-                )
++                yield partial + [divisor, remaining // divisor]
++                yield from _factor(remaining // divisor, divisor, partial + [divisor])
+             divisor += 1
+-        return combinations
+ 
+-    return _factor(number, 2, [], [])
++    yield from _factor(number, 2, [])
+diff --git a/algorithms/backtracking/find_words.py b/algorithms/backtracking/find_words.py
+index d1a8767..21eb44c 100644
+--- a/algorithms/backtracking/find_words.py
++++ b/algorithms/backtracking/find_words.py
+@@ -14,19 +14,22 @@ Complexity:
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def find_words(board: list[list[str]], words: list[str]) -> list[str]:
+-    """Find all words from the list that exist on the board.
++
++def find_words(board: list[list[str]], words: list[str]) -> Iterator[str]:
++    """Yield all words from the list that exist on the board.
+ 
+     Builds a trie from the word list, then uses backtracking to search
+-    the board for each word.
++    the board for each word. Matches are produced lazily as they are
++    discovered; duplicates are suppressed with a running seen-set.
+ 
+     Args:
+         board: A 2D grid of characters.
+         words: A list of words to search for.
+ 
+-    Returns:
+-        A list of words found on the board.
++    Yields:
++        Words found on the board.
+ 
+     Examples:
+         >>> board = [['o','a','a','n'], ['e','t','a','e']]
+@@ -47,9 +50,10 @@ def find_words(board: list[list[str]], words: list[str]) -> list[str]:
+ 
+     for row in range(len(board)):
+         for col in range(len(board[0])):
+-            _backtrack(board, row, col, trie, "", used, found)
+-
+-    return list(found)
++            for match in _backtrack(board, row, col, trie, "", used):
++                if match not in found:
++                    found.add(match)
++                    yield match
+ 
+ 
+ def _backtrack(
+@@ -59,11 +63,10 @@ def _backtrack(
+     trie: dict,
+     prefix: str,
+     used: list[list[bool]],
+-    found: set[str],
+-) -> None:
++) -> Iterator[str]:
+     """Recursively search the board for words matching the trie."""
+     if "#" in trie:
+-        found.add(prefix)
++        yield prefix
+ 
+     if row < 0 or row >= len(board) or col < 0 or col >= len(board[0]):
+         return
+@@ -71,16 +74,8 @@ def _backtrack(
+     if not used[row][col] and board[row][col] in trie:
+         used[row][col] = True
+         next_char = board[row][col]
+-        _backtrack(
+-            board, row + 1, col, trie[next_char], prefix + next_char, used, found
+-        )
+-        _backtrack(
+-            board, row, col + 1, trie[next_char], prefix + next_char, used, found
+-        )
+-        _backtrack(
+-            board, row - 1, col, trie[next_char], prefix + next_char, used, found
+-        )
+-        _backtrack(
+-            board, row, col - 1, trie[next_char], prefix + next_char, used, found
+-        )
++        yield from _backtrack(board, row + 1, col, trie[next_char], prefix + next_char, used)
++        yield from _backtrack(board, row, col + 1, trie[next_char], prefix + next_char, used)
++        yield from _backtrack(board, row - 1, col, trie[next_char], prefix + next_char, used)
++        yield from _backtrack(board, row, col - 1, trie[next_char], prefix + next_char, used)
+         used[row][col] = False
+diff --git a/algorithms/backtracking/generate_abbreviations.py b/algorithms/backtracking/generate_abbreviations.py
+index d96d17a..c7b8453 100644
+--- a/algorithms/backtracking/generate_abbreviations.py
++++ b/algorithms/backtracking/generate_abbreviations.py
+@@ -8,46 +8,47 @@ Reference: https://leetcode.com/problems/generalized-abbreviation/
+ 
+ Complexity:
+     Time:  O(2^n) where n is the length of the word
+-    Space: O(n) recursion depth
++    Space: O(n) recursion depth (abbreviations are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def generate_abbreviations(word: str) -> list[str]:
+-    """Generate all possible abbreviations of a word.
++
++def generate_abbreviations(word: str) -> Iterator[str]:
++    """Yield all possible abbreviations of a word.
++
++    Abbreviations are produced lazily, one at a time.
+ 
+     Args:
+         word: The input word to abbreviate.
+ 
+-    Returns:
+-        A list of all valid abbreviations.
++    Yields:
++        Valid abbreviations.
+ 
+     Examples:
+         >>> sorted(generate_abbreviations("ab"))
+         ['1b', '2', 'a1', 'ab']
+     """
+-    result: list[str] = []
+-    _backtrack(result, word, 0, 0, "")
+-    return result
++    yield from _backtrack(word, 0, 0, "")
+ 
+ 
+ def _backtrack(
+-    result: list[str],
+     word: str,
+     position: int,
+     count: int,
+     current: str,
+-) -> None:
++) -> Iterator[str]:
+     """Recursively build abbreviations by including or skipping characters."""
+     if position == len(word):
+         if count > 0:
+             current += str(count)
+-        result.append(current)
++        yield current
+         return
+ 
+     if count > 0:
+-        _backtrack(result, word, position + 1, 0, current + str(count) + word[position])
++        yield from _backtrack(word, position + 1, 0, current + str(count) + word[position])
+     else:
+-        _backtrack(result, word, position + 1, 0, current + word[position])
+-    _backtrack(result, word, position + 1, count + 1, current)
++        yield from _backtrack(word, position + 1, 0, current + word[position])
++    yield from _backtrack(word, position + 1, count + 1, current)
+diff --git a/algorithms/backtracking/generate_parenthesis.py b/algorithms/backtracking/generate_parenthesis.py
+index 0077946..7a84903 100644
+--- a/algorithms/backtracking/generate_parenthesis.py
++++ b/algorithms/backtracking/generate_parenthesis.py
+@@ -13,75 +13,73 @@ Complexity:
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def generate_parenthesis_v1(count: int) -> list[str]:
+-    """Generate all valid parenthesis combinations (right-first variant).
++
++def generate_parenthesis_v1(count: int) -> Iterator[str]:
++    """Yield all valid parenthesis combinations (right-first variant).
+ 
+     Builds combinations by tracking remaining left and right parentheses,
+-    trying to add a closing paren before an opening one.
++    trying to add a closing paren before an opening one. Combinations
++    are produced lazily, one at a time.
+ 
+     Args:
+         count: The number of parenthesis pairs.
+ 
+-    Returns:
+-        A list of all valid parenthesis strings.
++    Yields:
++        Valid parenthesis strings.
+ 
+     Examples:
+-        >>> generate_parenthesis_v1(2)
++        >>> list(generate_parenthesis_v1(2))
+         ['()()', '(())']
+     """
+-    result: list[str] = []
+-    _add_pair_v1(result, "", count, 0)
+-    return result
++    yield from _add_pair_v1("", count, 0)
+ 
+ 
+ def _add_pair_v1(
+-    result: list[str],
+     current: str,
+     left: int,
+     right: int,
+-) -> None:
++) -> Iterator[str]:
+     """Recursive helper for v1: tries closing before opening."""
+     if left == 0 and right == 0:
+-        result.append(current)
++        yield current
+         return
+     if right > 0:
+-        _add_pair_v1(result, current + ")", left, right - 1)
++        yield from _add_pair_v1(current + ")", left, right - 1)
+     if left > 0:
+-        _add_pair_v1(result, current + "(", left - 1, right + 1)
++        yield from _add_pair_v1(current + "(", left - 1, right + 1)
+ 
+ 
+-def generate_parenthesis_v2(count: int) -> list[str]:
+-    """Generate all valid parenthesis combinations (left-first variant).
++def generate_parenthesis_v2(count: int) -> Iterator[str]:
++    """Yield all valid parenthesis combinations (left-first variant).
+ 
+     Builds combinations by tracking remaining left and right parentheses,
+-    trying to add an opening paren before a closing one.
++    trying to add an opening paren before a closing one. Combinations
++    are produced lazily, one at a time.
+ 
+     Args:
+         count: The number of parenthesis pairs.
+ 
+-    Returns:
+-        A list of all valid parenthesis strings.
++    Yields:
++        Valid parenthesis strings.
+ 
+     Examples:
+-        >>> generate_parenthesis_v2(2)
++        >>> list(generate_parenthesis_v2(2))
+         ['(())', '()()']
+     """
+-    result: list[str] = []
+-    _add_pair_v2(result, "", count, count)
+-    return result
++    yield from _add_pair_v2("", count, count)
+ 
+ 
+ def _add_pair_v2(
+-    result: list[str],
+     current: str,
+     left: int,
+     right: int,
+-) -> None:
++) -> Iterator[str]:
+     """Recursive helper for v2: tries opening before closing."""
+     if left == 0 and right == 0:
+-        result.append(current)
++        yield current
+     if left > 0:
+-        _add_pair_v2(result, current + "(", left - 1, right)
++        yield from _add_pair_v2(current + "(", left - 1, right)
+     if right > 0 and left < right:
+-        _add_pair_v2(result, current + ")", left, right - 1)
++        yield from _add_pair_v2(current + ")", left, right - 1)
+diff --git a/algorithms/backtracking/letter_combination.py b/algorithms/backtracking/letter_combination.py
+index 8e4ba30..a749236 100644
+--- a/algorithms/backtracking/letter_combination.py
++++ b/algorithms/backtracking/letter_combination.py
+@@ -8,27 +8,34 @@ Reference: https://leetcode.com/problems/letter-combinations-of-a-phone-number/
+ 
+ Complexity:
+     Time:  O(4^n) where n is the number of digits
+-    Space: O(4^n) for the result list
++    Space: O(n) auxiliary (combinations are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
++from itertools import product
+ 
+-def letter_combinations(digits: str) -> list[str]:
+-    """Return all letter combinations for a digit string.
++
++def letter_combinations(digits: str) -> Iterator[str]:
++    """Yield all letter combinations for a digit string.
++
++    Combinations are produced lazily as a streaming cartesian product
++    over the keypad letters, so memory stays independent of the
++    (exponentially large) result count.
+ 
+     Args:
+         digits: A string of digits (2-9).
+ 
+-    Returns:
+-        A list of all possible letter combinations.
++    Yields:
++        Possible letter combinations.
+ 
+     Examples:
+-        >>> letter_combinations("23")
++        >>> list(letter_combinations("23"))
+         ['ad', 'ae', 'af', 'bd', 'be', 'bf', 'cd', 'ce', 'cf']
+     """
+     if digits == "":
+-        return []
++        return
+     keypad_map = {
+         "2": "abc",
+         "3": "def",
+@@ -39,11 +46,5 @@ def letter_combinations(digits: str) -> list[str]:
+         "8": "tuv",
+         "9": "wxyz",
+     }
+-    combinations: list[str] = [""]
+-    for digit in digits:
+-        expanded: list[str] = []
+-        for existing in combinations:
+-            for char in keypad_map[digit]:
+-                expanded.append(existing + char)
+-        combinations = expanded
+-    return combinations
++    for combination in product(*(keypad_map[digit] for digit in digits)):
++        yield "".join(combination)
+diff --git a/algorithms/backtracking/palindrome_partitioning.py b/algorithms/backtracking/palindrome_partitioning.py
+index 879b18b..19ab79c 100644
+--- a/algorithms/backtracking/palindrome_partitioning.py
++++ b/algorithms/backtracking/palindrome_partitioning.py
+@@ -16,34 +16,37 @@ from __future__ import annotations
+ from collections.abc import Generator
+ 
+ 
+-def palindromic_substrings(text: str) -> list[list[str]]:
+-    """Return all palindrome partitions of the input string.
++def palindromic_substrings(text: str) -> Generator[list[str], None, None]:
++    """Yield all palindrome partitions of the input string.
++
++    Partitions are produced lazily, one at a time, so callers can
++    stream them without materializing every partition in memory.
+ 
+     Args:
+         text: The string to partition.
+ 
+-    Returns:
+-        A list of partitions, each being a list of palindromic substrings.
++    Yields:
++        Lists of palindromic substrings forming a valid partition.
+ 
+     Examples:
+-        >>> palindromic_substrings("abc")
++        >>> list(palindromic_substrings("abc"))
+         [['a', 'b', 'c']]
+     """
+     if not text:
+-        return [[]]
+-    results: list[list[str]] = []
++        yield []
++        return
+     for i in range(len(text), 0, -1):
+         substring = text[:i]
+         if substring == substring[::-1]:
+             for rest in palindromic_substrings(text[i:]):
+-                results.append([substring] + rest)
+-    return results
++                yield [substring] + rest
+ 
+ 
+ def palindromic_substrings_iter(text: str) -> Generator[list[str], None, None]:
+     """Yield all palindrome partitions of the input string via a generator.
+ 
+-    A slightly more Pythonic approach using a recursive generator.
++    Kept as a backward-compatible alias of :func:`palindromic_substrings`,
++    which is itself lazy.
+ 
+     Args:
+         text: The string to partition.
+@@ -55,11 +58,4 @@ def palindromic_substrings_iter(text: str) -> Generator[list[str], None, None]:
+         >>> list(palindromic_substrings_iter("abc"))
+         [['a', 'b', 'c']]
+     """
+-    if not text:
+-        yield []
+-        return
+-    for i in range(len(text), 0, -1):
+-        substring = text[:i]
+-        if substring == substring[::-1]:
+-            for rest in palindromic_substrings_iter(text[i:]):
+-                yield [substring] + rest
++    yield from palindromic_substrings(text)
+diff --git a/algorithms/backtracking/permute.py b/algorithms/backtracking/permute.py
+index b7738c6..1e15ef5 100644
+--- a/algorithms/backtracking/permute.py
++++ b/algorithms/backtracking/permute.py
+@@ -7,7 +7,7 @@ Reference: https://en.wikipedia.org/wiki/Permutation
+ 
+ Complexity:
+     Time:  O(n * n!) where n is the number of elements
+-    Space: O(n * n!) to store all permutations
++    Space: O(n) auxiliary (permutations are produced lazily)
+ """
+ 
+ from __future__ import annotations
+@@ -15,31 +15,36 @@ from __future__ import annotations
+ from collections.abc import Generator
+ 
+ 
+-def permute(elements: list | str) -> list:
+-    """Return all permutations of the given elements.
++def permute(elements: list | str) -> Generator:
++    """Yield all permutations of the given elements.
++
++    Permutations are produced lazily, one at a time, so callers can
++    stream them without materializing all n! results in memory.
+ 
+     Args:
+         elements: A list or string of distinct elements.
+ 
+-    Returns:
+-        A list of all permutations (same type as input elements).
++    Yields:
++        One permutation at a time (same type as input elements).
+ 
+     Examples:
+-        >>> permute([1, 2, 3])
++        >>> list(permute([1, 2, 3]))
+         [[1, 2, 3], [2, 1, 3], [2, 3, 1], [1, 3, 2], [3, 1, 2], [3, 2, 1]]
+     """
+     if len(elements) <= 1:
+-        return [elements]
+-    result = []
++        yield elements
++        return
+     for perm in permute(elements[1:]):
+         for i in range(len(elements)):
+-            result.append(perm[:i] + elements[0:1] + perm[i:])
+-    return result
++            yield perm[:i] + elements[0:1] + perm[i:]
+ 
+ 
+ def permute_iter(elements: list | str) -> Generator:
+     """Yield all permutations of the given elements one at a time.
+ 
++    Kept as a backward-compatible alias of :func:`permute`, which is
++    itself lazy.
++
+     Args:
+         elements: A list or string of distinct elements.
+ 
+@@ -50,39 +55,31 @@ def permute_iter(elements: list | str) -> Generator:
+         >>> list(permute_iter([1, 2]))
+         [[1, 2], [2, 1]]
+     """
+-    if len(elements) <= 1:
+-        yield elements
+-    else:
+-        for perm in permute_iter(elements[1:]):
+-            for i in range(len(elements)):
+-                yield perm[:i] + elements[0:1] + perm[i:]
++    yield from permute(elements)
+ 
+ 
+-def permute_recursive(nums: list[int]) -> list[list[int]]:
+-    """Return all permutations using DFS backtracking.
++def permute_recursive(nums: list[int]) -> Generator[list[int], None, None]:
++    """Yield all permutations using DFS backtracking.
+ 
+     Args:
+         nums: A list of distinct integers.
+ 
+-    Returns:
+-        A list of all permutations.
++    Yields:
++        One permutation at a time.
+ 
+     Examples:
+         >>> sorted(permute_recursive([1, 2]))
+         [[1, 2], [2, 1]]
+     """
+-    result: list[list[int]] = []
+-    _dfs(result, nums, [])
+-    return result
++    yield from _dfs(nums, [])
+ 
+ 
+ def _dfs(
+-    result: list[list[int]],
+     nums: list[int],
+     path: list[int],
+-) -> None:
++) -> Generator[list[int], None, None]:
+     """DFS helper that builds permutations by choosing remaining elements."""
+     if not nums:
+-        result.append(path)
++        yield path
+     for i in range(len(nums)):
+-        _dfs(result, nums[:i] + nums[i + 1 :], path + [nums[i]])
++        yield from _dfs(nums[:i] + nums[i + 1 :], path + [nums[i]])
+diff --git a/algorithms/backtracking/permute_unique.py b/algorithms/backtracking/permute_unique.py
+index 46797fd..4fd9a44 100644
+--- a/algorithms/backtracking/permute_unique.py
++++ b/algorithms/backtracking/permute_unique.py
+@@ -13,27 +13,32 @@ Complexity:
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def permute_unique(nums: list[int]) -> list[list[int]]:
+-    """Return all unique permutations of a list that may have duplicates.
++
++def permute_unique(nums: list[int]) -> Iterator[list[int]]:
++    """Yield all unique permutations of a list that may have duplicates.
++
++    Permutations are produced lazily, one at a time, by inserting each
++    number into every position of the permutations of the preceding
++    numbers and stopping at the first equal neighbor.
+ 
+     Args:
+         nums: A list of integers, possibly with duplicates.
+ 
+-    Returns:
+-        A list of all unique permutations.
++    Yields:
++        One unique permutation at a time.
+ 
+     Examples:
+         >>> sorted(permute_unique([1, 1, 2]))
+         [[1, 1, 2], [1, 2, 1], [2, 1, 1]]
+     """
+-    permutations: list[list[int]] = [[]]
+-    for number in nums:
+-        new_permutations: list[list[int]] = []
+-        for existing in permutations:
+-            for i in range(len(existing) + 1):
+-                new_permutations.append(existing[:i] + [number] + existing[i:])
+-                if i < len(existing) and existing[i] == number:
+-                    break
+-        permutations = new_permutations
+-    return permutations
++    if not nums:
++        yield []
++        return
++    number = nums[-1]
++    for existing in permute_unique(nums[:-1]):
++        for i in range(len(existing) + 1):
++            yield existing[:i] + [number] + existing[i:]
++            if i < len(existing) and existing[i] == number:
++                break
+diff --git a/algorithms/backtracking/subsets.py b/algorithms/backtracking/subsets.py
+index ecf80ea..4ca1158 100644
+--- a/algorithms/backtracking/subsets.py
++++ b/algorithms/backtracking/subsets.py
+@@ -8,63 +8,64 @@ Reference: https://en.wikipedia.org/wiki/Power_set
+ 
+ Complexity:
+     Time:  O(2^n) where n is the number of elements
+-    Space: O(2^n) to store all subsets
++    Space: O(n) auxiliary (results are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def subsets(nums: list[int]) -> list[list[int]]:
+-    """Return all subsets of the given list using backtracking.
++
++def subsets(nums: list[int]) -> Iterator[list[int]]:
++    """Yield all subsets of the given list using backtracking.
++
++    Subsets are produced lazily, one at a time, so callers can stream
++    the power set without materializing it in memory.
+ 
+     Args:
+         nums: A list of distinct integers.
+ 
+-    Returns:
+-        A list of all subsets.
++    Yields:
++        One subset at a time.
+ 
+     Examples:
+         >>> sorted(subsets([1, 2]), key=lambda item: (len(item), item))
+         [[], [1], [2], [1, 2]]
+     """
+-    result: list[list[int]] = []
+-    _backtrack(result, nums, [], 0)
+-    return result
++    yield from _backtrack(nums, [], 0)
+ 
+ 
+ def _backtrack(
+-    result: list[list[int]],
+     nums: list[int],
+     stack: list[int],
+     position: int,
+-) -> None:
++) -> Iterator[list[int]]:
+     """Recursive helper that includes or excludes each element."""
+     if position == len(nums):
+-        result.append(list(stack))
++        yield list(stack)
+     else:
+         stack.append(nums[position])
+-        _backtrack(result, nums, stack, position + 1)
++        yield from _backtrack(nums, stack, position + 1)
+         stack.pop()
+-        _backtrack(result, nums, stack, position + 1)
++        yield from _backtrack(nums, stack, position + 1)
+ 
+ 
+-def subsets_v2(nums: list[int]) -> list[list[int]]:
+-    """Return all subsets of the given list using iteration.
++def subsets_v2(nums: list[int]) -> Iterator[list[int]]:
++    """Yield all subsets of the given list using bitmask enumeration.
+ 
+-    Builds subsets iteratively by extending each existing subset
+-    with the next element.
++    Each subset is produced lazily from its bitmask, keeping memory
++    usage independent of the (exponentially large) result count.
+ 
+     Args:
+         nums: A list of distinct integers.
+ 
+-    Returns:
+-        A list of all subsets.
++    Yields:
++        One subset at a time.
+ 
+     Examples:
+         >>> sorted(subsets_v2([1, 2]), key=lambda item: (len(item), item))
+         [[], [1], [2], [1, 2]]
+     """
+-    result: list[list[int]] = [[]]
+-    for number in sorted(nums):
+-        result += [item + [number] for item in result]
+-    return result
++    ordered = sorted(nums)
++    for mask in range(1 << len(ordered)):
++        yield [ordered[i] for i in range(len(ordered)) if mask & (1 << i)]
+diff --git a/algorithms/backtracking/subsets_unique.py b/algorithms/backtracking/subsets_unique.py
+index 592aa01..e787f18 100644
+--- a/algorithms/backtracking/subsets_unique.py
++++ b/algorithms/backtracking/subsets_unique.py
+@@ -8,28 +8,32 @@ Reference: https://leetcode.com/problems/subsets-ii/
+ 
+ Complexity:
+     Time:  O(2^n) where n is the number of elements
+-    Space: O(2^n) to store all subsets
++    Space: O(2^n) worst case for the dedup seen-set; results are produced lazily
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def subsets_unique(nums: list[int]) -> list[tuple[int, ...]]:
+-    """Return all unique subsets of a list that may have duplicates.
++
++def subsets_unique(nums: list[int]) -> Iterator[tuple[int, ...]]:
++    """Yield all unique subsets of a list that may have duplicates.
++
++    Subsets are produced lazily; duplicates are suppressed with a
++    running seen-set instead of a fully materialized result set.
+ 
+     Args:
+         nums: A list of integers, possibly with duplicates.
+ 
+-    Returns:
+-        A list of unique tuples representing each subset.
++    Yields:
++        Unique tuples representing each subset.
+ 
+     Examples:
+         >>> sorted(subsets_unique([1, 2, 2]))
+         [(), (1,), (1, 2), (1, 2, 2), (2,), (2, 2)]
+     """
+     found: set[tuple[int, ...]] = set()
+-    _backtrack(found, nums, [], 0)
+-    return list(found)
++    yield from _backtrack(found, nums, [], 0)
+ 
+ 
+ def _backtrack(
+@@ -37,12 +41,15 @@ def _backtrack(
+     nums: list[int],
+     stack: list[int],
+     position: int,
+-) -> None:
++) -> Iterator[tuple[int, ...]]:
+     """Recursive helper that includes or excludes each element."""
+     if position == len(nums):
+-        found.add(tuple(stack))
++        subset = tuple(stack)
++        if subset not in found:
++            found.add(subset)
++            yield subset
+     else:
+         stack.append(nums[position])
+-        _backtrack(found, nums, stack, position + 1)
++        yield from _backtrack(found, nums, stack, position + 1)
+         stack.pop()
+-        _backtrack(found, nums, stack, position + 1)
++        yield from _backtrack(found, nums, stack, position + 1)
+diff --git a/algorithms/bit_manipulation/subsets.py b/algorithms/bit_manipulation/subsets.py
+index 75b6a81..09f2afb 100644
+--- a/algorithms/bit_manipulation/subsets.py
++++ b/algorithms/bit_manipulation/subsets.py
+@@ -8,23 +8,28 @@ Reference: https://en.wikipedia.org/wiki/Power_set
+ 
+ Complexity:
+     Time:  O(n * 2^n)
+-    Space: O(n * 2^n)
++    Space: O(2^n) worst case for the dedup seen-set; subsets are produced lazily
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def subsets(nums: list[int]) -> set[tuple[int, ...]]:
+-    """Return all subsets of the given list as a set of tuples.
++
++def subsets(nums: list[int]) -> Iterator[tuple[int, ...]]:
++    """Yield all subsets of the given list as tuples, lazily.
+ 
+     Uses bitmask enumeration: for each number from 0 to 2^n - 1, the
+     set bits indicate which elements are included in that subset.
++    Subsets are produced one at a time; duplicates (possible when the
++    input contains repeated values) are suppressed with a running
++    seen-set.
+ 
+     Args:
+         nums: A list of distinct integers.
+ 
+-    Returns:
+-        A set of tuples, each representing one subset.
++    Yields:
++        Tuples, each representing one subset.
+ 
+     Examples:
+         >>> sorted(subsets([1, 2, 3]))
+@@ -32,12 +37,12 @@ def subsets(nums: list[int]) -> set[tuple[int, ...]]:
+     """
+     length = len(nums)
+     total = 1 << length
+-    result: set[tuple[int, ...]] = set()
++    seen: set[tuple[int, ...]] = set()
+ 
+     for mask in range(total):
+         subset = tuple(
+             number for bit_index, number in enumerate(nums) if mask & 1 << bit_index
+         )
+-        result.add(subset)
+-
+-    return result
++        if subset not in seen:
++            seen.add(subset)
++            yield subset
+diff --git a/algorithms/graph/all_factors.py b/algorithms/graph/all_factors.py
+index 960e714..db76f61 100644
+--- a/algorithms/graph/all_factors.py
++++ b/algorithms/graph/all_factors.py
+@@ -13,18 +13,22 @@ Complexity:
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def get_factors(n: int) -> list[list[int]]:
+-    """Return all factor combinations of *n* using recursion.
++
++def get_factors(n: int) -> Iterator[list[int]]:
++    """Yield all factor combinations of *n* using recursion.
++
++    Factorizations are produced lazily, one at a time.
+ 
+     Args:
+         n: The number to factorise.
+ 
+-    Returns:
+-        List of factor lists.
++    Yields:
++        Factor lists.
+ 
+     Examples:
+-        >>> get_factors(12)
++        >>> list(get_factors(12))
+         [[2, 6], [2, 2, 3], [3, 4]]
+     """
+ 
+@@ -32,64 +36,59 @@ def get_factors(n: int) -> list[list[int]]:
+         n: int,
+         i: int,
+         combi: list[int],
+-        res: list[list[int]],
+-    ) -> list[list[int]]:
++    ) -> Iterator[list[int]]:
+         while i * i <= n:
+             if n % i == 0:
+-                res += (combi + [i, int(n / i)],)
+-                _factor(n / i, i, combi + [i], res)
++                yield combi + [i, int(n / i)]
++                yield from _factor(n / i, i, combi + [i])
+             i += 1
+-        return res
+ 
+-    return _factor(n, 2, [], [])
++    yield from _factor(n, 2, [])
+ 
+ 
+-def get_factors_iterative1(n: int) -> list[list[int]]:
+-    """Return all factor combinations using an explicit stack.
++def get_factors_iterative1(n: int) -> Iterator[list[int]]:
++    """Yield all factor combinations using an explicit stack.
+ 
+     Args:
+         n: The number to factorise.
+ 
+-    Returns:
+-        List of factor lists.
++    Yields:
++        Factor lists.
+ 
+     Examples:
+-        >>> get_factors_iterative1(12)
++        >>> list(get_factors_iterative1(12))
+         [[2, 6], [3, 4], [2, 2, 3]]
+     """
+     todo: list[tuple[int, int, list[int]]] = [(n, 2, [])]
+-    res: list[list[int]] = []
+     while todo:
+         n, i, combi = todo.pop()
+         while i * i <= n:
+             if n % i == 0:
+-                res += (combi + [i, n // i],)
++                yield combi + [i, n // i]
+                 todo.append((n // i, i, combi + [i]))
+             i += 1
+-    return res
+ 
+ 
+-def get_factors_iterative2(n: int) -> list[list[int]]:
+-    """Return all factor combinations using a stack-based approach.
++def get_factors_iterative2(n: int) -> Iterator[list[int]]:
++    """Yield all factor combinations using a stack-based approach.
+ 
+     Args:
+         n: The number to factorise.
+ 
+-    Returns:
+-        List of factor lists.
++    Yields:
++        Factor lists.
+ 
+     Examples:
+-        >>> get_factors_iterative2(12)
++        >>> list(get_factors_iterative2(12))
+         [[2, 2, 3], [2, 6], [3, 4]]
+     """
+-    ans: list[list[int]] = []
+     stack: list[int] = []
+     x = 2
+     while True:
+         if x > n // x:
+             if not stack:
+-                return ans
+-            ans.append(stack + [n])
++                return
++            yield stack + [n]
+             x = stack.pop()
+             n *= x
+             x += 1
+diff --git a/algorithms/heap/sliding_window_max.py b/algorithms/heap/sliding_window_max.py
+index 5cbf6d7..cbe554f 100644
+--- a/algorithms/heap/sliding_window_max.py
++++ b/algorithms/heap/sliding_window_max.py
+@@ -14,32 +14,43 @@ Complexity:
+ from __future__ import annotations
+ 
+ import collections
++from collections.abc import Iterator
+ 
+ 
+-def max_sliding_window(nums: list[int], k: int) -> list[int]:
+-    """Find the maximum in each sliding window of size k.
++def max_sliding_window(nums: list[int], k: int) -> Iterator[int]:
++    """Return an iterator over the maximum of each sliding window of size k.
++
++    Window maxima are produced lazily, one at a time, as the input is
++    scanned.
+ 
+     Args:
+         nums: Input array of integers.
+         k: Window size.
+ 
+     Returns:
+-        List of maximum values for each window position.
++        An iterator of maximum values, one for each window position.
++
++    Raises:
++        ValueError: If k is not a positive integer.
+ 
+     Examples:
+-        >>> max_sliding_window([1, 3, -1, -3, 5, 3, 6, 7], 3)
++        >>> list(max_sliding_window([1, 3, -1, -3, 5, 3, 6, 7], 3))
+         [3, 3, 5, 5, 6, 7]
+     """
+-    if not nums:
+-        return nums
++    if k < 1:
++        raise ValueError("window size k must be a positive integer")
++    return _max_sliding_window(nums, k)
++
++
++def _max_sliding_window(nums: list[int], k: int) -> Iterator[int]:
++    """Yield the maximum of each sliding window of size k, one at a time."""
+     queue: collections.deque[int] = collections.deque()
+-    result: list[int] = []
+     for num in nums:
+         if len(queue) < k:
+             queue.append(num)
+         else:
+-            result.append(max(queue))
++            yield max(queue)
+             queue.popleft()
+             queue.append(num)
+-    result.append(max(queue))
+-    return result
++    if len(queue) == k:
++        yield max(queue)
+diff --git a/algorithms/math/generate_strobogrammtic.py b/algorithms/math/generate_strobogrammtic.py
+index c0f6bea..f69b6a6 100644
+--- a/algorithms/math/generate_strobogrammtic.py
++++ b/algorithms/math/generate_strobogrammtic.py
+@@ -8,52 +8,56 @@ Reference: https://en.wikipedia.org/wiki/Strobogrammatic_number
+ 
+ Complexity:
+     Time:  O(5^(n/2)) for generation
+-    Space: O(5^(n/2))
++    Space: O(n) auxiliary (numbers are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def gen_strobogrammatic(n: int) -> list[str]:
+-    """Generate all strobogrammatic numbers of length n.
++
++def gen_strobogrammatic(n: int) -> Iterator[str]:
++    """Yield all strobogrammatic numbers of length n, lazily.
++
++    Numbers are produced one at a time, so callers can stream them
++    without materializing all O(5^(n/2)) results in memory.
+ 
+     Args:
+         n: The desired length of strobogrammatic numbers.
+ 
+-    Returns:
+-        List of strobogrammatic number strings.
++    Yields:
++        Strobogrammatic number strings.
+ 
+     Examples:
+-        >>> gen_strobogrammatic(2)
++        >>> list(gen_strobogrammatic(2))
+         ['88', '11', '96', '69']
+     """
+-    return _helper(n, n)
++    yield from _helper(n, n)
+ 
+ 
+-def _helper(n: int, length: int) -> list[str]:
+-    """Recursively build strobogrammatic numbers of length n.
++def _helper(n: int, length: int) -> Iterator[str]:
++    """Recursively yield strobogrammatic numbers of length n.
+ 
+     Args:
+         n: Remaining length to fill.
+         length: Original target length.
+ 
+-    Returns:
+-        List of strobogrammatic number strings.
++    Yields:
++        Strobogrammatic number strings.
+     """
+     if n == 0:
+-        return [""]
++        yield ""
++        return
+     if n == 1:
+-        return ["1", "0", "8"]
+-    middles = _helper(n - 2, length)
+-    result = []
+-    for middle in middles:
++        yield from ("1", "0", "8")
++        return
++    for middle in _helper(n - 2, length):
+         if n != length:
+-            result.append("0" + middle + "0")
+-        result.append("8" + middle + "8")
+-        result.append("1" + middle + "1")
+-        result.append("9" + middle + "6")
+-        result.append("6" + middle + "9")
+-    return result
++            yield "0" + middle + "0"
++        yield "8" + middle + "8"
++        yield "1" + middle + "1"
++        yield "9" + middle + "6"
++        yield "6" + middle + "9"
+ 
+ 
+ def strobogrammatic_in_range(low: str, high: str) -> int:
+diff --git a/algorithms/matrix/spiral_traversal.py b/algorithms/matrix/spiral_traversal.py
+index f696408..0380f2e 100644
+--- a/algorithms/matrix/spiral_traversal.py
++++ b/algorithms/matrix/spiral_traversal.py
+@@ -13,23 +13,24 @@ Complexity:
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def spiral_traversal(matrix: list[list[int]]) -> list[int]:
+-    """Return matrix elements in spiral order.
++
++def spiral_traversal(matrix: list[list[int]]) -> Iterator[int]:
++    """Yield matrix elements in spiral order, one at a time (lazy).
+ 
+     Args:
+         matrix: 2D list of integers (m x n).
+ 
+-    Returns:
+-        List of elements in spiral order.
++    Yields:
++        Elements in spiral order.
+ 
+     Examples:
+-        >>> spiral_traversal([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
++        >>> list(spiral_traversal([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
+         [1, 2, 3, 6, 9, 8, 7, 4, 5]
+     """
+-    result: list[int] = []
+     if len(matrix) == 0:
+-        return result
++        return
+     row_begin = 0
+     row_end = len(matrix) - 1
+     col_begin = 0
+@@ -37,21 +38,19 @@ def spiral_traversal(matrix: list[list[int]]) -> list[int]:
+ 
+     while row_begin <= row_end and col_begin <= col_end:
+         for i in range(col_begin, col_end + 1):
+-            result.append(matrix[row_begin][i])
++            yield matrix[row_begin][i]
+         row_begin += 1
+ 
+         for i in range(row_begin, row_end + 1):
+-            result.append(matrix[i][col_end])
++            yield matrix[i][col_end]
+         col_end -= 1
+ 
+         if row_begin <= row_end:
+             for i in range(col_end, col_begin - 1, -1):
+-                result.append(matrix[row_end][i])
++                yield matrix[row_end][i]
+         row_end -= 1
+ 
+         if col_begin <= col_end:
+             for i in range(row_end, row_begin - 1, -1):
+-                result.append(matrix[i][col_begin])
++                yield matrix[i][col_begin]
+         col_begin += 1
+-
+-    return result
+diff --git a/algorithms/queue/max_sliding_window.py b/algorithms/queue/max_sliding_window.py
+index 9831e3f..0c23753 100644
+--- a/algorithms/queue/max_sliding_window.py
++++ b/algorithms/queue/max_sliding_window.py
+@@ -15,28 +15,39 @@ Complexity:
+ from __future__ import annotations
+ 
+ import collections
++from collections.abc import Iterator
+ 
+ 
+-def max_sliding_window(arr: list[int], k: int) -> list[int]:
+-    """Find the maximum in each sliding window of size k.
++def max_sliding_window(arr: list[int], k: int) -> Iterator[int]:
++    """Return an iterator over the maximum of each sliding window of size k.
+ 
+     Uses a deque to maintain indices of useful elements in decreasing
+     order. The front of the deque always holds the index of the current
+-    window maximum.
++    window maximum. Window maxima are produced lazily, one at a time, as
++    the input is scanned.
+ 
+     Args:
+         arr: Input array of integers.
+         k: Window size.
+ 
+     Returns:
+-        List of maximum values for each window position.
++        An iterator of maximum values, one for each window position.
++
++    Raises:
++        ValueError: If k is not a positive integer.
+ 
+     Examples:
+-        >>> max_sliding_window([1, 3, -1, -3, 5, 3, 6, 7], 3)
++        >>> list(max_sliding_window([1, 3, -1, -3, 5, 3, 6, 7], 3))
+         [3, 3, 5, 5, 6, 7]
+     """
++    if k < 1:
++        raise ValueError("window size k must be a positive integer")
++    return _max_sliding_window(arr, k)
++
++
++def _max_sliding_window(arr: list[int], k: int) -> Iterator[int]:
++    """Yield the maximum of each sliding window of size k, one at a time."""
+     index_deque: collections.deque[int] = collections.deque()
+-    result: list[int] = []
+     for i, value in enumerate(arr):
+         while index_deque and arr[index_deque[-1]] < value:
+             index_deque.pop()
+@@ -44,5 +55,4 @@ def max_sliding_window(arr: list[int], k: int) -> list[int]:
+         if index_deque[0] == i - k:
+             index_deque.popleft()
+         if i >= k - 1:
+-            result.append(arr[index_deque[0]])
+-    return result
++            yield arr[index_deque[0]]
+diff --git a/algorithms/set/find_keyboard_row.py b/algorithms/set/find_keyboard_row.py
+index f25853d..9d3a2e9 100644
+--- a/algorithms/set/find_keyboard_row.py
++++ b/algorithms/set/find_keyboard_row.py
+@@ -8,11 +8,13 @@ Reference: https://leetcode.com/problems/keyboard-row/description/
+ 
+ Complexity:
+     Time:  O(n * m) where n is the number of words and m is average word length
+-    Space: O(n)
++    Space: O(m) per word (matches are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
++
+ _KEYBOARD_ROWS: list[set[str]] = [
+     set("qwertyuiop"),
+     set("asdfghjkl"),
+@@ -20,22 +22,20 @@ _KEYBOARD_ROWS: list[set[str]] = [
+ ]
+ 
+ 
+-def find_keyboard_row(words: list[str]) -> list[str]:
+-    """Return words that can be typed using one keyboard row.
++def find_keyboard_row(words: list[str]) -> Iterator[str]:
++    """Yield words that can be typed using one keyboard row, lazily.
+ 
+     Args:
+         words: A list of words to check.
+ 
+-    Returns:
+-        A list of words each typable on a single keyboard row.
++    Yields:
++        Words each typable on a single keyboard row.
+ 
+     Examples:
+-        >>> find_keyboard_row(["Hello", "Alaska", "Dad", "Peace"])
++        >>> list(find_keyboard_row(["Hello", "Alaska", "Dad", "Peace"]))
+         ['Alaska', 'Dad']
+     """
+-    result: list[str] = []
+     for word in words:
+         for row in _KEYBOARD_ROWS:
+             if set(word.lower()).issubset(row):
+-                result.append(word)
+-    return result
++                yield word
+diff --git a/algorithms/string/breaking_bad.py b/algorithms/string/breaking_bad.py
+index 0639638..215cff4 100644
+--- a/algorithms/string/breaking_bad.py
++++ b/algorithms/string/breaking_bad.py
+@@ -9,64 +9,64 @@ Reference: https://en.wikipedia.org/wiki/Trie
+ 
+ Complexity:
+     Time:  O(n * m) for brute force, O(n * k) for trie-based approach
+-    Space: O(n * m) for storing results
++    Space: O(1) auxiliary (matches are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
+ import re
++from collections.abc import Iterator
+ from functools import reduce
+ 
+ 
+-def match_symbol(words: list[str], symbols: list[str]) -> list[str]:
+-    """Match symbols in words using regex and surround matches with brackets.
++def match_symbol(words: list[str], symbols: list[str]) -> Iterator[str]:
++    """Yield words with matched symbols surrounded by brackets, lazily.
++
++    Matches are produced one at a time as the word/symbol pairs are
++    scanned.
+ 
+     Args:
+         words: List of words to search through.
+         symbols: List of symbols to match within the words.
+ 
+-    Returns:
+-        List of words with matched symbols surrounded by square brackets.
++    Yields:
++        Words with matched symbols surrounded by square brackets.
+ 
+     Examples:
+-        >>> match_symbol(['Google'], ['le'])
++        >>> list(match_symbol(['Google'], ['le']))
+         ['Goog[le]']
+     """
+-    combined = []
+     for symbol in symbols:
+         for word in words:
+             match = re.search(symbol, word)
+             if match:
+-                combined.append(re.sub(symbol, f"[{symbol}]", word))
+-    return combined
++                yield re.sub(symbol, f"[{symbol}]", word)
+ 
+ 
+-def match_symbol_1(words: list[str], symbols: list[str]) -> list[str]:
+-    """Match the longest symbol in each word using sorted symbol list.
++def match_symbol_1(words: list[str], symbols: list[str]) -> Iterator[str]:
++    """Yield each word with the longest matched symbol bracketed, lazily.
+ 
+     Args:
+         words: List of words to search through.
+         symbols: List of symbols to match, sorted by length descending.
+ 
+-    Returns:
+-        List of words with the longest matched symbol bracketed.
++    Yields:
++        Words with the longest matched symbol bracketed.
+ 
+     Examples:
+-        >>> match_symbol_1(['Microsoft'], ['i', 'cro'])
++        >>> list(match_symbol_1(['Microsoft'], ['i', 'cro']))
+         ['Mi[cro]soft']
+     """
+-    result = []
+     symbols = sorted(symbols, key=lambda item: len(item), reverse=True)
+     for word in words:
+         word_replaced = ""
+         for symbol in symbols:
+             if word.find(symbol) != -1:
+                 word_replaced = word.replace(symbol, "[" + symbol + "]")
+-                result.append(word_replaced)
++                yield word_replaced
+                 break
+         if word_replaced == "":
+-            result.append(word)
+-    return result
++            yield word
+ 
+ 
+ class _TrieNode:
+diff --git a/algorithms/string/fizzbuzz.py b/algorithms/string/fizzbuzz.py
+index 47d31c3..940a6cc 100644
+--- a/algorithms/string/fizzbuzz.py
++++ b/algorithms/string/fizzbuzz.py
+@@ -8,28 +8,31 @@ Reference: https://en.wikipedia.org/wiki/Fizz_buzz
+ 
+ Complexity:
+     Time:  O(n)
+-    Space: O(n)
++    Space: O(1) auxiliary (values are produced lazily)
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ 
+-def fizzbuzz(number: int) -> list[int | str]:
+-    """Generate FizzBuzz sequence from 1 to number.
++
++def fizzbuzz(number: int) -> Iterator[int | str]:
++    """Generate the FizzBuzz sequence from 1 to number, lazily.
+ 
+     Args:
+         number: The upper bound of the sequence (inclusive).
+ 
+     Returns:
+-        A list where multiples of 3 are 'Fizz', multiples of 5 are 'Buzz',
+-        multiples of both are 'FizzBuzz', and all others are the integer value.
++        An iterator where multiples of 3 are 'Fizz', multiples of 5 are
++        'Buzz', multiples of both are 'FizzBuzz', and all others are the
++        integer value.
+ 
+     Raises:
+         ValueError: If number is less than 1.
+         TypeError: If number is None.
+ 
+     Examples:
+-        >>> fizzbuzz(5)
++        >>> list(fizzbuzz(5))
+         [1, 2, 'Fizz', 4, 'Buzz']
+     """
+     if number < 1:
+@@ -37,33 +40,36 @@ def fizzbuzz(number: int) -> list[int | str]:
+     if number is None:
+         raise TypeError("n cannot be None")
+ 
+-    result: list[int | str] = []
++    return _fizzbuzz_values(number)
++
++
++def _fizzbuzz_values(number: int) -> Iterator[int | str]:
++    """Yield FizzBuzz values from 1 to number, one at a time."""
+     for value in range(1, number + 1):
+         if value % 3 == 0 and value % 5 == 0:
+-            result.append("FizzBuzz")
++            yield "FizzBuzz"
+         elif value % 3 == 0:
+-            result.append("Fizz")
++            yield "Fizz"
+         elif value % 5 == 0:
+-            result.append("Buzz")
++            yield "Buzz"
+         else:
+-            result.append(value)
+-    return result
++            yield value
+ 
+ 
+-def fizzbuzz_with_helper_func(number: int) -> list[int | str]:
+-    """Generate FizzBuzz sequence using a helper function.
++def fizzbuzz_with_helper_func(number: int) -> Iterator[int | str]:
++    """Generate the FizzBuzz sequence using a helper function, lazily.
+ 
+     Args:
+         number: The upper bound of the sequence (inclusive).
+ 
+     Returns:
+-        A list of FizzBuzz values from 1 to number.
++        An iterator of FizzBuzz values from 1 to number.
+ 
+     Examples:
+-        >>> fizzbuzz_with_helper_func(3)
++        >>> list(fizzbuzz_with_helper_func(3))
+         [1, 2, 'Fizz']
+     """
+-    return [_fb(value) for value in range(1, number + 1)]
++    return (_fb(value) for value in range(1, number + 1))
+ 
+ 
+ def _fb(value: int) -> int | str:
+diff --git a/algorithms/string/word_squares.py b/algorithms/string/word_squares.py
+index 730ca9b..0b601d2 100644
+--- a/algorithms/string/word_squares.py
++++ b/algorithms/string/word_squares.py
+@@ -14,19 +14,22 @@ Complexity:
+ from __future__ import annotations
+ 
+ import collections
++from collections.abc import Iterator
+ 
+ 
+-def word_squares(words: list[str]) -> list[list[str]]:
+-    """Find all valid word squares from a list of same-length words.
++def word_squares(words: list[str]) -> Iterator[list[str]]:
++    """Yield all valid word squares from a list of same-length words.
++
++    Squares are produced lazily, one at a time.
+ 
+     Args:
+         words: A list of words, all having the same length.
+ 
+-    Returns:
+-        A list of word squares, where each square is a list of words.
++    Yields:
++        Word squares, where each square is a list of words.
+ 
+     Examples:
+-        >>> word_squares(["area", "lead", "wall", "lady", "ball"])
++        >>> list(word_squares(["area", "lead", "wall", "lady", "ball"]))
+         [['wall', 'area', 'lead', 'lady'], ['ball', 'area', 'lead', 'lady']]
+     """
+     word_length = len(words[0])
+@@ -35,17 +38,15 @@ def word_squares(words: list[str]) -> list[list[str]]:
+         for index in range(word_length):
+             prefix_map[word[:index]].append(word)
+ 
+-    def _build(square: list[str]) -> None:
++    def _build(square: list[str]) -> Iterator[list[str]]:
+         if len(square) == word_length:
+-            squares.append(square)
++            yield square
+             return
+         prefix = ""
+         for row in range(len(square)):
+             prefix += square[row][len(square)]
+         for word in prefix_map[prefix]:
+-            _build(square + [word])
++            yield from _build(square + [word])
+ 
+-    squares: list[list[str]] = []
+     for word in words:
+-        _build([word])
+-    return squares
++        yield from _build([word])
+diff --git a/algorithms/tree/binary_tree_paths.py b/algorithms/tree/binary_tree_paths.py
+index a31a393..8f15306 100644
+--- a/algorithms/tree/binary_tree_paths.py
++++ b/algorithms/tree/binary_tree_paths.py
+@@ -13,40 +13,41 @@ Complexity:
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
++
+ from algorithms.tree.tree import TreeNode
+ 
+ 
+-def binary_tree_paths(root: TreeNode | None) -> list[str]:
+-    """Return all root-to-leaf paths in the binary tree.
++def binary_tree_paths(root: TreeNode | None) -> Iterator[str]:
++    """Yield all root-to-leaf paths in the binary tree.
++
++    Paths are produced lazily, one at a time.
+ 
+     Args:
+         root: The root of the binary tree.
+ 
+-    Returns:
+-        A list of strings representing each root-to-leaf path.
++    Yields:
++        Strings representing each root-to-leaf path.
+ 
+     Examples:
+-        >>> binary_tree_paths(None)
++        >>> list(binary_tree_paths(None))
+         []
+     """
+-    result: list[str] = []
+     if root is None:
+-        return result
+-    _dfs(result, root, str(root.val))
+-    return result
++        return
++    yield from _dfs(root, str(root.val))
+ 
+ 
+-def _dfs(result: list[str], root: TreeNode, current: str) -> None:
++def _dfs(root: TreeNode, current: str) -> Iterator[str]:
+     """Perform depth-first search to collect all root-to-leaf paths.
+ 
+     Args:
+-        result: The list accumulating path strings.
+         root: The current node being visited.
+         current: The path string built so far.
+     """
+     if root.left is None and root.right is None:
+-        result.append(current)
++        yield current
+     if root.left:
+-        _dfs(result, root.left, current + "->" + str(root.left.val))
++        yield from _dfs(root.left, current + "->" + str(root.left.val))
+     if root.right:
+-        _dfs(result, root.right, current + "->" + str(root.right.val))
++        yield from _dfs(root.right, current + "->" + str(root.right.val))
+diff --git a/algorithms/tree/binary_tree_views.py b/algorithms/tree/binary_tree_views.py
+index 91b724a..1dfeac3 100644
+--- a/algorithms/tree/binary_tree_views.py
++++ b/algorithms/tree/binary_tree_views.py
+@@ -20,72 +20,73 @@ Complexity (all views):
+ from __future__ import annotations
+ 
+ from collections import deque
++from collections.abc import Iterator
+ 
+ from algorithms.common.tree_node import TreeNode
+ 
+ 
+-def left_view(root: TreeNode | None) -> list[int]:
+-    """Return the values visible from the left side of the tree.
++def left_view(root: TreeNode | None) -> Iterator[int]:
++    """Yield the values visible from the left side of the tree.
++
++    Values are produced lazily, one per level, from the left.
+ 
+     Args:
+         root: Root of the binary tree.
+ 
+-    Returns:
+-        List of node values, one per level, from the left.
++    Yields:
++        Node values, one per level, from the left.
+ 
+     Examples:
+         >>> from algorithms.common.tree_node import TreeNode
+         >>> root = TreeNode(1, TreeNode(2, TreeNode(4)), TreeNode(3))
+-        >>> left_view(root)
++        >>> list(left_view(root))
+         [1, 2, 4]
+     """
+     if root is None:
+-        return []
+-    result: list[int] = []
++        return
+     queue: deque[TreeNode] = deque([root])
+     while queue:
+         level_size = len(queue)
+         for i in range(level_size):
+             node = queue.popleft()
+             if i == 0:
+-                result.append(node.val)
++                yield node.val
+             if node.left:
+                 queue.append(node.left)
+             if node.right:
+                 queue.append(node.right)
+-    return result
+ 
+ 
+-def right_view(root: TreeNode | None) -> list[int]:
+-    """Return the values visible from the right side of the tree.
++def right_view(root: TreeNode | None) -> Iterator[int]:
++    """Yield the values visible from the right side of the tree.
++
++    Values are produced lazily, one per level, from the right.
+ 
+     Args:
+         root: Root of the binary tree.
+ 
+-    Returns:
+-        List of node values, one per level, from the right.
++    Yields:
++        Node values, one per level, from the right.
+ 
+     Examples:
+         >>> from algorithms.common.tree_node import TreeNode
+         >>> root = TreeNode(1, TreeNode(2, TreeNode(4)), TreeNode(3))
+-        >>> right_view(root)
++        >>> list(right_view(root))
+         [1, 3, 4]
+     """
+     if root is None:
+-        return []
+-    result: list[int] = []
++        return
+     queue: deque[TreeNode] = deque([root])
+     while queue:
+         level_size = len(queue)
+         for i in range(level_size):
+             node = queue.popleft()
+             if i == level_size - 1:
+-                result.append(node.val)
++                yield node.val
+             if node.left:
+                 queue.append(node.left)
+             if node.right:
+                 queue.append(node.right)
+-    return result
+ 
+ 
+ def top_view(root: TreeNode | None) -> list[int]:
+diff --git a/algorithms/tree/path_sum2.py b/algorithms/tree/path_sum2.py
+index b9dea4c..25819bb 100644
+--- a/algorithms/tree/path_sum2.py
++++ b/algorithms/tree/path_sum2.py
+@@ -14,103 +14,102 @@ Complexity:
+ from __future__ import annotations
+ 
+ from collections import deque
++from collections.abc import Iterator
+ 
+ from algorithms.tree.tree import TreeNode
+ 
+ 
+-def path_sum(root: TreeNode | None, sum: int) -> list[list[int]]:
+-    """Find all root-to-leaf paths with the given sum (recursive DFS).
++def path_sum(root: TreeNode | None, sum: int) -> Iterator[list[int]]:
++    """Yield all root-to-leaf paths with the given sum (recursive DFS).
++
++    Paths are produced lazily, one at a time.
+ 
+     Args:
+         root: The root of the binary tree.
+         sum: The target sum.
+ 
+-    Returns:
+-        A list of paths, where each path is a list of node values.
++    Yields:
++        Paths, where each path is a list of node values.
+ 
+     Examples:
+-        >>> path_sum(None, 0)
++        >>> list(path_sum(None, 0))
+         []
+     """
+     if root is None:
+-        return []
+-    result: list[list[int]] = []
+-    _dfs(root, sum, [], result)
+-    return result
++        return
++    yield from _dfs(root, sum, [])
+ 
+ 
+-def _dfs(root: TreeNode, sum: int, path: list[int], result: list[list[int]]) -> None:
+-    """Recursively collect paths that sum to the target value.
++def _dfs(root: TreeNode, sum: int, path: list[int]) -> Iterator[list[int]]:
++    """Recursively yield paths that sum to the target value.
+ 
+     Args:
+         root: The current node.
+         sum: The remaining target sum.
+         path: The path accumulated so far.
+-        result: The list accumulating valid paths.
+     """
+     if root.left is None and root.right is None and root.val == sum:
+-        path.append(root.val)
+-        result.append(path)
++        yield path + [root.val]
+     if root.left is not None:
+-        _dfs(root.left, sum - root.val, path + [root.val], result)
++        yield from _dfs(root.left, sum - root.val, path + [root.val])
+     if root.right is not None:
+-        _dfs(root.right, sum - root.val, path + [root.val], result)
++        yield from _dfs(root.right, sum - root.val, path + [root.val])
++
+ 
++def path_sum2(root: TreeNode | None, target: int) -> Iterator[list[int]]:
++    """Yield all root-to-leaf paths with the given sum (DFS with stack).
+ 
+-def path_sum2(root: TreeNode | None, target: int) -> list[list[int]]:
+-    """Find all root-to-leaf paths with the given sum (DFS with stack).
++    Paths are produced lazily, one at a time.
+ 
+     Args:
+         root: The root of the binary tree.
+         target: The target sum.
+ 
+-    Returns:
+-        A list of paths, where each path is a list of node values.
++    Yields:
++        Paths, where each path is a list of node values.
+ 
+     Examples:
+-        >>> path_sum2(None, 0)
++        >>> list(path_sum2(None, 0))
+         []
+     """
+     if root is None:
+-        return []
+-    result: list[list[int]] = []
++        return
+     stack: list[tuple[TreeNode, list[int]]] = [(root, [root.val])]
+     while stack:
+         node, path = stack.pop()
+         if node.left is None and node.right is None and sum(path) == target:
+-            result.append(path)
++            yield path
+         if node.left is not None:
+             stack.append((node.left, path + [node.left.val]))
+         if node.right is not None:
+             stack.append((node.right, path + [node.right.val]))
+-    return result
+ 
+ 
+-def path_sum3(root: TreeNode | None, sum: int) -> list[list[int]]:
+-    """Find all root-to-leaf paths with the given sum (BFS with queue).
++def path_sum3(root: TreeNode | None, sum: int) -> Iterator[list[int]]:
++    """Yield all root-to-leaf paths with the given sum (BFS with queue).
++
++    Paths are produced lazily, one at a time.
+ 
+     Args:
+         root: The root of the binary tree.
+         sum: The target sum.
+ 
+-    Returns:
+-        A list of paths, where each path is a list of node values.
++    Yields:
++        Paths, where each path is a list of node values.
+ 
+     Examples:
+-        >>> path_sum3(None, 0)
++        >>> list(path_sum3(None, 0))
+         []
+     """
+     if root is None:
+-        return []
+-    result: list[list[int]] = []
++        return
+     initial = (root, root.val, [root.val])
+     queue: deque[tuple[TreeNode, int, list[int]]] = deque([initial])
+     while queue:
+         node, val, path = queue.popleft()
+         if node.left is None and node.right is None and val == sum:
+-            result.append(path)
++            yield path
+         if node.left is not None:
+             queue.append((node.left, val + node.left.val, path + [node.left.val]))
+         if node.right is not None:
+             queue.append((node.right, val + node.right.val, path + [node.right.val]))
+-    return result
+diff --git a/algorithms/tree/traversal_inorder.py b/algorithms/tree/traversal_inorder.py
+index 3ad6a8a..664cdbd 100644
+--- a/algorithms/tree/traversal_inorder.py
++++ b/algorithms/tree/traversal_inorder.py
+@@ -11,31 +11,38 @@ class Node:
+ 
+ 
+ def inorder(root):
+-    """In order function"""
+-    res = []
++    """Yield node values in inorder, one at a time (lazy)."""
+     if not root:
+-        return res
++        return
+     stack = []
+     while root or stack:
+         while root:
+             stack.append(root)
+             root = root.left
+         root = stack.pop()
+-        res.append(root.val)
++        yield root.val
+         root = root.right
+-    return res
+ 
+ 
+ def inorder_rec(root, res=None):
+-    """Recursive Implementation"""
++    """Yield node values in inorder (recursive, lazy).
++
++    Backward compatibility: when a list is passed as ``res`` (the legacy
++    two-argument form), it is filled in traversal order and returned;
++    otherwise a lazy iterator is returned.
++    """
++    if res is not None:
++        res.extend(_inorder_gen(root))
++        return res
++    return _inorder_gen(root)
++
++
++def _inorder_gen(root):
+     if root is None:
+-        return []
+-    if res is None:
+-        res = []
+-    inorder_rec(root.left, res)
+-    res.append(root.val)
+-    inorder_rec(root.right, res)
+-    return res
++        return
++    yield from _inorder_gen(root.left)
++    yield root.val
++    yield from _inorder_gen(root.right)
+ 
+ 
+ if __name__ == "__main__":
+@@ -50,5 +57,5 @@ if __name__ == "__main__":
+     n2.left, n2.right = n4, n5
+     n3.left, n3.right = n6, n7
+ 
+-    assert inorder(n1) == [25, 50, 75, 100, 125, 150, 175]
+-    assert inorder_rec(n1) == [25, 50, 75, 100, 125, 150, 175]
++    assert list(inorder(n1)) == [25, 50, 75, 100, 125, 150, 175]
++    assert list(inorder_rec(n1)) == [25, 50, 75, 100, 125, 150, 175]
+diff --git a/algorithms/tree/traversal_level_order.py b/algorithms/tree/traversal_level_order.py
+index 1aa7311..068e5f9 100644
+--- a/algorithms/tree/traversal_level_order.py
++++ b/algorithms/tree/traversal_level_order.py
+@@ -19,9 +19,9 @@ return its level order traversal as:
+ 
+ 
+ def level_order(root):
+-    ans = []
++    """Yield lists of node values level by level, one level at a time (lazy)."""
+     if not root:
+-        return ans
++        return
+     level = [root]
+     while level:
+         current = []
+@@ -33,5 +33,4 @@ def level_order(root):
+             if node.right:
+                 new_level.append(node.right)
+         level = new_level
+-        ans.append(current)
+-    return ans
++        yield current
+diff --git a/algorithms/tree/traversal_postorder.py b/algorithms/tree/traversal_postorder.py
+index 56b403e..71207f4 100644
+--- a/algorithms/tree/traversal_postorder.py
++++ b/algorithms/tree/traversal_postorder.py
+@@ -11,31 +11,43 @@ class Node:
+ 
+ 
+ def postorder(root):
+-    res_temp = []
+-    res = []
++    """Yield node values in postorder, one at a time (lazy)."""
+     if not root:
+-        return res
+-    stack = []
+-    stack.append(root)
++        return
++    stack = [root]
++    last_visited = None
+     while stack:
+-        root = stack.pop()
+-        res_temp.append(root.val)
+-        if root.left:
+-            stack.append(root.left)
+-        if root.right:
+-            stack.append(root.right)
+-    while res_temp:
+-        res.append(res_temp.pop())
+-    return res
+-
+-
+-# Recursive Implementation
++        node = stack[-1]
++        if (
++            (node.left is None and node.right is None)
++            or (node.right is None and last_visited is node.left)
++            or last_visited is node.right
++        ):
++            yield node.val
++            last_visited = stack.pop()
++        else:
++            if node.right:
++                stack.append(node.right)
++            if node.left:
++                stack.append(node.left)
++
++
+ def postorder_rec(root, res=None):
++    """Yield node values in postorder (recursive, lazy).
++
++    Backward compatibility: when a list is passed as ``res`` (the legacy
++    two-argument form), it is filled in traversal order and returned;
++    otherwise a lazy iterator is returned.
++    """
++    if res is not None:
++        res.extend(_postorder_gen(root))
++        return res
++    return _postorder_gen(root)
++
++
++def _postorder_gen(root):
+     if root is None:
+-        return []
+-    if res is None:
+-        res = []
+-    postorder_rec(root.left, res)
+-    postorder_rec(root.right, res)
+-    res.append(root.val)
+-    return res
++        return
++    yield from _postorder_gen(root.left)
++    yield from _postorder_gen(root.right)
++    yield root.val
+diff --git a/algorithms/tree/traversal_preorder.py b/algorithms/tree/traversal_preorder.py
+index f841a85..bc0fc45 100644
+--- a/algorithms/tree/traversal_preorder.py
++++ b/algorithms/tree/traversal_preorder.py
+@@ -13,29 +13,35 @@ class Node:
+ 
+ 
+ def preorder(root):
+-    """Function to Preorder"""
+-    res = []
++    """Yield node values in preorder, one at a time (lazy)."""
+     if not root:
+-        return res
+-    stack = []
+-    stack.append(root)
++        return
++    stack = [root]
+     while stack:
+         root = stack.pop()
+-        res.append(root.val)
++        yield root.val
+         if root.right:
+             stack.append(root.right)
+         if root.left:
+             stack.append(root.left)
+-    return res
+ 
+ 
+ def preorder_rec(root, res=None):
+-    """Recursive Implementation"""
++    """Yield node values in preorder (recursive, lazy).
++
++    Backward compatibility: when a list is passed as ``res`` (the legacy
++    two-argument form), it is filled in traversal order and returned;
++    otherwise a lazy iterator is returned.
++    """
++    if res is not None:
++        res.extend(_preorder_gen(root))
++        return res
++    return _preorder_gen(root)
++
++
++def _preorder_gen(root):
+     if root is None:
+-        return []
+-    if res is None:
+-        res = []
+-    res.append(root.val)
+-    preorder_rec(root.left, res)
+-    preorder_rec(root.right, res)
+-    return res
++        return
++    yield root.val
++    yield from _preorder_gen(root.left)
++    yield from _preorder_gen(root.right)
+diff --git a/algorithms/tree/traversal_zigzag.py b/algorithms/tree/traversal_zigzag.py
+index 433a71e..6e93347 100644
+--- a/algorithms/tree/traversal_zigzag.py
++++ b/algorithms/tree/traversal_zigzag.py
+@@ -21,9 +21,9 @@ return its zigzag level order traversal as:
+ 
+ 
+ def zigzag_level(root):
+-    res = []
++    """Yield lists of node values in zigzag level order, one level at a time (lazy)."""
+     if not root:
+-        return res
++        return
+     level = [root]
+     flag = 1
+     while level:
+@@ -36,6 +36,5 @@ def zigzag_level(root):
+             if node.right:
+                 new_level.append(node.right)
+         level = new_level
+-        res.append(current[::flag])
++        yield current[::flag]
+         flag *= -1
+-    return res
+diff --git a/tests/test_array.py b/tests/test_array.py
+index df18c3f..a9318f3 100644
+--- a/tests/test_array.py
++++ b/tests/test_array.py
+@@ -54,35 +54,35 @@ class TestDeleteNth(unittest.TestCase):
+     def test_delete_nth_naive(self):
+ 
+         self.assertListEqual(
+-            delete_nth_naive([20, 37, 20, 21, 37, 21, 21], n=1), [20, 37, 21]
++            list(delete_nth_naive([20, 37, 20, 21, 37, 21, 21], n=1)), [20, 37, 21]
+         )
+         self.assertListEqual(
+-            delete_nth_naive([1, 1, 3, 3, 7, 2, 2, 2, 2], n=3), [1, 1, 3, 3, 7, 2, 2, 2]
++            list(delete_nth_naive([1, 1, 3, 3, 7, 2, 2, 2, 2], n=3)), [1, 1, 3, 3, 7, 2, 2, 2]
+         )
+         self.assertListEqual(
+-            delete_nth_naive([1, 2, 3, 1, 1, 2, 1, 2, 3, 3, 2, 4, 5, 3, 1], n=3),
++            list(delete_nth_naive([1, 2, 3, 1, 1, 2, 1, 2, 3, 3, 2, 4, 5, 3, 1], n=3)),
+             [1, 2, 3, 1, 1, 2, 2, 3, 3, 4, 5],
+         )
+-        self.assertListEqual(delete_nth_naive([], n=5), [])
++        self.assertListEqual(list(delete_nth_naive([], n=5)), [])
+         self.assertListEqual(
+-            delete_nth_naive([1, 2, 3, 1, 1, 2, 1, 2, 3, 3, 2, 4, 5, 3, 1], n=0), []
++            list(delete_nth_naive([1, 2, 3, 1, 1, 2, 1, 2, 3, 3, 2, 4, 5, 3, 1], n=0)), []
+         )
+ 
+     def test_delete_nth(self):
+ 
+         self.assertListEqual(
+-            delete_nth([20, 37, 20, 21, 37, 21, 21], n=1), [20, 37, 21]
++            list(delete_nth([20, 37, 20, 21, 37, 21, 21], n=1)), [20, 37, 21]
+         )
+         self.assertListEqual(
+-            delete_nth([1, 1, 3, 3, 7, 2, 2, 2, 2], n=3), [1, 1, 3, 3, 7, 2, 2, 2]
++            list(delete_nth([1, 1, 3, 3, 7, 2, 2, 2, 2], n=3)), [1, 1, 3, 3, 7, 2, 2, 2]
+         )
+         self.assertListEqual(
+-            delete_nth([1, 2, 3, 1, 1, 2, 1, 2, 3, 3, 2, 4, 5, 3, 1], n=3),
++            list(delete_nth([1, 2, 3, 1, 1, 2, 1, 2, 3, 3, 2, 4, 5, 3, 1], n=3)),
+             [1, 2, 3, 1, 1, 2, 2, 3, 3, 4, 5],
+         )
+-        self.assertListEqual(delete_nth([], n=5), [])
++        self.assertListEqual(list(delete_nth([], n=5)), [])
+         self.assertListEqual(
+-            delete_nth([1, 2, 3, 1, 1, 2, 1, 2, 3, 3, 2, 4, 5, 3, 1], n=0), []
++            list(delete_nth([1, 2, 3, 1, 1, 2, 1, 2, 3, 3, 2, 4, 5, 3, 1], n=0)), []
+         )
+ 
+ 
+@@ -90,15 +90,15 @@ class TestFlatten(unittest.TestCase):
+     def test_flatten(self):
+ 
+         nested_list = [2, 1, [3, [4, 5], 6], 7, [8]]
+-        flattened = flatten(nested_list)
++        flattened = list(flatten(nested_list))
+         self.assertEqual(flattened, [2, 1, 3, 4, 5, 6, 7, 8])
+ 
+         nested_list = [[3, [4, 5], 6], 7, [8]]
+-        flattened = flatten(nested_list)
++        flattened = list(flatten(nested_list))
+         self.assertEqual(flattened, [3, 4, 5, 6, 7, 8])
+ 
+         nested_list = [[], [8]]
+-        flattened = flatten(nested_list)
++        flattened = list(flatten(nested_list))
+         self.assertEqual(flattened, [8])
+ 
+     def test_flatten_iter(self):
+@@ -241,12 +241,12 @@ class TestMissingRanges(unittest.TestCase):
+         arr = [3, 5, 10, 11, 12, 15, 19]
+ 
+         self.assertListEqual(
+-            missing_ranges(arr, 0, 20),
++            list(missing_ranges(arr, 0, 20)),
+             [(0, 2), (4, 4), (6, 9), (13, 14), (16, 18), (20, 20)],
+         )
+ 
+         self.assertListEqual(
+-            missing_ranges(arr, 6, 100), [(6, 9), (13, 14), (16, 18), (20, 100)]
++            list(missing_ranges(arr, 6, 100)), [(6, 9), (13, 14), (16, 18), (20, 100)]
+         )
+ 
+ 
+@@ -360,21 +360,21 @@ class TestSummaryRanges(unittest.TestCase):
+     def test_summarize_ranges(self):
+ 
+         self.assertListEqual(
+-            summarize_ranges([0, 1, 2, 4, 5, 7]), [(0, 2), (4, 5), (7, 7)]
++            list(summarize_ranges([0, 1, 2, 4, 5, 7])), [(0, 2), (4, 5), (7, 7)]
+         )
+         self.assertListEqual(
+-            summarize_ranges([-5, -4, -3, 1, 2, 4, 5, 6]), [(-5, -3), (1, 2), (4, 6)]
++            list(summarize_ranges([-5, -4, -3, 1, 2, 4, 5, 6])), [(-5, -3), (1, 2), (4, 6)]
+         )
+-        self.assertListEqual(summarize_ranges([-2, -1, 0, 1, 2]), [(-2, 2)])
++        self.assertListEqual(list(summarize_ranges([-2, -1, 0, 1, 2])), [(-2, 2)])
+ 
+ 
+ class TestThreeSum(unittest.TestCase):
+     def test_three_sum(self):
+ 
+-        self.assertSetEqual(three_sum([-1, 0, 1, 2, -1, -4]), {(-1, 0, 1), (-1, -1, 2)})
++        self.assertSetEqual(set(three_sum([-1, 0, 1, 2, -1, -4])), {(-1, 0, 1), (-1, -1, 2)})
+ 
+         self.assertSetEqual(
+-            three_sum([-1, 3, 1, 2, -1, -4, -2]), {(-4, 1, 3), (-2, -1, 3), (-1, -1, 2)}
++            set(three_sum([-1, 3, 1, 2, -1, -4, -2])), {(-4, 1, 3), (-2, -1, 3), (-1, -1, 2)}
+         )
+ 
+ 
+@@ -402,10 +402,10 @@ class TestTop1(unittest.TestCase):
+ 
+ class TestLimit(unittest.TestCase):
+     def test_limit(self):
+-        self.assertListEqual(limit([1, 2, 3, 4, 5]), [1, 2, 3, 4, 5])
+-        self.assertListEqual(limit([1, 2, 3, 4, 5], 2, 4), [2, 3, 4])
+-        self.assertListEqual(limit([1, 2, 3, 4, 5], 2), [2, 3, 4, 5])
+-        self.assertListEqual(limit([1, 2, 3, 4, 5], None, 4), [1, 2, 3, 4])
++        self.assertListEqual(list(limit([1, 2, 3, 4, 5])), [1, 2, 3, 4, 5])
++        self.assertListEqual(list(limit([1, 2, 3, 4, 5], 2, 4)), [2, 3, 4])
++        self.assertListEqual(list(limit([1, 2, 3, 4, 5], 2)), [2, 3, 4, 5])
++        self.assertListEqual(list(limit([1, 2, 3, 4, 5], None, 4)), [1, 2, 3, 4])
+ 
+ 
+ class TestNSum(unittest.TestCase):
+diff --git a/tests/test_backtracking.py b/tests/test_backtracking.py
+index 660a5b8..89bfc2f 100644
+--- a/tests/test_backtracking.py
++++ b/tests/test_backtracking.py
+@@ -30,11 +30,11 @@ class TestAddOperator(unittest.TestCase):
+         # "123", 6 -> ["1+2+3", "1*2*3"]
+         s = "123"
+         target = 6
+-        self.assertEqual(add_operators(s, target), ["1+2+3", "1*2*3"])
++        self.assertEqual(list(add_operators(s, target)), ["1+2+3", "1*2*3"])
+         # "232", 8 -> ["2*3+2", "2+3*2"]
+         s = "232"
+         target = 8
+-        self.assertEqual(add_operators(s, target), ["2+3*2", "2*3+2"])
++        self.assertEqual(list(add_operators(s, target)), ["2+3*2", "2*3+2"])
+ 
+         s = "123045"
+         target = 3
+@@ -52,13 +52,13 @@ class TestAddOperator(unittest.TestCase):
+             "12+3*0-4-5",
+             "12-3*0-4-5",
+         ]
+-        self.assertEqual(add_operators(s, target), answer)
++        self.assertEqual(list(add_operators(s, target)), answer)
+ 
+ 
+ class TestPermuteAndAnagram(unittest.TestCase):
+     def test_permute(self):
+         perms = ["abc", "bac", "bca", "acb", "cab", "cba"]
+-        self.assertEqual(perms, permute("abc"))
++        self.assertEqual(perms, list(permute("abc")))
+ 
+     def test_permute_iter(self):
+         it = permute_iter("abc")
+@@ -92,7 +92,7 @@ class TestArrayCombinationSum(unittest.TestCase):
+             [3, 2, 2],
+         ]
+         answer.sort()
+-        self.assertListEqual(sorted(array_sum_combinations(a, b, c, target)), answer)
++        self.assertListEqual(sorted(list(array_sum_combinations(a, b, c, target))), answer)
+ 
+     def test_unique_array_sum_combinations(self):
+         a = [1, 2, 3, 3]
+@@ -102,7 +102,7 @@ class TestArrayCombinationSum(unittest.TestCase):
+         answer = [(2, 3, 2), (3, 2, 2), (1, 2, 4), (1, 4, 2), (2, 2, 3), (1, 3, 3)]
+         answer.sort()
+         self.assertListEqual(
+-            sorted(unique_array_sum_combinations(a, b, c, target)), answer
++            sorted(list(unique_array_sum_combinations(a, b, c, target))), answer
+         )
+ 
+ 
+@@ -117,36 +117,36 @@ class TestCombinationSum(unittest.TestCase):
+         candidates1 = [2, 3, 6, 7]
+         target1 = 7
+         answer1 = [[2, 2, 3], [7]]
+-        self.assertEqual(combination_sum(candidates1, target1), answer1)
++        self.assertEqual(list(combination_sum(candidates1, target1)), answer1)
+ 
+         candidates2 = [2, 3, 5]
+         target2 = 8
+         answer2 = [[2, 2, 2, 2], [2, 3, 3], [3, 5]]
+-        self.assertEqual(combination_sum(candidates2, target2), answer2)
++        self.assertEqual(list(combination_sum(candidates2, target2)), answer2)
+ 
+ 
+ class TestFactorCombinations(unittest.TestCase):
+     def test_get_factors(self):
+         target1 = 32
+         answer1 = [[2, 16], [2, 2, 8], [2, 2, 2, 4], [2, 2, 2, 2, 2], [2, 4, 4], [4, 8]]
+-        self.assertEqual(sorted(get_factors(target1)), sorted(answer1))
++        self.assertEqual(sorted(list(get_factors(target1))), sorted(answer1))
+ 
+         target2 = 12
+         answer2 = [[2, 6], [2, 2, 3], [3, 4]]
+-        self.assertEqual(sorted(get_factors(target2)), sorted(answer2))
+-        self.assertEqual(sorted(get_factors(1)), [])
+-        self.assertEqual(sorted(get_factors(37)), [])
++        self.assertEqual(sorted(list(get_factors(target2))), sorted(answer2))
++        self.assertEqual(sorted(list(get_factors(1))), [])
++        self.assertEqual(sorted(list(get_factors(37))), [])
+ 
+     def test_recursive_get_factors(self):
+         target1 = 32
+         answer1 = [[2, 16], [2, 2, 8], [2, 2, 2, 4], [2, 2, 2, 2, 2], [2, 4, 4], [4, 8]]
+-        self.assertEqual(sorted(recursive_get_factors(target1)), sorted(answer1))
++        self.assertEqual(sorted(list(recursive_get_factors(target1))), sorted(answer1))
+ 
+         target2 = 12
+         answer2 = [[2, 6], [2, 2, 3], [3, 4]]
+-        self.assertEqual(sorted(recursive_get_factors(target2)), sorted(answer2))
+-        self.assertEqual(sorted(recursive_get_factors(1)), [])
+-        self.assertEqual(sorted(recursive_get_factors(37)), [])
++        self.assertEqual(sorted(list(recursive_get_factors(target2))), sorted(answer2))
++        self.assertEqual(sorted(list(recursive_get_factors(1))), [])
++        self.assertEqual(sorted(list(recursive_get_factors(37))), [])
+ 
+ 
+ class TestFindWords(unittest.TestCase):
+@@ -159,7 +159,7 @@ class TestFindWords(unittest.TestCase):
+         ]
+ 
+         words = ["oath", "pea", "eat", "rain"]
+-        result = find_words(board, words)
++        result = list(find_words(board, words))
+         test_result = ["oath", "eat"]
+         self.assertEqual(sorted(result), sorted(test_result))
+ 
+@@ -172,22 +172,22 @@ class TestFindWords(unittest.TestCase):
+         ]
+ 
+         words = ["chicken", "nugget", "hello", "world"]
+-        self.assertEqual(find_words(board, words), [])
++        self.assertEqual(list(find_words(board, words)), [])
+ 
+     def test_empty(self):
+         board = []
+         words = []
+-        self.assertEqual(find_words(board, words), [])
++        self.assertEqual(list(find_words(board, words)), [])
+ 
+     def test_uneven(self):
+         board = [["o", "a", "a", "n"], ["e", "t", "a", "e"]]
+         words = ["oath", "pea", "eat", "rain"]
+-        self.assertEqual(find_words(board, words), ["eat"])
++        self.assertEqual(list(find_words(board, words)), ["eat"])
+ 
+     def test_repeat(self):
+         board = [["a", "a", "a"], ["a", "a", "a"], ["a", "a", "a"]]
+         words = ["a", "aa", "aaa", "aaaa", "aaaaa"]
+-        self.assertTrue(len(find_words(board, words)) == 5)
++        self.assertTrue(len(list(find_words(board, words))) == 5)
+ 
+ 
+ class TestGenerateAbbreviations(unittest.TestCase):
+@@ -211,7 +211,7 @@ class TestGenerateAbbreviations(unittest.TestCase):
+             "3d",
+             "4",
+         ]
+-        self.assertEqual(sorted(generate_abbreviations(word1)), sorted(answer1))
++        self.assertEqual(sorted(list(generate_abbreviations(word1))), sorted(answer1))
+ 
+         word2 = "hello"
+         answer2 = [
+@@ -248,7 +248,7 @@ class TestGenerateAbbreviations(unittest.TestCase):
+             "4o",
+             "5",
+         ]
+-        self.assertEqual(sorted(generate_abbreviations(word2)), sorted(answer2))
++        self.assertEqual(sorted(list(generate_abbreviations(word2))), sorted(answer2))
+ 
+ 
+ class TestPatternMatch(unittest.TestCase):
+@@ -267,14 +267,14 @@ class TestPatternMatch(unittest.TestCase):
+ 
+ class TestGenerateParenthesis(unittest.TestCase):
+     def test_generate_parenthesis(self):
+-        self.assertEqual(generate_parenthesis_v1(2), ["()()", "(())"])
++        self.assertEqual(list(generate_parenthesis_v1(2)), ["()()", "(())"])
+         self.assertEqual(
+-            generate_parenthesis_v1(3),
++            list(generate_parenthesis_v1(3)),
+             ["()()()", "()(())", "(())()", "(()())", "((()))"],
+         )
+-        self.assertEqual(generate_parenthesis_v2(2), ["(())", "()()"])
++        self.assertEqual(list(generate_parenthesis_v2(2)), ["(())", "()()"])
+         self.assertEqual(
+-            generate_parenthesis_v2(3),
++            list(generate_parenthesis_v2(3)),
+             ["((()))", "(()())", "(())()", "()(())", "()()()"],
+         )
+ 
+@@ -283,22 +283,22 @@ class TestLetterCombinations(unittest.TestCase):
+     def test_letter_combinations(self):
+         digit1 = "23"
+         answer1 = ["ad", "ae", "af", "bd", "be", "bf", "cd", "ce", "cf"]
+-        self.assertEqual(sorted(letter_combinations(digit1)), sorted(answer1))
++        self.assertEqual(sorted(list(letter_combinations(digit1))), sorted(answer1))
+ 
+         digit2 = "34"
+         answer2 = ["dg", "dh", "di", "eg", "eh", "ei", "fg", "fh", "fi"]
+-        self.assertEqual(sorted(letter_combinations(digit2)), sorted(answer2))
++        self.assertEqual(sorted(list(letter_combinations(digit2))), sorted(answer2))
+ 
+ 
+ class TestPalindromicSubstrings(unittest.TestCase):
+     def test_palindromic_substrings(self):
+         string1 = "abc"
+         answer1 = [["a", "b", "c"]]
+-        self.assertEqual(palindromic_substrings(string1), sorted(answer1))
++        self.assertEqual(list(palindromic_substrings(string1)), sorted(answer1))
+ 
+         string2 = "abcba"
+         answer2 = [["abcba"], ["a", "bcb", "a"], ["a", "b", "c", "b", "a"]]
+-        self.assertEqual(sorted(palindromic_substrings(string2)), sorted(answer2))
++        self.assertEqual(sorted(list(palindromic_substrings(string2))), sorted(answer2))
+ 
+         string3 = "abcccba"
+         answer3 = [
+@@ -309,14 +309,14 @@ class TestPalindromicSubstrings(unittest.TestCase):
+             ["a", "b", "c", "cc", "b", "a"],
+             ["a", "b", "c", "c", "c", "b", "a"],
+         ]
+-        self.assertEqual(sorted(palindromic_substrings(string3)), sorted(answer3))
++        self.assertEqual(sorted(list(palindromic_substrings(string3))), sorted(answer3))
+ 
+ 
+ class TestPermuteUnique(unittest.TestCase):
+     def test_permute_unique(self):
+         nums1 = [1, 1, 2]
+         answer1 = [[2, 1, 1], [1, 2, 1], [1, 1, 2]]
+-        self.assertEqual(sorted(permute_unique(nums1)), sorted(answer1))
++        self.assertEqual(sorted(list(permute_unique(nums1))), sorted(answer1))
+ 
+         nums2 = [1, 2, 1, 3]
+         answer2 = [
+@@ -333,11 +333,11 @@ class TestPermuteUnique(unittest.TestCase):
+             [1, 1, 3, 2],
+             [1, 1, 2, 3],
+         ]
+-        self.assertEqual(sorted(permute_unique(nums2)), sorted(answer2))
++        self.assertEqual(sorted(list(permute_unique(nums2))), sorted(answer2))
+ 
+         nums3 = [1, 2, 3]
+         answer3 = [[3, 2, 1], [2, 3, 1], [2, 1, 3], [3, 1, 2], [1, 3, 2], [1, 2, 3]]
+-        self.assertEqual(sorted(permute_unique(nums3)), sorted(answer3))
++        self.assertEqual(sorted(list(permute_unique(nums3))), sorted(answer3))
+ 
+ 
+ class TestPermute(unittest.TestCase):
+@@ -369,11 +369,11 @@ class TestPermute(unittest.TestCase):
+             [4, 3, 1, 2],
+             [4, 3, 2, 1],
+         ]
+-        self.assertEqual(sorted(permute(nums1)), sorted(answer1))
++        self.assertEqual(sorted(list(permute(nums1))), sorted(answer1))
+ 
+         nums2 = [1, 2, 3]
+         answer2 = [[3, 2, 1], [2, 3, 1], [2, 1, 3], [3, 1, 2], [1, 3, 2], [1, 2, 3]]
+-        self.assertEqual(sorted(permute(nums2)), sorted(answer2))
++        self.assertEqual(sorted(list(permute(nums2))), sorted(answer2))
+ 
+     def test_permute_recursive(self):
+         nums1 = [1, 2, 3, 4]
+@@ -403,18 +403,18 @@ class TestPermute(unittest.TestCase):
+             [4, 3, 1, 2],
+             [4, 3, 2, 1],
+         ]
+-        self.assertEqual(sorted(permute_recursive(nums1)), sorted(answer1))
++        self.assertEqual(sorted(list(permute_recursive(nums1))), sorted(answer1))
+ 
+         nums2 = [1, 2, 3]
+         answer2 = [[3, 2, 1], [2, 3, 1], [2, 1, 3], [3, 1, 2], [1, 3, 2], [1, 2, 3]]
+-        self.assertEqual(sorted(permute_recursive(nums2)), sorted(answer2))
++        self.assertEqual(sorted(list(permute_recursive(nums2))), sorted(answer2))
+ 
+ 
+ class TestSubsetsUnique(unittest.TestCase):
+     def test_subsets_unique(self):
+         nums1 = [1, 2, 2]
+         answer1 = [(1, 2), (1,), (1, 2, 2), (2,), (), (2, 2)]
+-        self.assertEqual(sorted(subsets_unique(nums1)), sorted(answer1))
++        self.assertEqual(sorted(list(subsets_unique(nums1))), sorted(answer1))
+ 
+         nums2 = [1, 2, 3, 4]
+         answer2 = [
+@@ -435,14 +435,14 @@ class TestSubsetsUnique(unittest.TestCase):
+             (3, 4),
+             (2, 4),
+         ]
+-        self.assertEqual(sorted(subsets_unique(nums2)), sorted(answer2))
++        self.assertEqual(sorted(list(subsets_unique(nums2))), sorted(answer2))
+ 
+ 
+ class TestSubsets(unittest.TestCase):
+     def test_subsets(self):
+         nums1 = [1, 2, 3]
+         answer1 = [[1, 2, 3], [1, 2], [1, 3], [1], [2, 3], [2], [3], []]
+-        self.assertEqual(sorted(subsets(nums1)), sorted(answer1))
++        self.assertEqual(sorted(list(subsets(nums1))), sorted(answer1))
+ 
+         nums2 = [1, 2, 3, 4]
+         answer2 = [
+@@ -463,12 +463,12 @@ class TestSubsets(unittest.TestCase):
+             [4],
+             [],
+         ]
+-        self.assertEqual(sorted(subsets(nums2)), sorted(answer2))
++        self.assertEqual(sorted(list(subsets(nums2))), sorted(answer2))
+ 
+     def test_subsets_v2(self):
+         nums1 = [1, 2, 3]
+         answer1 = [[1, 2, 3], [1, 2], [1, 3], [1], [2, 3], [2], [3], []]
+-        self.assertEqual(sorted(subsets_v2(nums1)), sorted(answer1))
++        self.assertEqual(sorted(list(subsets_v2(nums1))), sorted(answer1))
+ 
+         nums2 = [1, 2, 3, 4]
+         answer2 = [
+@@ -489,7 +489,7 @@ class TestSubsets(unittest.TestCase):
+             [4],
+             [],
+         ]
+-        self.assertEqual(sorted(subsets_v2(nums2)), sorted(answer2))
++        self.assertEqual(sorted(list(subsets_v2(nums2))), sorted(answer2))
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_bit_manipulation.py b/tests/test_bit_manipulation.py
+index 12b5206..a53d820 100644
+--- a/tests/test_bit_manipulation.py
++++ b/tests/test_bit_manipulation.py
+@@ -165,12 +165,12 @@ class TestSuite(unittest.TestCase):
+     def test_subsets(self):
+ 
+         self.assertSetEqual(
+-            subsets([1, 2, 3]),
++            set(subsets([1, 2, 3])),
+             {(), (1,), (2,), (3,), (1, 2), (1, 3), (2, 3), (1, 2, 3)},
+         )
+ 
+         self.assertSetEqual(
+-            subsets([10, 20, 30, 40]),
++            set(subsets([10, 20, 30, 40])),
+             {
+                 (10, 40),
+                 (10, 20, 40),
+diff --git a/tests/test_graph.py b/tests/test_graph.py
+index 0575442..0ccee79 100644
+--- a/tests/test_graph.py
++++ b/tests/test_graph.py
+@@ -463,19 +463,19 @@ class TestAllFactors(unittest.TestCase):
+     def test_get_factors(self):
+         self.assertEqual(
+             [[2, 16], [2, 2, 8], [2, 2, 2, 4], [2, 2, 2, 2, 2], [2, 4, 4], [4, 8]],
+-            get_factors(32),
++            list(get_factors(32)),
+         )
+ 
+     def test_get_factors_iterative1(self):
+         self.assertEqual(
+             [[2, 16], [4, 8], [2, 2, 8], [2, 4, 4], [2, 2, 2, 4], [2, 2, 2, 2, 2]],
+-            get_factors_iterative1(32),
++            list(get_factors_iterative1(32)),
+         )
+ 
+     def test_get_factors_iterative2(self):
+         self.assertEqual(
+             [[2, 2, 2, 2, 2], [2, 2, 2, 4], [2, 2, 8], [2, 4, 4], [2, 16], [4, 8]],
+-            get_factors_iterative2(32),
++            list(get_factors_iterative2(32)),
+         )
+ 
+ 
+diff --git a/tests/test_heap.py b/tests/test_heap.py
+index 909f314..202869e 100644
+--- a/tests/test_heap.py
++++ b/tests/test_heap.py
+@@ -43,7 +43,7 @@ class TestSuite(unittest.TestCase):
+ 
+     def test_max_sliding_window(self):
+         nums = [1, 3, -1, -3, 5, 3, 6, 7]
+-        self.assertEqual([3, 3, 5, 5, 6, 7], max_sliding_window(nums, 3))
++        self.assertEqual([3, 3, 5, 5, 6, 7], list(max_sliding_window(nums, 3)))
+ 
+     def test_k_closest_points(self):
+         points = [(1, 0), (2, 3), (5, 2), (1, 1), (2, 8), (10, 2), (-1, 0), (-2, -2)]
+diff --git a/tests/test_issue_fixes.py b/tests/test_issue_fixes.py
+index 9d66654..3ab140b 100644
+--- a/tests/test_issue_fixes.py
++++ b/tests/test_issue_fixes.py
+@@ -124,10 +124,10 @@ class TestBinaryTreeViews(unittest.TestCase):
+         )
+ 
+     def test_left_view(self):
+-        self.assertEqual(left_view(self.root), [1, 2, 4])
++        self.assertEqual(list(left_view(self.root)), [1, 2, 4])
+ 
+     def test_right_view(self):
+-        self.assertEqual(right_view(self.root), [1, 3, 6])
++        self.assertEqual(list(right_view(self.root)), [1, 3, 6])
+ 
+     def test_top_view(self):
+         self.assertEqual(top_view(self.root), [4, 2, 1, 3, 6])
+@@ -136,15 +136,15 @@ class TestBinaryTreeViews(unittest.TestCase):
+         self.assertEqual(bottom_view(self.root), [4, 2, 5, 3, 6])
+ 
+     def test_empty_tree(self):
+-        self.assertEqual(left_view(None), [])
+-        self.assertEqual(right_view(None), [])
++        self.assertEqual(list(left_view(None)), [])
++        self.assertEqual(list(right_view(None)), [])
+         self.assertEqual(top_view(None), [])
+         self.assertEqual(bottom_view(None), [])
+ 
+     def test_single_node(self):
+         root = TreeNode(42)
+-        self.assertEqual(left_view(root), [42])
+-        self.assertEqual(right_view(root), [42])
++        self.assertEqual(list(left_view(root)), [42])
++        self.assertEqual(list(right_view(root)), [42])
+         self.assertEqual(top_view(root), [42])
+         self.assertEqual(bottom_view(root), [42])
+ 
+@@ -157,8 +157,8 @@ class TestBinaryTreeViews(unittest.TestCase):
+         3
+         """
+         root = TreeNode(1, TreeNode(2, TreeNode(3)))
+-        self.assertEqual(left_view(root), [1, 2, 3])
+-        self.assertEqual(right_view(root), [1, 2, 3])
++        self.assertEqual(list(left_view(root)), [1, 2, 3])
++        self.assertEqual(list(right_view(root)), [1, 2, 3])
+ 
+     def test_right_skewed(self):
+         """
+@@ -169,8 +169,8 @@ class TestBinaryTreeViews(unittest.TestCase):
+             3
+         """
+         root = TreeNode(1, None, TreeNode(2, None, TreeNode(3)))
+-        self.assertEqual(left_view(root), [1, 2, 3])
+-        self.assertEqual(right_view(root), [1, 2, 3])
++        self.assertEqual(list(left_view(root)), [1, 2, 3])
++        self.assertEqual(list(right_view(root)), [1, 2, 3])
+ 
+ 
+ # ── Square root decomposition (#651) ────────────────────────────────────
+diff --git a/tests/test_lazy_golden.py b/tests/test_lazy_golden.py
+new file mode 100644
+index 0000000..d029776
+--- /dev/null
++++ b/tests/test_lazy_golden.py
+@@ -0,0 +1,524 @@
++"""Golden content table for lazily-converted enumeration APIs.
++
++Each case pins the exact item sequence (content and, where the
++historical order was deterministic, order) that the lazy iterator
++must produce, captured from the pre-conversion implementations.
++"""
++
++from __future__ import annotations
++
++import importlib
++import unittest
++
++
++# (module, function, args, expected, order_matters)
++GOLDEN_CASES = [
++    (
++        'algorithms.backtracking.subsets',
++        'subsets',
++        ([1, 2, 3],),
++        [[1, 2, 3], [1, 2], [1, 3], [1], [2, 3], [2], [3], []],
++        True,
++    ),
++    (
++        'algorithms.backtracking.subsets',
++        'subsets',
++        ([],),
++        [[]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.subsets',
++        'subsets',
++        ([5],),
++        [[5], []],
++        True,
++    ),
++    (
++        'algorithms.backtracking.subsets',
++        'subsets_v2',
++        ([1, 2, 3],),
++        [[], [1], [2], [1, 2], [3], [1, 3], [2, 3], [1, 2, 3]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.subsets_unique',
++        'subsets_unique',
++        ([1, 2, 2],),
++        [[], [1], [1, 2], [1, 2, 2], [2], [2, 2]],
++        False,
++    ),
++    (
++        'algorithms.backtracking.combination_sum',
++        'combination_sum',
++        ([2, 3, 6, 7], 7),
++        [[2, 2, 3], [7]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.combination_sum',
++        'combination_sum',
++        ([2, 3, 5], 8),
++        [[2, 2, 2, 2], [2, 3, 3], [3, 5]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.combination_sum',
++        'combination_sum',
++        ([2], 1),
++        [],
++        True,
++    ),
++    (
++        'algorithms.backtracking.generate_parenthesis',
++        'generate_parenthesis_v1',
++        (3,),
++        ['()()()', '()(())', '(())()', '(()())', '((()))'],
++        True,
++    ),
++    (
++        'algorithms.backtracking.generate_parenthesis',
++        'generate_parenthesis_v2',
++        (3,),
++        ['((()))', '(()())', '(())()', '()(())', '()()()'],
++        True,
++    ),
++    (
++        'algorithms.backtracking.generate_parenthesis',
++        'generate_parenthesis_v1',
++        (1,),
++        ['()'],
++        True,
++    ),
++    (
++        'algorithms.backtracking.generate_abbreviations',
++        'generate_abbreviations',
++        ('word',),
++        ['word', 'wor1', 'wo1d', 'wo2', 'w1rd', 'w1r1', 'w2d', 'w3', '1ord', '1or1', '1o1d', '1o2', '2rd', '2r1', '3d', '4'],
++        True,
++    ),
++    (
++        'algorithms.backtracking.add_operators',
++        'add_operators',
++        ('123', 6),
++        ['1+2+3', '1*2*3'],
++        True,
++    ),
++    (
++        'algorithms.backtracking.add_operators',
++        'add_operators',
++        ('232', 8),
++        ['2+3*2', '2*3+2'],
++        True,
++    ),
++    (
++        'algorithms.backtracking.array_sum_combinations',
++        'array_sum_combinations',
++        ([1, 2], [2, 3], [3, 4], 6),
++        [[1, 2, 3]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.array_sum_combinations',
++        'unique_array_sum_combinations',
++        ([1, 2], [2, 3], [3, 4], 6),
++        [[1, 2, 3]],
++        False,
++    ),
++    (
++        'algorithms.backtracking.factor_combinations',
++        'get_factors',
++        (32,),
++        [[2, 16], [4, 8], [2, 2, 8], [2, 4, 4], [2, 2, 2, 4], [2, 2, 2, 2, 2]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.factor_combinations',
++        'recursive_get_factors',
++        (32,),
++        [[2, 16], [2, 2, 8], [2, 2, 2, 4], [2, 2, 2, 2, 2], [2, 4, 4], [4, 8]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.find_words',
++        'find_words',
++        ([['o', 'a', 'a', 'n'], ['e', 't', 'a', 'e'], ['i', 'h', 'k', 'r'], ['i', 'f', 'l', 'v']], ['oath', 'pea', 'eat', 'rain']),
++        ['eat', 'oath'],
++        False,
++    ),
++    (
++        'algorithms.backtracking.letter_combination',
++        'letter_combinations',
++        ('23',),
++        ['ad', 'ae', 'af', 'bd', 'be', 'bf', 'cd', 'ce', 'cf'],
++        True,
++    ),
++    (
++        'algorithms.backtracking.letter_combination',
++        'letter_combinations',
++        ('',),
++        [],
++        True,
++    ),
++    (
++        'algorithms.backtracking.permute',
++        'permute',
++        ([1, 2, 3],),
++        [[1, 2, 3], [2, 1, 3], [2, 3, 1], [1, 3, 2], [3, 1, 2], [3, 2, 1]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.permute',
++        'permute',
++        ('ab',),
++        ['ab', 'ba'],
++        True,
++    ),
++    (
++        'algorithms.backtracking.permute',
++        'permute',
++        ([7],),
++        [[7]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.permute',
++        'permute_recursive',
++        ([1, 2, 3],),
++        [[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.permute',
++        'permute_iter',
++        ([1, 2],),
++        [[1, 2], [2, 1]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.permute_unique',
++        'permute_unique',
++        ([1, 1, 2],),
++        [[2, 1, 1], [1, 2, 1], [1, 1, 2]],
++        True,
++    ),
++    (
++        'algorithms.backtracking.palindrome_partitioning',
++        'palindromic_substrings',
++        ('aab',),
++        [['aa', 'b'], ['a', 'a', 'b']],
++        True,
++    ),
++    (
++        'algorithms.backtracking.palindrome_partitioning',
++        'palindromic_substrings_iter',
++        ('aab',),
++        [['aa', 'b'], ['a', 'a', 'b']],
++        True,
++    ),
++    (
++        'algorithms.array.missing_ranges',
++        'missing_ranges',
++        ([0, 1, 3, 50, 75], 0, 99),
++        [[2, 2], [4, 49], [51, 74], [76, 99]],
++        True,
++    ),
++    (
++        'algorithms.array.missing_ranges',
++        'missing_ranges',
++        ([], 1, 5),
++        [[1, 5]],
++        True,
++    ),
++    (
++        'algorithms.array.summarize_ranges',
++        'summarize_ranges',
++        ([0, 1, 2, 4, 5, 7],),
++        [[0, 2], [4, 5], [7, 7]],
++        True,
++    ),
++    (
++        'algorithms.array.summarize_ranges',
++        'summarize_ranges',
++        ([],),
++        [],
++        True,
++    ),
++    (
++        'algorithms.array.summarize_ranges',
++        'summarize_ranges',
++        ([5],),
++        [[5, 5]],
++        True,
++    ),
++    (
++        'algorithms.array.delete_nth',
++        'delete_nth',
++        ([1, 2, 3, 1, 2, 1, 2, 3], 2),
++        [1, 2, 3, 1, 2, 3],
++        True,
++    ),
++    (
++        'algorithms.array.delete_nth',
++        'delete_nth_naive',
++        ([1, 2, 3, 1, 2, 1, 2, 3], 2),
++        [1, 2, 3, 1, 2, 3],
++        True,
++    ),
++    (
++        'algorithms.array.three_sum',
++        'three_sum',
++        ([-1, 0, 1, 2, -1, -4],),
++        [[-1, -1, 2], [-1, 0, 1]],
++        False,
++    ),
++    (
++        'algorithms.array.three_sum',
++        'three_sum',
++        ([-1, 3, 1, 2, -1, -4, -2],),
++        [[-4, 1, 3], [-2, -1, 3], [-1, -1, 2]],
++        False,
++    ),
++    (
++        'algorithms.array.limit',
++        'limit',
++        ([1, 2, 3, 4, 5],),
++        [1, 2, 3, 4, 5],
++        True,
++    ),
++    (
++        'algorithms.array.limit',
++        'limit',
++        ([1, 2, 3, 4, 5], 2, 4),
++        [2, 3, 4],
++        True,
++    ),
++    (
++        'algorithms.string.fizzbuzz',
++        'fizzbuzz',
++        (15,),
++        [1, 2, 'Fizz', 4, 'Buzz', 'Fizz', 7, 8, 'Fizz', 'Buzz', 11, 'Fizz', 13, 14, 'FizzBuzz'],
++        True,
++    ),
++    (
++        'algorithms.string.fizzbuzz',
++        'fizzbuzz_with_helper_func',
++        (15,),
++        [1, 2, 'Fizz', 4, 'Buzz', 'Fizz', 7, 8, 'Fizz', 'Buzz', 11, 'Fizz', 13, 14, 'FizzBuzz'],
++        True,
++    ),
++    (
++        'algorithms.string.word_squares',
++        'word_squares',
++        (['area', 'lead', 'wall', 'lady', 'ball'],),
++        [['wall', 'area', 'lead', 'lady'], ['ball', 'area', 'lead', 'lady']],
++        True,
++    ),
++    (
++        'algorithms.string.breaking_bad',
++        'match_symbol',
++        (['Amazon', 'Microsoft', 'Google'], ['i', 'Am', 'cro', 'le', 'abc']),
++        ['M[i]crosoft', '[Am]azon', 'Mi[cro]soft', 'Goog[le]'],
++        True,
++    ),
++    (
++        'algorithms.string.breaking_bad',
++        'match_symbol_1',
++        (['Amazon', 'Microsoft', 'Google'], ['i', 'Am', 'cro', 'le', 'abc']),
++        ['[Am]azon', 'Mi[cro]soft', 'Goog[le]'],
++        True,
++    ),
++    (
++        'algorithms.matrix.spiral_traversal',
++        'spiral_traversal',
++        ([[1, 2, 3], [4, 5, 6], [7, 8, 9]],),
++        [1, 2, 3, 6, 9, 8, 7, 4, 5],
++        True,
++    ),
++    (
++        'algorithms.matrix.spiral_traversal',
++        'spiral_traversal',
++        ([[1, 2, 3, 4]],),
++        [1, 2, 3, 4],
++        True,
++    ),
++    (
++        'algorithms.matrix.spiral_traversal',
++        'spiral_traversal',
++        ([[1], [2], [3]],),
++        [1, 2, 3],
++        True,
++    ),
++    (
++        'algorithms.matrix.spiral_traversal',
++        'spiral_traversal',
++        ([],),
++        [],
++        True,
++    ),
++    (
++        'algorithms.heap.sliding_window_max',
++        'max_sliding_window',
++        ([1, 3, -1, -3, 5, 3, 6, 7], 3),
++        [3, 3, 5, 5, 6, 7],
++        True,
++    ),
++    (
++        'algorithms.heap.sliding_window_max',
++        'max_sliding_window',
++        ([2, 1, 5], 1),
++        [2, 1, 5],
++        True,
++    ),
++    (
++        'algorithms.queue.max_sliding_window',
++        'max_sliding_window',
++        ([1, 3, -1, -3, 5, 3, 6, 7], 3),
++        [3, 3, 5, 5, 6, 7],
++        True,
++    ),
++    (
++        'algorithms.queue.max_sliding_window',
++        'max_sliding_window',
++        ([2, 1, 5], 1),
++        [2, 1, 5],
++        True,
++    ),
++    (
++        'algorithms.graph.all_factors',
++        'get_factors',
++        (60,),
++        [[2, 30], [2, 2, 15], [2, 2, 3, 5], [2, 3, 10], [2, 5, 6], [3, 20], [3, 4, 5], [4, 15], [5, 12], [6, 10]],
++        True,
++    ),
++    (
++        'algorithms.graph.all_factors',
++        'get_factors_iterative1',
++        (60,),
++        [[2, 30], [3, 20], [4, 15], [5, 12], [6, 10], [3, 4, 5], [2, 2, 15], [2, 3, 10], [2, 5, 6], [2, 2, 3, 5]],
++        True,
++    ),
++    (
++        'algorithms.graph.all_factors',
++        'get_factors_iterative2',
++        (60,),
++        [[2, 2, 3, 5], [2, 2, 15], [2, 3, 10], [2, 5, 6], [2, 30], [3, 4, 5], [3, 20], [4, 15], [5, 12], [6, 10]],
++        True,
++    ),
++    (
++        'algorithms.math.generate_strobogrammtic',
++        'gen_strobogrammatic',
++        (1,),
++        ['1', '0', '8'],
++        True,
++    ),
++    (
++        'algorithms.math.generate_strobogrammtic',
++        'gen_strobogrammatic',
++        (2,),
++        ['88', '11', '96', '69'],
++        True,
++    ),
++    (
++        'algorithms.math.generate_strobogrammtic',
++        'gen_strobogrammatic',
++        (3,),
++        ['818', '111', '916', '619', '808', '101', '906', '609', '888', '181', '986', '689'],
++        True,
++    ),
++    (
++        'algorithms.set.find_keyboard_row',
++        'find_keyboard_row',
++        (['Hello', 'Alaska', 'Dad', 'Peace'],),
++        ['Alaska', 'Dad'],
++        True,
++    ),
++    (
++        'algorithms.backtracking.permute',
++        'permute',
++        ('abc',),
++        ['abc', 'bac', 'bca', 'acb', 'cab', 'cba'],
++        True,
++    ),
++    (
++        'algorithms.backtracking.subsets',
++        'subsets_v2',
++        ([2, 4, 6],),
++        [[], [2], [4], [2, 4], [6], [2, 6], [4, 6], [2, 4, 6]],
++        True,
++    ),
++    (
++        'algorithms.array.summarize_ranges',
++        'summarize_ranges',
++        ([-5, -4, -3, 1, 2, 4, 5, 6],),
++        [[-5, -3], [1, 2], [4, 6]],
++        True,
++    ),
++    (
++        'algorithms.array.missing_ranges',
++        'missing_ranges',
++        ([3, 5, 10, 11, 12, 15, 19], 0, 20),
++        [[0, 2], [4, 4], [6, 9], [13, 14], [16, 18], [20, 20]],
++        True,
++    ),
++    (
++        'algorithms.queue.max_sliding_window',
++        'max_sliding_window',
++        ([1, 3, -1, -3, 5, 3, 6, 7], 5),
++        [5, 5, 6, 7],
++        True,
++    ),
++    (
++        'algorithms.queue.max_sliding_window',
++        'max_sliding_window',
++        ([1, 3, -1, -3, 5, 3, 6, 7], 7),
++        [6, 7],
++        True,
++    ),
++    (
++        'algorithms.queue.max_sliding_window',
++        'max_sliding_window',
++        ([8, 5, 10, 7, 9, 4, 15, 12, 90, 13], 4),
++        [10, 10, 10, 15, 15, 90, 90],
++        True,
++    ),
++    (
++        'algorithms.heap.sliding_window_max',
++        'max_sliding_window',
++        ([8, 5, 10, 7, 9, 4, 15, 12, 90, 13], 2),
++        [8, 10, 10, 9, 9, 15, 15, 90, 90],
++        True,
++    ),]
++
++
++class TestGoldenContent(unittest.TestCase):
++    def test_lazy_iterator_and_content(self):
++        for module_name, func_name, args, expected, ordered in GOLDEN_CASES:
++            with self.subTest(api=f"{module_name}.{func_name}"):
++                func = getattr(importlib.import_module(module_name), func_name)
++                result = func(*args)
++                self.assertNotIsInstance(
++                    result, (list, tuple, set, frozenset, dict, str),
++                    "expected a lazy iterator, not a materialized container",
++                )
++                self.assertIs(iter(result), result, 'expected a single-pass iterator')
++                actual = list(result)
++                def canon(items):
++                    normalized = [
++                        tuple(item) if isinstance(item, list) else item
++                        for item in items
++                    ]
++                    return sorted(map(repr, normalized))
++
++                if ordered:
++                    self.assertEqual(
++                        [tuple(item) if isinstance(item, list) else item for item in actual],
++                        [tuple(item) if isinstance(item, list) else item for item in expected],
++                    )
++                else:
++                    self.assertEqual(canon(actual), canon(expected))
++                self.assertEqual(list(result), [], "iterator must be exhausted")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_lazy_iteration.py b/tests/test_lazy_iteration.py
+new file mode 100644
+index 0000000..14196b0
+--- /dev/null
++++ b/tests/test_lazy_iteration.py
+@@ -0,0 +1,1009 @@
++"""Contract tests for the library-wide lazy iteration convention.
++
++Enumeration-style public APIs (functions that produce multiple independent
++result items, where the first item can be computed without computing all
++of them) return single-pass lazy iterators. This module pins down the
++contract:
++
++1. The return value is a single-pass iterator: ``iter(r) is r`` and it is
++   not a materialized container (list / tuple / set / dict).
++2. The yielded items match the historical content and order exactly.
++3. Results are produced lazily: the first item is available without
++   computing the whole result set.
++4. APIs whose first result inherently requires the whole computation
++   (sorting, global selection, grouping) keep returning materialized
++   containers.
++"""
++
++from __future__ import annotations
++
++import time
++import unittest
++
++from algorithms.array.delete_nth import delete_nth, delete_nth_naive
++from algorithms.array.flatten import flatten, flatten_iter
++from algorithms.array.limit import limit
++from algorithms.array.merge_intervals import merge_intervals
++from algorithms.array.missing_ranges import missing_ranges
++from algorithms.array.summarize_ranges import summarize_ranges
++from algorithms.array.three_sum import three_sum
++from algorithms.array.top_1 import top_1
++from algorithms.backtracking.add_operators import add_operators
++from algorithms.backtracking.array_sum_combinations import (
++    array_sum_combinations,
++    unique_array_sum_combinations,
++)
++from algorithms.backtracking.combination_sum import combination_sum
++from algorithms.backtracking.factor_combinations import (
++    get_factors,
++    recursive_get_factors,
++)
++from algorithms.backtracking.find_words import find_words
++from algorithms.backtracking.generate_abbreviations import generate_abbreviations
++from algorithms.backtracking.generate_parenthesis import (
++    generate_parenthesis_v1,
++    generate_parenthesis_v2,
++)
++from algorithms.backtracking.letter_combination import letter_combinations
++from algorithms.backtracking.palindrome_partitioning import (
++    palindromic_substrings,
++    palindromic_substrings_iter,
++)
++from algorithms.backtracking.permute import permute, permute_iter, permute_recursive
++from algorithms.backtracking.permute_unique import permute_unique
++from algorithms.backtracking.subsets import subsets, subsets_v2
++from algorithms.backtracking.subsets_unique import subsets_unique
++from algorithms.bit_manipulation.subsets import subsets as bit_subsets
++from algorithms.graph.all_factors import (
++    get_factors as graph_get_factors,
++    get_factors_iterative1,
++    get_factors_iterative2,
++)
++from algorithms.graph.find_all_cliques import find_all_cliques
++from algorithms.heap.k_closest_points import k_closest
++from algorithms.heap.sliding_window_max import (
++    max_sliding_window as heap_max_sliding_window,
++)
++from algorithms.math.generate_strobogrammtic import gen_strobogrammatic
++from algorithms.matrix.spiral_traversal import spiral_traversal
++from algorithms.set.find_keyboard_row import find_keyboard_row
++from algorithms.queue.max_sliding_window import (
++    max_sliding_window as queue_max_sliding_window,
++)
++from algorithms.sorting.merge_sort import merge_sort
++from algorithms.sorting.quick_sort import quick_sort
++from algorithms.string.breaking_bad import match_symbol, match_symbol_1
++from algorithms.string.fizzbuzz import fizzbuzz, fizzbuzz_with_helper_func
++from algorithms.string.group_anagrams import group_anagrams
++from algorithms.string.word_squares import word_squares
++from algorithms.tree.binary_tree_paths import binary_tree_paths
++from algorithms.tree.binary_tree_views import (
++    bottom_view,
++    left_view,
++    right_view,
++    top_view,
++)
++from algorithms.tree.path_sum2 import path_sum, path_sum2, path_sum3
++from algorithms.tree.traversal_inorder import inorder, inorder_rec
++from algorithms.tree.traversal_level_order import level_order
++from algorithms.tree.traversal_postorder import postorder, postorder_rec
++from algorithms.tree.traversal_preorder import preorder, preorder_rec
++from algorithms.tree.traversal_zigzag import zigzag_level
++
++
++def build_sample_tree():
++    r"""Build the shared sample tree used across traversal tests.
++
++            1
++           / \
++          2   3
++         / \   \
++        4   5   6
++           /
++          7
++    """
++    from algorithms.common.tree_node import TreeNode
++
++    def node(val, left=None, right=None):
++        item = TreeNode(val)
++        item.left = left
++        item.right = right
++        return item
++
++    return node(1, node(2, node(4), node(5, node(7))), node(3, None, node(6)))
++
++
++def build_view_tree():
++    r"""Build the asymmetric tree used for the view functions.
++
++            1
++           / \
++          2   3
++           \ / \
++           4 5  6
++    """
++    from algorithms.common.tree_node import TreeNode
++
++    def node(val, left=None, right=None):
++        item = TreeNode(val)
++        item.left = left
++        item.right = right
++        return item
++
++    return node(1, node(2, None, node(4)), node(3, node(5), node(6)))
++
++
++class IteratorContractMixin:
++    """Shared assertions for the single-pass lazy iterator contract."""
++
++    def assert_lazy_iterator(self, value):
++        self.assertNotIsInstance(value, (list, tuple, set, frozenset, dict, str))
++        self.assertIs(iter(value), value, "expected a single-pass iterator")
++
++    def assert_sequence(self, func, args, expected, kwargs=None):
++        result = func(*args, **(kwargs or {}))
++        self.assert_lazy_iterator(result)
++        self.assertEqual(list(result), list(expected))
++        self.assertEqual(list(result), [], "iterator must be exhausted")
++
++
++class TestSubsetsLazy(IteratorContractMixin, unittest.TestCase):
++    def test_subsets_content_and_order(self):
++        self.assert_sequence(
++            subsets,
++            ([1, 2, 3],),
++            [[1, 2, 3], [1, 2], [1, 3], [1], [2, 3], [2], [3], []],
++        )
++
++    def test_subsets_empty(self):
++        self.assert_sequence(subsets, ([],), [[]])
++
++    def test_subsets_single(self):
++        self.assert_sequence(subsets, ([5],), [[5], []])
++
++    def test_subsets_v2_content_and_order(self):
++        self.assert_sequence(
++            subsets_v2,
++            ([1, 2, 3],),
++            [[], [1], [2], [1, 2], [3], [1, 3], [2, 3], [1, 2, 3]],
++        )
++
++    def test_subsets_unique(self):
++        result = subsets_unique([1, 2, 2])
++        self.assert_lazy_iterator(result)
++        self.assertEqual(
++            sorted(result), [(), (1,), (1, 2), (1, 2, 2), (2,), (2, 2)]
++        )
++
++    def test_bit_subsets(self):
++        result = bit_subsets([1, 2, 3])
++        self.assert_lazy_iterator(result)
++        self.assertEqual(
++            set(result),
++            {(), (1,), (2,), (3,), (1, 2), (1, 3), (2, 3), (1, 2, 3)},
++        )
++
++
++class TestCombinationSumLazy(IteratorContractMixin, unittest.TestCase):
++    def test_target_seven(self):
++        self.assert_sequence(combination_sum, ([2, 3, 6, 7], 7), [[2, 2, 3], [7]])
++
++    def test_target_eight(self):
++        self.assert_sequence(
++            combination_sum,
++            ([2, 3, 5], 8),
++            [[2, 2, 2, 2], [2, 3, 3], [3, 5]],
++        )
++
++    def test_no_combination(self):
++        self.assert_sequence(combination_sum, ([2], 1), [])
++
++
++class TestGenerateParenthesisLazy(IteratorContractMixin, unittest.TestCase):
++    def test_v1_order(self):
++        self.assert_sequence(
++            generate_parenthesis_v1,
++            (3,),
++            ["()()()", "()(())", "(())()", "(()())", "((()))"],
++        )
++
++    def test_v2_order(self):
++        self.assert_sequence(
++            generate_parenthesis_v2,
++            (3,),
++            ["((()))", "(()())", "(())()", "()(())", "()()()"],
++        )
++
++    def test_v1_single_pair(self):
++        self.assert_sequence(generate_parenthesis_v1, (1,), ["()"])
++
++
++class TestGenerateAbbreviationsLazy(IteratorContractMixin, unittest.TestCase):
++    def test_word(self):
++        self.assert_sequence(
++            generate_abbreviations,
++            ("word",),
++            [
++                "word", "wor1", "wo1d", "wo2",
++                "w1rd", "w1r1", "w2d", "w3",
++                "1ord", "1or1", "1o1d", "1o2",
++                "2rd", "2r1", "3d", "4",
++            ],
++        )
++
++
++class TestAddOperatorsLazy(IteratorContractMixin, unittest.TestCase):
++    def test_basic(self):
++        self.assert_sequence(add_operators, ("123", 6), ["1+2+3", "1*2*3"])
++
++    def test_second(self):
++        self.assert_sequence(add_operators, ("232", 8), ["2+3*2", "2*3+2"])
++
++    def test_empty_digits(self):
++        self.assert_sequence(add_operators, ("", 0), [])
++
++
++class TestArraySumCombinationsLazy(IteratorContractMixin, unittest.TestCase):
++    def test_basic(self):
++        self.assert_sequence(
++            array_sum_combinations, ([1, 2], [2, 3], [3, 4], 6), [[1, 2, 3]]
++        )
++
++    def test_unique(self):
++        result = unique_array_sum_combinations([1, 2], [2, 3], [3, 4], 6)
++        self.assert_lazy_iterator(result)
++        self.assertEqual(sorted(result), [(1, 2, 3)])
++
++
++class TestFactorCombinationsLazy(IteratorContractMixin, unittest.TestCase):
++    def test_get_factors_order(self):
++        self.assert_sequence(
++            get_factors,
++            (32,),
++            [[2, 16], [4, 8], [2, 2, 8], [2, 4, 4], [2, 2, 2, 4], [2, 2, 2, 2, 2]],
++        )
++
++    def test_recursive_get_factors_order(self):
++        self.assert_sequence(
++            recursive_get_factors,
++            (32,),
++            [[2, 16], [2, 2, 8], [2, 2, 2, 4], [2, 2, 2, 2, 2], [2, 4, 4], [4, 8]],
++        )
++
++
++class TestFindWordsLazy(IteratorContractMixin, unittest.TestCase):
++    board = [
++        ["o", "a", "a", "n"],
++        ["e", "t", "a", "e"],
++        ["i", "h", "k", "r"],
++        ["i", "f", "l", "v"],
++    ]
++
++    def test_found_words(self):
++        result = find_words(self.board, ["oath", "pea", "eat", "rain"])
++        self.assert_lazy_iterator(result)
++        self.assertEqual(sorted(result), ["eat", "oath"])
++
++    def test_no_match(self):
++        self.assert_sequence(find_words, (self.board, ["chicken", "nugget"]), [])
++
++    def test_empty_board(self):
++        self.assert_sequence(find_words, ([], []), [])
++
++
++class TestLetterCombinationsLazy(IteratorContractMixin, unittest.TestCase):
++    def test_two_digits(self):
++        self.assert_sequence(
++            letter_combinations,
++            ("23",),
++            ["ad", "ae", "af", "bd", "be", "bf", "cd", "ce", "cf"],
++        )
++
++    def test_empty(self):
++        self.assert_sequence(letter_combinations, ("",), [])
++
++
++class TestPermuteLazy(IteratorContractMixin, unittest.TestCase):
++    def test_list_input(self):
++        self.assert_sequence(
++            permute,
++            ([1, 2, 3],),
++            [[1, 2, 3], [2, 1, 3], [2, 3, 1], [1, 3, 2], [3, 1, 2], [3, 2, 1]],
++        )
++
++    def test_str_input(self):
++        self.assert_sequence(permute, ("ab",), ["ab", "ba"])
++
++    def test_single(self):
++        self.assert_sequence(permute, ([7],), [[7]])
++
++    def test_recursive(self):
++        self.assert_sequence(
++            permute_recursive,
++            ([1, 2, 3],),
++            [[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]],
++        )
++
++    def test_permute_iter_alias(self):
++        result = permute_iter([1, 2])
++        self.assert_lazy_iterator(result)
++        self.assertEqual(list(result), [[1, 2], [2, 1]])
++
++    def test_permute_unique(self):
++        result = permute_unique([1, 1, 2])
++        self.assert_lazy_iterator(result)
++        self.assertEqual(sorted(result), [[1, 1, 2], [1, 2, 1], [2, 1, 1]])
++
++
++class TestPalindromePartitioningLazy(IteratorContractMixin, unittest.TestCase):
++    def test_content(self):
++        self.assert_sequence(
++            palindromic_substrings, ("aab",), [["aa", "b"], ["a", "a", "b"]]
++        )
++
++    def test_iter_alias(self):
++        result = palindromic_substrings_iter("aab")
++        self.assert_lazy_iterator(result)
++        self.assertEqual(list(result), [["aa", "b"], ["a", "a", "b"]])
++
++
++class TestTreeTraversalLazy(IteratorContractMixin, unittest.TestCase):
++    def test_inorder(self):
++        self.assert_sequence(inorder, (build_sample_tree(),), [4, 2, 7, 5, 1, 3, 6])
++
++    def test_inorder_rec(self):
++        self.assert_sequence(
++            inorder_rec, (build_sample_tree(),), [4, 2, 7, 5, 1, 3, 6]
++        )
++
++    def test_preorder(self):
++        self.assert_sequence(
++            preorder, (build_sample_tree(),), [1, 2, 4, 5, 7, 3, 6]
++        )
++
++    def test_preorder_rec(self):
++        self.assert_sequence(
++            preorder_rec, (build_sample_tree(),), [1, 2, 4, 5, 7, 3, 6]
++        )
++
++    def test_postorder(self):
++        self.assert_sequence(
++            postorder, (build_sample_tree(),), [4, 7, 5, 2, 6, 3, 1]
++        )
++
++    def test_postorder_rec(self):
++        self.assert_sequence(
++            postorder_rec, (build_sample_tree(),), [4, 7, 5, 2, 6, 3, 1]
++        )
++
++    def test_empty_tree(self):
++        self.assert_sequence(inorder, (None,), [])
++        self.assert_sequence(preorder, (None,), [])
++        self.assert_sequence(postorder, (None,), [])
++
++    def test_legacy_accumulator_still_works(self):
++        acc = []
++        returned = inorder_rec(build_sample_tree(), acc)
++        self.assertIs(returned, acc)
++        self.assertEqual(acc, [4, 2, 7, 5, 1, 3, 6])
++        acc2 = [0]
++        preorder_rec(build_sample_tree(), acc2)
++        self.assertEqual(acc2, [0, 1, 2, 4, 5, 7, 3, 6])
++        acc3 = []
++        postorder_rec(build_sample_tree(), acc3)
++        self.assertEqual(acc3, [4, 7, 5, 2, 6, 3, 1])
++
++
++class TestLevelOrderLazy(IteratorContractMixin, unittest.TestCase):
++    def test_level_order(self):
++        self.assert_sequence(
++            level_order,
++            (build_sample_tree(),),
++            [[1], [2, 3], [4, 5, 6], [7]],
++        )
++
++    def test_level_order_empty(self):
++        self.assert_sequence(level_order, (None,), [])
++
++    def test_zigzag(self):
++        self.assert_sequence(
++            zigzag_level,
++            (build_sample_tree(),),
++            [[1], [3, 2], [4, 5, 6], [7]],
++        )
++
++
++class TestTreePathsLazy(IteratorContractMixin, unittest.TestCase):
++    def test_binary_tree_paths(self):
++        self.assert_sequence(
++            binary_tree_paths,
++            (build_sample_tree(),),
++            ["1->2->4", "1->2->5->7", "1->3->6"],
++        )
++
++    def test_binary_tree_paths_empty(self):
++        self.assert_sequence(binary_tree_paths, (None,), [])
++
++    def test_path_sum_variants(self):
++        expected = [[1, 2, 5, 7]]
++        self.assert_sequence(path_sum, (build_sample_tree(), 15), expected)
++        self.assert_sequence(path_sum2, (build_sample_tree(), 15), expected)
++        self.assert_sequence(path_sum3, (build_sample_tree(), 15), expected)
++
++    def test_path_sum_no_match(self):
++        self.assert_sequence(path_sum, (build_sample_tree(), 100), [])
++
++
++class TestTreeViewsLazy(IteratorContractMixin, unittest.TestCase):
++    def test_left_view(self):
++        self.assert_sequence(left_view, (build_view_tree(),), [1, 2, 4])
++
++    def test_right_view(self):
++        self.assert_sequence(right_view, (build_view_tree(),), [1, 3, 6])
++
++    def test_top_and_bottom_stay_materialized(self):
++        top = top_view(build_view_tree())
++        bottom = bottom_view(build_view_tree())
++        self.assertIsInstance(top, list)
++        self.assertIsInstance(bottom, list)
++        self.assertEqual(top, [2, 1, 3, 6])
++        self.assertEqual(bottom, [2, 5, 3, 6])
++
++
++class TestArrayLazy(IteratorContractMixin, unittest.TestCase):
++    def test_missing_ranges(self):
++        self.assert_sequence(
++            missing_ranges,
++            ([0, 1, 3, 50, 75], 0, 99),
++            [(2, 2), (4, 49), (51, 74), (76, 99)],
++        )
++
++    def test_missing_ranges_empty_array(self):
++        self.assert_sequence(missing_ranges, ([], 1, 5), [(1, 5)])
++
++    def test_summarize_ranges(self):
++        self.assert_sequence(
++            summarize_ranges, ([0, 1, 2, 4, 5, 7],), [(0, 2), (4, 5), (7, 7)]
++        )
++
++    def test_summarize_ranges_edge(self):
++        self.assert_sequence(summarize_ranges, ([],), [])
++        self.assert_sequence(summarize_ranges, ([5],), [(5, 5)])
++
++    def test_delete_nth(self):
++        self.assert_sequence(
++            delete_nth, ([1, 2, 3, 1, 2, 1, 2, 3], 2), [1, 2, 3, 1, 2, 3]
++        )
++
++    def test_delete_nth_naive(self):
++        self.assert_sequence(
++            delete_nth_naive, ([1, 2, 3, 1, 2, 1, 2, 3], 2), [1, 2, 3, 1, 2, 3]
++        )
++
++    def test_three_sum(self):
++        result = three_sum([-1, 0, 1, 2, -1, -4])
++        self.assert_lazy_iterator(result)
++        self.assertEqual(set(result), {(-1, 0, 1), (-1, -1, 2)})
++
++
++class TestStringLazy(IteratorContractMixin, unittest.TestCase):
++    expected_fizzbuzz_15 = [
++        1, 2, "Fizz", 4, "Buzz", "Fizz", 7, 8,
++        "Fizz", "Buzz", 11, "Fizz", 13, 14, "FizzBuzz",
++    ]
++
++    def test_fizzbuzz(self):
++        self.assert_sequence(fizzbuzz, (15,), self.expected_fizzbuzz_15)
++
++    def test_fizzbuzz_helper(self):
++        self.assert_sequence(
++            fizzbuzz_with_helper_func, (15,), self.expected_fizzbuzz_15
++        )
++
++    def test_fizzbuzz_validation_is_eager(self):
++        with self.assertRaises(ValueError):
++            fizzbuzz(0)
++        with self.assertRaises(ValueError):
++            fizzbuzz(-2)
++
++    def test_word_squares(self):
++        self.assert_sequence(
++            word_squares,
++            (["area", "lead", "wall", "lady", "ball"],),
++            [["wall", "area", "lead", "lady"], ["ball", "area", "lead", "lady"]],
++        )
++
++    def test_match_symbol(self):
++        words = ["Amazon", "Microsoft", "Google"]
++        symbols = ["i", "Am", "cro", "le", "abc"]
++        self.assert_sequence(
++            match_symbol,
++            (words, symbols),
++            ["M[i]crosoft", "[Am]azon", "Mi[cro]soft", "Goog[le]"],
++        )
++
++    def test_match_symbol_1(self):
++        words = ["Amazon", "Microsoft", "Google"]
++        symbols = ["i", "Am", "cro", "le", "abc"]
++        self.assert_sequence(
++            match_symbol_1,
++            (words, symbols),
++            ["[Am]azon", "Mi[cro]soft", "Goog[le]"],
++        )
++
++    def test_group_anagrams_stays_materialized(self):
++        result = group_anagrams(["eat", "tea", "tan", "ate", "nat", "bat"])
++        self.assertIsInstance(result, list)
++        self.assertEqual(result, [["eat", "tea", "ate"], ["tan", "nat"], ["bat"]])
++
++
++class TestMatrixLazy(IteratorContractMixin, unittest.TestCase):
++    def test_spiral_square(self):
++        self.assert_sequence(
++            spiral_traversal,
++            ([[1, 2, 3], [4, 5, 6], [7, 8, 9]],),
++            [1, 2, 3, 6, 9, 8, 7, 4, 5],
++        )
++
++    def test_spiral_single_row_and_col(self):
++        self.assert_sequence(spiral_traversal, ([[1, 2, 3, 4]],), [1, 2, 3, 4])
++        self.assert_sequence(spiral_traversal, ([[1], [2], [3]],), [1, 2, 3])
++
++    def test_spiral_empty(self):
++        self.assert_sequence(spiral_traversal, ([],), [])
++
++
++class TestSlidingWindowLazy(IteratorContractMixin, unittest.TestCase):
++    nums = [1, 3, -1, -3, 5, 3, 6, 7]
++
++    def test_heap_variant(self):
++        self.assert_sequence(
++            heap_max_sliding_window, (self.nums, 3), [3, 3, 5, 5, 6, 7]
++        )
++
++    def test_queue_variant(self):
++        self.assert_sequence(
++            queue_max_sliding_window, (self.nums, 3), [3, 3, 5, 5, 6, 7]
++        )
++
++    def test_window_of_one(self):
++        for variant in (heap_max_sliding_window, queue_max_sliding_window):
++            self.assert_sequence(variant, ([2, 1, 5], 1), [2, 1, 5])
++
++    def test_unified_edge_semantics(self):
++        for variant in (heap_max_sliding_window, queue_max_sliding_window):
++            # k == len: exactly one window
++            self.assertEqual(list(variant(self.nums, len(self.nums))), [7])
++            # k > len: no complete window
++            self.assertEqual(list(variant(self.nums, len(self.nums) + 1)), [])
++            # empty input
++            self.assertEqual(list(variant([], 3)), [])
++            # invalid k must raise eagerly at call time
++            with self.assertRaises(ValueError):
++                variant(self.nums, 0)
++            with self.assertRaises(ValueError):
++                variant(self.nums, -3)
++
++
++class TestGraphFactorsLazy(IteratorContractMixin, unittest.TestCase):
++    def test_recursive(self):
++        self.assert_sequence(
++            graph_get_factors,
++            (60,),
++            [
++                [2, 30], [2, 2, 15], [2, 2, 3, 5], [2, 3, 10], [2, 5, 6],
++                [3, 20], [3, 4, 5], [4, 15], [5, 12], [6, 10],
++            ],
++        )
++
++    def test_iterative1(self):
++        self.assert_sequence(
++            get_factors_iterative1,
++            (60,),
++            [
++                [2, 30], [3, 20], [4, 15], [5, 12], [6, 10],
++                [3, 4, 5], [2, 2, 15], [2, 3, 10], [2, 5, 6], [2, 2, 3, 5],
++            ],
++        )
++
++    def test_iterative2(self):
++        self.assert_sequence(
++            get_factors_iterative2,
++            (60,),
++            [
++                [2, 2, 3, 5], [2, 2, 15], [2, 3, 10], [2, 5, 6], [2, 30],
++                [3, 4, 5], [3, 20], [4, 15], [5, 12], [6, 10],
++            ],
++        )
++
++
++class TestStrobogrammaticLazy(IteratorContractMixin, unittest.TestCase):
++    def test_length_two(self):
++        self.assert_sequence(gen_strobogrammatic, (2,), ["88", "11", "96", "69"])
++
++    def test_length_three(self):
++        self.assert_sequence(
++            gen_strobogrammatic,
++            (3,),
++            [
++                "818", "111", "916", "619", "808", "101",
++                "906", "609", "888", "181", "986", "689",
++            ],
++        )
++
++    def test_length_one(self):
++        self.assert_sequence(gen_strobogrammatic, (1,), ["1", "0", "8"])
++
++
++class TestEagerApisUnchanged(unittest.TestCase):
++    """APIs whose first result needs the whole computation stay materialized."""
++
++    def test_sorts_return_lists(self):
++        self.assertIsInstance(merge_sort([3, 1, 2]), list)
++        self.assertIsInstance(quick_sort([3, 1, 2]), list)
++
++    def test_merge_intervals_returns_list(self):
++        result = merge_intervals([[1, 3], [2, 6], [8, 10]])
++        self.assertIsInstance(result, list)
++        self.assertEqual(result, [[1, 6], [8, 10]])
++
++    def test_top_1_returns_list(self):
++        self.assertIsInstance(top_1([1, 1, 2, 2, 2, 3]), list)
++
++    def test_find_all_cliques_returns_list(self):
++        edges = {
++            "A": {"B", "C"},
++            "B": {"A", "C"},
++            "C": {"A", "B"},
++            "D": {"E"},
++            "E": {"D"},
++            "F": set(),
++        }
++        self.assertIsInstance(find_all_cliques(edges), list)
++
++    def test_k_closest_returns_list(self):
++        result = k_closest([(1, 2), (3, 4), (5, 6), (7, 8)], 2, (0, 0))
++        self.assertIsInstance(result, list)
++
++    def test_flatten_stays_lazy(self):
++        result = flatten([1, [2, [3, 4], 5]])
++        self.assertIs(iter(result), result)
++        self.assertEqual(list(result), [1, 2, 3, 4, 5])
++
++
++class TestLazinessProbes(unittest.TestCase):
++    """The first item must be available without computing all results."""
++
++    budget_sec = 10.0
++
++    def assert_first_item_fast(self, func, args):
++        start = time.perf_counter()
++        iterator = func(*args)
++        first = next(iterator)
++        elapsed = time.perf_counter() - start
++        self.assertLess(
++            elapsed,
++            self.budget_sec,
++            f"first item took {elapsed:.2f}s; results must be produced lazily",
++        )
++        return first
++
++    def test_permute_first_item(self):
++        first = self.assert_first_item_fast(permute, (list(range(11)),))
++        self.assertEqual(first, list(range(11)))
++
++    def test_generate_parenthesis_first_item(self):
++        first = self.assert_first_item_fast(generate_parenthesis_v1, (15,))
++        self.assertIsInstance(first, str)
++
++    def test_subsets_first_item(self):
++        first = self.assert_first_item_fast(subsets, (list(range(24)),))
++        self.assertEqual(first, list(range(24)))
++
++    def test_strobogrammatic_first_item(self):
++        first = self.assert_first_item_fast(gen_strobogrammatic, (20,))
++        self.assertEqual(len(first), 20)
++
++    def test_letter_combinations_first_item(self):
++        first = self.assert_first_item_fast(letter_combinations, ("9" * 12,))
++        self.assertEqual(first, "w" * 12)
++
++
++class TestSetAndLimitLazy(IteratorContractMixin, unittest.TestCase):
++    def test_find_keyboard_row(self):
++        self.assert_sequence(
++            find_keyboard_row,
++            (["Hello", "Alaska", "Dad", "Peace"],),
++            ["Alaska", "Dad"],
++        )
++
++    def test_find_keyboard_row_none_match(self):
++        self.assert_sequence(find_keyboard_row, (["xyzq", "wqv"],), [])
++
++    def test_limit_defaults(self):
++        self.assert_sequence(limit, ([1, 2, 3, 4, 5],), [1, 2, 3, 4, 5])
++
++    def test_limit_bounded(self):
++        self.assert_sequence(limit, ([1, 2, 3, 4, 5], 2, 4), [2, 3, 4])
++
++    def test_limit_empty(self):
++        self.assert_sequence(limit, ([],), [])
++
++
++class TestFlattenLazy(IteratorContractMixin, unittest.TestCase):
++    def test_flatten_lazy(self):
++        self.assert_sequence(
++            flatten, ([1, [2, [3, 4], 5]],), [1, 2, 3, 4, 5]
++        )
++
++    def test_flatten_iter_alias(self):
++        result = flatten_iter([2, [3, [4]]])
++        self.assertIs(iter(result), result)
++        self.assertEqual(list(result), [2, 3, 4])
++
++    def test_flatten_legacy_accumulator(self):
++        acc = [0]
++        returned = flatten([1, [2, [3]]], acc)
++        self.assertIs(returned, acc)
++        self.assertEqual(acc, [0, 1, 2, 3])
++
++
++class TestAdditionalEdgeCases(IteratorContractMixin, unittest.TestCase):
++    def test_combination_sum_unsorted_candidates(self):
++        # candidates are sorted internally before the search starts
++        self.assert_sequence(combination_sum, ([7, 3, 2, 6], 7), [[2, 2, 3], [7]])
++
++    def test_generate_abbreviations_sorted(self):
++        result = generate_abbreviations("ab")
++        self.assert_lazy_iterator(result)
++        self.assertEqual(sorted(result), ["1b", "2", "a1", "ab"])
++
++    def test_letter_combinations_single_digit(self):
++        self.assert_sequence(letter_combinations, ("2",), ["a", "b", "c"])
++
++    def test_get_factors_prime_and_one(self):
++        self.assert_sequence(get_factors, (1,), [])
++        self.assert_sequence(get_factors, (37,), [])
++        self.assert_sequence(recursive_get_factors, (1,), [])
++        self.assert_sequence(recursive_get_factors, (37,), [])
++
++    def test_strobogrammatic_zero(self):
++        self.assert_sequence(gen_strobogrammatic, (0,), [""])
++
++    def test_add_operators_no_solution(self):
++        self.assert_sequence(add_operators, ("123", 100), [])
++
++    def test_path_sum_empty_tree(self):
++        self.assert_sequence(path_sum, (None, 0), [])
++        self.assert_sequence(path_sum2, (None, 0), [])
++        self.assert_sequence(path_sum3, (None, 0), [])
++
++    def test_views_empty_tree(self):
++        self.assert_sequence(left_view, (None,), [])
++        self.assert_sequence(right_view, (None,), [])
++
++    def test_views_single_node(self):
++        from algorithms.common.tree_node import TreeNode
++
++        root = TreeNode(42)
++        self.assert_sequence(left_view, (root,), [42])
++        self.assert_sequence(right_view, (TreeNode(42),), [42])
++
++    def test_level_order_single_node(self):
++        from algorithms.common.tree_node import TreeNode
++
++        self.assert_sequence(level_order, (TreeNode(1),), [[1]])
++        self.assert_sequence(zigzag_level, (TreeNode(1),), [[1]])
++
++    def test_missing_ranges_no_gaps(self):
++        self.assert_sequence(missing_ranges, ([1, 2, 3], 1, 3), [])
++
++    def test_delete_nth_zero(self):
++        self.assert_sequence(delete_nth, ([1, 1, 2], 0), [])
++        self.assert_sequence(delete_nth_naive, ([1, 1, 2], 0), [])
++
++    def test_spiral_rectangle(self):
++        self.assert_sequence(
++            spiral_traversal,
++            ([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]],),
++            [1, 2, 3, 4, 8, 12, 11, 10, 9, 5, 6, 7],
++        )
++
++    def test_fizzbuzz_one(self):
++        self.assert_sequence(fizzbuzz, (1,), [1])
++
++    def test_bit_subsets_empty(self):
++        result = bit_subsets([])
++        self.assert_lazy_iterator(result)
++        self.assertEqual(list(result), [()])
++
++    def test_three_sum_no_triplets(self):
++        self.assert_sequence(three_sum, ([1, 2, 3],), [])
++
++
++class TestSinglePassSemantics(unittest.TestCase):
++    """Converted APIs return single-pass iterators, never rewindable ones."""
++
++    def assert_single_pass(self, func, args):
++        first_pass = func(*args)
++        drained = list(first_pass)
++        self.assertEqual(list(first_pass), [])
++        # a fresh call produces the full sequence again
++        self.assertEqual(list(func(*args)), drained)
++
++    def test_backtracking_single_pass(self):
++        self.assert_single_pass(subsets, ([1, 2],))
++        self.assert_single_pass(combination_sum, ([2, 3], 5))
++        self.assert_single_pass(permute, ([1, 2],))
++        self.assert_single_pass(generate_parenthesis_v2, (2,))
++        self.assert_single_pass(letter_combinations, ("23",))
++
++    def test_tree_single_pass(self):
++        self.assert_single_pass(inorder, (build_sample_tree(),))
++        self.assert_single_pass(level_order, (build_sample_tree(),))
++        self.assert_single_pass(binary_tree_paths, (build_sample_tree(),))
++
++    def test_array_string_single_pass(self):
++        self.assert_single_pass(summarize_ranges, ([1, 2, 4],))
++        self.assert_single_pass(delete_nth, ([1, 1, 2], 1))
++        self.assert_single_pass(fizzbuzz, (5,),)
++        self.assert_single_pass(spiral_traversal, ([[1, 2], [3, 4]],))
++
++
++class TestMoreLazinessProbes(unittest.TestCase):
++    """First-item latency must not depend on the total result count."""
++
++    budget_sec = 10.0
++
++    def assert_first_item_fast(self, func, args):
++        start = time.perf_counter()
++        iterator = func(*args)
++        first = next(iterator)
++        elapsed = time.perf_counter() - start
++        self.assertLess(
++            elapsed,
++            self.budget_sec,
++            f"first item took {elapsed:.2f}s; results must be produced lazily",
++        )
++        return first
++
++    def test_permute_recursive_first_item(self):
++        first = self.assert_first_item_fast(permute_recursive, (list(range(10)),))
++        self.assertEqual(first, list(range(10)))
++
++    def test_palindromic_substrings_first_item(self):
++        # 2^19 partitions exist for a 20-char string of 'a's
++        first = self.assert_first_item_fast(palindromic_substrings, ("a" * 20,))
++        self.assertEqual(first, ["a" * 20])
++
++    def test_word_squares_like_enumeration(self):
++        first = self.assert_first_item_fast(subsets_v2, (list(range(20)),))
++        self.assertEqual(first, [])
++
++    def test_abbreviations_first_item(self):
++        # 2^25 abbreviations for a 25-letter word
++        first = self.assert_first_item_fast(generate_abbreviations, ("a" * 25,))
++        self.assertEqual(first, "a" * 25)
++
++    def test_add_operators_first_item(self):
++        first = self.assert_first_item_fast(add_operators, ("1" * 12, 12))
++        self.assertIsInstance(first, str)
++
++    def test_factor_combinations_first_item(self):
++        first = self.assert_first_item_fast(get_factors, (2**18,))
++        self.assertEqual(first, [2, 2**17])
++
++
++class TestDeepTreeLaziness(unittest.TestCase):
++    """Traversal of a deep tree must reach the first item without
++    walking the whole tree, and results must stream one at a time."""
++
++    budget_sec = 10.0
++
++    @staticmethod
++    def build_left_chain(depth):
++        from algorithms.tree.traversal_inorder import Node
++
++        root = current = Node(0)
++        for value in range(1, depth):
++            current.left = Node(value)
++            current = current.left
++        return root
++
++    def test_inorder_first_item_on_deep_tree(self):
++        root = self.build_left_chain(100_000)
++        start = time.perf_counter()
++        iterator = inorder(root)
++        first = next(iterator)
++        elapsed = time.perf_counter() - start
++        self.assertLess(elapsed, self.budget_sec)
++        self.assertEqual(first, 99_999)
++
++    def test_inorder_streams_incrementally(self):
++        root = self.build_left_chain(1000)
++        iterator = inorder(root)
++        self.assertEqual([next(iterator) for _ in range(5)], [999, 998, 997, 996, 995])
++
++    def test_preorder_streams_incrementally(self):
++        root = self.build_left_chain(1000)
++        iterator = preorder(root)
++        self.assertEqual([next(iterator) for _ in range(3)], [0, 1, 2])
++
++    def test_level_order_first_level_fast(self):
++        root = self.build_left_chain(50_000)
++        start = time.perf_counter()
++        iterator = level_order(root)
++        first = next(iterator)
++        elapsed = time.perf_counter() - start
++        self.assertLess(elapsed, self.budget_sec)
++        self.assertEqual(first, [0])
++
++
++class TestIteratorNotRewindable(unittest.TestCase):
++    """Every converted API returns a single-pass iterator: a second
++    full pass over the same object must yield nothing, while a fresh
++    call reproduces the complete sequence."""
++
++    def check(self, func, args):
++        first = func(*args)
++        snapshot = list(first)
++        self.assertEqual(list(first), [])
++        self.assertEqual(list(func(*args)), snapshot)
++
++    def test_backtracking(self):
++        self.check(subsets, ([1, 2],))
++        self.check(subsets_v2, ([1, 2],))
++        self.check(subsets_unique, ([1, 2],))
++        self.check(combination_sum, ([2, 3], 5))
++        self.check(generate_parenthesis_v1, (2,))
++        self.check(generate_parenthesis_v2, (2,))
++        self.check(generate_abbreviations, ("ab",))
++        self.check(add_operators, ("12", 3))
++        self.check(letter_combinations, ("23",))
++        self.check(permute, ([1, 2],))
++        self.check(permute_recursive, ([1, 2],))
++        self.check(permute_unique, ([1, 2],))
++        self.check(palindromic_substrings, ("aa",))
++        self.check(get_factors, (12,))
++        self.check(recursive_get_factors, (12,))
++
++    def test_tree(self):
++        self.check(inorder, (build_sample_tree(),))
++        self.check(inorder_rec, (build_sample_tree(),))
++        self.check(preorder, (build_sample_tree(),))
++        self.check(preorder_rec, (build_sample_tree(),))
++        self.check(postorder, (build_sample_tree(),))
++        self.check(postorder_rec, (build_sample_tree(),))
++        self.check(level_order, (build_sample_tree(),))
++        self.check(zigzag_level, (build_sample_tree(),))
++        self.check(binary_tree_paths, (build_sample_tree(),))
++        self.check(path_sum, (build_sample_tree(), 15))
++        self.check(left_view, (build_view_tree(),))
++        self.check(right_view, (build_view_tree(),))
++
++    def test_array_string_matrix_graph_math(self):
++        self.check(missing_ranges, ([0, 3], 0, 5))
++        self.check(summarize_ranges, ([1, 2, 4],))
++        self.check(delete_nth, ([1, 1, 2], 1))
++        self.check(delete_nth_naive, ([1, 1, 2], 1))
++        self.check(three_sum, ([-1, 0, 1],))
++        self.check(limit, ([1, 2, 3], 2))
++        self.check(fizzbuzz, (5,))
++        self.check(fizzbuzz_with_helper_func, (5,))
++        self.check(word_squares, (["area", "lead", "wall", "lady", "ball"],))
++        self.check(match_symbol, (["Google"], ["le"]))
++        self.check(match_symbol_1, (["Microsoft"], ["i", "cro"]))
++        self.check(spiral_traversal, ([[1, 2], [3, 4]],))
++        self.check(heap_max_sliding_window, ([1, 3, 2], 2))
++        self.check(queue_max_sliding_window, ([1, 3, 2], 2))
++        self.check(graph_get_factors, (12,))
++        self.check(get_factors_iterative1, (12,))
++        self.check(get_factors_iterative2, (12,))
++        self.check(gen_strobogrammatic, (2,))
++        self.check(find_keyboard_row, (["Hello", "Alaska"],))
++        self.check(bit_subsets, ([1, 2],))
++        self.check(flatten, ([1, [2]],))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_math.py b/tests/test_math.py
+index 251b1d8..4940351 100644
+--- a/tests/test_math.py
++++ b/tests/test_math.py
+@@ -206,7 +206,7 @@ class TestGenerateStroboGrammatic(unittest.TestCase):
+     """
+ 
+     def test_gen_strobomatic(self):
+-        self.assertEqual(["88", "11", "96", "69"], gen_strobogrammatic(2))
++        self.assertEqual(["88", "11", "96", "69"], list(gen_strobogrammatic(2)))
+ 
+     def test_strobogrammatic_in_range(self):
+         self.assertEqual(4, strobogrammatic_in_range("10", "100"))
+diff --git a/tests/test_matrix.py b/tests/test_matrix.py
+index 7902e2e..549a8f7 100644
+--- a/tests/test_matrix.py
++++ b/tests/test_matrix.py
+@@ -293,7 +293,7 @@ class TestSpiralTraversal(unittest.TestCase):
+ 
+     def test_spiral_traversal(self):
+         self.assertEqual(
+-            spiral_traversal.spiral_traversal([[1, 2, 3], [4, 5, 6], [7, 8, 9]]),
++            list(spiral_traversal.spiral_traversal([[1, 2, 3], [4, 5, 6], [7, 8, 9]])),
+             [1, 2, 3, 6, 9, 8, 7, 4, 5],
+         )
+ 
+diff --git a/tests/test_queue.py b/tests/test_queue.py
+index 0268dba..9e9d5ad 100644
+--- a/tests/test_queue.py
++++ b/tests/test_queue.py
+@@ -76,15 +76,15 @@ class TestQueue(unittest.TestCase):
+ class TestSuite(unittest.TestCase):
+     def test_max_sliding_window(self):
+         array = [1, 3, -1, -3, 5, 3, 6, 7]
+-        self.assertEqual(max_sliding_window(array, k=5), [5, 5, 6, 7])
+-        self.assertEqual(max_sliding_window(array, k=3), [3, 3, 5, 5, 6, 7])
+-        self.assertEqual(max_sliding_window(array, k=7), [6, 7])
++        self.assertEqual(list(max_sliding_window(array, k=5)), [5, 5, 6, 7])
++        self.assertEqual(list(max_sliding_window(array, k=3)), [3, 3, 5, 5, 6, 7])
++        self.assertEqual(list(max_sliding_window(array, k=7)), [6, 7])
+ 
+         array = [8, 5, 10, 7, 9, 4, 15, 12, 90, 13]
+-        self.assertEqual(max_sliding_window(array, k=4), [10, 10, 10, 15, 15, 90, 90])
+-        self.assertEqual(max_sliding_window(array, k=7), [15, 15, 90, 90])
++        self.assertEqual(list(max_sliding_window(array, k=4)), [10, 10, 10, 15, 15, 90, 90])
++        self.assertEqual(list(max_sliding_window(array, k=7)), [15, 15, 90, 90])
+         self.assertEqual(
+-            max_sliding_window(array, k=2), [8, 10, 10, 9, 9, 15, 15, 90, 90]
++            list(max_sliding_window(array, k=2)), [8, 10, 10, 9, 9, 15, 15, 90, 90]
+         )
+ 
+     def test_reconstruct_queue(self):
+diff --git a/tests/test_set.py b/tests/test_set.py
+index 04a6e53..22ded81 100644
+--- a/tests/test_set.py
++++ b/tests/test_set.py
+@@ -6,5 +6,5 @@ from algorithms.set import find_keyboard_row
+ class TestFindKeyboardRow(unittest.TestCase):
+     def test_find_keyboard_row(self):
+         self.assertEqual(
+-            ["Alaska", "Dad"], find_keyboard_row(["Hello", "Alaska", "Dad", "Peace"])
++            ["Alaska", "Dad"], list(find_keyboard_row(["Hello", "Alaska", "Dad", "Peace"]))
+         )
+diff --git a/tests/test_string.py b/tests/test_string.py
+index 84b97cd..bbe8af9 100644
+--- a/tests/test_string.py
++++ b/tests/test_string.py
+@@ -95,12 +95,12 @@ class TestBreakingBad(unittest.TestCase):
+         self.result = ["M[i]crosoft", "[Am]azon", "Mi[cro]soft", "Goog[le]"]
+ 
+     def test_match_symbol(self):
+-        self.assertEqual(self.result, match_symbol(self.words, self.symbols))
++        self.assertEqual(self.result, list(match_symbol(self.words, self.symbols)))
+ 
+     def test_match_symbol_1(self):
+         self.assertEqual(
+             ["[Am]azon", "Mi[cro]soft", "Goog[le]"],
+-            match_symbol_1(self.words, self.symbols),
++            list(match_symbol_1(self.words, self.symbols)),
+         )
+ 
+     def test_bracket(self):
+@@ -495,7 +495,7 @@ class TestWordSquares(unittest.TestCase):
+     def test_word_squares(self):
+         self.assertEqual(
+             [["wall", "area", "lead", "lady"], ["ball", "area", "lead", "lady"]],
+-            word_squares(["area", "lead", "wall", "lady", "ball"]),
++            list(word_squares(["area", "lead", "wall", "lady", "ball"])),
+         )
+ 
+ 
+@@ -746,17 +746,17 @@ class TestFizzbuzz(unittest.TestCase):
+         self.assertRaises(TypeError, fizzbuzz.fizzbuzz, "hello")
+ 
+         # Testing a base case, n = 3
+-        result = fizzbuzz.fizzbuzz(3)
++        result = list(fizzbuzz.fizzbuzz(3))
+         expected = [1, 2, "Fizz"]
+         self.assertEqual(result, expected)
+ 
+         # Testing a base case, n = 5
+-        result = fizzbuzz.fizzbuzz(5)
++        result = list(fizzbuzz.fizzbuzz(5))
+         expected = [1, 2, "Fizz", 4, "Buzz"]
+         self.assertEqual(result, expected)
+ 
+         # Testing a base case, n = 15 i.e. mod 3 and 5
+-        result = fizzbuzz.fizzbuzz(15)
++        result = list(fizzbuzz.fizzbuzz(15))
+         expected = [
+             1,
+             2,
+diff --git a/tests/test_tree.py b/tests/test_tree.py
+index af9a7fb..ceeff48 100644
+--- a/tests/test_tree.py
++++ b/tests/test_tree.py
+@@ -18,18 +18,18 @@ class Node:
+ class TestTraversal(unittest.TestCase):
+     def test_preorder(self):
+         tree = create_tree()
+-        self.assertEqual([100, 50, 25, 75, 150, 125, 175], preorder(tree))
+-        self.assertEqual([100, 50, 25, 75, 150, 125, 175], preorder_rec(tree))
++        self.assertEqual([100, 50, 25, 75, 150, 125, 175], list(preorder(tree)))
++        self.assertEqual([100, 50, 25, 75, 150, 125, 175], list(preorder_rec(tree)))
+ 
+     def test_postorder(self):
+         tree = create_tree()
+-        self.assertEqual([25, 75, 50, 125, 175, 150, 100], postorder(tree))
+-        self.assertEqual([25, 75, 50, 125, 175, 150, 100], postorder_rec(tree))
++        self.assertEqual([25, 75, 50, 125, 175, 150, 100], list(postorder(tree)))
++        self.assertEqual([25, 75, 50, 125, 175, 150, 100], list(postorder_rec(tree)))
+ 
+     def test_inorder(self):
+         tree = create_tree()
+-        self.assertEqual([25, 50, 75, 100, 125, 150, 175], inorder(tree))
+-        self.assertEqual([25, 50, 75, 100, 125, 150, 175], inorder_rec(tree))
++        self.assertEqual([25, 50, 75, 100, 125, 150, 175], list(inorder(tree)))
++        self.assertEqual([25, 50, 75, 100, 125, 150, 175], list(inorder_rec(tree)))
+ 
+ 
+ def create_tree():

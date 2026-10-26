@@ -1,0 +1,2593 @@
+diff --git a/great_expectations/expectations/__init__.py b/great_expectations/expectations/__init__.py
+index 14d84f1..227aa5f 100644
+--- a/great_expectations/expectations/__init__.py
++++ b/great_expectations/expectations/__init__.py
+@@ -32,6 +32,10 @@ from .core import (
+     ExpectColumnValuesToBeNull,
+     ExpectColumnValuesToBeOfType,
+     ExpectColumnValuesToBeUnique,
++    ExpectColumnValuesToBeValidCreditCardNumber,
++    ExpectColumnValuesToBeValidIban,
++    ExpectColumnValuesToBeValidIso8601Datetime,
++    ExpectColumnValuesToBeValidUuid,
+     ExpectColumnValuesToMatchJsonSchema,
+     ExpectColumnValuesToMatchLikePattern,
+     ExpectColumnValuesToMatchLikePatternList,
+diff --git a/great_expectations/expectations/core/__init__.py b/great_expectations/expectations/core/__init__.py
+index 1089c84..5ebb62a 100644
+--- a/great_expectations/expectations/core/__init__.py
++++ b/great_expectations/expectations/core/__init__.py
+@@ -58,6 +58,14 @@ from .expect_column_values_to_be_json_parseable import (
+ from .expect_column_values_to_be_null import ExpectColumnValuesToBeNull
+ from .expect_column_values_to_be_of_type import ExpectColumnValuesToBeOfType
+ from .expect_column_values_to_be_unique import ExpectColumnValuesToBeUnique
++from .expect_column_values_to_be_valid_credit_card_number import (
++    ExpectColumnValuesToBeValidCreditCardNumber,
++)
++from .expect_column_values_to_be_valid_iban import ExpectColumnValuesToBeValidIban
++from .expect_column_values_to_be_valid_iso8601_datetime import (
++    ExpectColumnValuesToBeValidIso8601Datetime,
++)
++from .expect_column_values_to_be_valid_uuid import ExpectColumnValuesToBeValidUuid
+ from .expect_column_values_to_match_json_schema import (
+     ExpectColumnValuesToMatchJsonSchema,
+ )
+diff --git a/great_expectations/expectations/core/expect_column_values_to_be_valid_credit_card_number.py b/great_expectations/expectations/core/expect_column_values_to_be_valid_credit_card_number.py
+new file mode 100644
+index 0000000..2c150d3
+--- /dev/null
++++ b/great_expectations/expectations/core/expect_column_values_to_be_valid_credit_card_number.py
+@@ -0,0 +1,300 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Type, Union
++
++from great_expectations.compatibility import pydantic  # noqa: F401, TID251 # FIXME CoP
++from great_expectations.expectations.expectation import (
++    ColumnMapExpectation,
++    _style_row_condition,
++    render_suite_parameter_string,
++)
++from great_expectations.expectations.metadata_types import DataQualityIssues, SupportedDataSources
++from great_expectations.expectations.model_field_descriptions import (
++    COLUMN_DESCRIPTION,
++    FAILURE_SEVERITY_DESCRIPTION,
++    MOSTLY_DESCRIPTION,
++)
++from great_expectations.render import LegacyRendererType, RenderedStringTemplateContent
++from great_expectations.render.renderer.renderer import renderer
++from great_expectations.render.renderer_configuration import (
++    RendererConfiguration,
++    RendererValueType,
++)
++from great_expectations.render.util import (
++    num_to_str,
++    parse_row_condition_string,
++    substitute_none_for_missing,
++)
++
++if TYPE_CHECKING:
++    from great_expectations.core import (
++        ExpectationValidationResult,
++    )
++    from great_expectations.expectations.expectation_configuration import (
++        ExpectationConfiguration,
++    )
++    from great_expectations.render.renderer_configuration import AddParamArgs
++
++EXPECTATION_SHORT_DESCRIPTION = (
++    "Expect the column entries to be strings that are valid payment card numbers."
++)
++DATA_QUALITY_ISSUES = [DataQualityIssues.VALIDITY.value]
++SUPPORTED_DATA_SOURCES = [
++    SupportedDataSources.PANDAS.value,
++    SupportedDataSources.SPARK.value,
++]
++
++
++class ExpectColumnValuesToBeValidCreditCardNumber(ColumnMapExpectation):
++    __doc__ = f"""{EXPECTATION_SHORT_DESCRIPTION}
++
++    Spaces and hyphens are ignored, so grouped presentations such as "4532 0151 1283 0366" are \
++    accepted. After removing those separators the value must consist solely of decimal digits, \
++    must be between 13 and 19 digits long (inclusive), and must satisfy the Luhn (mod 10) \
++    checksum. Empty strings and non-string values are not considered valid. Note that passing \
++    this expectation does not prove a card exists or is active; it only proves the number is \
++    structurally well formed.
++
++    ExpectColumnValuesToBeValidCreditCardNumber is a \
++    Column Map Expectation.
++
++    Column Map Expectations are one of the most common types of Expectation.
++    They are evaluated for a single column and ask a yes/no question for every row in that column.
++    Based on the result, they then calculate the percentage of rows that gave a positive answer. If the percentage is high enough, the Expectation considers that data valid.
++
++    Args:
++        column (str): \
++            {COLUMN_DESCRIPTION}
++
++    Other Parameters:
++        mostly (None or a float between 0 and 1): \
++            {MOSTLY_DESCRIPTION} \
++            For more detail, see [mostly](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#mostly). Default 1.
++        result_format (str or None): \
++            Which output mode to use: BOOLEAN_ONLY, BASIC, COMPLETE, or SUMMARY. \
++            For more detail, see [result_format](https://docs.greatexpectations.io/docs/reference/expectations/result_format).
++        catch_exceptions (boolean or None): \
++            If True, then catch exceptions and include them as part of the result object. \
++            For more detail, see [catch_exceptions](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#catch_exceptions).
++        meta (dict or None): \
++            A JSON-serializable dictionary (nesting allowed) that will be included in the output without \
++            modification. For more detail, see [meta](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#meta).
++        severity (str or None): \
++            {FAILURE_SEVERITY_DESCRIPTION} \
++            For more detail, see [failure severity](https://docs.greatexpectations.io/docs/cloud/expectations/expectations_overview/#failure-severity).
++
++    Returns:
++        An [ExpectationSuiteValidationResult](https://docs.greatexpectations.io/docs/terms/validation_result)
++
++        Exact fields vary depending on the values passed to result_format, catch_exceptions, and meta.
++
++    Supported Data Sources:
++        [{SUPPORTED_DATA_SOURCES[0]}](https://docs.greatexpectations.io/docs/application_integration_support/)
++        [{SUPPORTED_DATA_SOURCES[1]}](https://docs.greatexpectations.io/docs/application_integration_support/)
++
++    Data Quality Issues:
++        {DATA_QUALITY_ISSUES[0]}
++
++    Example Data:
++                valid_card_numbers          invalid_card_numbers
++            0   "4532015112830366"          "4532015112830367"
++            1   "5425 2334 3010 9903"       "123456789012"
++            2   "3782-822463-10005"         "4532-0151-1283-03ab"
++
++    Code Examples:
++        Passing Case:
++            Input:
++                ExpectColumnValuesToBeValidCreditCardNumber(
++                    column="valid_card_numbers",
++            )
++
++            Output:
++                {{
++                  "exception_info": {{
++                    "raised_exception": false,
++                    "exception_traceback": null,
++                    "exception_message": null
++                  }},
++                  "result": {{
++                    "element_count": 3,
++                    "unexpected_count": 0,
++                    "unexpected_percent": 0.0,
++                    "partial_unexpected_list": [],
++                    "missing_count": 0,
++                    "missing_percent": 0.0,
++                    "unexpected_percent_total": 0.0,
++                    "unexpected_percent_nonmissing": 0.0
++                  }},
++                  "meta": {{}},
++                  "success": true
++                }}
++
++        Failing Case:
++            Input:
++                ExpectColumnValuesToBeValidCreditCardNumber(
++                    column="invalid_card_numbers",
++            )
++
++            Output:
++                {{
++                  "exception_info": {{
++                    "raised_exception": false,
++                    "exception_traceback": null,
++                    "exception_message": null
++                  }},
++                  "result": {{
++                    "element_count": 3,
++                    "unexpected_count": 3,
++                    "unexpected_percent": 100.0,
++                    "partial_unexpected_list": [
++                      "4532015112830367",
++                      "123456789012",
++                      "4532-0151-1283-03ab"
++                    ],
++                    "missing_count": 0,
++                    "missing_percent": 0.0,
++                    "unexpected_percent_total": 100.0,
++                    "unexpected_percent_nonmissing": 100.0
++                  }},
++                  "meta": {{}},
++                  "success": false
++                }}
++    """  # noqa: E501 # FIXME CoP
++
++    library_metadata: ClassVar[Dict[str, Union[str, list, bool]]] = {
++        "maturity": "production",
++        "tags": ["core expectation", "column map expectation"],
++        "contributors": [
++            "@great_expectations",
++        ],
++        "requirements": [],
++        "has_full_test_suite": True,
++        "manually_reviewed_code": True,
++    }
++    _library_metadata = library_metadata
++
++    map_metric = "column_values.valid_credit_card_number"
++    success_keys = ("mostly",)
++    args_keys = ("column",)
++
++    class Config:
++        title = "Expect column values to be valid credit card numbers"
++
++        @staticmethod
++        def schema_extra(
++            schema: Dict[str, Any], model: Type[ExpectColumnValuesToBeValidCreditCardNumber]
++        ) -> None:
++            ColumnMapExpectation.Config.schema_extra(schema, model)
++            schema["properties"]["metadata"]["properties"].update(
++                {
++                    "data_quality_issues": {
++                        "title": "Data Quality Issues",
++                        "type": "array",
++                        "const": DATA_QUALITY_ISSUES,
++                    },
++                    "library_metadata": {
++                        "title": "Library Metadata",
++                        "type": "object",
++                        "const": model._library_metadata,
++                    },
++                    "short_description": {
++                        "title": "Short Description",
++                        "type": "string",
++                        "const": EXPECTATION_SHORT_DESCRIPTION,
++                    },
++                    "supported_data_sources": {
++                        "title": "Supported Data Sources",
++                        "type": "array",
++                        "const": SUPPORTED_DATA_SOURCES,
++                    },
++                }
++            )
++
++    @classmethod
++    def _prescriptive_template(
++        cls,
++        renderer_configuration: RendererConfiguration,
++    ) -> RendererConfiguration:
++        add_param_args: AddParamArgs = (
++            ("column", RendererValueType.STRING),
++            ("mostly", RendererValueType.NUMBER),
++        )
++        for name, param_type in add_param_args:
++            renderer_configuration.add_param(name=name, param_type=param_type)
++
++        params = renderer_configuration.params
++
++        template_str = "values must be valid credit card numbers"
++
++        if params.mostly and params.mostly.value < 1.0:
++            renderer_configuration = cls._add_mostly_pct_param(
++                renderer_configuration=renderer_configuration
++            )
++            template_str += ", at least $mostly_pct % of the time."
++        else:
++            template_str += "."
++
++        if renderer_configuration.include_column_name:
++            template_str = f"$column {template_str}"
++
++        renderer_configuration.template_str = template_str
++
++        return renderer_configuration
++
++    @classmethod
++    @renderer(renderer_type=LegacyRendererType.PRESCRIPTIVE)
++    @render_suite_parameter_string
++    def _prescriptive_renderer(
++        cls,
++        configuration: Optional[ExpectationConfiguration] = None,
++        result: Optional[ExpectationValidationResult] = None,
++        runtime_configuration: Optional[dict] = None,
++        **kwargs,
++    ):
++        runtime_configuration = runtime_configuration or {}
++        include_column_name = runtime_configuration.get("include_column_name") is not False
++        styling = runtime_configuration.get("styling")
++        params = substitute_none_for_missing(
++            configuration.kwargs,
++            [
++                "column",
++                "mostly",
++                "row_condition",
++                "condition_parser",
++            ],
++        )
++
++        template_str = "values must be valid credit card numbers"
++
++        if params["mostly"] is not None:
++            if isinstance(params["mostly"], (int, float)) and params["mostly"] < 1.0:
++                params["mostly_pct"] = num_to_str(params["mostly"] * 100, no_scientific=True)
++            template_str += ", at least $mostly_pct % of the time."
++        else:
++            template_str += "."
++
++        if include_column_name:
++            template_str = f"$column {template_str}"
++
++        if params["row_condition"] is not None:
++            conditional_template_str = parse_row_condition_string(params["row_condition"])
++
++            template_str, styling = _style_row_condition(
++                conditional_template_str,
++                template_str,
++                params,
++                styling,
++            )
++
++        return [
++            RenderedStringTemplateContent(
++                **{
++                    "content_block_type": "string_template",
++                    "string_template": {
++                        "template": template_str,
++                        "params": params,
++                        "styling": styling,
++                    },
++                }
++            )
++        ]
+diff --git a/great_expectations/expectations/core/expect_column_values_to_be_valid_iban.py b/great_expectations/expectations/core/expect_column_values_to_be_valid_iban.py
+new file mode 100644
+index 0000000..c2a65b9
+--- /dev/null
++++ b/great_expectations/expectations/core/expect_column_values_to_be_valid_iban.py
+@@ -0,0 +1,300 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Type, Union
++
++from great_expectations.compatibility import pydantic  # noqa: F401, TID251 # FIXME CoP
++from great_expectations.expectations.expectation import (
++    ColumnMapExpectation,
++    _style_row_condition,
++    render_suite_parameter_string,
++)
++from great_expectations.expectations.metadata_types import DataQualityIssues, SupportedDataSources
++from great_expectations.expectations.model_field_descriptions import (
++    COLUMN_DESCRIPTION,
++    FAILURE_SEVERITY_DESCRIPTION,
++    MOSTLY_DESCRIPTION,
++)
++from great_expectations.render import LegacyRendererType, RenderedStringTemplateContent
++from great_expectations.render.renderer.renderer import renderer
++from great_expectations.render.renderer_configuration import (
++    RendererConfiguration,
++    RendererValueType,
++)
++from great_expectations.render.util import (
++    num_to_str,
++    parse_row_condition_string,
++    substitute_none_for_missing,
++)
++
++if TYPE_CHECKING:
++    from great_expectations.core import (
++        ExpectationValidationResult,
++    )
++    from great_expectations.expectations.expectation_configuration import (
++        ExpectationConfiguration,
++    )
++    from great_expectations.render.renderer_configuration import AddParamArgs
++
++EXPECTATION_SHORT_DESCRIPTION = (
++    "Expect the column entries to be strings that are valid International Bank Account Numbers (IBANs)."
++)
++DATA_QUALITY_ISSUES = [DataQualityIssues.VALIDITY.value]
++SUPPORTED_DATA_SOURCES = [
++    SupportedDataSources.PANDAS.value,
++    SupportedDataSources.SPARK.value,
++]
++
++
++class ExpectColumnValuesToBeValidIban(ColumnMapExpectation):
++    __doc__ = f"""{EXPECTATION_SHORT_DESCRIPTION}
++
++    Whitespace (including the customary groups-of-four presentation) and letter case are ignored. \
++    The normalized value must match the ISO 13616 structure (a two-letter country code, two check \
++    digits, then an alphanumeric Basic Bank Account Number), must have exactly the total length \
++    mandated for its country code by the ISO 13616 / SWIFT IBAN registry, and must pass the \
++    ISO 13616 mod-97 checksum. Values with country codes that do not participate in the IBAN \
++    registry, empty strings, and non-string values are not considered valid.
++
++    ExpectColumnValuesToBeValidIban is a \
++    Column Map Expectation.
++
++    Column Map Expectations are one of the most common types of Expectation.
++    They are evaluated for a single column and ask a yes/no question for every row in that column.
++    Based on the result, they then calculate the percentage of rows that gave a positive answer. If the percentage is high enough, the Expectation considers that data valid.
++
++    Args:
++        column (str): \
++            {COLUMN_DESCRIPTION}
++
++    Other Parameters:
++        mostly (None or a float between 0 and 1): \
++            {MOSTLY_DESCRIPTION} \
++            For more detail, see [mostly](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#mostly). Default 1.
++        result_format (str or None): \
++            Which output mode to use: BOOLEAN_ONLY, BASIC, COMPLETE, or SUMMARY. \
++            For more detail, see [result_format](https://docs.greatexpectations.io/docs/reference/expectations/result_format).
++        catch_exceptions (boolean or None): \
++            If True, then catch exceptions and include them as part of the result object. \
++            For more detail, see [catch_exceptions](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#catch_exceptions).
++        meta (dict or None): \
++            A JSON-serializable dictionary (nesting allowed) that will be included in the output without \
++            modification. For more detail, see [meta](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#meta).
++        severity (str or None): \
++            {FAILURE_SEVERITY_DESCRIPTION} \
++            For more detail, see [failure severity](https://docs.greatexpectations.io/docs/cloud/expectations/expectations_overview/#failure-severity).
++
++    Returns:
++        An [ExpectationSuiteValidationResult](https://docs.greatexpectations.io/docs/terms/validation_result)
++
++        Exact fields vary depending on the values passed to result_format, catch_exceptions, and meta.
++
++    Supported Data Sources:
++        [{SUPPORTED_DATA_SOURCES[0]}](https://docs.greatexpectations.io/docs/application_integration_support/)
++        [{SUPPORTED_DATA_SOURCES[1]}](https://docs.greatexpectations.io/docs/application_integration_support/)
++
++    Data Quality Issues:
++        {DATA_QUALITY_ISSUES[0]}
++
++    Example Data:
++                valid_ibans                     invalid_ibans
++            0   "GB29 NWBK 6016 1331 9268 19"   "GB29 NWBK 6016 1331 9268 18"
++            1   "DE89370400440532013000"        "XX89370400440532013000"
++            2   "FR1420041010050500013M02606"   "GB29NWBK6016"
++
++    Code Examples:
++        Passing Case:
++            Input:
++                ExpectColumnValuesToBeValidIban(
++                    column="valid_ibans",
++            )
++
++            Output:
++                {{
++                  "exception_info": {{
++                    "raised_exception": false,
++                    "exception_traceback": null,
++                    "exception_message": null
++                  }},
++                  "result": {{
++                    "element_count": 3,
++                    "unexpected_count": 0,
++                    "unexpected_percent": 0.0,
++                    "partial_unexpected_list": [],
++                    "missing_count": 0,
++                    "missing_percent": 0.0,
++                    "unexpected_percent_total": 0.0,
++                    "unexpected_percent_nonmissing": 0.0
++                  }},
++                  "meta": {{}},
++                  "success": true
++                }}
++
++        Failing Case:
++            Input:
++                ExpectColumnValuesToBeValidIban(
++                    column="invalid_ibans",
++            )
++
++            Output:
++                {{
++                  "exception_info": {{
++                    "raised_exception": false,
++                    "exception_traceback": null,
++                    "exception_message": null
++                  }},
++                  "result": {{
++                    "element_count": 3,
++                    "unexpected_count": 3,
++                    "unexpected_percent": 100.0,
++                    "partial_unexpected_list": [
++                      "GB29 NWBK 6016 1331 9268 18",
++                      "XX89370400440532013000",
++                      "GB29NWBK6016"
++                    ],
++                    "missing_count": 0,
++                    "missing_percent": 0.0,
++                    "unexpected_percent_total": 100.0,
++                    "unexpected_percent_nonmissing": 100.0
++                  }},
++                  "meta": {{}},
++                  "success": false
++                }}
++    """  # noqa: E501 # FIXME CoP
++
++    library_metadata: ClassVar[Dict[str, Union[str, list, bool]]] = {
++        "maturity": "production",
++        "tags": ["core expectation", "column map expectation"],
++        "contributors": [
++            "@great_expectations",
++        ],
++        "requirements": [],
++        "has_full_test_suite": True,
++        "manually_reviewed_code": True,
++    }
++    _library_metadata = library_metadata
++
++    map_metric = "column_values.valid_iban"
++    success_keys = ("mostly",)
++    args_keys = ("column",)
++
++    class Config:
++        title = "Expect column values to be valid IBANs"
++
++        @staticmethod
++        def schema_extra(
++            schema: Dict[str, Any], model: Type[ExpectColumnValuesToBeValidIban]
++        ) -> None:
++            ColumnMapExpectation.Config.schema_extra(schema, model)
++            schema["properties"]["metadata"]["properties"].update(
++                {
++                    "data_quality_issues": {
++                        "title": "Data Quality Issues",
++                        "type": "array",
++                        "const": DATA_QUALITY_ISSUES,
++                    },
++                    "library_metadata": {
++                        "title": "Library Metadata",
++                        "type": "object",
++                        "const": model._library_metadata,
++                    },
++                    "short_description": {
++                        "title": "Short Description",
++                        "type": "string",
++                        "const": EXPECTATION_SHORT_DESCRIPTION,
++                    },
++                    "supported_data_sources": {
++                        "title": "Supported Data Sources",
++                        "type": "array",
++                        "const": SUPPORTED_DATA_SOURCES,
++                    },
++                }
++            )
++
++    @classmethod
++    def _prescriptive_template(
++        cls,
++        renderer_configuration: RendererConfiguration,
++    ) -> RendererConfiguration:
++        add_param_args: AddParamArgs = (
++            ("column", RendererValueType.STRING),
++            ("mostly", RendererValueType.NUMBER),
++        )
++        for name, param_type in add_param_args:
++            renderer_configuration.add_param(name=name, param_type=param_type)
++
++        params = renderer_configuration.params
++
++        template_str = "values must be valid IBANs"
++
++        if params.mostly and params.mostly.value < 1.0:
++            renderer_configuration = cls._add_mostly_pct_param(
++                renderer_configuration=renderer_configuration
++            )
++            template_str += ", at least $mostly_pct % of the time."
++        else:
++            template_str += "."
++
++        if renderer_configuration.include_column_name:
++            template_str = f"$column {template_str}"
++
++        renderer_configuration.template_str = template_str
++
++        return renderer_configuration
++
++    @classmethod
++    @renderer(renderer_type=LegacyRendererType.PRESCRIPTIVE)
++    @render_suite_parameter_string
++    def _prescriptive_renderer(
++        cls,
++        configuration: Optional[ExpectationConfiguration] = None,
++        result: Optional[ExpectationValidationResult] = None,
++        runtime_configuration: Optional[dict] = None,
++        **kwargs,
++    ):
++        runtime_configuration = runtime_configuration or {}
++        include_column_name = runtime_configuration.get("include_column_name") is not False
++        styling = runtime_configuration.get("styling")
++        params = substitute_none_for_missing(
++            configuration.kwargs,
++            [
++                "column",
++                "mostly",
++                "row_condition",
++                "condition_parser",
++            ],
++        )
++
++        template_str = "values must be valid IBANs"
++
++        if params["mostly"] is not None:
++            if isinstance(params["mostly"], (int, float)) and params["mostly"] < 1.0:
++                params["mostly_pct"] = num_to_str(params["mostly"] * 100, no_scientific=True)
++            template_str += ", at least $mostly_pct % of the time."
++        else:
++            template_str += "."
++
++        if include_column_name:
++            template_str = f"$column {template_str}"
++
++        if params["row_condition"] is not None:
++            conditional_template_str = parse_row_condition_string(params["row_condition"])
++
++            template_str, styling = _style_row_condition(
++                conditional_template_str,
++                template_str,
++                params,
++                styling,
++            )
++
++        return [
++            RenderedStringTemplateContent(
++                **{
++                    "content_block_type": "string_template",
++                    "string_template": {
++                        "template": template_str,
++                        "params": params,
++                        "styling": styling,
++                    },
++                }
++            )
++        ]
+diff --git a/great_expectations/expectations/core/expect_column_values_to_be_valid_iso8601_datetime.py b/great_expectations/expectations/core/expect_column_values_to_be_valid_iso8601_datetime.py
+new file mode 100644
+index 0000000..52a695a
+--- /dev/null
++++ b/great_expectations/expectations/core/expect_column_values_to_be_valid_iso8601_datetime.py
+@@ -0,0 +1,299 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Type, Union
++
++from great_expectations.compatibility import pydantic  # noqa: F401, TID251 # FIXME CoP
++from great_expectations.expectations.expectation import (
++    ColumnMapExpectation,
++    _style_row_condition,
++    render_suite_parameter_string,
++)
++from great_expectations.expectations.metadata_types import DataQualityIssues, SupportedDataSources
++from great_expectations.expectations.model_field_descriptions import (
++    COLUMN_DESCRIPTION,
++    FAILURE_SEVERITY_DESCRIPTION,
++    MOSTLY_DESCRIPTION,
++)
++from great_expectations.render import LegacyRendererType, RenderedStringTemplateContent
++from great_expectations.render.renderer.renderer import renderer
++from great_expectations.render.renderer_configuration import (
++    RendererConfiguration,
++    RendererValueType,
++)
++from great_expectations.render.util import (
++    num_to_str,
++    parse_row_condition_string,
++    substitute_none_for_missing,
++)
++
++if TYPE_CHECKING:
++    from great_expectations.core import (
++        ExpectationValidationResult,
++    )
++    from great_expectations.expectations.expectation_configuration import (
++        ExpectationConfiguration,
++    )
++    from great_expectations.render.renderer_configuration import AddParamArgs
++
++EXPECTATION_SHORT_DESCRIPTION = (
++    "Expect the column entries to be strings that are valid ISO 8601 calendar dates or datetimes."
++)
++DATA_QUALITY_ISSUES = [DataQualityIssues.VALIDITY.value]
++SUPPORTED_DATA_SOURCES = [
++    SupportedDataSources.PANDAS.value,
++    SupportedDataSources.SPARK.value,
++]
++
++
++class ExpectColumnValuesToBeValidIso8601Datetime(ColumnMapExpectation):
++    __doc__ = f"""{EXPECTATION_SHORT_DESCRIPTION}
++
++    Accepted values begin with a calendar date in "YYYY-MM-DD" form and may continue with a time \
++    component separated by "T" (or a space), optional fractional seconds, and an optional UTC \
++    offset ("Z" or "+/-HH:MM"). Impossible dates (for example month 13) and times (for example \
++    hour 25) are not valid. Compact ("20260115"), week ("2026-W03-4"), and ordinal ("2026-015") \
++    notations, bare times, empty strings, and non-string values are not considered valid.
++
++    ExpectColumnValuesToBeValidIso8601Datetime is a \
++    Column Map Expectation.
++
++    Column Map Expectations are one of the most common types of Expectation.
++    They are evaluated for a single column and ask a yes/no question for every row in that column.
++    Based on the result, they then calculate the percentage of rows that gave a positive answer. If the percentage is high enough, the Expectation considers that data valid.
++
++    Args:
++        column (str): \
++            {COLUMN_DESCRIPTION}
++
++    Other Parameters:
++        mostly (None or a float between 0 and 1): \
++            {MOSTLY_DESCRIPTION} \
++            For more detail, see [mostly](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#mostly). Default 1.
++        result_format (str or None): \
++            Which output mode to use: BOOLEAN_ONLY, BASIC, COMPLETE, or SUMMARY. \
++            For more detail, see [result_format](https://docs.greatexpectations.io/docs/reference/expectations/result_format).
++        catch_exceptions (boolean or None): \
++            If True, then catch exceptions and include them as part of the result object. \
++            For more detail, see [catch_exceptions](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#catch_exceptions).
++        meta (dict or None): \
++            A JSON-serializable dictionary (nesting allowed) that will be included in the output without \
++            modification. For more detail, see [meta](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#meta).
++        severity (str or None): \
++            {FAILURE_SEVERITY_DESCRIPTION} \
++            For more detail, see [failure severity](https://docs.greatexpectations.io/docs/cloud/expectations/expectations_overview/#failure-severity).
++
++    Returns:
++        An [ExpectationSuiteValidationResult](https://docs.greatexpectations.io/docs/terms/validation_result)
++
++        Exact fields vary depending on the values passed to result_format, catch_exceptions, and meta.
++
++    Supported Data Sources:
++        [{SUPPORTED_DATA_SOURCES[0]}](https://docs.greatexpectations.io/docs/application_integration_support/)
++        [{SUPPORTED_DATA_SOURCES[1]}](https://docs.greatexpectations.io/docs/application_integration_support/)
++
++    Data Quality Issues:
++        {DATA_QUALITY_ISSUES[0]}
++
++    Example Data:
++                valid_timestamps                invalid_timestamps
++            0   "2026-01-15"                    "2026-13-45"
++            1   "2026-01-15T10:30:00Z"          "2026-01-15T25:00:00"
++            2   "2026-12-31 23:59:59.999999"    "January 15, 2026"
++
++    Code Examples:
++        Passing Case:
++            Input:
++                ExpectColumnValuesToBeValidIso8601Datetime(
++                    column="valid_timestamps",
++            )
++
++            Output:
++                {{
++                  "exception_info": {{
++                    "raised_exception": false,
++                    "exception_traceback": null,
++                    "exception_message": null
++                  }},
++                  "result": {{
++                    "element_count": 3,
++                    "unexpected_count": 0,
++                    "unexpected_percent": 0.0,
++                    "partial_unexpected_list": [],
++                    "missing_count": 0,
++                    "missing_percent": 0.0,
++                    "unexpected_percent_total": 0.0,
++                    "unexpected_percent_nonmissing": 0.0
++                  }},
++                  "meta": {{}},
++                  "success": true
++                }}
++
++        Failing Case:
++            Input:
++                ExpectColumnValuesToBeValidIso8601Datetime(
++                    column="invalid_timestamps",
++            )
++
++            Output:
++                {{
++                  "exception_info": {{
++                    "raised_exception": false,
++                    "exception_traceback": null,
++                    "exception_message": null
++                  }},
++                  "result": {{
++                    "element_count": 3,
++                    "unexpected_count": 3,
++                    "unexpected_percent": 100.0,
++                    "partial_unexpected_list": [
++                      "2026-13-45",
++                      "2026-01-15T25:00:00",
++                      "January 15, 2026"
++                    ],
++                    "missing_count": 0,
++                    "missing_percent": 0.0,
++                    "unexpected_percent_total": 100.0,
++                    "unexpected_percent_nonmissing": 100.0
++                  }},
++                  "meta": {{}},
++                  "success": false
++                }}
++    """  # noqa: E501 # FIXME CoP
++
++    library_metadata: ClassVar[Dict[str, Union[str, list, bool]]] = {
++        "maturity": "production",
++        "tags": ["core expectation", "column map expectation"],
++        "contributors": [
++            "@great_expectations",
++        ],
++        "requirements": [],
++        "has_full_test_suite": True,
++        "manually_reviewed_code": True,
++    }
++    _library_metadata = library_metadata
++
++    map_metric = "column_values.valid_iso8601_datetime"
++    success_keys = ("mostly",)
++    args_keys = ("column",)
++
++    class Config:
++        title = "Expect column values to be valid ISO 8601 datetimes"
++
++        @staticmethod
++        def schema_extra(
++            schema: Dict[str, Any], model: Type[ExpectColumnValuesToBeValidIso8601Datetime]
++        ) -> None:
++            ColumnMapExpectation.Config.schema_extra(schema, model)
++            schema["properties"]["metadata"]["properties"].update(
++                {
++                    "data_quality_issues": {
++                        "title": "Data Quality Issues",
++                        "type": "array",
++                        "const": DATA_QUALITY_ISSUES,
++                    },
++                    "library_metadata": {
++                        "title": "Library Metadata",
++                        "type": "object",
++                        "const": model._library_metadata,
++                    },
++                    "short_description": {
++                        "title": "Short Description",
++                        "type": "string",
++                        "const": EXPECTATION_SHORT_DESCRIPTION,
++                    },
++                    "supported_data_sources": {
++                        "title": "Supported Data Sources",
++                        "type": "array",
++                        "const": SUPPORTED_DATA_SOURCES,
++                    },
++                }
++            )
++
++    @classmethod
++    def _prescriptive_template(
++        cls,
++        renderer_configuration: RendererConfiguration,
++    ) -> RendererConfiguration:
++        add_param_args: AddParamArgs = (
++            ("column", RendererValueType.STRING),
++            ("mostly", RendererValueType.NUMBER),
++        )
++        for name, param_type in add_param_args:
++            renderer_configuration.add_param(name=name, param_type=param_type)
++
++        params = renderer_configuration.params
++
++        template_str = "values must be valid ISO 8601 dates or datetimes"
++
++        if params.mostly and params.mostly.value < 1.0:
++            renderer_configuration = cls._add_mostly_pct_param(
++                renderer_configuration=renderer_configuration
++            )
++            template_str += ", at least $mostly_pct % of the time."
++        else:
++            template_str += "."
++
++        if renderer_configuration.include_column_name:
++            template_str = f"$column {template_str}"
++
++        renderer_configuration.template_str = template_str
++
++        return renderer_configuration
++
++    @classmethod
++    @renderer(renderer_type=LegacyRendererType.PRESCRIPTIVE)
++    @render_suite_parameter_string
++    def _prescriptive_renderer(
++        cls,
++        configuration: Optional[ExpectationConfiguration] = None,
++        result: Optional[ExpectationValidationResult] = None,
++        runtime_configuration: Optional[dict] = None,
++        **kwargs,
++    ):
++        runtime_configuration = runtime_configuration or {}
++        include_column_name = runtime_configuration.get("include_column_name") is not False
++        styling = runtime_configuration.get("styling")
++        params = substitute_none_for_missing(
++            configuration.kwargs,
++            [
++                "column",
++                "mostly",
++                "row_condition",
++                "condition_parser",
++            ],
++        )
++
++        template_str = "values must be valid ISO 8601 dates or datetimes"
++
++        if params["mostly"] is not None:
++            if isinstance(params["mostly"], (int, float)) and params["mostly"] < 1.0:
++                params["mostly_pct"] = num_to_str(params["mostly"] * 100, no_scientific=True)
++            template_str += ", at least $mostly_pct % of the time."
++        else:
++            template_str += "."
++
++        if include_column_name:
++            template_str = f"$column {template_str}"
++
++        if params["row_condition"] is not None:
++            conditional_template_str = parse_row_condition_string(params["row_condition"])
++
++            template_str, styling = _style_row_condition(
++                conditional_template_str,
++                template_str,
++                params,
++                styling,
++            )
++
++        return [
++            RenderedStringTemplateContent(
++                **{
++                    "content_block_type": "string_template",
++                    "string_template": {
++                        "template": template_str,
++                        "params": params,
++                        "styling": styling,
++                    },
++                }
++            )
++        ]
+diff --git a/great_expectations/expectations/core/expect_column_values_to_be_valid_uuid.py b/great_expectations/expectations/core/expect_column_values_to_be_valid_uuid.py
+new file mode 100644
+index 0000000..5265098
+--- /dev/null
++++ b/great_expectations/expectations/core/expect_column_values_to_be_valid_uuid.py
+@@ -0,0 +1,335 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Type, Union
++
++from great_expectations.compatibility import pydantic
++from great_expectations.core.suite_parameters import (
++    SuiteParameterDict,  # noqa: TC001 # FIXME CoP
++)
++from great_expectations.expectations.expectation import (
++    ColumnMapExpectation,
++    _style_row_condition,
++    render_suite_parameter_string,
++)
++from great_expectations.expectations.metadata_types import DataQualityIssues, SupportedDataSources
++from great_expectations.expectations.model_field_descriptions import (
++    COLUMN_DESCRIPTION,
++    FAILURE_SEVERITY_DESCRIPTION,
++    MOSTLY_DESCRIPTION,
++)
++from great_expectations.render import LegacyRendererType, RenderedStringTemplateContent
++from great_expectations.render.renderer.renderer import renderer
++from great_expectations.render.renderer_configuration import (
++    RendererConfiguration,
++    RendererValueType,
++)
++from great_expectations.render.util import (
++    num_to_str,
++    parse_row_condition_string,
++    substitute_none_for_missing,
++)
++
++if TYPE_CHECKING:
++    from great_expectations.core import (
++        ExpectationValidationResult,
++    )
++    from great_expectations.expectations.expectation_configuration import (
++        ExpectationConfiguration,
++    )
++    from great_expectations.render.renderer_configuration import AddParamArgs
++
++EXPECTATION_SHORT_DESCRIPTION = (
++    "Expect the column entries to be strings that are valid RFC 4122 UUIDs."
++)
++UUID_VERSION_DESCRIPTION = (
++    "If provided, only UUIDs of this version are considered valid. Must be one of 1, 3, 4, or 5."
++)
++DATA_QUALITY_ISSUES = [DataQualityIssues.VALIDITY.value]
++SUPPORTED_DATA_SOURCES = [
++    SupportedDataSources.PANDAS.value,
++    SupportedDataSources.SPARK.value,
++]
++
++_VALID_UUID_VERSIONS = (1, 3, 4, 5)
++
++
++class ExpectColumnValuesToBeValidUuid(ColumnMapExpectation):
++    __doc__ = f"""{EXPECTATION_SHORT_DESCRIPTION}
++
++    Only the canonical 8-4-4-4-12 hyphenated hexadecimal representation is accepted, for example \
++    "6f1c2e4a-9d3b-4a7e-8c1d-2b5a6f7e8d9c". Hexadecimal digits may be upper or lower case. \
++    Surrounding braces, "urn:uuid:" prefixes, undelimited 32-digit hexadecimal strings, empty \
++    strings, and non-string values are not considered valid. An optional version constraint may \
++    be supplied, in which case the version nibble of each UUID must match it exactly.
++
++    ExpectColumnValuesToBeValidUuid is a \
++    Column Map Expectation.
++
++    Column Map Expectations are one of the most common types of Expectation.
++    They are evaluated for a single column and ask a yes/no question for every row in that column.
++    Based on the result, they then calculate the percentage of rows that gave a positive answer. If the percentage is high enough, the Expectation considers that data valid.
++
++    Args:
++        column (str): \
++            {COLUMN_DESCRIPTION}
++        uuid_version (int or None): \
++            {UUID_VERSION_DESCRIPTION}
++
++    Other Parameters:
++        mostly (None or a float between 0 and 1): \
++            {MOSTLY_DESCRIPTION} \
++            For more detail, see [mostly](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#mostly). Default 1.
++        result_format (str or None): \
++            Which output mode to use: BOOLEAN_ONLY, BASIC, COMPLETE, or SUMMARY. \
++            For more detail, see [result_format](https://docs.greatexpectations.io/docs/reference/expectations/result_format).
++        catch_exceptions (boolean or None): \
++            If True, then catch exceptions and include them as part of the result object. \
++            For more detail, see [catch_exceptions](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#catch_exceptions).
++        meta (dict or None): \
++            A JSON-serializable dictionary (nesting allowed) that will be included in the output without \
++            modification. For more detail, see [meta](https://docs.greatexpectations.io/docs/reference/expectations/standard_arguments/#meta).
++        severity (str or None): \
++            {FAILURE_SEVERITY_DESCRIPTION} \
++            For more detail, see [failure severity](https://docs.greatexpectations.io/docs/cloud/expectations/expectations_overview/#failure-severity).
++
++    Returns:
++        An [ExpectationSuiteValidationResult](https://docs.greatexpectations.io/docs/terms/validation_result)
++
++        Exact fields vary depending on the values passed to result_format, catch_exceptions, and meta.
++
++    Supported Data Sources:
++        [{SUPPORTED_DATA_SOURCES[0]}](https://docs.greatexpectations.io/docs/application_integration_support/)
++        [{SUPPORTED_DATA_SOURCES[1]}](https://docs.greatexpectations.io/docs/application_integration_support/)
++
++    Data Quality Issues:
++        {DATA_QUALITY_ISSUES[0]}
++
++    Example Data:
++                valid_uuids                                invalid_uuids
++            0   "6f1c2e4a-9d3b-4a7e-8c1d-2b5a6f7e8d9c"      "{{6f1c2e4a-9d3b-4a7e-8c1d-2b5a6f7e8d9c}}"
++            1   "A987FBC9-4BED-4078-8F07-0081B0BA4590"      "6f1c2e4a9d3b4a7e8c1d2b5a6f7e8d9c"
++            2   "1b671a64-40d5-491e-99b0-da01ff1f3341"      "not-a-uuid"
++
++    Code Examples:
++        Passing Case:
++            Input:
++                ExpectColumnValuesToBeValidUuid(
++                    column="valid_uuids",
++            )
++
++            Output:
++                {{
++                  "exception_info": {{
++                    "raised_exception": false,
++                    "exception_traceback": null,
++                    "exception_message": null
++                  }},
++                  "result": {{
++                    "element_count": 3,
++                    "unexpected_count": 0,
++                    "unexpected_percent": 0.0,
++                    "partial_unexpected_list": [],
++                    "missing_count": 0,
++                    "missing_percent": 0.0,
++                    "unexpected_percent_total": 0.0,
++                    "unexpected_percent_nonmissing": 0.0
++                  }},
++                  "meta": {{}},
++                  "success": true
++                }}
++
++        Failing Case:
++            Input:
++                ExpectColumnValuesToBeValidUuid(
++                    column="invalid_uuids",
++            )
++
++            Output:
++                {{
++                  "exception_info": {{
++                    "raised_exception": false,
++                    "exception_traceback": null,
++                    "exception_message": null
++                  }},
++                  "result": {{
++                    "element_count": 3,
++                    "unexpected_count": 3,
++                    "unexpected_percent": 100.0,
++                    "partial_unexpected_list": [
++                      "{{6f1c2e4a-9d3b-4a7e-8c1d-2b5a6f7e8d9c}}",
++                      "6f1c2e4a9d3b4a7e8c1d2b5a6f7e8d9c",
++                      "not-a-uuid"
++                    ],
++                    "missing_count": 0,
++                    "missing_percent": 0.0,
++                    "unexpected_percent_total": 100.0,
++                    "unexpected_percent_nonmissing": 100.0
++                  }},
++                  "meta": {{}},
++                  "success": false
++                }}
++    """  # noqa: E501 # FIXME CoP
++
++    uuid_version: Optional[Union[int, SuiteParameterDict]] = pydantic.Field(
++        default=None, description=UUID_VERSION_DESCRIPTION
++    )
++
++    @pydantic.validator("uuid_version")
++    def _validate_uuid_version(
++        cls, uuid_version: Optional[Union[int, SuiteParameterDict]]
++    ) -> Optional[Union[int, SuiteParameterDict]]:
++        if isinstance(uuid_version, int) and uuid_version not in _VALID_UUID_VERSIONS:
++            raise ValueError(  # noqa: TRY003 # FIXME CoP
++                f"uuid_version must be one of {_VALID_UUID_VERSIONS}; got {uuid_version}."
++            )
++        return uuid_version
++
++    library_metadata: ClassVar[Dict[str, Union[str, list, bool]]] = {
++        "maturity": "production",
++        "tags": ["core expectation", "column map expectation"],
++        "contributors": [
++            "@great_expectations",
++        ],
++        "requirements": [],
++        "has_full_test_suite": True,
++        "manually_reviewed_code": True,
++    }
++    _library_metadata = library_metadata
++
++    map_metric = "column_values.valid_uuid"
++    success_keys = (
++        "uuid_version",
++        "mostly",
++    )
++    args_keys = (
++        "column",
++        "uuid_version",
++    )
++
++    class Config:
++        title = "Expect column values to be valid UUIDs"
++
++        @staticmethod
++        def schema_extra(
++            schema: Dict[str, Any], model: Type[ExpectColumnValuesToBeValidUuid]
++        ) -> None:
++            ColumnMapExpectation.Config.schema_extra(schema, model)
++            schema["properties"]["metadata"]["properties"].update(
++                {
++                    "data_quality_issues": {
++                        "title": "Data Quality Issues",
++                        "type": "array",
++                        "const": DATA_QUALITY_ISSUES,
++                    },
++                    "library_metadata": {
++                        "title": "Library Metadata",
++                        "type": "object",
++                        "const": model._library_metadata,
++                    },
++                    "short_description": {
++                        "title": "Short Description",
++                        "type": "string",
++                        "const": EXPECTATION_SHORT_DESCRIPTION,
++                    },
++                    "supported_data_sources": {
++                        "title": "Supported Data Sources",
++                        "type": "array",
++                        "const": SUPPORTED_DATA_SOURCES,
++                    },
++                }
++            )
++
++    @classmethod
++    def _prescriptive_template(
++        cls,
++        renderer_configuration: RendererConfiguration,
++    ) -> RendererConfiguration:
++        add_param_args: AddParamArgs = (
++            ("column", RendererValueType.STRING),
++            ("uuid_version", RendererValueType.NUMBER),
++            ("mostly", RendererValueType.NUMBER),
++        )
++        for name, param_type in add_param_args:
++            renderer_configuration.add_param(name=name, param_type=param_type)
++
++        params = renderer_configuration.params
++
++        template_str = "values must be valid UUIDs"
++        if params.uuid_version and params.uuid_version.value is not None:
++            template_str = "values must be valid version $uuid_version UUIDs"
++
++        if params.mostly and params.mostly.value < 1.0:
++            renderer_configuration = cls._add_mostly_pct_param(
++                renderer_configuration=renderer_configuration
++            )
++            template_str += ", at least $mostly_pct % of the time."
++        else:
++            template_str += "."
++
++        if renderer_configuration.include_column_name:
++            template_str = f"$column {template_str}"
++
++        renderer_configuration.template_str = template_str
++
++        return renderer_configuration
++
++    @classmethod
++    @renderer(renderer_type=LegacyRendererType.PRESCRIPTIVE)
++    @render_suite_parameter_string
++    def _prescriptive_renderer(
++        cls,
++        configuration: Optional[ExpectationConfiguration] = None,
++        result: Optional[ExpectationValidationResult] = None,
++        runtime_configuration: Optional[dict] = None,
++        **kwargs,
++    ):
++        runtime_configuration = runtime_configuration or {}
++        include_column_name = runtime_configuration.get("include_column_name") is not False
++        styling = runtime_configuration.get("styling")
++        params = substitute_none_for_missing(
++            configuration.kwargs,
++            [
++                "column",
++                "uuid_version",
++                "mostly",
++                "row_condition",
++                "condition_parser",
++            ],
++        )
++
++        template_str = "values must be valid UUIDs"
++        if params["uuid_version"] is not None:
++            template_str = "values must be valid version $uuid_version UUIDs"
++
++        if params["mostly"] is not None:
++            if isinstance(params["mostly"], (int, float)) and params["mostly"] < 1.0:
++                params["mostly_pct"] = num_to_str(params["mostly"] * 100, no_scientific=True)
++            template_str += ", at least $mostly_pct % of the time."
++        else:
++            template_str += "."
++
++        if include_column_name:
++            template_str = f"$column {template_str}"
++
++        if params["row_condition"] is not None:
++            conditional_template_str = parse_row_condition_string(params["row_condition"])
++
++            template_str, styling = _style_row_condition(
++                conditional_template_str,
++                template_str,
++                params,
++                styling,
++            )
++
++        return [
++            RenderedStringTemplateContent(
++                **{
++                    "content_block_type": "string_template",
++                    "string_template": {
++                        "template": template_str,
++                        "params": params,
++                        "styling": styling,
++                    },
++                }
++            )
++        ]
+diff --git a/great_expectations/expectations/metrics/column_map_metrics/__init__.py b/great_expectations/expectations/metrics/column_map_metrics/__init__.py
+index cf6235b..63fc6d6 100644
+--- a/great_expectations/expectations/metrics/column_map_metrics/__init__.py
++++ b/great_expectations/expectations/metrics/column_map_metrics/__init__.py
+@@ -24,4 +24,8 @@ from .column_values_not_outliers import ColumnValuesNotOutliers
+ from .column_values_null import ColumnValuesNull
+ from .column_values_of_type import ColumnValuesOfType
+ from .column_values_unique import ColumnValuesUnique
++from .column_values_valid_credit_card_number import ColumnValuesValidCreditCardNumber
++from .column_values_valid_iban import ColumnValuesValidIban
++from .column_values_valid_iso8601_datetime import ColumnValuesValidIso8601Datetime
++from .column_values_valid_uuid import ColumnValuesValidUuid
+ from .column_values_z_score import ColumnValuesZScore
+diff --git a/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_credit_card_number.py b/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_credit_card_number.py
+new file mode 100644
+index 0000000..7e01f0a
+--- /dev/null
++++ b/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_credit_card_number.py
+@@ -0,0 +1,64 @@
++from __future__ import annotations
++
++from great_expectations.compatibility import pyspark
++from great_expectations.compatibility.pyspark import functions as F
++from great_expectations.execution_engine import (
++    PandasExecutionEngine,
++    SparkDFExecutionEngine,
++)
++from great_expectations.expectations.metrics.map_metric_provider import (
++    ColumnMapMetricProvider,
++    column_condition_partial,
++)
++
++# PAN lengths permitted by ISO/IEC 7812-1 are up to 19 digits; lengths below
++# 13 are not issued by any major scheme.
++_MIN_PAN_LENGTH = 13
++_MAX_PAN_LENGTH = 19
++
++
++def _luhn_checksum_is_valid(digits: str) -> bool:
++    """Validate a string of decimal digits against the Luhn (mod 10) algorithm."""
++    total = 0
++    for index_from_right, char in enumerate(reversed(digits)):
++        digit = int(char)
++        if index_from_right % 2 == 1:
++            digit *= 2
++            if digit > 9:
++                digit -= 9
++        total += digit
++    return total % 10 == 0
++
++
++def _is_valid_credit_card_number(val: object) -> bool:
++    """Check whether a value is a plausibly valid payment card number (PAN).
++
++    Spaces and hyphens are ignored, so grouped presentations such as
++    "4532 0151 1283 0366" are accepted. After stripping those separators the
++    value must consist solely of decimal digits, be between 13 and 19 digits
++    long (inclusive), and satisfy the Luhn checksum.
++    """
++    if not isinstance(val, str):
++        return False
++    digits = val.replace(" ", "").replace("-", "")
++    if not digits.isdigit():
++        return False
++    if not _MIN_PAN_LENGTH <= len(digits) <= _MAX_PAN_LENGTH:
++        return False
++    return _luhn_checksum_is_valid(digits)
++
++
++class ColumnValuesValidCreditCardNumber(ColumnMapMetricProvider):
++    condition_metric_name = "column_values.valid_credit_card_number"
++
++    @column_condition_partial(engine=PandasExecutionEngine)
++    def _pandas(cls, column, **kwargs):
++        return column.map(_is_valid_credit_card_number)
++
++    @column_condition_partial(engine=SparkDFExecutionEngine)
++    def _spark(cls, column, **kwargs):
++        is_valid_credit_card_number_udf = F.udf(
++            _is_valid_credit_card_number, pyspark.types.BooleanType()
++        )
++
++        return is_valid_credit_card_number_udf(column)
+diff --git a/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_iban.py b/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_iban.py
+new file mode 100644
+index 0000000..2c0e3b4
+--- /dev/null
++++ b/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_iban.py
+@@ -0,0 +1,158 @@
++from __future__ import annotations
++
++import re
++
++from great_expectations.compatibility import pyspark
++from great_expectations.compatibility.pyspark import functions as F
++from great_expectations.execution_engine import (
++    PandasExecutionEngine,
++    SparkDFExecutionEngine,
++)
++from great_expectations.expectations.metrics.map_metric_provider import (
++    ColumnMapMetricProvider,
++    column_condition_partial,
++)
++
++# Total IBAN length (country code and check digits included) per ISO 13616
++# country/territory code, as published in the SWIFT IBAN registry.
++_IBAN_LENGTHS_BY_COUNTRY = {
++    "AD": 24,
++    "AE": 23,
++    "AL": 28,
++    "AT": 20,
++    "AZ": 28,
++    "BA": 20,
++    "BE": 16,
++    "BG": 22,
++    "BH": 22,
++    "BI": 27,
++    "BR": 29,
++    "BY": 28,
++    "CH": 21,
++    "CR": 22,
++    "CY": 28,
++    "CZ": 24,
++    "DE": 22,
++    "DJ": 27,
++    "DK": 18,
++    "DO": 28,
++    "EE": 20,
++    "EG": 29,
++    "ES": 24,
++    "FI": 18,
++    "FO": 18,
++    "FR": 27,
++    "GB": 22,
++    "GE": 22,
++    "GI": 23,
++    "GL": 18,
++    "GR": 27,
++    "GT": 28,
++    "HR": 21,
++    "HU": 28,
++    "IE": 22,
++    "IL": 23,
++    "IQ": 23,
++    "IS": 26,
++    "IT": 27,
++    "JO": 30,
++    "KW": 30,
++    "KZ": 20,
++    "LB": 28,
++    "LC": 32,
++    "LI": 21,
++    "LT": 20,
++    "LU": 20,
++    "LV": 21,
++    "LY": 25,
++    "MC": 27,
++    "MD": 24,
++    "ME": 22,
++    "MK": 19,
++    "MR": 27,
++    "MT": 31,
++    "MU": 30,
++    "MZ": 25,
++    "NL": 18,
++    "NO": 15,
++    "PK": 24,
++    "PL": 28,
++    "PS": 29,
++    "PT": 25,
++    "QA": 29,
++    "RO": 24,
++    "RS": 22,
++    "SA": 24,
++    "SC": 31,
++    "SD": 18,
++    "SE": 24,
++    "SI": 19,
++    "SK": 24,
++    "SM": 27,
++    "SO": 23,
++    "ST": 25,
++    "SV": 28,
++    "TL": 23,
++    "TN": 24,
++    "TR": 26,
++    "UA": 29,
++    "VA": 22,
++    "VG": 24,
++    "XK": 20,
++}
++
++_IBAN_STRUCTURE_PATTERN = re.compile(r"^[A-Z]{2}[0-9]{2}[A-Z0-9]+$")
++
++
++def _iban_mod97_is_valid(compact_iban: str) -> bool:
++    """Run the ISO 13616 mod-97 check on a normalized (compact, upper-case) IBAN.
++
++    The first four characters are moved to the end, letters are expanded to
++    their numeric equivalents (A=10, ..., Z=35), and the resulting number must
++    leave remainder 1 modulo 97. The remainder is computed incrementally so
++    arbitrarily long expansions never overflow.
++    """
++    rearranged = compact_iban[4:] + compact_iban[:4]
++    remainder = 0
++    for char in rearranged:
++        if char.isalpha():
++            expansion = str(ord(char) - 55)
++        else:
++            expansion = char
++        for digit in expansion:
++            remainder = (remainder * 10 + int(digit)) % 97
++    return remainder == 1
++
++
++def _is_valid_iban(val: object) -> bool:
++    """Check whether a value is a structurally valid IBAN.
++
++    Whitespace (including the customary groups-of-four presentation) and
++    letter case are ignored. The normalized value must match the IBAN
++    structure (two-letter country code, two check digits, then an alphanumeric
++    BBAN), must have exactly the total length mandated by the ISO 13616
++    registry for its country code, and must pass the mod-97 checksum.
++    """
++    if not isinstance(val, str):
++        return False
++    compact = re.sub(r"\s+", "", val).upper()
++    if not _IBAN_STRUCTURE_PATTERN.match(compact):
++        return False
++    expected_length = _IBAN_LENGTHS_BY_COUNTRY.get(compact[:2])
++    if expected_length is None or len(compact) != expected_length:
++        return False
++    return _iban_mod97_is_valid(compact)
++
++
++class ColumnValuesValidIban(ColumnMapMetricProvider):
++    condition_metric_name = "column_values.valid_iban"
++
++    @column_condition_partial(engine=PandasExecutionEngine)
++    def _pandas(cls, column, **kwargs):
++        return column.map(_is_valid_iban)
++
++    @column_condition_partial(engine=SparkDFExecutionEngine)
++    def _spark(cls, column, **kwargs):
++        is_valid_iban_udf = F.udf(_is_valid_iban, pyspark.types.BooleanType())
++
++        return is_valid_iban_udf(column)
+diff --git a/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_iso8601_datetime.py b/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_iso8601_datetime.py
+new file mode 100644
+index 0000000..4c4fe5c
+--- /dev/null
++++ b/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_iso8601_datetime.py
+@@ -0,0 +1,57 @@
++from __future__ import annotations
++
++import re
++from datetime import datetime
++
++from great_expectations.compatibility import pyspark
++from great_expectations.compatibility.pyspark import functions as F
++from great_expectations.execution_engine import (
++    PandasExecutionEngine,
++    SparkDFExecutionEngine,
++)
++from great_expectations.expectations.metrics.map_metric_provider import (
++    ColumnMapMetricProvider,
++    column_condition_partial,
++)
++
++# The value must at least begin with a full calendar date (YYYY-MM-DD). This
++# intentionally rejects compact ("20260115"), week ("2026-W03-4") and ordinal
++# ("2026-015") notations, as well as bare times: the expectation targets
++# calendar dates and datetimes, not the full breadth of ISO 8601.
++_ISO8601_CALENDAR_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
++
++
++def _is_valid_iso8601_datetime(val: object) -> bool:
++    """Check whether a value is a valid ISO 8601 calendar date or datetime string.
++
++    Accepted values begin with a calendar date in ``YYYY-MM-DD`` form and may
++    continue with a time component separated by ``T`` (or a space), optional
++    fractional seconds, and an optional UTC offset (``Z`` or ``+/-HH:MM``).
++    The string must be parseable by ``datetime.fromisoformat``; impossible
++    dates (e.g. month 13) and times (e.g. hour 25) are rejected.
++    """
++    if not isinstance(val, str):
++        return False
++    if not _ISO8601_CALENDAR_DATE_PREFIX.match(val):
++        return False
++    try:
++        datetime.fromisoformat(val)
++    except ValueError:
++        return False
++    return True
++
++
++class ColumnValuesValidIso8601Datetime(ColumnMapMetricProvider):
++    condition_metric_name = "column_values.valid_iso8601_datetime"
++
++    @column_condition_partial(engine=PandasExecutionEngine)
++    def _pandas(cls, column, **kwargs):
++        return column.map(_is_valid_iso8601_datetime)
++
++    @column_condition_partial(engine=SparkDFExecutionEngine)
++    def _spark(cls, column, **kwargs):
++        is_valid_iso8601_datetime_udf = F.udf(
++            _is_valid_iso8601_datetime, pyspark.types.BooleanType()
++        )
++
++        return is_valid_iso8601_datetime_udf(column)
+diff --git a/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_uuid.py b/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_uuid.py
+new file mode 100644
+index 0000000..1d7ec31
+--- /dev/null
++++ b/great_expectations/expectations/metrics/column_map_metrics/column_values_valid_uuid.py
+@@ -0,0 +1,63 @@
++from __future__ import annotations
++
++import re
++from typing import Optional
++
++from great_expectations.compatibility import pyspark
++from great_expectations.compatibility.pyspark import functions as F
++from great_expectations.execution_engine import (
++    PandasExecutionEngine,
++    SparkDFExecutionEngine,
++)
++from great_expectations.expectations.metrics.map_metric_provider import (
++    ColumnMapMetricProvider,
++    column_condition_partial,
++)
++
++_UUID_CANONICAL_PATTERN = re.compile(
++    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
++)
++# Position of the version nibble within the canonical 36-character representation
++# (first hexadecimal digit of the third hyphen-separated group).
++_UUID_VERSION_NIBBLE_INDEX = 14
++
++
++def _is_valid_uuid(val: object, uuid_version: Optional[int]) -> bool:
++    """Check whether a value is a canonical RFC 4122 UUID string.
++
++    Only the canonical 8-4-4-4-12 hyphenated hexadecimal representation is
++    accepted (surrounding braces, "urn:uuid:" prefixes and undelimited
++    32-digit hex strings are rejected). Hexadecimal digits may be upper or
++    lower case. When ``uuid_version`` is provided, the version nibble of the
++    UUID must match it exactly.
++    """
++    if not isinstance(val, str):
++        return False
++    if not _UUID_CANONICAL_PATTERN.fullmatch(val):
++        return False
++    if uuid_version is not None:
++        try:
++            version_nibble = int(val[_UUID_VERSION_NIBBLE_INDEX], 16)
++        except (ValueError, IndexError):
++            return False
++        if version_nibble != uuid_version:
++            return False
++    return True
++
++
++class ColumnValuesValidUuid(ColumnMapMetricProvider):
++    condition_metric_name = "column_values.valid_uuid"
++    condition_value_keys = ("uuid_version",)
++
++    @column_condition_partial(engine=PandasExecutionEngine)
++    def _pandas(cls, column, uuid_version=None, **kwargs):
++        return column.map(lambda val: _is_valid_uuid(val, uuid_version))
++
++    @column_condition_partial(engine=SparkDFExecutionEngine)
++    def _spark(cls, column, uuid_version=None, **kwargs):
++        def is_valid_uuid(val):
++            return _is_valid_uuid(val, uuid_version)
++
++        is_valid_uuid_udf = F.udf(is_valid_uuid, pyspark.types.BooleanType())
++
++        return is_valid_uuid_udf(column)
+diff --git a/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_credit_card_number.py b/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_credit_card_number.py
+new file mode 100644
+index 0000000..81182bf
+--- /dev/null
++++ b/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_credit_card_number.py
+@@ -0,0 +1,192 @@
++from typing import Sequence
++
++import pandas as pd
++
++import great_expectations.expectations as gxe
++from great_expectations.datasource.fluent.interfaces import Batch
++from tests.integration.conftest import parameterize_batch_for_data_sources
++from tests.integration.test_utils.data_source_config import (
++    PandasDataFrameDatasourceTestConfig,
++)
++from tests.integration.test_utils.data_source_config.base import DataSourceTestConfig
++
++VALID_PANS = "valid_pans"
++GROUPED_PANS = "grouped_pans"
++BAD_CHECKSUM = "bad_checksum"
++BAD_STRUCTURE = "bad_structure"
++MIXED_QUALITY = "mixed_quality"
++NUMERIC_PRESENTATIONS = "numeric_presentations"
++NULLABLE_PANS = "nullable_pans"
++
++SUPPORTED_DATA_SOURCES: Sequence[DataSourceTestConfig] = [
++    PandasDataFrameDatasourceTestConfig(),
++]
++
++DATA = pd.DataFrame(
++    {
++        VALID_PANS: [
++            "4532015112830366",  # Visa test number
++            "5425233430109903",  # Mastercard test number
++            "378282246310005",  # American Express test number
++            "6011111111111117",  # Discover test number
++            "30569309025904",  # Diners Club test number
++        ],
++        GROUPED_PANS: [
++            "4532 0151 1283 0366",
++            "5425 2334 3010 9903",
++            "3782-822463-10005",
++            "6011 1111 1111 1117",
++            "3056 9309 0259 04",
++        ],
++        BAD_CHECKSUM: [
++            "4532015112830367",
++            "5425233430109904",
++            "6011111111111118",
++            "30569309025905",
++            "378282246310006",
++        ],
++        BAD_STRUCTURE: [
++            "123456789012",  # too short (12 digits)
++            "45320151128303661234567890",  # too long (20 digits)
++            "4532-0151-1283-03ab",  # non-digit characters
++            "4532@015112830366",  # non-separator punctuation
++            "",  # empty
++        ],
++        MIXED_QUALITY: [
++            "4532015112830366",
++            "4532015112830367",
++            "5425233430109903",
++            "123456789012",
++            "6011111111111117",
++        ],
++        NUMERIC_PRESENTATIONS: [
++            "4532015112830366",
++            4532015112830366,
++            "5425233430109903",
++            "6011111111111117",
++            30569309025904,
++        ],
++        NULLABLE_PANS: [
++            "4532015112830366",
++            None,
++            "4532015112830367",
++            None,
++            "5425233430109903",
++        ],
++    }
++)
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_luhn_valid_numbers_success(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidCreditCardNumber(column=VALID_PANS)
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_grouped_presentations_success(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidCreditCardNumber(column=GROUPED_PANS)
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_luhn_checksum_failures_rejected(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidCreditCardNumber(column=BAD_CHECKSUM)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["unexpected_count"] == 5
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_structurally_invalid_numbers_rejected(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidCreditCardNumber(column=BAD_STRUCTURE)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["unexpected_count"] == 5
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_mostly_threshold_met(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidCreditCardNumber(
++        column=MIXED_QUALITY, mostly=0.5
++    )
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_mostly_threshold_not_met(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidCreditCardNumber(
++        column=MIXED_QUALITY, mostly=0.75
++    )
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_expectation_type_and_core_registration(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidCreditCardNumber(column=VALID_PANS)
++    assert expectation.expectation_type == "expect_column_values_to_be_valid_credit_card_number"
++    assert expectation.configuration.type == "expect_column_values_to_be_valid_credit_card_number"
++
++    from great_expectations.expectations.core import (
++        ExpectColumnValuesToBeValidCreditCardNumber,
++    )
++
++    assert ExpectColumnValuesToBeValidCreditCardNumber is (
++        gxe.ExpectColumnValuesToBeValidCreditCardNumber
++    )
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_result_format_complete_lists_unexpected_values(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidCreditCardNumber(column=BAD_CHECKSUM)
++    result = batch_for_datasource.validate(expectation, result_format="COMPLETE")
++    assert not result.success
++    assert set(result.result["unexpected_list"]) == {
++        "4532015112830367",
++        "5425233430109904",
++        "6011111111111118",
++        "30569309025905",
++        "378282246310006",
++    }
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_numeric_values_are_not_strings_and_fail(batch_for_datasource: Batch) -> None:
++    # The same digits presented as an integer (not a string) are not valid input.
++    expectation = gxe.ExpectColumnValuesToBeValidCreditCardNumber(column=NUMERIC_PRESENTATIONS)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["element_count"] == 5
++    assert result.result["unexpected_count"] == 2
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_nulls_are_missing_not_unexpected(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidCreditCardNumber(column=NULLABLE_PANS)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["element_count"] == 5
++    assert result.result["missing_count"] == 2
++    assert result.result["unexpected_count"] == 1
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_configuration_serialization_round_trip(batch_for_datasource: Batch) -> None:
++    from great_expectations.expectations.expectation_configuration import (
++        ExpectationConfiguration,
++    )
++
++    expectation = gxe.ExpectColumnValuesToBeValidCreditCardNumber(
++        column=VALID_PANS, mostly=0.95
++    )
++    config_dict = expectation.configuration.to_json_dict()
++    assert config_dict["type"] == "expect_column_values_to_be_valid_credit_card_number"
++
++    rebuilt = ExpectationConfiguration(**config_dict)
++    assert rebuilt.type == "expect_column_values_to_be_valid_credit_card_number"
++    assert rebuilt.kwargs["column"] == VALID_PANS
++    assert rebuilt.kwargs["mostly"] == 0.95
+diff --git a/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_iban.py b/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_iban.py
+new file mode 100644
+index 0000000..107189f
+--- /dev/null
++++ b/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_iban.py
+@@ -0,0 +1,250 @@
++from typing import Sequence
++
++import pandas as pd
++
++import great_expectations.expectations as gxe
++from great_expectations.datasource.fluent.interfaces import Batch
++from tests.integration.conftest import parameterize_batch_for_data_sources
++from tests.integration.test_utils.data_source_config import (
++    PandasDataFrameDatasourceTestConfig,
++)
++from tests.integration.test_utils.data_source_config.base import DataSourceTestConfig
++
++VALID_IBANS = "valid_ibans"
++FORMATTED_IBANS = "formatted_ibans"
++BAD_CHECKSUM = "bad_checksum"
++BAD_REGISTRY = "bad_registry"
++MIXED_QUALITY = "mixed_quality"
++
++SUPPORTED_DATA_SOURCES: Sequence[DataSourceTestConfig] = [
++    PandasDataFrameDatasourceTestConfig(),
++]
++
++DATA = pd.DataFrame(
++    {
++        VALID_IBANS: [
++            "GB29NWBK60161331926819",
++            "DE89370400440532013000",
++            "FR1420041010050500013M02606",
++            "NL91ABNA0417164300",
++            "ES9121000418450200051332",
++        ],
++        FORMATTED_IBANS: [
++            "GB29 NWBK 6016 1331 9268 19",
++            "de89 3704 0044 0532 0130 00",
++            "FR14 2004 1010 0505 0001 3M02 606",
++            "NL91 ABNA 0417 1643 00",
++            "ES91 2100 0418 4502 0005 1332",
++        ],
++        BAD_CHECKSUM: [
++            "GB29NWBK60161331926818",
++            "DE89370400440532013001",
++            "NL91ABNA0417164301",
++            "ES9121000418450200051333",
++            "FR1420041010050500013M02607",
++        ],
++        BAD_REGISTRY: [
++            "XX89370400440532013000",  # country code not in the IBAN registry
++            "US29NWBK60161331926819",  # the US does not participate in IBAN
++            "GB29NWBK6016",  # too short for a GB IBAN
++            "DE893704004405320130001234",  # too long for a DE IBAN
++            "IT60X054281110100000012",  # too short for an IT IBAN
++        ],
++        MIXED_QUALITY: [
++            "GB29NWBK60161331926819",
++            "GB29NWBK60161331926818",
++            "DE89370400440532013000",
++            "XX89370400440532013000",
++            "NL91ABNA0417164300",
++        ],
++    }
++)
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_registry_ibans_success(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIban(column=VALID_IBANS)
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_whitespace_and_lowercase_presentations_success(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIban(column=FORMATTED_IBANS)
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_mod97_checksum_failures_rejected(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIban(column=BAD_CHECKSUM)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["unexpected_count"] == 5
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_unknown_country_and_wrong_length_rejected(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIban(column=BAD_REGISTRY)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["unexpected_count"] == 5
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_mostly_threshold_met(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIban(column=MIXED_QUALITY, mostly=0.5)
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_mostly_threshold_not_met(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIban(column=MIXED_QUALITY, mostly=0.7)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++
++
++# One known-valid IBAN per country/territory, drawn from the public
++# ISO 13616 / SWIFT IBAN registry examples.
++REGISTRY_EXAMPLE_IBANS = [
++    "AD1200012030200359100100",
++    "AE070331234567890123456",
++    "AL47212110090000000235698741",
++    "AT611904300234573201",
++    "AZ21NABZ00000000137010001944",
++    "BA391290079401028494",
++    "BE68539007547034",
++    "BG80BNBG96611020345678",
++    "BH67BMAG00001299123456",
++    "BR9700360305000010009795493P1",
++    "BY13NBRB3600900000002Z00AB00",
++    "CH9300762011623852957",
++    "CR05015202001026284066",
++    "CY17002001280000001200527600",
++    "CZ6508000000192000145399",
++    "DE89370400440532013000",
++    "DK5000400440116243",
++    "EE382200221020145685",
++    "ES9121000418450200051332",
++    "FI2112345600000785",
++    "FO6264600001631634",
++    "FR1420041010050500013M02606",
++    "GB29NWBK60161331926819",
++    "GE29NB0000000101904917",
++    "GI75NWBK000000007099453",
++    "GR1601101250000000012300695",
++    "HR1210010051863000160",
++    "HU42117730161111101800000000",
++    "IE29AIBK93115212345678",
++    "IS140159260076545510730339",
++    "IT60X0542811101000000123456",
++    "KW81CBKU0000000000001234560101",
++    "LB62099900000001001901229114",
++    "LI21088100002324013AA",
++    "LT121000011101001000",
++    "LU280019400644750000",
++    "LV80BANK0000435195001",
++    "MC5813488000010051108001292",
++    "MD24AG000225100013104168",
++    "ME25505000012345678951",
++    "MK07250120000058984",
++    "MT84MALT011000012345MTLCAST001S",
++    "NL91ABNA0417164300",
++    "NO9386011117947",
++    "PL61109010140000071219812874",
++    "PS92PALS000000000400123456702",
++    "PT50000201231234567890154",
++    "QA58DOHB00001234567890ABCDEFG",
++    "RO49AAAA1B31007593840000",
++    "RS35260005601001611379",
++    "SA0380000000608010167519",
++    "SE4550000000058398257466",
++    "SI56191000000123438",
++    "SK3112000000198742637541",
++    "SM86U0322509800000000270100",
++    "TL380080012345678910157",
++    "TN5910006035183598478831",
++    "TR330006100519786457841326",
++    "VA59001123000012345678",
++    "VG96VPVG0000012345678901",
++    "XK051212012345678906",
++]
++
++
++def test_registry_examples_for_all_supported_countries_success() -> None:
++    import great_expectations as gx
++
++    context = gx.get_context(mode="ephemeral")
++    datasource = context.data_sources.add_pandas("pandas")
++    asset = datasource.add_dataframe_asset("ibans")
++    batch_definition = asset.add_batch_definition_whole_dataframe("bd")
++    batch = batch_definition.get_batch(
++        batch_parameters={"dataframe": pd.DataFrame({"iban": REGISTRY_EXAMPLE_IBANS})}
++    )
++    expectation = gxe.ExpectColumnValuesToBeValidIban(column="iban")
++    result = batch.validate(expectation)
++    assert result.success
++
++
++def test_nulls_are_missing_not_unexpected() -> None:
++    import great_expectations as gx
++
++    context = gx.get_context(mode="ephemeral")
++    datasource = context.data_sources.add_pandas("pandas")
++    asset = datasource.add_dataframe_asset("ibans")
++    batch_definition = asset.add_batch_definition_whole_dataframe("bd")
++    batch = batch_definition.get_batch(
++        batch_parameters={
++            "dataframe": pd.DataFrame(
++                {"iban": ["GB29NWBK60161331926819", None, "GB29NWBK60161331926818", None]}
++            )
++        }
++    )
++    expectation = gxe.ExpectColumnValuesToBeValidIban(column="iban")
++    result = batch.validate(expectation)
++    assert not result.success
++    assert result.result["element_count"] == 4
++    assert result.result["missing_count"] == 2
++    assert result.result["unexpected_count"] == 1
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_expectation_type_and_core_registration(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIban(column=VALID_IBANS)
++    assert expectation.expectation_type == "expect_column_values_to_be_valid_iban"
++    assert expectation.configuration.type == "expect_column_values_to_be_valid_iban"
++
++    from great_expectations.expectations.core import ExpectColumnValuesToBeValidIban
++
++    assert ExpectColumnValuesToBeValidIban is gxe.ExpectColumnValuesToBeValidIban
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_result_format_complete_lists_unexpected_values(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIban(column=BAD_CHECKSUM)
++    result = batch_for_datasource.validate(expectation, result_format="COMPLETE")
++    assert not result.success
++    assert set(result.result["unexpected_list"]) == {
++        "GB29NWBK60161331926818",
++        "DE89370400440532013001",
++        "NL91ABNA0417164301",
++        "ES9121000418450200051333",
++        "FR1420041010050500013M02607",
++    }
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_configuration_serialization_round_trip(batch_for_datasource: Batch) -> None:
++    from great_expectations.expectations.expectation_configuration import (
++        ExpectationConfiguration,
++    )
++
++    expectation = gxe.ExpectColumnValuesToBeValidIban(column=VALID_IBANS, mostly=0.99)
++    config_dict = expectation.configuration.to_json_dict()
++    assert config_dict["type"] == "expect_column_values_to_be_valid_iban"
++
++    rebuilt = ExpectationConfiguration(**config_dict)
++    assert rebuilt.type == "expect_column_values_to_be_valid_iban"
++    assert rebuilt.kwargs["column"] == VALID_IBANS
++    assert rebuilt.kwargs["mostly"] == 0.99
+diff --git a/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_iso8601_datetime.py b/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_iso8601_datetime.py
+new file mode 100644
+index 0000000..54d6d27
+--- /dev/null
++++ b/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_iso8601_datetime.py
+@@ -0,0 +1,154 @@
++from typing import Sequence
++
++import pandas as pd
++
++import great_expectations.expectations as gxe
++from great_expectations.datasource.fluent.interfaces import Batch
++from tests.integration.conftest import parameterize_batch_for_data_sources
++from tests.integration.test_utils.data_source_config import (
++    PandasDataFrameDatasourceTestConfig,
++)
++from tests.integration.test_utils.data_source_config.base import DataSourceTestConfig
++
++VALID_DATES = "valid_dates"
++VALID_DATETIMES = "valid_datetimes"
++IMPOSSIBLE_VALUES = "impossible_values"
++NON_ISO_NOTATIONS = "non_iso_notations"
++MIXED_QUALITY = "mixed_quality"
++NULLABLE_TIMESTAMPS = "nullable_timestamps"
++
++SUPPORTED_DATA_SOURCES: Sequence[DataSourceTestConfig] = [
++    PandasDataFrameDatasourceTestConfig(),
++]
++
++DATA = pd.DataFrame(
++    {
++        VALID_DATES: ["2026-01-15", "2026-12-31", "2000-02-29", "1999-12-31", "2024-02-29"],
++        VALID_DATETIMES: [
++            "2026-01-15T10:30:00",
++            "2026-01-15T10:30:00Z",
++            "2026-01-15T10:30:00.123456+05:30",
++            "2026-12-31 23:59:59",
++            "2026-06-30T00:00:00-08:00",
++        ],
++        IMPOSSIBLE_VALUES: [
++            "2026-13-45",
++            "2026-01-15T25:00:00",
++            "2023-02-29",
++            "2026-01-15T10:30:61",
++            "2026-04-31",
++        ],
++        NON_ISO_NOTATIONS: [
++            "20260115",
++            "01/15/2026",
++            "January 15, 2026",
++            "10:30:00",
++            "2026-01",
++        ],
++        MIXED_QUALITY: ["2026-01-15", "2026-13-45", "2026-12-31", "not-a-date", ""],
++        NULLABLE_TIMESTAMPS: ["2026-01-15", None, "not-a-date", None, None],
++    }
++)
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_calendar_dates_success(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIso8601Datetime(column=VALID_DATES)
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_datetimes_with_offsets_success(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIso8601Datetime(column=VALID_DATETIMES)
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_impossible_dates_and_times_rejected(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIso8601Datetime(column=IMPOSSIBLE_VALUES)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["unexpected_count"] == 5
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_non_iso_notations_rejected(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIso8601Datetime(column=NON_ISO_NOTATIONS)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["unexpected_count"] == 5
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_mostly_threshold_met(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIso8601Datetime(
++        column=MIXED_QUALITY, mostly=0.4
++    )
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_mostly_threshold_not_met(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIso8601Datetime(
++        column=MIXED_QUALITY, mostly=0.5
++    )
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_expectation_type_and_core_registration(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIso8601Datetime(column=VALID_DATES)
++    assert expectation.expectation_type == "expect_column_values_to_be_valid_iso8601_datetime"
++    assert expectation.configuration.type == "expect_column_values_to_be_valid_iso8601_datetime"
++
++    from great_expectations.expectations.core import ExpectColumnValuesToBeValidIso8601Datetime
++
++    assert ExpectColumnValuesToBeValidIso8601Datetime is (
++        gxe.ExpectColumnValuesToBeValidIso8601Datetime
++    )
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_result_format_complete_lists_unexpected_values(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIso8601Datetime(column=IMPOSSIBLE_VALUES)
++    result = batch_for_datasource.validate(expectation, result_format="COMPLETE")
++    assert not result.success
++    assert set(result.result["unexpected_list"]) == {
++        "2026-13-45",
++        "2026-01-15T25:00:00",
++        "2023-02-29",
++        "2026-01-15T10:30:61",
++        "2026-04-31",
++    }
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_nulls_are_missing_not_unexpected(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidIso8601Datetime(column=NULLABLE_TIMESTAMPS)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["element_count"] == 5
++    assert result.result["missing_count"] == 3
++    assert result.result["unexpected_count"] == 1
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_configuration_serialization_round_trip(batch_for_datasource: Batch) -> None:
++    from great_expectations.expectations.expectation_configuration import (
++        ExpectationConfiguration,
++    )
++
++    expectation = gxe.ExpectColumnValuesToBeValidIso8601Datetime(
++        column=VALID_DATES, mostly=0.8
++    )
++    config_dict = expectation.configuration.to_json_dict()
++    assert config_dict["type"] == "expect_column_values_to_be_valid_iso8601_datetime"
++
++    rebuilt = ExpectationConfiguration(**config_dict)
++    assert rebuilt.type == "expect_column_values_to_be_valid_iso8601_datetime"
++    assert rebuilt.kwargs["column"] == VALID_DATES
++    assert rebuilt.kwargs["mostly"] == 0.8
+diff --git a/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_uuid.py b/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_uuid.py
+new file mode 100644
+index 0000000..89189ee
+--- /dev/null
++++ b/tests/integration/data_sources_and_expectations/expectations/test_expect_column_values_to_be_valid_uuid.py
+@@ -0,0 +1,224 @@
++from typing import Sequence
++
++import pandas as pd
++
++import great_expectations.expectations as gxe
++from great_expectations.datasource.fluent.interfaces import Batch
++from tests.integration.conftest import parameterize_batch_for_data_sources
++from tests.integration.test_utils.data_source_config import (
++    PandasDataFrameDatasourceTestConfig,
++)
++from tests.integration.test_utils.data_source_config.base import DataSourceTestConfig
++
++VALID_ANY_VERSION = "valid_any_version"
++VALID_V4_ONLY = "valid_v4_only"
++MIXED_VERSIONS = "mixed_versions"
++INVALID_FORMATS = "invalid_formats"
++WITH_NULLS = "with_nulls"
++FLAG = "flag"
++
++V1_UUID = "1b671a64-40d5-11ee-be56-0242ac120002"
++V3_UUID = "6fa459ea-ee8a-3ca4-894e-db77e160355e"
++V4_UUID = "6f1c2e4a-9d3b-4a7e-8c1d-2b5a6f7e8d9c"
++V4_UUID_UPPER = "A987FBC9-4BED-4078-8F07-0081B0BA4590"
++V5_UUID = "987fbc97-4bed-5078-af07-9141ba07c9f3"
++
++SUPPORTED_DATA_SOURCES: Sequence[DataSourceTestConfig] = [
++    PandasDataFrameDatasourceTestConfig(),
++]
++
++DATA = pd.DataFrame(
++    {
++        VALID_ANY_VERSION: [V1_UUID, V3_UUID, V4_UUID, V4_UUID_UPPER, V5_UUID],
++        VALID_V4_ONLY: [V4_UUID, V4_UUID_UPPER, V4_UUID, V4_UUID, V4_UUID_UPPER],
++        MIXED_VERSIONS: [V4_UUID, V1_UUID, V5_UUID, V4_UUID, V4_UUID_UPPER],
++        INVALID_FORMATS: [
++            "{6f1c2e4a-9d3b-4a7e-8c1d-2b5a6f7e8d9c}",
++            "6f1c2e4a9d3b4a7e8c1d2b5a6f7e8d9c",
++            "urn:uuid:6f1c2e4a-9d3b-4a7e-8c1d-2b5a6f7e8d9c",
++            "6f1c2e4a-9d3b-4a7e-8c1d-2b5a6f7e8d9",
++            "not-a-uuid",
++        ],
++        WITH_NULLS: [V4_UUID, None, "not-a-uuid", None, None],
++        FLAG: [1, 1, 0, 1, 0],
++    }
++)
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_all_uuid_versions_accepted_when_no_version_given(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(column=VALID_ANY_VERSION)
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_version_constraint_success(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(column=VALID_V4_ONLY, uuid_version=4)
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_version_constraint_rejects_other_versions(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(column=MIXED_VERSIONS, uuid_version=4)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["unexpected_count"] == 2
++    assert set(result.result["partial_unexpected_list"]) == {V1_UUID, V5_UUID}
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_non_canonical_representations_rejected(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(column=INVALID_FORMATS)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["unexpected_count"] == 5
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_nulls_are_missing_not_unexpected(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(column=WITH_NULLS)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["element_count"] == 5
++    assert result.result["missing_count"] == 3
++    assert result.result["unexpected_count"] == 1
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_mostly_threshold_met(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(column=WITH_NULLS, mostly=0.5)
++    result = batch_for_datasource.validate(expectation)
++    assert result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_mostly_threshold_not_met(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(column=WITH_NULLS, mostly=0.6)
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_each_version_constraint_filters_exactly(batch_for_datasource: Batch) -> None:
++    # VALID_ANY_VERSION holds one v1, one v3, two v4 and one v5 UUID.
++    expected_unexpected = {
++        1: {V3_UUID, V4_UUID, V4_UUID_UPPER, V5_UUID},
++        3: {V1_UUID, V4_UUID, V4_UUID_UPPER, V5_UUID},
++        4: {V1_UUID, V3_UUID, V5_UUID},
++        5: {V1_UUID, V3_UUID, V4_UUID, V4_UUID_UPPER},
++    }
++    for version, unexpected in expected_unexpected.items():
++        expectation = gxe.ExpectColumnValuesToBeValidUuid(
++            column=VALID_ANY_VERSION, uuid_version=version
++        )
++        result = batch_for_datasource.validate(expectation)
++        assert not result.success
++        assert result.result["unexpected_count"] == len(unexpected)
++        assert set(result.result["partial_unexpected_list"]) == unexpected
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_unsupported_uuid_version_rejected_at_construction(batch_for_datasource: Batch) -> None:
++    import pydantic
++    import pytest
++
++    with pytest.raises(pydantic.ValidationError):
++        gxe.ExpectColumnValuesToBeValidUuid(column=VALID_ANY_VERSION, uuid_version=2)
++    with pytest.raises(pydantic.ValidationError):
++        gxe.ExpectColumnValuesToBeValidUuid(column=VALID_ANY_VERSION, uuid_version=6)
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_expectation_type_and_core_registration(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(column=VALID_ANY_VERSION)
++    assert expectation.expectation_type == "expect_column_values_to_be_valid_uuid"
++    assert expectation.configuration.type == "expect_column_values_to_be_valid_uuid"
++
++    from great_expectations.expectations.core import ExpectColumnValuesToBeValidUuid
++
++    assert ExpectColumnValuesToBeValidUuid is gxe.ExpectColumnValuesToBeValidUuid
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_configuration_serialization_round_trip(batch_for_datasource: Batch) -> None:
++    from great_expectations.expectations.expectation_configuration import (
++        ExpectationConfiguration,
++    )
++
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(
++        column=VALID_ANY_VERSION, uuid_version=4, mostly=0.9
++    )
++    config_dict = expectation.configuration.to_json_dict()
++    assert config_dict["type"] == "expect_column_values_to_be_valid_uuid"
++
++    rebuilt = ExpectationConfiguration(**config_dict)
++    assert rebuilt.type == "expect_column_values_to_be_valid_uuid"
++    assert rebuilt.kwargs["column"] == VALID_ANY_VERSION
++    assert rebuilt.kwargs["uuid_version"] == 4
++    assert rebuilt.kwargs["mostly"] == 0.9
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_result_format_complete_lists_unexpected_values(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(column=MIXED_VERSIONS, uuid_version=4)
++    result = batch_for_datasource.validate(expectation, result_format="COMPLETE")
++    assert not result.success
++    assert set(result.result["unexpected_list"]) == {V1_UUID, V5_UUID}
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_result_format_boolean_only_omits_details(batch_for_datasource: Batch) -> None:
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(column=MIXED_VERSIONS, uuid_version=4)
++    result = batch_for_datasource.validate(expectation, result_format="BOOLEAN_ONLY")
++    assert not result.success
++    assert result.result == {}
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_suite_end_to_end_statistics(batch_for_datasource: Batch) -> None:
++    import great_expectations as gx
++
++    suite = gx.ExpectationSuite(
++        name="uuid_governance",
++        expectations=[
++            gxe.ExpectColumnValuesToBeValidUuid(column=VALID_ANY_VERSION),
++            gxe.ExpectColumnValuesToBeValidUuid(column=MIXED_VERSIONS, uuid_version=4),
++        ],
++    )
++    result = batch_for_datasource.validate(suite)
++    assert not result.success
++    assert result.statistics["evaluated_expectations"] == 2
++    assert result.statistics["successful_expectations"] == 1
++    assert result.statistics["unsuccessful_expectations"] == 1
++
++
++@parameterize_batch_for_data_sources(data_source_configs=SUPPORTED_DATA_SOURCES, data=DATA)
++def test_row_condition_filters_evaluated_rows(batch_for_datasource: Batch) -> None:
++    # MIXED_VERSIONS = [v4, v1, v5, v4, v4]; FLAG selects rows 0, 1 and 3,
++    # so only the v1 value is evaluated as unexpected under uuid_version=4.
++    expectation = gxe.ExpectColumnValuesToBeValidUuid(
++        column=MIXED_VERSIONS,
++        uuid_version=4,
++        row_condition=f"{FLAG}==1",
++        condition_parser="pandas",
++    )
++    result = batch_for_datasource.validate(expectation)
++    assert not result.success
++    assert result.result["element_count"] == 3
++    assert result.result["unexpected_count"] == 1
++    assert result.result["partial_unexpected_list"] == [V1_UUID]
++
++    # FLAG selects rows 2 and 4 (v5 and v4), so only the v5 value is unexpected.
++    expectation_all_valid = gxe.ExpectColumnValuesToBeValidUuid(
++        column=MIXED_VERSIONS,
++        uuid_version=4,
++        row_condition=f"{FLAG}==0",
++        condition_parser="pandas",
++    )
++    result_all_valid = batch_for_datasource.validate(expectation_all_valid)
++    assert not result_all_valid.success
++    assert result_all_valid.result["element_count"] == 2
++    assert result_all_valid.result["unexpected_count"] == 1
++    assert result_all_valid.result["partial_unexpected_list"] == [V5_UUID]
+diff --git a/great_expectations/expectations/metrics/column_map_metrics/column_values_json_parseable.py b/great_expectations/expectations/metrics/column_map_metrics/column_values_json_parseable.py
+index a5d6349..5d0839a 100644
+--- a/great_expectations/expectations/metrics/column_map_metrics/column_values_json_parseable.py
++++ b/great_expectations/expectations/metrics/column_map_metrics/column_values_json_parseable.py
+@@ -14,29 +14,36 @@ from great_expectations.expectations.metrics.map_metric_provider import (
+ )
+ 
+ 
++def _is_json_document(val: object) -> bool:
++    """Return True iff ``val`` is a string that parses as a top-level JSON document.
++
++    A "JSON document" for data governance purposes is a top-level JSON object
++    (``{...}``) or JSON array (``[...]``). Primitive JSON literals — numbers,
++    booleans, ``null`` and bare quoted strings — are technically parseable by
++    :func:`json.loads` but do not represent structured records and are
++    therefore not considered documents. Empty strings, whitespace-only
++    strings, and non-string values are also rejected.
++    """
++    if not isinstance(val, str):
++        return False
++    if not val.strip():
++        return False
++    try:
++        parsed = json.loads(val)
++    except (ValueError, TypeError):
++        return False
++    return isinstance(parsed, (dict, list))
++
++
+ class ColumnValuesJsonParseable(ColumnMapMetricProvider):
+     condition_metric_name = "column_values.json_parseable"
+ 
+     @column_condition_partial(engine=PandasExecutionEngine)
+     def _pandas(cls, column, **kwargs):
+-        def is_json(val):
+-            try:
+-                json.loads(val)
+-                return True
+-            except Exception:
+-                return False
+-
+-        return column.map(is_json)
++        return column.map(_is_json_document)
+ 
+     @column_condition_partial(engine=SparkDFExecutionEngine)
+     def _spark(cls, column, **kwargs):
+-        def is_json(val):
+-            try:
+-                json.loads(val)
+-                return True
+-            except Exception:
+-                return False
+-
+-        is_json_udf = F.udf(is_json, pyspark.types.BooleanType())
++        is_json_udf = F.udf(_is_json_document, pyspark.types.BooleanType())
+ 
+         return is_json_udf(column)
+diff --git a/great_expectations/expectations/core/expect_column_values_to_be_json_parseable.py b/great_expectations/expectations/core/expect_column_values_to_be_json_parseable.py
+index d4c2dd4..b0a5ef9 100644
+--- a/great_expectations/expectations/core/expect_column_values_to_be_json_parseable.py
++++ b/great_expectations/expectations/core/expect_column_values_to_be_json_parseable.py
+@@ -35,7 +35,15 @@ except ImportError:
+ 
+ 
+ class ExpectColumnValuesToBeJsonParseable(ColumnMapExpectation):
+-    """Expect the column entries to be data written in JavaScript Object Notation.
++    """Expect the column entries to be structured JSON documents.
++
++    A structured JSON document, for the purposes of this Expectation, is a
++    string that parses as a JSON object (``{...}``) or a JSON array
++    (``[...]``). Bare JSON primitives — numbers, booleans, ``null`` and
++    quoted string literals — are rejected even though they are strictly
++    parseable by ``json.loads``, because in a data-governance context they
++    do not represent records. Empty strings, whitespace-only strings and
++    non-string values are likewise not considered valid.
+ 
+     ExpectColumnValuesToBeJsonParseable is a \
+     Column Map Expectation.

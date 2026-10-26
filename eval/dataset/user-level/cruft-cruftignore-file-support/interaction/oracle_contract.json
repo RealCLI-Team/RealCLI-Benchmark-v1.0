@@ -1,0 +1,111 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": [
+    "instruction.md",
+    "tests/test_outputs.py"
+  ],
+  "requirements": [
+    {
+      "id": "skip_line_prefix_exact",
+      "verifier_assertion": "test_update_skip_lines_are_exact_and_sorted asserts each announcement line matches SKIP_LINE_RE and equals GOLDEN_SKIP_LINES verbatim; every reported line has the exact prefix `Skipping ignored path: ` followed by a single space and the path with no trailing decoration.",
+      "script_refs": ["s_skip_line_format"],
+      "must_include": ["Skipping ignored path:", "one line per path"]
+    },
+    {
+      "id": "skip_line_path_style_and_order",
+      "verifier_assertion": "test_update_skip_lines_are_exact_and_sorted also asserts paths use POSIX forward slashes (no backslash), are project-relative (no leading `/`), and are sorted alphabetically.",
+      "script_refs": ["s_skip_line_format", "s_skip_line_order_and_scope"],
+      "must_include": ["POSIX", "forward-slash", "sorted ALPHABETICALLY", "RELATIVE to the project root"]
+    },
+    {
+      "id": "skip_only_when_would_have_changed",
+      "verifier_assertion": "test_no_skip_report_when_ignored_paths_unchanged asserts `Skipping ignored path:` does NOT appear when the template didn't touch any ignored path this update. Only ignored paths that WOULD have been changed are announced.",
+      "script_refs": ["s_skip_line_order_and_scope"],
+      "must_include": ["ONLY paths that WOULD HAVE been changed", "must NOT appear in the notice"]
+    },
+    {
+      "id": "update_preserves_matched_paths",
+      "verifier_assertion": "Multiple tests (test_update_preserves_ignored_and_updates_managed, test_update_ignored_deleted_template_file_is_kept, test_update_ignored_new_template_file_is_not_created, test_update_ignored_user_deleted_file_is_not_recreated) collectively assert: matched paths are never created, modified, or deleted by update; on-disk user content wins; template additions and deletions of matched paths are ignored; user-deleted matched files are not resurrected.",
+      "script_refs": ["s_update_preserves"],
+      "must_include": ["must NOT create", "must NOT modify", "must NOT delete", "must NOT resurrect"]
+    },
+    {
+      "id": "no_rej_on_both_merge_paths",
+      "verifier_assertion": "test_update_creates_no_rej_files_in_git_repo (three-way-merge path) and rej_files(...) == [] assertions across other update tests (--reject fallback path) collectively require that matched paths never produce .rej files on either code path.",
+      "script_refs": ["s_no_rej_files"],
+      "must_include": [".rej", "three-way-merge", "--reject"]
+    },
+    {
+      "id": "rules_from_target_template_version",
+      "verifier_assertion": "test_rules_come_from_new_template_version and test_project_only_cruftignore_has_no_effect assert the rule set governing an update is the incoming (target) template version's rendered .cruftignore, not the old version's, and not a stray project-side .cruftignore that wasn't shipped by the template.",
+      "script_refs": ["s_rules_from_new_version"],
+      "must_include": ["TARGET template version", "old version's `.cruftignore` said is irrelevant"]
+    },
+    {
+      "id": "cruftignore_self_immunity",
+      "verifier_assertion": "test_cruftignore_is_never_self_ignored asserts that even with rules like `*` / `**` / `.*` the .cruftignore file itself is not self-excluded — it updates like any managed file. test_cruftignore_file_itself_is_updated confirms it flows through normal update.",
+      "script_refs": ["s_cruftignore_never_self_ignored"],
+      "must_include": ["NEVER self-ignored", "`*`, `**`, or `.*`"]
+    },
+    {
+      "id": "composes_with_existing_skip",
+      "verifier_assertion": "test_update_composes_with_existing_skip_mechanism asserts .cruftignore stacks on top of the pre-existing `skip` list from `.cruft.json` / `pyproject.toml [tool.cruft] skip` — a path protected by EITHER mechanism is preserved. test_utils_generate_remove_paths_unchanged_regression additionally asserts the legacy `_remove_paths` helper still accepts a set of Path and removes them.",
+      "script_refs": ["s_composes_with_skip"],
+      "must_include": ["`skip` in `.cruft.json`", "`[tool.cruft] skip` in `pyproject.toml`", "layer, not replace", "EITHER"]
+    },
+    {
+      "id": "diff_excludes_and_exit_code",
+      "verifier_assertion": "test_diff_excludes_ignored_paths, test_diff_exit_code_counts_only_managed_differences, and test_diff_after_successful_update_is_clean collectively assert diff output does not mention matched paths and --exit-code returns 0 when only matched paths differ.",
+      "script_refs": ["s_diff_excludes"],
+      "must_include": ["must NOT appear in the diff output", "must NOT influence `--exit-code`"]
+    },
+    {
+      "id": "diff_rules_from_checkout",
+      "verifier_assertion": "test_diff_uses_checkout_versions_rules asserts the diff rule set is taken from --checkout (or the .cruft.json-recorded commit), not from the latest tip.",
+      "script_refs": ["s_diff_rules_from_checkout"],
+      "must_include": ["--checkout", ".cruft.json"]
+    },
+    {
+      "id": "diff_output_is_clean_patch",
+      "verifier_assertion": "test_diff_output_is_clean_patch_text and test_diff_output_is_a_valid_patch assert the diff output stream contains no `Skipping` / advisory text and is applyable by `patch -p0`. The instruction requires the output remain a clean `git apply` / `patch` consumable patch.",
+      "script_refs": ["s_diff_clean_patch"],
+      "must_include": ["clean patch text", "`git apply`", "`patch`", "No extra advisory text"]
+    },
+    {
+      "id": "existing_capabilities_preserved",
+      "verifier_assertion": "test_update_with_skip_update_flag_still_bumps_state asserts --skip-update still advances .cruft.json commit. test_update_with_checkout_uses_that_versions_rules asserts --checkout re-targets the update. Instruction requires interactive y/n/s/v prompt, `-y`, --strict, subdirectory support, extra_context, three-way merge / --reject, and the `v` view excluding matched paths, all remain intact.",
+      "script_refs": ["s_existing_capabilities_preserved"],
+      "must_include": ["`--skip-update`", "`--checkout`", "`--strict`", "`extra_context`", "when the user types `v`"]
+    },
+    {
+      "id": "create_still_renders_everything",
+      "verifier_assertion": "test_create_renders_everything and test_create_renders_everything_even_with_wildcard_rules assert cruft create emits every template file (including .cruftignore and every matched file) even when the rule set contains `*` / `**`.",
+      "script_refs": ["s_create_unchanged"],
+      "must_include": ["`cruft create` behaviour is completely unaffected", "including `.cruftignore` itself", "every file that matches an ignore pattern"]
+    },
+    {
+      "id": "check_unaffected",
+      "verifier_assertion": "test_check_unaffected asserts `cruft check` still compares commit hashes and returns non-zero when template has new commits.",
+      "script_refs": ["s_check_unchanged"],
+      "must_include": ["`cruft check` behaviour is unchanged", "comparing recorded commit hash"]
+    },
+    {
+      "id": "offline_tests_still_pass",
+      "verifier_assertion": "test_existing_offline_unit_tests_still_pass asserts pytest test_utils.py + test_exceptions.py (minus one skip-listed integration case) all pass unchanged after the feature is added.",
+      "script_refs": ["s_offline_tests_pass"],
+      "must_include": ["`tests/test_utils.py`", "`tests/test_exceptions.py`", "must ALL continue to pass"]
+    },
+    {
+      "id": "gitignore_pattern_semantics",
+      "verifier_assertion": "test_pattern_semantics_end_to_end covers root-anchor (`/rooted.txt` matches root only), directory-only (`build/`), globstar (`src/**/gen_*.py`), and negation last-rule-wins (`*.log` then `!keep.log`).",
+      "script_refs": ["s_gitignore_syntax"],
+      "must_include": ["Root-anchored with a leading `/`", "Directory-only with a trailing `/`", "`**` globstar", "Negation with leading `!` with last-rule-wins"]
+    },
+    {
+      "id": "docs_added_to_readme",
+      "verifier_assertion": "Instruction requires user-facing documentation added to README.md; while test_outputs.py does not itself grep README, the engineering-requirements section of instruction.md makes it a task constraint. Tests use locally constructed temp git template repos and must not access the network.",
+      "script_refs": ["s_docs_and_tests"],
+      "must_include": ["`README.md`", "local temp git template repositories", "NO network access"]
+    }
+  ]
+}

@@ -1,0 +1,202 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test.sh"],
+  "requirements": [
+    {
+      "id": "result_file_location",
+      "verifier_assertion": "result.json must exist at /app/result.json",
+      "script_refs": ["result_schema", "cli_stdlib"],
+      "must_include": ["/app/result.json"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "result_top_level_structure",
+      "verifier_assertion": "result.json must contain 'reviewed' (int) and 'findings' (list)",
+      "script_refs": ["result_schema"],
+      "must_include": ["reviewed", "findings"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "finding_object_fields",
+      "verifier_assertion": "Each finding must have exactly: finding_id, verdict, reachable, cvss_vector, sink_location, attack_path, false_positive_reason",
+      "script_refs": ["result_schema"],
+      "must_include": ["finding_id", "verdict", "reachable", "cvss_vector", "sink_location", "attack_path", "false_positive_reason"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "verdict_values",
+      "verifier_assertion": "verdict must be 'confirmed' or 'false_positive'",
+      "script_refs": ["result_schema", "verdict_rule"],
+      "must_include": ["confirmed", "false_positive"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "reviewed_equals_unique_count",
+      "verifier_assertion": "reviewed must equal the number of unique findings (5)",
+      "script_refs": ["dedup_order"],
+      "must_include": ["unique findings"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "dedup_first_occurrence",
+      "verifier_assertion": "Deduplicate by finding_id keeping first occurrence in input order",
+      "script_refs": ["dedup_order"],
+      "must_include": ["first occurrence"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "findings_sorted_ascending",
+      "verifier_assertion": "Sort findings array by finding_id ascending",
+      "script_refs": ["dedup_order"],
+      "must_include": ["finding_id ascending"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "sink_line_must_contain_execute",
+      "verifier_assertion": "The reported file:line must contain db.execute or cursor.execute; otherwise false_positive with reference mismatch",
+      "script_refs": ["sink_rule"],
+      "must_include": ["db.execute", "cursor.execute"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "injectable_patterns",
+      "verifier_assertion": "Injectable only if SQL built by concatenation (+), f-string, % formatting, or .format()",
+      "script_refs": ["injection_rule"],
+      "must_include": ["concatenation", "f-string", ".format()"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "parameterized_not_injectable",
+      "verifier_assertion": "A query using ? or %s placeholders with bound parameters is NOT injectable",
+      "script_refs": ["injection_rule"],
+      "must_include": ["NOT injectable"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "reachability_route_hops",
+      "verifier_assertion": "Reachable when triggered from registered route, direct or within 2 call hops from handler reading request input",
+      "script_refs": ["reachability_rule"],
+      "must_include": ["registered route", "2 call hops"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "reachable_independent_of_verdict",
+      "verifier_assertion": "The reachable field reflects the reachability rule regardless of the verdict",
+      "script_refs": ["reachability_rule"],
+      "must_include": ["regardless of the verdict"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "verdict_conjunction",
+      "verifier_assertion": "confirmed only if injectable AND reachable; otherwise false_positive",
+      "script_refs": ["verdict_rule"],
+      "must_include": ["injectable", "reachable"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "cvss_template",
+      "verifier_assertion": "For confirmed: CVSS:3.1/AV:N/AC:L/PR:<x>/UI:N/S:U/C:H/I:<x>/A:N",
+      "script_refs": ["cvss_rule"],
+      "must_include": ["CVSS:3.1/AV:N/AC:L/PR:"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "cvss_pr_guard_rule",
+      "verifier_assertion": "PR:L if access-control guard on route-to-sink path, otherwise PR:N",
+      "script_refs": ["cvss_rule", "guard_definition"],
+      "must_include": ["PR:L", "PR:N"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "cvss_i_keyword_rule",
+      "verifier_assertion": "I:H if SQL keyword is INSERT, UPDATE, or DELETE; otherwise I:N",
+      "script_refs": ["cvss_rule"],
+      "must_include": ["I:H", "INSERT", "UPDATE", "DELETE", "I:N"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "guard_names",
+      "verifier_assertion": "Access-control guard: require_auth, require_admin, or require_role",
+      "script_refs": ["guard_definition"],
+      "must_include": ["require_auth", "require_admin", "require_role"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "fp_reason_null_when_confirmed",
+      "verifier_assertion": "false_positive_reason must be null when verdict is confirmed",
+      "script_refs": ["field_rules"],
+      "must_include": ["null"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "fp_reason_nonempty_when_fp",
+      "verifier_assertion": "false_positive_reason must be a non-null non-empty string when verdict is false_positive",
+      "script_refs": ["field_rules"],
+      "must_include": ["non-null"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "attack_path_confirmed_format",
+      "verifier_assertion": "For confirmed: attack_path contains the route path and sink location as file:line",
+      "script_refs": ["field_rules"],
+      "must_include": ["route path", "file"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "attack_path_empty_for_fp",
+      "verifier_assertion": "For false_positive: attack_path is the empty string",
+      "script_refs": ["field_rules"],
+      "must_include": ["empty string"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "sink_location_confirmed",
+      "verifier_assertion": "For confirmed: sink_location is {file, line}; for false_positive: null",
+      "script_refs": ["field_rules"],
+      "must_include": ["sink_location"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "no_absolute_paths",
+      "verifier_assertion": "Output values must not contain absolute filesystem paths",
+      "script_refs": ["output_sanitization"],
+      "must_include": ["absolute filesystem paths"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "no_urls_ips_tokens",
+      "verifier_assertion": "Output values must not contain IP addresses, URLs, or token-like strings",
+      "script_refs": ["output_sanitization"],
+      "must_include": ["IP addresses", "URLs", "token-like strings"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "cli_invocation",
+      "verifier_assertion": "solution.py invoked with --codebase, --findings, --output arguments",
+      "script_refs": ["cli_stdlib"],
+      "must_include": ["--codebase", "--findings", "--output"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "stdlib_only",
+      "verifier_assertion": "Use only the Python standard library",
+      "script_refs": ["cli_stdlib"],
+      "must_include": ["standard library"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "cvss_null_for_fp",
+      "verifier_assertion": "For false_positive findings, cvss_vector must be null",
+      "script_refs": ["cvss_rule"],
+      "must_include": ["null"],
+      "forbidden_anywhere": []
+    },
+    {
+      "id": "request_input_patterns",
+      "verifier_assertion": "Request input read via request.args, request.form, request.values, or request.json",
+      "script_refs": ["reachability_rule"],
+      "must_include": ["request.args", "request.form"],
+      "forbidden_anywhere": []
+    }
+  ]
+}

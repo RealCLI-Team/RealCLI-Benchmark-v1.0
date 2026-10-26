@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# Final-state verification for the offline cleaning pipeline.
+# Runs from the task root. Exits non-zero on the first failure.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+resolve_task_root() {
+  for candidate in "${TASK_ROOT:-}" /app /workspace "$(cd "$SCRIPT_DIR/.." && pwd)" "$(pwd)"; do
+    [ -n "$candidate" ] || continue
+    if [ -d "$candidate/inputs" ] || [ -d "$candidate/outputs" ] || [ -d "$candidate/output" ] || [ -f "$candidate/task.toml" ] || [ -d "$candidate/rootfs" ] || [ -f "$candidate/Makefile" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  cd "$SCRIPT_DIR/.." && pwd
+}
+TASK_ROOT="$(resolve_task_root)"
+cd "$TASK_ROOT"
+ROOT="$TASK_ROOT"
+ROOT_DIR="$TASK_ROOT"
+task_root="$TASK_ROOT"
+HERE="$SCRIPT_DIR"
+script_dir="$SCRIPT_DIR"
+
+
+fail() { echo "FAIL: $1" >&2; exit 1; }
+pass() { echo "ok: $1"; }
+
+OUT="outputs"
+
+# --- 1. required files exist ----------------------------------------------
+for f in \
+  "$OUT/customers_cleaned.csv" \
+  "$OUT/transactions_cleaned.csv" \
+  "$OUT/products_cleaned.csv" \
+  "$OUT/rejected_records.csv" \
+  "$OUT/aggregated_metrics.csv" \
+  "$OUT/dimensions_audit.txt" \
+  "$OUT/quality_report.html" \
+  "$OUT/manifest.md5" \
+  "scripts/run_pipeline.sh" ; do
+  [ -s "$f" ] || fail "missing or empty: $f"
+done
+pass "all deliverables present"
+
+# --- 2. cleaned CSVs are UTF-8 text/csv -----------------------------------
+for f in customers_cleaned.csv transactions_cleaned.csv products_cleaned.csv ; do
+  mime="$(file -i "$OUT/$f")"
+  echo "$mime" | grep -qE 'text/csv|text/plain' || fail "$f not csv/text mime: $mime"
+  echo "$mime" | grep -qE 'utf-8|us-ascii' || fail "$f not utf-8/ascii: $mime"
+done
+pass "cleaned CSVs are utf-8 text"
+
+# accented name must decode correctly (encoding repair)
+grep -q "José" "$OUT/customers_cleaned.csv" || fail "customers encoding not repaired (José missing)"
+pass "encoding repaired"
+
+# --- 3. header columns match the contract ---------------------------------
+chk_header() {
+  local file="$1" expect="$2"
+  local got
+  got="$(head -n1 "$OUT/$file" | tr -d '\r')"
+  [ "$got" = "$expect" ] || fail "$file header mismatch: got [$got]"
+}
+chk_header customers_cleaned.csv "customer_id,name,region,signup_date,email"
+chk_header transactions_cleaned.csv "transaction_id,customer_id,product_id,amount,currency,txn_date"
+chk_header products_cleaned.csv "product_id,product_name,category,unit_price"
+chk_header rejected_records.csv "source_file,raw_line,reason"
+chk_header aggregated_metrics.csv "category,region,txn_count,total_amount"
+pass "headers match schema"
+
+# --- 4. rejected records: nothing dropped silently ------------------------
+read -r customers_before products_before transactions_before raw_total < <(python3 - <<'PY'
+import csv
+import io
+import os
+import zipfile
+
+def decode(data):
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    raise SystemExit("cannot decode input CSV")
+
+zip_path = "/root/.interaction/baseline_inputs/aia-xt1-dl-kaggle.zip"
+if not os.path.exists(zip_path):
+    zip_path = "inputs/aia-xt1-dl-kaggle.zip"
+
+counts = []
+try:
+    with zipfile.ZipFile(zip_path) as z:
+        for name in ["customers.csv", "products.csv", "transactions.csv"]:
+            rows = list(csv.reader(io.StringIO(decode(z.read(name)))))
+            counts.append(max(0, len(rows) - 1))
+except FileNotFoundError:
+    raise SystemExit("input zip not found in inputs/ or the baseline backup")
+print(*counts, sum(counts))
+PY
+)
+clean_rows=0
+for f in customers_cleaned.csv products_cleaned.csv transactions_cleaned.csv ; do
+  n=$(($(wc -l < "$OUT/$f") - 1))
+  clean_rows=$((clean_rows + n))
+done
+rej_rows=$(($(wc -l < "$OUT/rejected_records.csv") - 1))
+total=$((clean_rows + rej_rows))
+[ "$total" -eq "$raw_total" ] || fail "row accounting off: clean=$clean_rows rejected=$rej_rows total=$total (expected $raw_total)"
+[ "$rej_rows" -ge 1 ] || fail "no rejected records isolated"
+pass "row accounting balances ($clean_rows clean + $rej_rows rejected = $raw_total)"
+
+# reasons come from the fixed vocabulary in inputs/README.md
+bad=$(python3 - "$OUT/rejected_records.csv" <<'PY'
+import csv, sys
+allowed = {"missing_name","missing_region","invalid_date","negative_price",
+           "invalid_amount","unknown_customer","unknown_product"}
+bad = 0
+with open(sys.argv[1], encoding="utf-8", newline="") as f:
+    r = csv.DictReader(f)
+    for row in r:
+        if row.get("reason") not in allowed:
+            bad += 1
+print(bad)
+PY
+)
+[ "$bad" -eq 0 ] || fail "$bad rejected rows use a reason outside the vocabulary"
+grep -q "unknown_customer" "$OUT/rejected_records.csv" || fail "unknown_customer not isolated"
+grep -q "unknown_product" "$OUT/rejected_records.csv" || fail "unknown_product not isolated"
+pass "rejection reasons valid"
+
+# --- 5. amount normalization (no $ or thousands comma) --------------------
+if tail -n +2 "$OUT/transactions_cleaned.csv" | cut -d, -f4 | grep -q '[$]'; then
+  fail "amount column still contains '\$'"
+fi
+pass "amount normalized"
+
+# --- 6. dimensions audit cross-checks wc -l -------------------------------
+customers_after=$(($(wc -l < "$OUT/customers_cleaned.csv") - 1))
+products_after=$(($(wc -l < "$OUT/products_cleaned.csv") - 1))
+transactions_after=$(($(wc -l < "$OUT/transactions_cleaned.csv") - 1))
+python3 - "$OUT/dimensions_audit.txt" "$customers_before" "$customers_after" "$products_before" "$products_after" "$transactions_before" "$transactions_after" <<'PY' || fail "audit counts wrong"
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+expected = {
+    "customers.csv": (int(sys.argv[2]), int(sys.argv[3])),
+    "products.csv": (int(sys.argv[4]), int(sys.argv[5])),
+    "transactions.csv": (int(sys.argv[6]), int(sys.argv[7])),
+}
+for name, (want_before, want_after) in expected.items():
+    # 2026-09-19 QC fix: previously required rows_before and rows_after on
+    # the *same* line as the file name, which failed correct multi-line
+    # layouts (name header line, then separate rows_before/rows_after lines)
+    # even though the contract (output_schema.json) and this comment only
+    # require the numbers to be present in this file's audit section.
+    # Now: match the section from the file-name line up to the next file's
+    # section header and check the numbers anywhere inside it.
+    other_names = [n for n in expected if n != name]
+    lines = text.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        if name in ln:
+            start = i
+            break
+    if start is None:
+        raise SystemExit(1)
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if any(n in lines[i] for n in other_names):
+            end = i
+            break
+    section = "\n".join(lines[start:end])
+    before = re.search(r"rows_before\s*[=:]?\s*(\d+)", section)
+    after = re.search(r"rows_after\s*[=:]?\s*(\d+)", section)
+    if not (before and after and int(before.group(1)) == want_before and int(after.group(1)) == want_after):
+        raise SystemExit(1)
+PY
+pass "dimensions audit matches counts"
+
+# --- 7. md5 manifest reproducible -----------------------------------------
+BASELINE_ZIP=/root/.interaction/baseline_inputs/aia-xt1-dl-kaggle.zip
+if [ ! -f inputs/aia-xt1-dl-kaggle.zip ] && [ -f "$BASELINE_ZIP" ]; then
+  grep -v "inputs/aia-xt1-dl-kaggle.zip" "$OUT/manifest.md5" > /tmp/manifest_nozip.md5 || true
+  md5sum --check --status /tmp/manifest_nozip.md5 || fail "manifest.md5 check failed"
+  want_zip_md5=$(grep "inputs/aia-xt1-dl-kaggle.zip" "$OUT/manifest.md5" | awk '{print $1}')
+  got_zip_md5=$(md5sum "$BASELINE_ZIP" | awk '{print $1}')
+  [ -n "$want_zip_md5" ] || fail "manifest missing input zip"
+  [ "$want_zip_md5" = "$got_zip_md5" ] || fail "manifest md5 for input zip does not match baseline copy"
+else
+  md5sum --check --status "$OUT/manifest.md5" || fail "manifest.md5 check failed"
+fi
+grep -q "inputs/aia-xt1-dl-kaggle.zip" "$OUT/manifest.md5" || fail "manifest missing input zip"
+pass "manifest md5 verified"
+
+# --- 8. sqlite join/aggregation sanity ------------------------------------
+groups=$(sqlite3 :memory: <<'SQL'
+.mode csv
+.import outputs/customers_cleaned.csv c
+.import outputs/transactions_cleaned.csv t
+.import outputs/products_cleaned.csv p
+SELECT COUNT(*) FROM (
+  SELECT p.category, c.region
+  FROM c JOIN t ON c.customer_id=t.customer_id
+         JOIN p ON t.product_id=p.product_id
+  GROUP BY p.category, c.region
+);
+SQL
+)
+agg_lines=$(($(wc -l < "$OUT/aggregated_metrics.csv") - 1))
+[ "$groups" = "$agg_lines" ] || fail "join groups ($groups) != aggregated_metrics rows ($agg_lines)"
+[ "$groups" -ge 1 ] || fail "join produced no groups"
+pass "join aggregation consistent ($groups groups)"
+
+# --- 9. independent content recomputation -----------------------------------
+python3 - <<'PY' || fail "cleaned outputs do not match independently recomputed expected data"
+import csv
+import datetime as dt
+import io
+import zipfile
+from collections import defaultdict
+from pathlib import Path
+
+ROOT = Path(".")
+OUT = ROOT / "outputs"
+ZIP_PATH = ROOT / "inputs" / "aia-xt1-dl-kaggle.zip"
+BASELINE_ZIP = Path("/root/.interaction/baseline_inputs/aia-xt1-dl-kaggle.zip")
+if not ZIP_PATH.exists() and BASELINE_ZIP.exists():
+    ZIP_PATH = BASELINE_ZIP
+
+
+def decode(data):
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+    raise AssertionError("cannot decode input CSV")
+
+
+def parse_date(value):
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y"):
+        try:
+            return dt.datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return None
+
+
+def read_raw_csv(archive, name):
+    text = decode(archive.read(name))
+    rows = list(csv.reader(io.StringIO(text)))
+    header, body = rows[0], rows[1:]
+    return header, body
+
+
+def raw_line(row):
+    return ",".join(row)
+
+
+try:
+    archive = zipfile.ZipFile(ZIP_PATH)
+except FileNotFoundError:
+    raise SystemExit("input zip not found in inputs/ or the baseline backup")
+with archive:
+    customer_header, customer_rows = read_raw_csv(archive, "customers.csv")
+    product_header, product_rows = read_raw_csv(archive, "products.csv")
+    transaction_header, transaction_rows = read_raw_csv(archive, "transactions.csv")
+
+expected_rejected = []
+expected_customers = []
+valid_customers = set()
+for row in customer_rows:
+    rec = dict(zip(customer_header, row))
+    parsed_date = parse_date(rec.get("signup_date", ""))
+    reason = None
+    if not rec.get("name", "").strip():
+        reason = "missing_name"
+    elif not rec.get("region", "").strip():
+        reason = "missing_region"
+    elif parsed_date is None:
+        reason = "invalid_date"
+    if reason:
+        expected_rejected.append({"source_file": "customers.csv", "raw_line": raw_line(row), "reason": reason})
+        continue
+    cleaned = {
+        "customer_id": rec["customer_id"].strip(),
+        "name": rec["name"].strip(),
+        "region": rec["region"].strip().capitalize(),
+        "signup_date": parsed_date,
+        "email": rec["email"].strip(),
+    }
+    expected_customers.append(cleaned)
+    valid_customers.add(cleaned["customer_id"])
+
+expected_products = []
+valid_products = {}
+for row in product_rows:
+    rec = dict(zip(product_header, row))
+    reason = None
+    try:
+        price = float(rec.get("unit_price", "").strip())
+    except ValueError:
+        price = None
+    if not rec.get("product_name", "").strip():
+        reason = "missing_name"
+    elif price is None or price < 0:
+        reason = "negative_price"
+    if reason:
+        expected_rejected.append({"source_file": "products.csv", "raw_line": raw_line(row), "reason": reason})
+        continue
+    cleaned = {
+        "product_id": rec["product_id"].strip(),
+        "product_name": rec["product_name"].strip(),
+        "category": rec["category"].strip(),
+        "unit_price": f"{price:.2f}",
+    }
+    expected_products.append(cleaned)
+    valid_products[cleaned["product_id"]] = cleaned
+
+expected_transactions = []
+for row in transaction_rows:
+    rec = dict(zip(transaction_header, row))
+    parsed_date = parse_date(rec.get("txn_date", ""))
+    amount_text = rec.get("amount", "").strip().replace("$", "").replace(",", "")
+    try:
+        amount = float(amount_text)
+    except ValueError:
+        amount = None
+    reason = None
+    if parsed_date is None:
+        reason = "invalid_date"
+    elif amount is None:
+        reason = "invalid_amount"
+    elif rec.get("customer_id", "").strip() not in valid_customers:
+        reason = "unknown_customer"
+    elif rec.get("product_id", "").strip() not in valid_products:
+        reason = "unknown_product"
+    if reason:
+        expected_rejected.append({"source_file": "transactions.csv", "raw_line": raw_line(row), "reason": reason})
+        continue
+    expected_transactions.append(
+        {
+            "transaction_id": rec["transaction_id"].strip(),
+            "customer_id": rec["customer_id"].strip(),
+            "product_id": rec["product_id"].strip(),
+            "amount": f"{amount:.2f}",
+            "currency": rec["currency"].strip(),
+            "txn_date": parsed_date,
+        }
+    )
+
+customer_by_id = {row["customer_id"]: row for row in expected_customers}
+product_by_id = {row["product_id"]: row for row in expected_products}
+aggregate = defaultdict(lambda: {"txn_count": 0, "total_amount": 0.0})
+for txn in expected_transactions:
+    key = (product_by_id[txn["product_id"]]["category"], customer_by_id[txn["customer_id"]]["region"])
+    aggregate[key]["txn_count"] += 1
+    aggregate[key]["total_amount"] += float(txn["amount"])
+expected_aggregate = [
+    {
+        "category": category,
+        "region": region,
+        "txn_count": str(values["txn_count"]),
+        "total_amount": f"{values['total_amount']:.2f}",
+    }
+    for (category, region), values in sorted(aggregate.items())
+]
+
+
+def load_csv(path):
+    with path.open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+unordered_checks = [
+    ("customers_cleaned.csv", expected_customers),
+    ("products_cleaned.csv", expected_products),
+    ("transactions_cleaned.csv", expected_transactions),
+    ("rejected_records.csv", expected_rejected),
+]
+for filename, expected in unordered_checks:
+    actual = load_csv(OUT / filename)
+    if sorted(actual, key=lambda row: tuple(row.items())) != sorted(expected, key=lambda row: tuple(row.items())):
+        raise AssertionError(f"{filename} content mismatch: expected {expected!r}, got {actual!r}")
+
+actual_aggregate = load_csv(OUT / "aggregated_metrics.csv")
+if actual_aggregate != expected_aggregate:
+    raise AssertionError(
+        f"aggregated_metrics.csv content/order mismatch: expected {expected_aggregate!r}, got {actual_aggregate!r}"
+    )
+PY
+pass "cleaned file contents and aggregate values match expected"
+
+# --- 10. offline HTML report -----------------------------------------------
+H="$OUT/quality_report.html"
+grep -qi "<html" "$H" || fail "report missing DOCTYPE"
+grep -qi '<html' "$H" || fail "report missing <html>"
+grep -qi '</html>' "$H" || fail "report missing </html>"
+grep -q -e '缺失值分布' -e 'Missing value' -e 'missing value' "$H" || fail "report missing 缺失值分布 section"
+grep -q -e '分组聚合统计' -e 'Group' -e 'group' "$H" || fail "report missing 分组聚合统计 section"
+grep -q -e '质量评分' -e 'Quality score' -e 'quality score' "$H" || fail "report missing 质量评分 section"
+grep -q '<table' "$H" || fail "report has no table"
+python3 - "$H" <<'PY' || fail "report references an external/remote resource"
+import re
+import sys
+html = open(sys.argv[1], encoding="utf-8").read()
+patterns = [
+    r"<script\b[^>]*\bsrc\s*=",
+    r"<link\b[^>]*\bhref\s*=",
+    r"<(?:img|iframe|embed|object|source)\b[^>]*\b(?:src|data)\s*=\s*['\"]?\s*(?:https?:)?//",
+    r"@import\s+(?:url\()?['\"]?\s*(?:https?:)?//",
+    r"url\(\s*['\"]?\s*(?:https?:)?//",
+]
+raise SystemExit(1 if any(re.search(pattern, html, re.I) for pattern in patterns) else 0)
+PY
+pass "offline HTML report valid"
+
+echo "ALL TESTS PASSED"

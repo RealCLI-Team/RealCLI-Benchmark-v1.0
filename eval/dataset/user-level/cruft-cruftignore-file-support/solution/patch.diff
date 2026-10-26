@@ -1,0 +1,2492 @@
+diff --git a/README.md b/README.md
+index 6dbc7e8..8f5da98 100644
+--- a/README.md
++++ b/README.md
+@@ -167,6 +167,55 @@ With time, your boilerplate may end up being very different from the actual cook
+ 
+ The `cruft diff` command optionally accepts an `--exit-code` flag that will make cruft exit with a non-0 code if any diff is found. You can combine this flag with the `skip` section of your `.cruft.json` to make stricter CI checks that ensures any improvement to the template is always submitted upstream.
+ 
++## Ignoring files with .cruftignore
++
++Sometimes a template ships files that are meant to be owned by the generated
++project: local configuration, environment specific settings, generated assets
++that users are expected to customize. Updating those files from the template
++would clobber the user's changes, and `cruft diff` would keep flagging them
++forever.
++
++Template authors can declare such paths in a `.cruftignore` file placed at the
++root of the generated project (that is, inside the template's top-level
++directory so it gets rendered like any other file). The file uses the same
++pattern syntax as `.gitignore`:
++
++```
++# Local configuration is owned by the project, never touch it on update.
++config.ini
++settings/
++
++# Logs are ignored everywhere, except the one we want to keep in sync.
++*.log
++!keep.log
++```
++
++Once a `.cruftignore` is present in the template rendering being compared:
++
++* `cruft update` never creates, modifies or deletes an ignored path. The
++  file on disk always wins, no `*.rej` conflict files are produced for
++  ignored paths, and each ignored path that would otherwise have changed is
++  reported as `Skipping ignored path: <path>`.
++* `cruft diff` does not report differences for ignored paths, and they do
++  not influence the `--exit-code` outcome.
++* `cruft create` is not affected: every template file, including the
++  `.cruftignore` file itself, is rendered as usual.
++
++The rules that apply are always the ones shipped by the template version
++being compared (for `cruft update`, the new template version). The
++`.cruftignore` file itself is never ignored: it follows the normal update
++rules, so template authors can evolve the rule set over time and have it
++propagate to generated projects.
++
++Patterns follow `.gitignore` conventions: blank lines and `#` comments are
++skipped, a leading `!` negates a pattern, a trailing `/` matches directories
++only, patterns containing a `/` are anchored to the project root while
++patterns without one match the basename at any depth, `*` and `?` never
++cross a directory boundary, and `**` matches across directories. When
++several patterns match, the last one wins. Like in git, a file below an
++excluded directory cannot be re-included by a later negation.
++
++
+ ## Automating updates with GitHub Actions
+ 
+ If you have many repositories to manage, you can automate the change detection process with GitHub Actions. This example runs every Monday at 2am UTC and creates a new pull request if there are changes detected which a maintainer can accept or reject. It creates two PRs - one to pull in the new files to the repository and one to update the `.cruft.json` file only, which has the effect of rejecting the change from the upstream repository.
+diff --git a/cruft/_commands/diff.py b/cruft/_commands/diff.py
+index dd38a1a..fecf414 100644
+--- a/cruft/_commands/diff.py
++++ b/cruft/_commands/diff.py
+@@ -6,6 +6,8 @@ from typing import Optional
+ 
+ import typer
+ 
++from cruft import _ignore
++
+ from . import utils
+ from .utils.iohelper import AltTemporaryDirectory
+ 
+@@ -50,6 +52,13 @@ def diff(
+                 update_deleted_paths=True,
+             )
+ 
++        # Paths the template's .cruftignore excludes from cruft's change
++        # tracking are stripped from the rendering so they never show up
++        # in the computed diff (and never influence --exit-code).
++        _ignore.remove_ignored(
++            remote_template_dir, _ignore.IgnoreRules.from_render(remote_template_dir)
++        )
++
+         # Then we create a new tree with each file in the template that also exist
+         # locally.
+         for path in sorted(remote_template_dir.glob("**/*")):
+diff --git a/cruft/_commands/update.py b/cruft/_commands/update.py
+index 15a70f5..ca7960a 100644
+--- a/cruft/_commands/update.py
++++ b/cruft/_commands/update.py
+@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional, Set
+ import click
+ import typer
+ 
++from cruft import _ignore
++
+ from . import utils
+ from .utils import example
+ from .utils.iohelper import AltTemporaryDirectory
+@@ -286,6 +288,20 @@ def _apply_project_updates(
+     skip_apply_ask: bool,
+     allow_untracked_files: bool,
+ ) -> bool:
++    # Honor the .cruftignore file shipped by the new template version:
++    # strip ignored paths from both renderings so the computed changeset
++    # never creates, modifies or deletes them. The user's files on disk
++    # always win for those paths.
++    ignore_rules = _ignore.IgnoreRules.from_render(new_main_directory)
++    if ignore_rules:
++        skipped_paths = _ignore.ignored_changed_paths(
++            old_main_directory, new_main_directory, ignore_rules
++        )
++        _ignore.remove_ignored(old_main_directory, ignore_rules)
++        _ignore.remove_ignored(new_main_directory, ignore_rules)
++        for skipped_path in skipped_paths:
++            typer.secho(f"Skipping ignored path: {skipped_path}", fg=typer.colors.YELLOW)
++
+     diff = utils.diff.get_diff(old_main_directory, new_main_directory)
+ 
+     if not skip_apply_ask and not skip_update:
+diff --git a/cruft/_ignore.py b/cruft/_ignore.py
+new file mode 100644
+index 0000000..0fe0c02
+--- /dev/null
++++ b/cruft/_ignore.py
+@@ -0,0 +1,361 @@
++"""Support for ``.cruftignore`` files.
++
++A template author may place a ``.cruftignore`` file at the root of the
++generated project (that is, inside the template's top-level directory, so
++that it is rendered like any other template file).  The file declares,
++using ``.gitignore`` style patterns, which project paths cruft must leave
++untouched when propagating template changes:
++
++* ``cruft update`` never creates, modifies or deletes an ignored path.
++  The file on disk always wins, no ``*.rej`` files are produced for
++  ignored paths and no data the user put there is ever overwritten.
++* ``cruft diff`` never reports differences for ignored paths and they do
++  not influence the ``--exit-code`` outcome.
++* ``cruft create`` and ``cruft check`` are not affected; ``create``
++  renders every template file, including ``.cruftignore`` itself.
++
++The rules that apply are always taken from the template rendering being
++compared (for ``update`` the rendering of the new template version, for
++``diff`` the rendering of the checked out template version).  If that
++rendering does not contain a ``.cruftignore`` file, nothing is ignored.
++The ``.cruftignore`` file itself is never ignored and follows the normal
++update rules, so template authors can evolve the rule set over time.
++
++Pattern syntax follows ``.gitignore`` conventions:
++
++* Blank lines and lines starting with ``#`` are ignored.
++* A leading ``!`` negates the pattern (re-includes the path); a literal
++  ``!`` or ``#`` at the start can be escaped with a backslash.
++* A trailing ``/`` makes the pattern match directories only.
++* A pattern containing a ``/`` (other than the trailing one) is anchored
++  to the project root; a leading ``/`` is allowed but not required.
++  A pattern without a ``/`` matches the basename at any depth.
++* ``*`` matches any run of characters except ``/``, ``?`` matches a
++  single character except ``/``, ``[...]`` is a character class and
++  ``**`` matches across directory boundaries.
++* When several patterns match, the last one in the file wins.
++* If a directory is excluded, everything below it stays excluded; it is
++  not possible to re-include a file inside an excluded directory.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++import shutil
++from dataclasses import dataclass
++from pathlib import Path, PurePosixPath
++from typing import Iterable, List, Optional, Sequence, Set, Tuple
++
++CRUFTIGNORE_FILENAME = ".cruftignore"
++
++# Prefixes used by cruft's own diff machinery (see
++# ``cruft._commands.utils.diff``) plus the conventional git prefixes, so
++# that ``filter_diff`` can cope with both.
++_DIFF_PREFIXES = ("upstream-template-old/", "upstream-template-new/", "a/", "b/")
++
++
++def _translate_glob(pattern: str) -> str:
++    """Translate the body of a gitignore pattern into a regex string.
++
++    The translation follows gitignore wildcard rules: ``*`` and ``?``
++    never cross a ``/`` boundary, character classes are passed through
++    (with ``!`` rewritten to ``^``) and ``**`` crosses directories.
++    """
++    i = 0
++    n = len(pattern)
++    parts: List[str] = []
++    while i < n:
++        char = pattern[i]
++        if pattern[i : i + 2] == "**":
++            if pattern[i : i + 3] == "**/":
++                # Leading or middle "**/" matches zero or more whole
++                # directories ("**/x" == "x" at any depth, "a/**/b"
++                # matches "a/b" as well as "a/c/d/b").
++                parts.append("(?:.*/)?")
++                i += 3
++            elif i + 2 == n:
++                # Trailing "**" matches everything that follows.
++                parts.append(".*")
++                i += 2
++            else:
++                # A "**" that is neither followed by "/" nor trailing is
++                # not special in gitignore; treat it as a plain "*".
++                parts.append("[^/]*")
++                i += 2
++        elif char == "*":
++            parts.append("[^/]*")
++            i += 1
++        elif char == "?":
++            parts.append("[^/]")
++            i += 1
++        elif char == "[":
++            j = i + 1
++            if j < n and pattern[j] in "!^":
++                j += 1
++            if j < n and pattern[j] == "]":
++                j += 1
++            while j < n and pattern[j] != "]":
++                j += 1
++            if j >= n:
++                # Unterminated class: a literal "[".
++                parts.append(r"\[")
++                i += 1
++            else:
++                inner = pattern[i + 1 : j]
++                if inner.startswith("!"):
++                    inner = "^" + inner[1:]
++                inner = inner.replace("\\", "\\\\")
++                parts.append("[" + inner + "]")
++                i = j + 1
++        else:
++            parts.append(re.escape(char))
++            i += 1
++    return "".join(parts)
++
++
++@dataclass
++class IgnoreRule:
++    """A single parsed ``.cruftignore`` line."""
++
++    pattern: str
++    regex: "re.Pattern[str]"
++    negated: bool
++    dir_only: bool
++    anchored: bool
++
++    def matches(self, path: str, is_dir: bool) -> bool:
++        """Whether this rule matches ``path`` (project relative, POSIX)."""
++        if self.dir_only and not is_dir:
++            return False
++        return bool(self.regex.match(path))
++
++
++def _parse_line(line: str) -> Optional[IgnoreRule]:
++    """Parse one ``.cruftignore`` line, returning ``None`` if it is void."""
++    # Trailing whitespace is not significant (escaped trailing spaces are
++    # an obscure corner we deliberately do not support).
++    line = line.rstrip()
++    if not line or line.startswith("#"):
++        return None
++    negated = False
++    if line.startswith("!"):
++        negated = True
++        line = line[1:]
++    elif line.startswith("\\!") or line.startswith("\\#"):
++        line = line[1:]
++    dir_only = line.endswith("/")
++    if dir_only:
++        line = line[:-1]
++    # A pattern containing a slash (besides a trailing one) is anchored
++    # to the project root; a leading slash only makes that explicit.
++    anchored = "/" in line
++    line = line.lstrip("/")
++    if not line:
++        return None
++    body = _translate_glob(line)
++    if anchored:
++        regex = re.compile("^" + body + "$")
++    else:
++        # No slash: match the basename at any depth.
++        regex = re.compile("(?:^|.*/)" + body + "$")
++    return IgnoreRule(
++        pattern=line, regex=regex, negated=negated, dir_only=dir_only, anchored=anchored
++    )
++
++
++class IgnoreRules:
++    """An ordered set of ``.cruftignore`` rules with gitignore semantics."""
++
++    def __init__(self, rules: Sequence[IgnoreRule]):
++        self.rules: List[IgnoreRule] = list(rules)
++
++    def __bool__(self) -> bool:
++        return bool(self.rules)
++
++    def __len__(self) -> int:
++        return len(self.rules)
++
++    @classmethod
++    def from_lines(cls, lines: Iterable[str]) -> "IgnoreRules":
++        """Build a rule set from the lines of a ``.cruftignore`` file."""
++        parsed = []
++        for line in lines:
++            rule = _parse_line(line)
++            if rule is not None:
++                parsed.append(rule)
++        return cls(parsed)
++
++    @classmethod
++    def from_file(cls, path: Path) -> "IgnoreRules":
++        """Build a rule set from a file; an absent file means no rules."""
++        if not path.is_file():
++            return cls([])
++        return cls.from_lines(path.read_text(encoding="utf-8").splitlines())
++
++    @classmethod
++    def from_render(cls, render_dir: Path) -> "IgnoreRules":
++        """Load the rules shipped by a template rendering, if any."""
++        return cls.from_file(Path(render_dir) / CRUFTIGNORE_FILENAME)
++
++    def _status(self, path: str, is_dir: bool) -> Optional[bool]:
++        """Resolve the ignore status of a single path.
++
++        Returns ``True`` (ignored), ``False`` (explicitly re-included) or
++        ``None`` (no rule matched).  The last matching rule wins.
++        """
++        status: Optional[bool] = None
++        for rule in self.rules:
++            if rule.matches(path, is_dir):
++                status = not rule.negated
++        return status
++
++    def match(self, path: "os.PathLike[str] | str", is_dir: bool = False) -> bool:
++        """Whether ``path`` (relative to the project root) is ignored.
++
++        Every ancestor directory is considered as well: as in gitignore,
++        a path below an excluded directory is excluded and cannot be
++        re-included by a later negation.  The ``.cruftignore`` file at
++        the project root itself is never ignored.
++        """
++        parts = [part for part in PurePosixPath(str(path).replace(os.sep, "/")).parts if part != "/"]
++        if not parts:
++            return False
++        if parts == [CRUFTIGNORE_FILENAME]:
++            return False
++        for depth in range(1, len(parts) + 1):
++            candidate = "/".join(parts[:depth])
++            candidate_is_dir = depth < len(parts) or is_dir
++            status = self._status(candidate, candidate_is_dir)
++            if status and depth < len(parts):
++                # An excluded directory excludes its whole subtree.
++                return True
++            if depth == len(parts):
++                return bool(status)
++        return False
++
++
++def _relative_paths(root: Path) -> Set[str]:
++    """All files below ``root`` as POSIX paths relative to ``root``."""
++    found = set()
++    for dirpath, _dirnames, filenames in os.walk(root):
++        for filename in filenames:
++            full = Path(dirpath) / filename
++            found.add(full.relative_to(root).as_posix())
++    return found
++
++
++def remove_ignored(root: Path, rules: IgnoreRules) -> Set[str]:
++    """Delete every ignored path from the tree at ``root``.
++
++    Returns the set of removed file paths, relative to ``root``.  Used to
++    strip ignored paths from template renderings before they are
++    diffed, so ignored paths never show up in computed changesets.
++    """
++    removed: Set[str] = set()
++    if not rules:
++        return removed
++    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
++        dir_path = Path(dirpath)
++        kept_dirs = []
++        for dirname in dirnames:
++            relative = (dir_path / dirname).relative_to(root).as_posix()
++            if rules.match(relative, is_dir=True):
++                removed.add(relative)
++                # Prune the whole subtree from the walk.
++                for sub in _relative_paths(dir_path / dirname):
++                    removed.add(f"{relative}/{sub}")
++                shutil.rmtree(dir_path / dirname)
++            else:
++                kept_dirs.append(dirname)
++        dirnames[:] = kept_dirs
++        for filename in filenames:
++            full = dir_path / filename
++            relative = full.relative_to(root).as_posix()
++            if rules.match(relative):
++                full.unlink()
++                removed.add(relative)
++    return removed
++
++
++def ignored_changed_paths(old_dir: Path, new_dir: Path, rules: IgnoreRules) -> List[str]:
++    """Ignored paths whose rendering would change between two trees.
++
++    A path counts as changed when it exists in only one of the trees or
++    when its content differs.  The result is sorted for stable output.
++    """
++    if not rules:
++        return []
++    old_paths = _relative_paths(old_dir)
++    new_paths = _relative_paths(new_dir)
++    changed = []
++    for relative in sorted(old_paths | new_paths):
++        if not rules.match(relative):
++            continue
++        old_file = old_dir / relative
++        new_file = new_dir / relative
++        if not old_file.is_file() or not new_file.is_file():
++            changed.append(relative)
++        elif old_file.read_bytes() != new_file.read_bytes():
++            changed.append(relative)
++    return changed
++
++
++def split_diff_sections(diff_text: str) -> List[str]:
++    """Split a unified diff into a preamble plus per-file sections."""
++    sections: List[str] = []
++    current: List[str] = []
++    for line in diff_text.splitlines(keepends=True):
++        if line.startswith("diff --git ") and current:
++            sections.append("".join(current))
++            current = []
++        current.append(line)
++    if current:
++        sections.append("".join(current))
++    return sections
++
++
++def _strip_diff_prefix(path: str) -> Optional[str]:
++    """Normalize a ``---``/``+++`` diff path to a project relative path."""
++    if path == "/dev/null":
++        return None
++    for prefix in _DIFF_PREFIXES:
++        if path.startswith(prefix):
++            return path[len(prefix) :]
++    return path
++
++
++def _section_paths(section: str) -> Tuple[Optional[str], Optional[str]]:
++    """Extract the (old, new) project relative paths of a diff section."""
++    old_path: Optional[str] = None
++    new_path: Optional[str] = None
++    for line in section.splitlines():
++        if line.startswith("--- "):
++            old_path = _strip_diff_prefix(line[4:].strip())
++        elif line.startswith("+++ "):
++            new_path = _strip_diff_prefix(line[4:].strip())
++    return old_path, new_path
++
++
++def filter_diff(diff_text: str, rules: IgnoreRules) -> Tuple[str, List[str]]:
++    """Drop every per-file section of ``diff_text`` that touches only
++    ignored paths.
++
++    Returns the filtered diff together with the sorted list of project
++    relative paths whose sections were dropped.  Sections are dropped
++    only when *all* of their paths are ignored, so a change moving
++    content from an ignored path to a managed one is still applied.  A
++    rule set without rules (or a missing ``.cruftignore``) is a no-op.
++    """
++    if not rules:
++        return diff_text, []
++    kept: List[str] = []
++    skipped: List[str] = []
++    for section in split_diff_sections(diff_text):
++        old_path, new_path = _section_paths(section)
++        paths = [path for path in (old_path, new_path) if path]
++        if paths and all(rules.match(path) for path in paths):
++            skipped.append(new_path or old_path or "")
++        else:
++            kept.append(section)
++    return "".join(kept), sorted(set(skipped))
+diff --git a/tests/test_ignore.py b/tests/test_ignore.py
+new file mode 100644
+index 0000000..478afac
+--- /dev/null
++++ b/tests/test_ignore.py
+@@ -0,0 +1,774 @@
++"""Tests for the ``.cruftignore`` feature.
++
++Unit tests cover the pattern engine in ``cruft._ignore``; integration
++tests exercise ``cruft create`` / ``cruft update`` / ``cruft diff``
++against locally constructed git template repositories, fully offline.
++"""
++
++import json
++import os
++import subprocess
++from pathlib import Path
++from typing import Dict, Optional
++
++import pytest
++
++import cruft
++from cruft import _ignore
++from cruft._ignore import IgnoreRules
++
++GIT_ENV = {
++    "GIT_AUTHOR_NAME": "cruft-test",
++    "GIT_AUTHOR_EMAIL": "cruft-test@example.com",
++    "GIT_COMMITTER_NAME": "cruft-test",
++    "GIT_COMMITTER_EMAIL": "cruft-test@example.com",
++    "GIT_CONFIG_NOSYSTEM": "1",
++    "HOME": os.environ.get("HOME", "/tmp"),
++}
++
++
++def _git(args, cwd):
++    env = dict(os.environ)
++    env.update(GIT_ENV)
++    subprocess.run(["git"] + list(args), cwd=str(cwd), env=env, check=True,
++                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++
++
++def _commit_all(repo_dir: Path, message: str):
++    _git(["add", "-A"], repo_dir)
++    _git(["commit", "-qm", message, "--no-gpg-sign"], repo_dir)
++
++
++def make_template(
++    root: Path,
++    files: Dict[str, str],
++    context: Optional[dict] = None,
++    message: str = "template commit",
++) -> Path:
++    """Create (or extend) a local git cookiecutter template at ``root``.
++
++    ``files`` maps paths relative to the generated project root to file
++    contents; they are written into the ``{{cookiecutter.project_slug}}``
++    directory of the template.  The whole tree is committed.
++    """
++    root = Path(root)
++    root.mkdir(parents=True, exist_ok=True)
++    template_dir = root / "{{cookiecutter.project_slug}}"
++    if not (root / "cookiecutter.json").exists():
++        (root / "cookiecutter.json").write_text(
++            json.dumps(context or {"project_slug": "demo", "author": "Alice"})
++        )
++        _git(["init", "-q", "-b", "main"], root)
++    for relative, content in files.items():
++        path = template_dir / relative
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(content)
++    _commit_all(root, message)
++    return root
++
++
++def head_commit(repo_dir: Path) -> str:
++    env = dict(os.environ)
++    env.update(GIT_ENV)
++    out = subprocess.run(
++        ["git", "rev-parse", "HEAD"], cwd=str(repo_dir), env=env, check=True,
++        stdout=subprocess.PIPE,
++    )
++    return out.stdout.decode().strip()
++
++
++def create_project(template_dir: Path, output_dir: Path) -> Path:
++    return Path(cruft.create(str(template_dir), Path(output_dir), no_input=True))
++
++
++def read_cruft_state(project_dir: Path) -> dict:
++    return json.loads((Path(project_dir) / ".cruft.json").read_text())
++
++
++############################################################
++# Unit tests: pattern parsing and matching                 #
++############################################################
++
++
++class TestPatternSemantics:
++    def test_blank_lines_and_comments_are_ignored(self):
++        rules = IgnoreRules.from_lines(["", "   ", "# a comment"])
++        assert len(rules) == 0
++        assert not rules.match("anything.txt")
++
++    def test_comment_rule_only_at_line_start(self):
++        rules = IgnoreRules.from_lines(["#foo"])
++        assert len(rules) == 0
++
++    def test_escaped_comment_and_negation(self):
++        rules = IgnoreRules.from_lines([r"\#literal", r"\!literal"])
++        assert rules.match("#literal")
++        assert rules.match("!literal")
++
++    def test_simple_basename_matches_at_any_depth(self):
++        rules = IgnoreRules.from_lines(["config.ini"])
++        assert rules.match("config.ini")
++        assert rules.match("a/config.ini")
++        assert rules.match("a/b/c/config.ini")
++        assert not rules.match("config.ini.bak")
++        assert not rules.match("myconfig.ini")
++
++    def test_star_does_not_cross_directories(self):
++        rules = IgnoreRules.from_lines(["*.log"])
++        assert rules.match("x.log")
++        assert rules.match("deep/nested/y.log")
++        assert not rules.match("x.logs")
++        rules2 = IgnoreRules.from_lines(["logs/*.log"])
++        assert rules2.match("logs/x.log")
++        assert not rules2.match("logs/deep/x.log")
++
++    def test_question_mark_matches_single_character(self):
++        rules = IgnoreRules.from_lines(["file?.txt"])
++        assert rules.match("file1.txt")
++        assert rules.match("dir/fileA.txt")
++        assert not rules.match("file10.txt")
++        assert not rules.match("file/.txt")
++
++    def test_character_class(self):
++        rules = IgnoreRules.from_lines(["data[0-9].csv"])
++        assert rules.match("data3.csv")
++        assert not rules.match("datax.csv")
++        rules_neg = IgnoreRules.from_lines(["data[!0-9].csv"])
++        assert rules_neg.match("datax.csv")
++        assert not rules_neg.match("data3.csv")
++
++    def test_anchored_pattern_matches_only_from_root(self):
++        rules = IgnoreRules.from_lines(["/settings.ini"])
++        assert rules.match("settings.ini")
++        assert not rules.match("config/settings.ini")
++
++    def test_pattern_with_slash_is_anchored_without_leading_slash(self):
++        rules = IgnoreRules.from_lines(["config/settings.ini"])
++        assert rules.match("config/settings.ini")
++        assert not rules.match("other/config/settings.ini")
++
++    def test_directory_only_pattern(self):
++        rules = IgnoreRules.from_lines(["build/"])
++        assert rules.match("build", is_dir=True)
++        assert not rules.match("build", is_dir=False)
++        assert rules.match("build/output.bin")
++        assert rules.match("nested/build", is_dir=True)
++        assert rules.match("nested/build/output.bin")
++
++    def test_double_star_leading(self):
++        rules = IgnoreRules.from_lines(["**/secret.txt"])
++        assert rules.match("secret.txt")
++        assert rules.match("a/secret.txt")
++        assert rules.match("a/b/c/secret.txt")
++
++    def test_double_star_trailing(self):
++        rules = IgnoreRules.from_lines(["docs/**"])
++        assert rules.match("docs/a.md")
++        assert rules.match("docs/a/b/c.md")
++        assert not rules.match("other/docs/a.md")
++
++    def test_double_star_middle(self):
++        rules = IgnoreRules.from_lines(["src/**/generated.py"])
++        assert rules.match("src/generated.py")
++        assert rules.match("src/a/generated.py")
++        assert rules.match("src/a/b/c/generated.py")
++        assert not rules.match("lib/src/a/generated.py")
++
++    def test_double_star_whole_pattern(self):
++        rules = IgnoreRules.from_lines(["**"])
++        assert rules.match("anything")
++        assert rules.match("any/thing/at/all")
++
++    def test_negation_reincludes(self):
++        rules = IgnoreRules.from_lines(["*.log", "!keep.log"])
++        assert rules.match("x.log")
++        assert not rules.match("keep.log")
++        assert not rules.match("dir/keep.log")
++
++    def test_last_matching_rule_wins(self):
++        rules = IgnoreRules.from_lines(["!keep.log", "*.log"])
++        assert rules.match("keep.log")
++        rules2 = IgnoreRules.from_lines(["*.log", "!keep.log", "keep.log"])
++        assert rules2.match("keep.log")
++
++    def test_cannot_reinclude_below_excluded_directory(self):
++        rules = IgnoreRules.from_lines(["vendor/", "!vendor/keep.txt"])
++        assert rules.match("vendor/keep.txt")
++
++    def test_can_reinclude_directory_itself(self):
++        rules = IgnoreRules.from_lines(["vendor/", "!vendor/"])
++        assert not rules.match("vendor/keep.txt")
++
++    def test_negation_of_contents_within_directory(self):
++        rules = IgnoreRules.from_lines(["assets/*", "!assets/logo.png"])
++        assert rules.match("assets/style.css")
++        assert not rules.match("assets/logo.png")
++
++    def test_cruftignore_file_is_never_ignored(self):
++        rules = IgnoreRules.from_lines(["*", "**", ".*"])
++        assert not rules.match(".cruftignore")
++        assert not rules.match(".cruftignore", is_dir=False)
++
++    def test_trailing_whitespace_is_stripped(self):
++        rules = IgnoreRules.from_lines(["foo.txt   "])
++        assert rules.match("foo.txt")
++
++    def test_empty_ruleset_matches_nothing(self):
++        rules = IgnoreRules.from_lines([])
++        assert not rules
++        assert len(rules) == 0
++        assert not rules.match("anything.txt")
++
++    def test_missing_file_means_empty_rules(self, tmp_path):
++        rules = IgnoreRules.from_file(tmp_path / ".cruftignore")
++        assert not rules
++        assert not rules.match("anything")
++
++    def test_from_file_reads_rules(self, tmp_path):
++        ignore_file = tmp_path / ".cruftignore"
++        ignore_file.write_text("*.pyc\n!keep.pyc\n")
++        rules = IgnoreRules.from_file(ignore_file)
++        assert rules.match("x.pyc")
++        assert not rules.match("keep.pyc")
++
++    def test_from_render_looks_at_render_root(self, tmp_path):
++        render = tmp_path / "render"
++        render.mkdir()
++        (render / ".cruftignore").write_text("*.tmp\n")
++        rules = IgnoreRules.from_render(render)
++        assert rules.match("x.tmp")
++
++    def test_root_only_pattern_does_not_match_nested(self):
++        rules = IgnoreRules.from_lines(["/gen/"])
++        assert rules.match("gen", is_dir=True)
++        assert rules.match("gen/file.py")
++        assert not rules.match("src/gen", is_dir=True)
++        assert not rules.match("src/gen/file.py")
++
++
++class TestFilterDiff:
++    SAMPLE_DIFF = (
++        "diff --git upstream-template-old/a.log upstream-template-new/a.log\n"
++        "index 1111111..2222222 100644\n"
++        "--- upstream-template-old/a.log\n"
++        "+++ upstream-template-new/a.log\n"
++        "@@ -1 +1 @@\n"
++        "-old\n"
++        "+new\n"
++        "diff --git upstream-template-old/README.md upstream-template-new/README.md\n"
++        "index 3333333..4444444 100644\n"
++        "--- upstream-template-old/README.md\n"
++        "+++ upstream-template-new/README.md\n"
++        "@@ -1 +1 @@\n"
++        "-old readme\n"
++        "+new readme\n"
++    )
++
++    def test_drops_sections_for_ignored_paths(self):
++        rules = IgnoreRules.from_lines(["*.log"])
++        filtered, skipped = _ignore.filter_diff(self.SAMPLE_DIFF, rules)
++        assert skipped == ["a.log"]
++        assert "a.log" not in filtered
++        assert "README.md" in filtered
++
++    def test_no_rules_is_a_noop(self):
++        rules = IgnoreRules.from_lines([])
++        filtered, skipped = _ignore.filter_diff(self.SAMPLE_DIFF, rules)
++        assert filtered == self.SAMPLE_DIFF
++        assert skipped == []
++
++    def test_new_file_section_uses_plus_path(self):
++        diff = (
++            "diff --git upstream-template-old/added.log upstream-template-new/added.log\n"
++            "new file mode 100644\n"
++            "index 0000000..1111111\n"
++            "--- /dev/null\n"
++            "+++ upstream-template-new/added.log\n"
++            "@@ -0,0 +1 @@\n"
++            "+brand new\n"
++        )
++        rules = IgnoreRules.from_lines(["*.log"])
++        filtered, skipped = _ignore.filter_diff(diff, rules)
++        assert filtered == ""
++        assert skipped == ["added.log"]
++
++    def test_deleted_file_section_uses_minus_path(self):
++        diff = (
++            "diff --git upstream-template-old/gone.log upstream-template-new/gone.log\n"
++            "deleted file mode 100644\n"
++            "index 1111111..0000000\n"
++            "--- upstream-template-old/gone.log\n"
++            "+++ /dev/null\n"
++            "@@ -1 +0,0 @@\n"
++            "-bye\n"
++        )
++        rules = IgnoreRules.from_lines(["*.log"])
++        filtered, skipped = _ignore.filter_diff(diff, rules)
++        assert filtered == ""
++        assert skipped == ["gone.log"]
++
++    def test_section_with_mixed_paths_is_kept(self):
++        # A change moving content from an ignored path to a managed path
++        # must still be applied.
++        diff = (
++            "diff --git upstream-template-old/a.log upstream-template-new/README.md\n"
++            "similarity index 90%\n"
++            "rename from upstream-template-old/a.log\n"
++            "rename to upstream-template-new/README.md\n"
++            "--- upstream-template-old/a.log\n"
++            "+++ upstream-template-new/README.md\n"
++            "@@ -1 +1 @@\n"
++            "-old\n"
++            "+new\n"
++        )
++        rules = IgnoreRules.from_lines(["*.log"])
++        filtered, skipped = _ignore.filter_diff(diff, rules)
++        assert "README.md" in filtered
++        assert skipped == []
++
++    def test_split_diff_sections(self):
++        sections = _ignore.split_diff_sections(self.SAMPLE_DIFF)
++        assert len(sections) == 2
++        assert sections[0].startswith("diff --git")
++        assert "a.log" in sections[0]
++        assert "README.md" in sections[1]
++
++
++class TestRemoveIgnored:
++    def test_removes_files_and_directories(self, tmp_path):
++        root = tmp_path / "tree"
++        (root / "build" / "deep").mkdir(parents=True)
++        (root / "build" / "out.bin").write_text("bin")
++        (root / "build" / "deep" / "x.bin").write_text("bin2")
++        (root / "src").mkdir()
++        (root / "src" / "app.py").write_text("code")
++        (root / "debug.log").write_text("log")
++        rules = IgnoreRules.from_lines(["build/", "*.log"])
++        removed = _ignore.remove_ignored(root, rules)
++        assert removed == {"build", "build/out.bin", "build/deep/x.bin", "debug.log"}
++        assert not (root / "build").exists()
++        assert not (root / "debug.log").exists()
++        assert (root / "src" / "app.py").exists()
++
++    def test_no_rules_keeps_everything(self, tmp_path):
++        root = tmp_path / "tree"
++        root.mkdir()
++        (root / "a.txt").write_text("a")
++        removed = _ignore.remove_ignored(root, IgnoreRules.from_lines([]))
++        assert removed == set()
++        assert (root / "a.txt").exists()
++
++    def test_negated_files_are_kept(self, tmp_path):
++        root = tmp_path / "tree"
++        root.mkdir()
++        (root / "a.log").write_text("a")
++        (root / "keep.log").write_text("keep")
++        rules = IgnoreRules.from_lines(["*.log", "!keep.log"])
++        removed = _ignore.remove_ignored(root, rules)
++        assert removed == {"a.log"}
++        assert (root / "keep.log").exists()
++
++
++class TestIgnoredChangedPaths:
++    def test_detects_modified_added_and_removed(self, tmp_path):
++        old = tmp_path / "old"
++        new = tmp_path / "new"
++        old.mkdir()
++        new.mkdir()
++        (old / "mod.log").write_text("v1")
++        (new / "mod.log").write_text("v2")
++        (old / "same.log").write_text("same")
++        (new / "same.log").write_text("same")
++        (new / "added.log").write_text("new")
++        (old / "removed.log").write_text("old")
++        (old / "managed.txt").write_text("a")
++        (new / "managed.txt").write_text("b")
++        rules = IgnoreRules.from_lines(["*.log"])
++        changed = _ignore.ignored_changed_paths(old, new, rules)
++        assert changed == ["added.log", "mod.log", "removed.log"]
++
++
++############################################################
++# Integration tests: cruft update honors .cruftignore      #
++############################################################
++
++V1_FILES = {
++    "README.md": "# {{cookiecutter.project_slug}}\nby {{cookiecutter.author}}\n",
++    "config.ini": "[app]\nname = {{cookiecutter.project_slug}}\n",
++    "settings/local.ini": "env = dev\n",
++    "notes.txt": "first version\n",
++    ".cruftignore": "# user-owned files\nconfig.ini\nsettings/\n",
++}
++
++V2_CHANGES = {
++    "README.md": "# {{cookiecutter.project_slug}}\nby {{cookiecutter.author}}\nv2 line\n",
++    "config.ini": "[app]\nname = {{cookiecutter.project_slug}}\ndebug = false\n",
++    "settings/local.ini": "env = prod\n",
++    "notes.txt": "second version\n",
++}
++
++
++@pytest.fixture()
++def template_and_project(tmp_path):
++    """A created project plus its (still mutable) template repository."""
++    template = make_template(tmp_path / "template", V1_FILES, message="v1")
++    project = create_project(template, tmp_path / "output")
++    return template, project
++
++
++class TestUpdateHonorsCruftignore:
++    def test_ignored_modified_file_keeps_user_content(self, template_and_project):
++        template, project = template_and_project
++        (project / "config.ini").write_text("[app]\nname = demo\n# my local tweaks\n")
++        make_template(template, V2_CHANGES, message="v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# my local tweaks\n"
++        assert not (project / "config.ini.rej").exists()
++
++    def test_managed_files_are_updated(self, template_and_project):
++        template, project = template_and_project
++        make_template(template, V2_CHANGES, message="v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert (project / "README.md").read_text() == "# demo\nby Alice\nv2 line\n"
++        assert (project / "notes.txt").read_text() == "second version\n"
++
++    def test_ignored_directory_is_not_touched(self, template_and_project):
++        template, project = template_and_project
++        (project / "settings" / "local.ini").write_text("env = mine\n")
++        make_template(template, V2_CHANGES, message="v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert (project / "settings" / "local.ini").read_text() == "env = mine\n"
++
++    def test_ignored_new_template_file_is_not_created(self, template_and_project):
++        template, project = template_and_project
++        make_template(
++            template,
++            {"config_extra.ini": "[extra]\n", "README.md": V2_CHANGES["README.md"]},
++            message="v2",
++        )
++        # Extend the ignore file in the new template version.
++        make_template(
++            template,
++            {".cruftignore": "config.ini\nsettings/\nconfig_extra.ini\n"},
++            message="v2 ignore extra",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert not (project / "config_extra.ini").exists()
++        assert (project / "README.md").read_text() == "# demo\nby Alice\nv2 line\n"
++
++    def test_ignored_deleted_template_file_is_kept(self, template_and_project):
++        template, project = template_and_project
++        (project / "config.ini").write_text("[app]\nname = demo\n# custom\n")
++        template_file = template / "{{cookiecutter.project_slug}}" / "config.ini"
++        template_file.unlink()
++        _commit_all(template, "v2 removes config.ini")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# custom\n"
++
++    def test_managed_deleted_template_file_is_removed(self, template_and_project):
++        template, project = template_and_project
++        template_file = template / "{{cookiecutter.project_slug}}" / "notes.txt"
++        template_file.unlink()
++        _commit_all(template, "v2 removes notes.txt")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert not (project / "notes.txt").exists()
++
++    def test_update_reports_skipped_paths(self, template_and_project, capsys):
++        template, project = template_and_project
++        make_template(template, V2_CHANGES, message="v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        out = capsys.readouterr().out
++        assert "Skipping ignored path: config.ini" in out
++        assert "Skipping ignored path: settings/local.ini" in out
++        assert "README.md" not in [
++            line.split("Skipping ignored path: ")[-1]
++            for line in out.splitlines()
++            if "Skipping ignored path:" in line
++        ]
++
++    def test_no_skip_report_when_ignored_paths_unchanged(self, template_and_project, capsys):
++        template, project = template_and_project
++        make_template(template, {"README.md": V2_CHANGES["README.md"]}, message="v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        out = capsys.readouterr().out
++        assert "Skipping ignored path:" not in out
++
++    def test_cruftignore_itself_is_updated(self, template_and_project):
++        template, project = template_and_project
++        make_template(
++            template,
++            {".cruftignore": "config.ini\nsettings/\nextra.ini\n"},
++            message="v2 new ignore rules",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert (project / ".cruftignore").read_text() == "config.ini\nsettings/\nextra.ini\n"
++
++    def test_rules_come_from_new_template_version(self, template_and_project):
++        # The old template ignores config.ini, the new one does not:
++        # the new ruleset wins and the file becomes managed.
++        template, project = template_and_project
++        make_template(
++            template,
++            {
++                "config.ini": V2_CHANGES["config.ini"],
++                ".cruftignore": "settings/\n",
++            },
++            message="v2 un-ignores config.ini",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\ndebug = false\n"
++
++    def test_cruft_state_commit_is_updated(self, template_and_project):
++        template, project = template_and_project
++        make_template(template, V2_CHANGES, message="v2")
++        new_commit = head_commit(template)
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert read_cruft_state(project)["commit"] == new_commit
++
++    def test_update_without_cruftignore_is_unchanged(self, tmp_path):
++        # Templates without .cruftignore keep the historical behavior:
++        # conflicting user edits produce .rej files.
++        files = {k: v for k, v in V1_FILES.items() if k != ".cruftignore"}
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        make_template(template, {"config.ini": V2_CHANGES["config.ini"]}, message="v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# mine\n"
++        assert (project / "config.ini.rej").exists()
++
++    def test_update_with_git_project_and_committed_changes(self, template_and_project):
++        template, project = template_and_project
++        # Turn the project into a clean git repository with user edits
++        # committed, so the 3-way apply path is taken.
++        _git(["init", "-q", "-b", "main"], project)
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        _commit_all(project, "project with local tweaks")
++        make_template(template, V2_CHANGES, message="v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# mine\n"
++        assert (project / "README.md").read_text() == "# demo\nby Alice\nv2 line\n"
++
++    def test_negation_patterns_during_update(self, tmp_path):
++        files = dict(V1_FILES)
++        files[".cruftignore"] = "*.log\n!keep.log\n"
++        files["error.log"] = "template error log v1\n"
++        files["keep.log"] = "template keep log v1\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        make_template(
++            template,
++            {
++                "error.log": "template error log v2\n",
++                "keep.log": "template keep log v2\n",
++            },
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert (project / "error.log").read_text() == "template error log v1\n"
++        assert (project / "keep.log").read_text() == "template keep log v2\n"
++
++    def test_anchored_pattern_during_update(self, tmp_path):
++        files = dict(V1_FILES)
++        files[".cruftignore"] = "/config.ini\n"
++        files["docs/config.ini"] = "[docs]\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        make_template(
++            template,
++            {
++                "config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++                "docs/config.ini": "[docs]\nv2\n",
++            },
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        # Root config.ini is ignored, nested docs/config.ini is managed.
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n"
++        assert (project / "docs" / "config.ini").read_text() == "[docs]\nv2\n"
++
++    def test_ignored_path_deleted_by_user_is_not_recreated(self, template_and_project):
++        template, project = template_and_project
++        (project / "config.ini").unlink()
++        make_template(template, V2_CHANGES, message="v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        assert not (project / "config.ini").exists()
++
++    def test_cruftignore_removed_from_template_manages_files_again(
++        self, template_and_project
++    ):
++        template, project = template_and_project
++        ignore_file = template / "{{cookiecutter.project_slug}}" / ".cruftignore"
++        ignore_file.unlink()
++        make_template(template, {"config.ini": V2_CHANGES["config.ini"]}, message="v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        # .cruftignore is gone and config.ini follows the template again.
++        assert not (project / ".cruftignore").exists()
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\ndebug = false\n"
++
++
++############################################################
++# Integration tests: cruft diff honors .cruftignore        #
++############################################################
++
++
++class TestDiffHonorsCruftignore:
++    def test_ignored_paths_produce_no_diff(self, template_and_project, capsys):
++        template, project = template_and_project
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++
++        assert cruft.diff(project) is True
++        out = capsys.readouterr().out
++        assert "config.ini" not in out
++
++    def test_managed_paths_still_show_in_diff(self, template_and_project, capsys):
++        template, project = template_and_project
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        (project / "notes.txt").write_text("user notes\n")
++
++        assert cruft.diff(project) is True
++        out = capsys.readouterr().out
++        assert "config.ini" not in out
++        assert "notes.txt" in out
++
++    def test_diff_exit_code_ignores_ignored_paths(self, template_and_project):
++        template, project = template_and_project
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        (project / "settings" / "local.ini").write_text("env = mine\n")
++
++        # Only ignored paths differ: the project counts as up to date.
++        assert cruft.diff(project, exit_code=True) is True
++
++    def test_diff_exit_code_flags_managed_differences(self, template_and_project):
++        template, project = template_and_project
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        (project / "notes.txt").write_text("user notes\n")
++
++        assert cruft.diff(project, exit_code=True) is False
++
++    def test_diff_output_remains_a_usable_patch(self, template_and_project, capsys):
++        template, project = template_and_project
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        (project / "notes.txt").write_text("user notes\n")
++
++        assert cruft.diff(project) is True
++        out = capsys.readouterr().out
++        # Every file section header must reference a managed path only.
++        for line in out.splitlines():
++            if line.startswith(("--- ", "+++ ", "diff --git")):
++                assert "config.ini" not in line
++                assert "settings" not in line
++
++
++############################################################
++# Integration tests: create and check are unaffected       #
++############################################################
++
++
++class TestCreateAndCheckUnaffected:
++    def test_create_renders_everything_including_cruftignore(self, tmp_path):
++        template = make_template(tmp_path / "template", V1_FILES, message="v1")
++        project = create_project(template, tmp_path / "output")
++
++        assert (project / ".cruftignore").read_text() == V1_FILES[".cruftignore"]
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n"
++        assert (project / "settings" / "local.ini").read_text() == "env = dev\n"
++        assert (project / "README.md").exists()
++
++    def test_create_with_ignore_file_still_creates_ignored_paths(self, tmp_path):
++        files = dict(V1_FILES)
++        files[".cruftignore"] = "*\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++
++        # Even a wildcard ignore must not prevent initial generation.
++        assert (project / "README.md").exists()
++        assert (project / "config.ini").exists()
++
++    def test_check_still_detects_outdated_project(self, template_and_project):
++        template, project = template_and_project
++        make_template(template, V2_CHANGES, message="v2")
++
++        assert cruft.check(project) is False
++
++    def test_check_passes_for_up_to_date_project(self, template_and_project):
++        template, project = template_and_project
++
++        assert cruft.check(project) is True
++
++
++############################################################
++# Integration tests: CLI level                             #
++############################################################
++
++
++class TestCliLevel:
++    def test_cli_update_honors_cruftignore(self, template_and_project):
++        from typer.testing import CliRunner
++
++        from cruft._cli import app
++
++        template, project = template_and_project
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        make_template(template, V2_CHANGES, message="v2")
++
++        runner = CliRunner()
++        result = runner.invoke(
++            app, ["update", "--project-dir", str(project), "--skip-apply-ask"]
++        )
++
++        assert result.exit_code == 0
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# mine\n"
++        assert (project / "README.md").read_text() == "# demo\nby Alice\nv2 line\n"
++
++    def test_cli_diff_exit_code(self, template_and_project):
++        from typer.testing import CliRunner
++
++        from cruft._cli import app
++
++        template, project = template_and_project
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++
++        runner = CliRunner()
++        result = runner.invoke(app, ["diff", "--project-dir", str(project), "--exit-code"])
++        assert result.exit_code == 0
++
++        (project / "notes.txt").write_text("user notes\n")
++        result = runner.invoke(app, ["diff", "--project-dir", str(project), "--exit-code"])
++        assert result.exit_code == 1
++        assert "notes.txt" in result.stdout
++        assert "config.ini" not in result.stdout
+diff --git a/tests/test_ignore_edge_cases.py b/tests/test_ignore_edge_cases.py
+new file mode 100644
+index 0000000..559bb57
+--- /dev/null
++++ b/tests/test_ignore_edge_cases.py
+@@ -0,0 +1,1218 @@
++"""Edge case tests for the ``.cruftignore`` feature.
++
++These complement ``tests/test_ignore.py`` with pattern engine corner
++cases, diff filtering of unusual patch sections and integration
++scenarios around repeated updates, alternate template layouts and
++binary files.  Everything runs against locally constructed git
++repositories, fully offline.
++"""
++
++import json
++import os
++import subprocess
++from pathlib import Path
++from typing import Dict, Optional
++
++import pytest
++
++import cruft
++from cruft import _ignore
++from cruft._ignore import IgnoreRules
++
++GIT_ENV = {
++    "GIT_AUTHOR_NAME": "cruft-test",
++    "GIT_AUTHOR_EMAIL": "cruft-test@example.com",
++    "GIT_COMMITTER_NAME": "cruft-test",
++    "GIT_COMMITTER_EMAIL": "cruft-test@example.com",
++    "GIT_CONFIG_NOSYSTEM": "1",
++    "HOME": os.environ.get("HOME", "/tmp"),
++}
++
++
++def _git(args, cwd):
++    env = dict(os.environ)
++    env.update(GIT_ENV)
++    subprocess.run(["git"] + list(args), cwd=str(cwd), env=env, check=True,
++                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++
++
++def _commit_all(repo_dir: Path, message: str):
++    _git(["add", "-A"], repo_dir)
++    _git(["commit", "-qm", message, "--no-gpg-sign"], repo_dir)
++
++
++def make_template(
++    root: Path,
++    files: Dict[str, str],
++    context: Optional[dict] = None,
++    message: str = "template commit",
++    inner_dir: str = "{{cookiecutter.project_slug}}",
++) -> Path:
++    """Create (or extend) a local git cookiecutter template at ``root``."""
++    root = Path(root)
++    root.mkdir(parents=True, exist_ok=True)
++    template_dir = root / inner_dir
++    if not (root / "cookiecutter.json").exists():
++        (root / "cookiecutter.json").write_text(
++            json.dumps(context or {"project_slug": "demo", "author": "Alice"})
++        )
++        _git(["init", "-q", "-b", "main"], root)
++    for relative, content in files.items():
++        path = template_dir / relative
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(content)
++    _commit_all(root, message)
++    return root
++
++
++def make_binary_template_file(path: Path, payload: bytes):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_bytes(payload)
++
++
++def head_commit(repo_dir: Path) -> str:
++    env = dict(os.environ)
++    env.update(GIT_ENV)
++    out = subprocess.run(
++        ["git", "rev-parse", "HEAD"], cwd=str(repo_dir), env=env, check=True,
++        stdout=subprocess.PIPE,
++    )
++    return out.stdout.decode().strip()
++
++
++def create_project(template_dir: Path, output_dir: Path, **kwargs) -> Path:
++    return Path(cruft.create(str(template_dir), Path(output_dir), no_input=True, **kwargs))
++
++
++def read_cruft_state(project_dir: Path) -> dict:
++    return json.loads((Path(project_dir) / ".cruft.json").read_text())
++
++
++BASE_V1 = {
++    "README.md": "# {{cookiecutter.project_slug}}\nby {{cookiecutter.author}}\n",
++    "config.ini": "[app]\nname = {{cookiecutter.project_slug}}\n",
++    "notes.txt": "first version\n",
++}
++
++
++############################################################
++# Pattern engine corner cases                              #
++############################################################
++
++
++class TestPatternEngineCornerCases:
++    def test_dotfile_patterns(self):
++        rules = IgnoreRules.from_lines([".*"])
++        assert rules.match(".env")
++        assert rules.match("config/.env")
++        assert not rules.match(".cruftignore")
++        assert not rules.match("visible.txt")
++
++    def test_pattern_matching_directory_and_file_alike(self):
++        # Without a trailing slash a pattern matches files *and* dirs.
++        rules = IgnoreRules.from_lines(["target"])
++        assert rules.match("target", is_dir=True)
++        assert rules.match("target", is_dir=False)
++        assert rules.match("a/target/out.bin")
++
++    def test_multiple_slashes_anchor_at_root(self):
++        rules = IgnoreRules.from_lines(["a/b/c.txt"])
++        assert rules.match("a/b/c.txt")
++        assert not rules.match("x/a/b/c.txt")
++        assert not rules.match("a/b/d.txt")
++
++    def test_star_star_between_segments(self):
++        rules = IgnoreRules.from_lines(["a/**/b/**/c.txt"])
++        assert rules.match("a/b/c.txt")
++        assert rules.match("a/x/b/y/c.txt")
++        assert rules.match("a/x/y/b/z/w/c.txt")
++        assert not rules.match("a/x/c.txt")
++
++    def test_class_with_range_and_literal(self):
++        rules = IgnoreRules.from_lines(["log[0-9][ab].txt"])
++        assert rules.match("log3a.txt")
++        assert rules.match("log9b.txt")
++        assert not rules.match("log3c.txt")
++        assert not rules.match("log30a.txt")
++
++    def test_unterminated_class_is_literal_bracket(self):
++        rules = IgnoreRules.from_lines(["weird[.txt"])
++        assert rules.match("weird[.txt")
++        assert not rules.match("weirdx.txt")
++
++    def test_escaped_negation_and_hash(self):
++        rules = IgnoreRules.from_lines([r"\!important.txt", r"\#hash.txt"])
++        assert rules.match("!important.txt")
++        assert rules.match("#hash.txt")
++        assert not rules.match("important.txt")
++
++    def test_negation_without_match_has_no_effect(self):
++        rules = IgnoreRules.from_lines(["!nothing.txt"])
++        assert not rules.match("nothing.txt")
++        assert not rules.match("other.txt")
++
++    def test_double_negation_chain(self):
++        rules = IgnoreRules.from_lines(
++            ["*.log", "!keep.log", "keep.log", "!keep.log"]
++        )
++        assert not rules.match("keep.log")
++        assert rules.match("error.log")
++
++    def test_rooted_negation(self):
++        rules = IgnoreRules.from_lines(["*.md", "!/README.md"])
++        assert not rules.match("README.md")
++        assert rules.match("docs/README.md")
++        assert rules.match("guide.md")
++
++    def test_directory_pattern_with_negated_child_still_excluded(self):
++        rules = IgnoreRules.from_lines(["logs/", "!logs/today.log"])
++        assert rules.match("logs/today.log")
++        assert rules.match("logs", is_dir=True)
++
++    def test_globstar_alone_matches_everything_below(self):
++        rules = IgnoreRules.from_lines(["data/**"])
++        assert rules.match("data/x")
++        assert rules.match("data/x/y/z")
++        assert not rules.match("data", is_dir=True)
++
++    def test_paths_with_spaces(self):
++        rules = IgnoreRules.from_lines(["my folder/", "with space.txt"])
++        assert rules.match("my folder/a.txt")
++        assert rules.match("with space.txt")
++        assert rules.match("deep/with space.txt")
++
++    def test_deeply_nested_basename_match(self):
++        rules = IgnoreRules.from_lines(["Thumbs.db"])
++        assert rules.match("a/b/c/d/e/f/Thumbs.db")
++        assert not rules.match("a/b/c/d/e/f/Thumbs.db.bak")
++
++    def test_leading_slash_on_directory_pattern(self):
++        rules = IgnoreRules.from_lines(["/cache/"])
++        assert rules.match("cache/x.bin")
++        assert not rules.match("src/cache/x.bin")
++
++    def test_match_empty_path_is_false(self):
++        rules = IgnoreRules.from_lines(["*", "**"])
++        assert not rules.match("")
++        assert not rules.match("/")
++
++    def test_rules_are_ordered(self):
++        rules = IgnoreRules.from_lines(["b.txt", "a.txt", "c.txt"])
++        assert [r.pattern for r in rules.rules] == ["b.txt", "a.txt", "c.txt"]
++
++    def test_crlf_lines_are_tolerated(self):
++        rules = IgnoreRules.from_lines(["*.log\r", "!keep.log\r"])
++        assert rules.match("x.log")
++        assert not rules.match("keep.log")
++
++    def test_only_slash_pattern_is_void(self):
++        rules = IgnoreRules.from_lines(["/"])
++        assert len(rules) == 0
++
++    def test_dir_only_pattern_does_not_match_file(self):
++        rules = IgnoreRules.from_lines(["node_modules/"])
++        assert not rules.match("node_modules", is_dir=False)
++        assert rules.match("node_modules", is_dir=True)
++
++    def test_repr_of_empty_and_nonempty(self):
++        empty = IgnoreRules.from_lines([])
++        full = IgnoreRules.from_lines(["x"])
++        assert bool(empty) is False
++        assert bool(full) is True
++        assert len(full) == 1
++
++
++############################################################
++# Diff filtering of unusual patch sections                 #
++############################################################
++
++
++class TestFilterDiffSections:
++    def test_empty_diff(self):
++        filtered, skipped = _ignore.filter_diff("", IgnoreRules.from_lines(["*"]))
++        assert filtered == ""
++        assert skipped == []
++
++    def test_preamble_is_preserved(self):
++        diff = "some preamble line\n" + (
++            "diff --git upstream-template-old/a.txt upstream-template-new/a.txt\n"
++            "--- upstream-template-old/a.txt\n"
++            "+++ upstream-template-new/a.txt\n"
++            "@@ -1 +1 @@\n-x\n+y\n"
++        )
++        filtered, _ = _ignore.filter_diff(diff, IgnoreRules.from_lines(["zzz"]))
++        assert filtered.startswith("some preamble line\n")
++
++    def test_binary_section_is_filtered(self):
++        diff = (
++            "diff --git upstream-template-old/logo.png upstream-template-new/logo.png\n"
++            "index 1111111..2222222 100644\n"
++            "GIT binary patch\n"
++            "literal 3\n"
++            "abc\n"
++        )
++        rules = IgnoreRules.from_lines(["*.png"])
++        filtered, skipped = _ignore.filter_diff(diff, rules)
++        # Without ---/+++ headers there is no path evidence; the section
++        # must be kept rather than silently dropped.
++        assert "GIT binary patch" in filtered
++        assert skipped == []
++
++    def test_mode_change_section_is_filtered_by_header_path(self):
++        diff = (
++            "diff --git upstream-template-old/run.sh upstream-template-new/run.sh\n"
++            "old mode 100644\n"
++            "new mode 100755\n"
++            "--- upstream-template-old/run.sh\n"
++            "+++ upstream-template-new/run.sh\n"
++        )
++        rules = IgnoreRules.from_lines(["*.sh"])
++        filtered, skipped = _ignore.filter_diff(diff, rules)
++        assert filtered == ""
++        assert skipped == ["run.sh"]
++
++    def test_mixed_diff_keeps_only_managed(self):
++        diff = (
++            "diff --git upstream-template-old/skip.txt upstream-template-new/skip.txt\n"
++            "--- upstream-template-old/skip.txt\n"
++            "+++ upstream-template-new/skip.txt\n"
++            "@@ -1 +1 @@\n-a\n+b\n"
++            "diff --git upstream-template-old/keep.txt upstream-template-new/keep.txt\n"
++            "--- upstream-template-old/keep.txt\n"
++            "+++ upstream-template-new/keep.txt\n"
++            "@@ -1 +1 @@\n-c\n+d\n"
++            "diff --git upstream-template-old/skip2.log upstream-template-new/skip2.log\n"
++            "--- upstream-template-old/skip2.log\n"
++            "+++ upstream-template-new/skip2.log\n"
++            "@@ -1 +1 @@\n-e\n+f\n"
++        )
++        rules = IgnoreRules.from_lines(["skip.txt", "*.log"])
++        filtered, skipped = _ignore.filter_diff(diff, rules)
++        assert skipped == ["skip.txt", "skip2.log"]
++        assert "keep.txt" in filtered
++        assert "skip.txt" not in filtered
++        assert "skip2.log" not in filtered
++
++    def test_git_style_prefixes_are_recognized(self):
++        diff = (
++            "diff --git a/src/app.py b/src/app.py\n"
++            "index 1111111..2222222 100644\n"
++            "--- a/src/app.py\n"
++            "+++ b/src/app.py\n"
++            "@@ -1 +1 @@\n-old\n+new\n"
++        )
++        rules = IgnoreRules.from_lines(["src/"])
++        filtered, skipped = _ignore.filter_diff(diff, rules)
++        assert filtered == ""
++        assert skipped == ["src/app.py"]
++
++    def test_skipped_paths_are_sorted_and_unique(self):
++        diff = (
++            "diff --git upstream-template-old/b.log upstream-template-new/b.log\n"
++            "--- upstream-template-old/b.log\n"
++            "+++ upstream-template-new/b.log\n"
++            "@@ -1 +1 @@\n-a\n+b\n"
++            "diff --git upstream-template-old/a.log upstream-template-new/a.log\n"
++            "--- upstream-template-old/a.log\n"
++            "+++ upstream-template-new/a.log\n"
++            "@@ -1 +1 @@\n-a\n+b\n"
++        )
++        rules = IgnoreRules.from_lines(["*.log"])
++        _, skipped = _ignore.filter_diff(diff, rules)
++        assert skipped == ["a.log", "b.log"]
++
++
++############################################################
++# remove_ignored / ignored_changed_paths corner cases      #
++############################################################
++
++
++class TestTreeOperations:
++    def test_remove_ignored_returns_posix_paths(self, tmp_path):
++        root = tmp_path / "tree"
++        (root / "sub" / "deep").mkdir(parents=True)
++        (root / "sub" / "deep" / "x.log").write_text("x")
++        rules = IgnoreRules.from_lines(["*.log"])
++        removed = _ignore.remove_ignored(root, rules)
++        assert removed == {"sub/deep/x.log"}
++
++    def test_remove_ignored_keeps_negated(self, tmp_path):
++        root = tmp_path / "tree"
++        (root / "logs").mkdir(parents=True)
++        (root / "logs" / "a.log").write_text("a")
++        (root / "logs" / "keep.log").write_text("keep")
++        rules = IgnoreRules.from_lines(["*.log", "!keep.log"])
++        removed = _ignore.remove_ignored(root, rules)
++        assert removed == {"logs/a.log"}
++        assert (root / "logs" / "keep.log").read_text() == "keep"
++
++    def test_ignored_changed_paths_binary_content(self, tmp_path):
++        old = tmp_path / "old"
++        new = tmp_path / "new"
++        old.mkdir()
++        new.mkdir()
++        (old / "blob.bin").write_bytes(b"\x00\x01\x02")
++        (new / "blob.bin").write_bytes(b"\x00\x01\x03")
++        rules = IgnoreRules.from_lines(["*.bin"])
++        assert _ignore.ignored_changed_paths(old, new, rules) == ["blob.bin"]
++        (new / "blob.bin").write_bytes(b"\x00\x01\x02")
++        assert _ignore.ignored_changed_paths(old, new, rules) == []
++
++    def test_ignored_changed_paths_empty_rules(self, tmp_path):
++        old = tmp_path / "old"
++        new = tmp_path / "new"
++        old.mkdir()
++        new.mkdir()
++        (old / "a.txt").write_text("1")
++        (new / "a.txt").write_text("2")
++        assert _ignore.ignored_changed_paths(old, new, IgnoreRules.from_lines([])) == []
++
++    def test_ignored_changed_paths_only_in_one_tree(self, tmp_path):
++        old = tmp_path / "old"
++        new = tmp_path / "new"
++        old.mkdir()
++        new.mkdir()
++        (new / "fresh.log").write_text("new")
++        rules = IgnoreRules.from_lines(["*.log"])
++        assert _ignore.ignored_changed_paths(old, new, rules) == ["fresh.log"]
++
++
++############################################################
++# Integration edge cases                                   #
++############################################################
++
++
++class TestRepeatedUpdates:
++    def test_two_consecutive_updates_keep_ignored_files(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++
++        make_template(
++            template,
++            {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++             "notes.txt": "second version\n"},
++            message="v2",
++        )
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# mine\n"
++        assert (project / "notes.txt").read_text() == "second version\n"
++
++        make_template(
++            template,
++            {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv3\n",
++             "notes.txt": "third version\n"},
++            message="v3",
++        )
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# mine\n"
++        assert (project / "notes.txt").read_text() == "third version\n"
++        assert read_cruft_state(project)["commit"] == head_commit(template)
++
++    def test_update_is_stable_when_run_again(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        make_template(
++            template, {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n"},
++            message="v2",
++        )
++        assert cruft.update(project, skip_apply_ask=True) is True
++        snapshot = {
++            p.relative_to(project).as_posix(): p.read_bytes()
++            for p in sorted(project.rglob("*"))
++            if p.is_file()
++        }
++        # A second update is a no-op that must not touch anything.
++        assert cruft.update(project, skip_apply_ask=True) is True
++        snapshot2 = {
++            p.relative_to(project).as_posix(): p.read_bytes()
++            for p in sorted(project.rglob("*"))
++            if p.is_file()
++        }
++        assert snapshot == snapshot2
++
++
++class TestOnlyIgnoredChanges:
++    def test_update_succeeds_when_only_ignored_paths_change(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        make_template(
++            template, {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n"},
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        # State still moves forward even though no file was applied.
++        assert read_cruft_state(project)["commit"] == head_commit(template)
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# mine\n"
++        assert not list(project.rglob("*.rej"))
++
++
++class TestBinaryFiles:
++    def test_ignored_binary_file_is_never_modified(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "assets/\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        asset = (
++            template / "{{cookiecutter.project_slug}}" / "assets" / "logo.bin"
++        )
++        make_binary_template_file(asset, bytes(range(64)))
++        _commit_all(template, "v1 asset")
++        project = create_project(template, tmp_path / "output")
++
++        user_payload = b"\xff" * 64
++        (project / "assets" / "logo.bin").write_bytes(user_payload)
++
++        asset_v2 = bytes(reversed(range(64)))
++        asset.write_bytes(asset_v2)
++        _commit_all(template, "v2 asset")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "assets" / "logo.bin").read_bytes() == user_payload
++
++    def test_managed_binary_file_is_updated(self, tmp_path):
++        files = dict(BASE_V1)
++        template = make_template(tmp_path / "template", files, message="v1")
++        asset = template / "{{cookiecutter.project_slug}}" / "data.bin"
++        make_binary_template_file(asset, bytes(range(32)))
++        _commit_all(template, "v1 data")
++        project = create_project(template, tmp_path / "output")
++
++        payload_v2 = b"\xab" * 32
++        asset.write_bytes(payload_v2)
++        _commit_all(template, "v2 data")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "data.bin").read_bytes() == payload_v2
++
++
++class TestTemplateSubdirectory:
++    def test_cruftignore_with_template_subdirectory(self, tmp_path):
++        # Template lives in a subdirectory of its git repository; the
++        # .cruftignore semantics are relative to the generated project
++        # root exactly as before.
++        repo = tmp_path / "templaterepo"
++        inner = repo / "templates" / "main"
++        inner.mkdir(parents=True)
++        (repo / "top-level.txt").write_text("not part of the template")
++        (inner / "cookiecutter.json").write_text(
++            json.dumps({"project_slug": "demo", "author": "Alice"})
++        )
++        tdir = inner / "{{cookiecutter.project_slug}}"
++        tdir.mkdir(parents=True)
++        (tdir / "README.md").write_text("# {{cookiecutter.project_slug}}\n")
++        (tdir / "config.ini").write_text("[app]\nname = {{cookiecutter.project_slug}}\n")
++        (tdir / ".cruftignore").write_text("config.ini\n")
++        _git(["init", "-q", "-b", "main"], repo)
++        _commit_all(repo, "v1")
++
++        project = Path(
++            cruft.create(
++                str(repo),
++                tmp_path / "output",
++                no_input=True,
++                directory="templates/main",
++            )
++        )
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++
++        (tdir / "config.ini").write_text("[app]\nname = {{cookiecutter.project_slug}}\nv2\n")
++        (tdir / "README.md").write_text("# {{cookiecutter.project_slug}}\nv2\n")
++        _commit_all(repo, "v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# mine\n"
++        assert (project / "README.md").read_text() == "# demo\nv2\n"
++
++
++class TestSkipUpdateFlag:
++    def test_skip_update_still_bumps_state_without_touching_files(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        make_template(
++            template,
++            {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++             "notes.txt": "second version\n"},
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True, skip_update=True) is True
++
++        assert read_cruft_state(project)["commit"] == head_commit(template)
++        # skip_update means nothing is applied at all.
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n"
++        assert (project / "notes.txt").read_text() == "first version\n"
++
++
++class TestInteractiveView:
++    def test_interactive_view_hides_ignored_paths(self, tmp_path, monkeypatch):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        make_template(
++            template,
++            {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++             "notes.txt": "second version\n"},
++            message="v2",
++        )
++
++        shown = []
++        monkeypatch.setattr(
++            "cruft._commands.utils.diff.display_diff",
++            lambda old, new: shown.append((old, new)),
++        )
++        answers = iter(["v", "y"])
++        monkeypatch.setattr("typer.prompt", lambda *a, **k: next(answers))
++
++        assert cruft.update(project, skip_apply_ask=False) is True
++        # The view path was exercised and the update was applied.
++        assert (project / "notes.txt").read_text() == "second version\n"
++        # Ignored paths were stripped from the trees being viewed.
++        assert shown, "display_diff should have been invoked"
++        old_tree, new_tree = shown[0]
++        assert not (Path(old_tree) / "config.ini").exists()
++        assert not (Path(new_tree) / "config.ini").exists()
++
++
++class TestDiffCheckout:
++    def test_diff_against_older_checkout_uses_that_versions_rules(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        v1_commit = head_commit(template)
++        project = create_project(template, tmp_path / "output")
++
++        # The template evolves: config.ini is no longer ignored.
++        (template / "{{cookiecutter.project_slug}}" / ".cruftignore").write_text("")
++        _commit_all(template, "v2 empty ignore")
++
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++
++        # Diffing against the old commit still uses the old rules.
++        assert cruft.diff(project, exit_code=True, checkout=v1_commit) is True
++
++
++class TestUserCreatedFiles:
++    def test_user_files_inside_ignored_directory_survive_update(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "local/\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "local").mkdir()
++        (project / "local" / "mine.txt").write_text("user data\n")
++
++        make_template(
++            template,
++            {"local/from_template.txt": "template file\n", "notes.txt": "second\n"},
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "local" / "mine.txt").read_text() == "user data\n"
++        assert not (project / "local" / "from_template.txt").exists()
++        assert (project / "notes.txt").read_text() == "second\n"
++
++    def test_user_files_outside_ignore_rules_are_left_alone(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "extra_user_file.txt").write_text("user file\n")
++
++        make_template(template, {"notes.txt": "second\n"}, message="v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "extra_user_file.txt").read_text() == "user file\n"
++
++
++class TestIgnoreFileContentVariations:
++    def test_cruftignore_with_template_variables_is_rendered(self, tmp_path):
++        # The .cruftignore file is a normal template file: cookiecutter
++        # variables inside it are rendered like anywhere else.
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "{{cookiecutter.project_slug}}.local.ini\n"
++        files["demo.local.ini"] = "local = true\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "demo.local.ini").write_text("local = mine\n")
++
++        make_template(
++            template, {"demo.local.ini": "local = false\n", "notes.txt": "second\n"},
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "demo.local.ini").read_text() == "local = mine\n"
++        assert (project / "notes.txt").read_text() == "second\n"
++
++    def test_malformed_lines_are_tolerated(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "\n\n# only comments\n   \n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++
++        make_template(template, {"notes.txt": "second\n"}, message="v2")
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "notes.txt").read_text() == "second\n"
++
++
++############################################################
++# Advanced scenarios                                       #
++############################################################
++
++
++class TestAdvancedScenarios:
++    def test_update_with_extra_context_still_honors_ignore(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        make_template(
++            template,
++            {
++                "config.ini": "[app]\nname = {{cookiecutter.project_slug}}\n"
++                "author = {{cookiecutter.author}}\n",
++                "notes.txt": "by {{cookiecutter.author}}\n",
++            },
++            message="v2",
++        )
++
++        assert (
++            cruft.update(
++                project,
++                skip_apply_ask=True,
++                extra_context={"author": "Bob"},
++            )
++            is True
++        )
++
++        # Ignored path untouched; managed path re-rendered with new input.
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n"
++        assert (project / "notes.txt").read_text() == "by Bob\n"
++        state = read_cruft_state(project)
++        assert state["context"]["cookiecutter"]["author"] == "Bob"
++
++    def test_update_with_checkout_honors_ignore(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        make_template(
++            template,
++            {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++             "notes.txt": "second\n"},
++            message="v2",
++        )
++        v2_commit = head_commit(template)
++        make_template(template, {"notes.txt": "third\n"}, message="v3")
++
++        assert (
++            cruft.update(project, skip_apply_ask=True, checkout=v2_commit, strict=False)
++            is True
++        )
++
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# mine\n"
++        assert (project / "notes.txt").read_text() == "second\n"
++        assert read_cruft_state(project)["commit"] == v2_commit
++
++    def test_diff_after_update_is_empty(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        make_template(
++            template,
++            {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++             "notes.txt": "second\n"},
++            message="v2",
++        )
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        # After a successful update the only remaining difference is the
++        # ignored file, so the diff is empty and --exit-code passes.
++        assert cruft.diff(project, exit_code=True) is True
++
++    def test_diff_output_is_applyable_patch(self, tmp_path):
++        import shutil
++        import subprocess as sp
++
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "notes.txt").write_text("user notes\n")
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++
++        # Capture the diff in patch form (non-TTY output is sanitized).
++        from typer.testing import CliRunner
++
++        from cruft._cli import app
++
++        runner = CliRunner()
++        result = runner.invoke(app, ["diff", "--project-dir", str(project)])
++        assert result.exit_code == 0
++        patch_text = result.stdout
++        assert "notes.txt" in patch_text
++        assert "config.ini" not in patch_text
++
++        # The emitted patch applies cleanly on top of a fresh copy of the
++        # project and reproduces the template rendering for managed files.
++        replica = tmp_path / "replica"
++        shutil.copytree(project, replica)
++        normalized = patch_text.replace("upstream-template-old/", "").replace(
++            "upstream-template-new/", ""
++        )
++        apply_proc = sp.run(
++            ["git", "apply", "-p0"],
++            input=normalized.encode(),
++            cwd=str(replica),
++            stdout=sp.PIPE,
++            stderr=sp.PIPE,
++        )
++        assert apply_proc.returncode == 0, apply_proc.stderr.decode()
++        assert (replica / "notes.txt").read_text() == "first version\n"
++
++    def test_unicode_file_names(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "données/\n"
++        files["données/résumé.txt"] = "version 1\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "données" / "résumé.txt").write_text("mes données\n")
++        make_template(
++            template,
++            {"données/résumé.txt": "version 2\n", "notes.txt": "second\n"},
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "données" / "résumé.txt").read_text() == "mes données\n"
++        assert (project / "notes.txt").read_text() == "second\n"
++
++    def test_globstar_basename_pattern(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "**/*.snapshot\n"
++        files["a.snapshot"] = "s1\n"
++        files["deep/nested/b.snapshot"] = "s2\n"
++        files["deep/keep.txt"] = "k\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        make_template(
++            template,
++            {
++                "a.snapshot": "s1 v2\n",
++                "deep/nested/b.snapshot": "s2 v2\n",
++                "deep/keep.txt": "k v2\n",
++            },
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "a.snapshot").read_text() == "s1\n"
++        assert (project / "deep" / "nested" / "b.snapshot").read_text() == "s2\n"
++        assert (project / "deep" / "keep.txt").read_text() == "k v2\n"
++
++    def test_ignore_rules_evolving_across_versions(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        files["extra.ini"] = "x1\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++
++        # v2 widens the ignore set.
++        make_template(
++            template,
++            {
++                ".cruftignore": "config.ini\nextra.ini\n",
++                "config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++                "extra.ini": "x2\n",
++            },
++            message="v2",
++        )
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n"
++        assert (project / "extra.ini").read_text() == "x1\n"
++
++        # v3 narrows it again: extra.ini becomes managed. The template
++        # patch expects the v2 content, while the project still has the
++        # user's v1 content, so the update surfaces a standard conflict
++        # (a .rej file) exactly like it would without any ignore rules.
++        make_template(
++            template,
++            {".cruftignore": "config.ini\n", "extra.ini": "x3\n"},
++            message="v3",
++        )
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "extra.ini").read_text() == "x1\n"
++        assert (project / "extra.ini.rej").exists()
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n"
++
++    def test_multiple_projects_from_same_template(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project_a = create_project(template, tmp_path / "out_a")
++        project_b = create_project(template, tmp_path / "out_b")
++        (project_a / "config.ini").write_text("[app]\nname = demo\n# a\n")
++        (project_b / "config.ini").write_text("[app]\nname = demo\n# b\n")
++        make_template(
++            template,
++            {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++             "notes.txt": "second\n"},
++            message="v2",
++        )
++
++        assert cruft.update(project_a, skip_apply_ask=True) is True
++        assert cruft.update(project_b, skip_apply_ask=True) is True
++
++        assert (project_a / "config.ini").read_text() == "[app]\nname = demo\n# a\n"
++        assert (project_b / "config.ini").read_text() == "[app]\nname = demo\n# b\n"
++        assert (project_a / "notes.txt").read_text() == "second\n"
++        assert (project_b / "notes.txt").read_text() == "second\n"
++
++    def test_ignored_empty_file(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "empty.marker\n"
++        files["empty.marker"] = ""
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        make_template(
++            template, {"empty.marker": "now filled\n", "notes.txt": "second\n"},
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "empty.marker").read_text() == ""
++        assert (project / "notes.txt").read_text() == "second\n"
++
++    def test_skip_report_covers_only_paths_that_would_change(self, tmp_path, capsys):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\nextra.ini\n"
++        files["extra.ini"] = "x1\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        # Only config.ini changes in the template; extra.ini is ignored
++        # but unchanged and therefore not reported.
++        make_template(
++            template, {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n"},
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        out = capsys.readouterr().out
++        assert "Skipping ignored path: config.ini" in out
++        assert "Skipping ignored path: extra.ini" not in out
++
++    def test_ignored_path_added_and_removed_between_versions(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "ephemeral.txt\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++
++        # v2 adds the ignored file...
++        make_template(
++            template, {"ephemeral.txt": "temp v2\n", "notes.txt": "second\n"},
++            message="v2",
++        )
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert not (project / "ephemeral.txt").exists()
++
++        # ...and v3 removes it again: nothing must break.
++        (template / "{{cookiecutter.project_slug}}" / "ephemeral.txt").unlink()
++        _commit_all(template, "v3")
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert not (project / "ephemeral.txt").exists()
++        assert read_cruft_state(project)["commit"] == head_commit(template)
++
++
++############################################################
++# CLI flows and project layout edge cases                  #
++############################################################
++
++
++class TestCliFlows:
++    def test_cli_update_prints_skip_report(self, tmp_path):
++        from typer.testing import CliRunner
++
++        from cruft._cli import app
++
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        make_template(
++            template,
++            {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++             "notes.txt": "second\n"},
++            message="v2",
++        )
++
++        runner = CliRunner()
++        result = runner.invoke(
++            app, ["update", "--project-dir", str(project), "--skip-apply-ask"]
++        )
++        assert result.exit_code == 0
++        assert "Skipping ignored path: config.ini" in result.stdout
++        assert (project / "notes.txt").read_text() == "second\n"
++
++    def test_cli_diff_omits_ignored_paths(self, tmp_path):
++        from typer.testing import CliRunner
++
++        from cruft._cli import app
++
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        (project / "notes.txt").write_text("user notes\n")
++
++        runner = CliRunner()
++        result = runner.invoke(app, ["diff", "--project-dir", str(project)])
++        assert result.exit_code == 0
++        assert "notes.txt" in result.stdout
++        assert "config.ini" not in result.stdout
++
++    def test_cli_create_then_update_roundtrip(self, tmp_path):
++        from typer.testing import CliRunner
++
++        from cruft._cli import app
++
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++
++        runner = CliRunner()
++        result = runner.invoke(
++            app,
++            ["create", "--output-dir", str(tmp_path / "out"), str(template), "-y"],
++        )
++        assert result.exit_code == 0
++        project = tmp_path / "out" / "demo"
++        assert (project / ".cruftignore").exists()
++
++        (project / "config.ini").write_text("[app]\nname = demo\n# cli user\n")
++        make_template(
++            template,
++            {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++             "notes.txt": "second\n"},
++            message="v2",
++        )
++        result = runner.invoke(
++            app, ["update", "--project-dir", str(project), "--skip-apply-ask"]
++        )
++        assert result.exit_code == 0
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# cli user\n"
++
++
++class TestProjectInsideGitSubdirectory:
++    def test_update_in_git_repo_subdirectory(self, tmp_path):
++        # The generated project lives in a subdirectory of a git
++        # repository; cruft applies patches with a --directory offset.
++        # Ignored paths must stay untouched on that code path as well.
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++
++        repo_root = tmp_path / "monorepo"
++        repo_root.mkdir()
++        _git(["init", "-q", "-b", "main"], repo_root)
++        project = create_project(template, repo_root / "packages")
++        assert project.parent.name == "packages"
++        _commit_all(repo_root, "initial project")
++
++        # Commit a user change to the ignored file.
++        (project / "config.ini").write_text("[app]\nname = demo\n# mine\n")
++        _commit_all(repo_root, "user tweak")
++
++        make_template(
++            template,
++            {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++             "notes.txt": "second\n"},
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n# mine\n"
++        assert (project / "notes.txt").read_text() == "second\n"
++
++
++class TestRulesOnlyChanges:
++    def test_template_change_limited_to_cruftignore(self, tmp_path):
++        # The only template change is the rule set itself: it must be
++        # propagated like any other managed file.
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++
++        make_template(
++            template, {".cruftignore": "config.ini\nnotes.txt\n"}, message="v2"
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / ".cruftignore").read_text() == "config.ini\nnotes.txt\n"
++        assert read_cruft_state(project)["commit"] == head_commit(template)
++
++    def test_user_edit_of_cruftignore_is_managed_content(self, tmp_path, capsys):
++        # .cruftignore is never ignored itself: a local modification
++        # shows up in cruft diff like any other file.
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "config.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / ".cruftignore").write_text("config.ini\n# user comment\n")
++
++        assert cruft.diff(project) is True
++        out = capsys.readouterr().out
++        assert ".cruftignore" in out
++
++
++class TestPatternPrecedence:
++    def test_anchored_and_basename_patterns_both_apply(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "seed.txt\n/data/seed.txt\n!data/seed.txt\n"
++        files["seed.txt"] = "root v1\n"
++        files["data/seed.txt"] = "data v1\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        make_template(
++            template,
++            {"seed.txt": "root v2\n", "data/seed.txt": "data v2\n",
++             "notes.txt": "second\n"},
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        # Root seed.txt is ignored (basename rule), data/seed.txt was
++        # re-included by the trailing negation and got updated.
++        assert (project / "seed.txt").read_text() == "root v1\n"
++        assert (project / "data" / "seed.txt").read_text() == "data v2\n"
++        assert (project / "notes.txt").read_text() == "second\n"
++
++    def test_directory_rule_vs_nested_negation_on_update(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "gen/\n"
++        files["gen/a.py"] = "a v1\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        make_template(
++            template,
++            {"gen/a.py": "a v2\n", "gen/b.py": "b v2\n", "notes.txt": "second\n"},
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "gen" / "a.py").read_text() == "a v1\n"
++        assert not (project / "gen" / "b.py").exists()
++        assert (project / "notes.txt").read_text() == "second\n"
++
++
++class TestEngineAPI:
++    def test_rule_dataclass_fields(self):
++        rules = IgnoreRules.from_lines(["!build/"])
++        rule = rules.rules[0]
++        assert rule.pattern == "build"
++        assert rule.negated is True
++        assert rule.dir_only is True
++        assert rule.anchored is False
++        assert rule.matches("build", is_dir=True)
++        assert not rule.matches("build", is_dir=False)
++
++    def test_anchored_flag_detection(self):
++        rules = IgnoreRules.from_lines(["a/b.txt", "c.txt", "/d.txt", "e/"])
++        anchored = {r.pattern: r.anchored for r in rules.rules}
++        assert anchored == {
++            "a/b.txt": True,
++            "c.txt": False,
++            "d.txt": True,
++            "e": False,
++        }
++
++    def test_match_accepts_path_objects(self, tmp_path):
++        rules = IgnoreRules.from_lines(["*.log"])
++        from pathlib import PurePath
++
++        assert rules.match(PurePath("x/y.log"))
++        assert not rules.match(PurePath("x/y.txt"))
++
++    def test_from_file_with_utf8_bom_tolerated_or_literal(self, tmp_path):
++        # A BOM is part of the first line; this test pins the behavior
++        # that the engine neither crashes nor ignores unrelated files.
++        ignore_file = tmp_path / ".cruftignore"
++        ignore_file.write_bytes("*.log\n".encode("utf-8"))
++        rules = IgnoreRules.from_file(ignore_file)
++        assert rules.match("error.log")
++
++
++class TestIgnoreFileDiscovery:
++    def test_rules_only_come_from_template_rendering(self, tmp_path):
++        # A .cruftignore that exists only in the project but not in the
++        # template rendering has no effect: the template owns the rules.
++        files = dict(BASE_V1)
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        (project / ".cruftignore").write_text("notes.txt\n")
++
++        make_template(template, {"notes.txt": "second\n"}, message="v2")
++        assert cruft.update(project, skip_apply_ask=True) is True
++
++        # notes.txt updated normally because the template ships no rules.
++        assert (project / "notes.txt").read_text() == "second\n"
++        # The stray ignore file is left alone (it is a user file).
++        assert (project / ".cruftignore").read_text() == "notes.txt\n"
++
++    def test_rendered_ignore_file_does_not_leak_template_variables(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "# project: {{cookiecutter.project_slug}}\nconfig.ini\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++
++        rendered = (project / ".cruftignore").read_text()
++        assert "{{cookiecutter.project_slug}}" not in rendered
++        assert "demo" in rendered
++
++        make_template(
++            template,
++            {"config.ini": "[app]\nname = {{cookiecutter.project_slug}}\nv2\n",
++             "notes.txt": "second\n"},
++            message="v2",
++        )
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n"
++        assert (project / "notes.txt").read_text() == "second\n"
++
++    def test_ignore_all_then_reinclude_single_file(self, tmp_path):
++        files = dict(BASE_V1)
++        files[".cruftignore"] = "*\n!README.md\n"
++        template = make_template(tmp_path / "template", files, message="v1")
++        project = create_project(template, tmp_path / "output")
++        make_template(
++            template,
++            {
++                "README.md": "# {{cookiecutter.project_slug}}\nv2\n",
++                "config.ini": "[app]\nv2\n",
++                "notes.txt": "second\n",
++            },
++            message="v2",
++        )
++
++        assert cruft.update(project, skip_apply_ask=True) is True
++        assert (project / "README.md").read_text() == "# demo\nv2\n"
++        assert (project / "config.ini").read_text() == "[app]\nname = demo\n"
++        assert (project / "notes.txt").read_text() == "first version\n"

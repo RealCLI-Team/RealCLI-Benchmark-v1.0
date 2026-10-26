@@ -1,0 +1,123 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test_outputs.py"],
+  "requirements": [
+    {
+      "id": "module_class_ctor",
+      "verifier_assertion": "test_outputs.py:133-143 imports `fs.cryptfs` and requires a class named `CryptFS`; every check constructs it as `CryptFS(backing, key=...)`. _check_encryption_semantics and _run_conformance both pass a str key; the ctor must accept str (and, per instruction, bytes). A missing module, wrong class name, or ctor that rejects the (backing_fs, key) shape fails at import/first-construct.",
+      "script_refs": ["s_module_class"],
+      "must_include": [
+        "fs/cryptfs.py",
+        "CryptFS",
+        "CryptFS(backing_fs, key)",
+        "Both str and bytes must be accepted as the key."
+      ]
+    },
+    {
+      "id": "opener_protocol_url",
+      "verifier_assertion": "test_outputs.py:173-199 (_check_opener) calls `fs.open_fs('crypt://{key}@')` and requires the result be a CryptFS that round-trips writebytes/readbytes. _ensure_opener_registered imports every newly added module under fs/opener/, relying on the opener registering protocol `crypt` on import. The backing-omitted form `crypt://<key>@` must resolve to an in-memory backing store.",
+      "script_refs": ["s_opener"],
+      "must_include": [
+        "fs.open_fs(\"crypt://...\")",
+        "the protocol name `crypt`",
+        "crypt://<key>@osfs:///data",
+        "crypt://<key>@",
+        "Put the opener under `fs/opener/`"
+      ]
+    },
+    {
+      "id": "content_round_trip",
+      "verifier_assertion": "test_outputs.py:225-230 requires readbytes/readtext to return exactly what was written for a binary file, a nested text file, and an empty file. The conformance suite additionally drives large transfers, seeks, and append writes (test lines 195-197 also round-trip through the opener).",
+      "script_refs": ["s_no_plaintext_at_rest"],
+      "must_include": [
+        "reading it back through `CryptFS` must return exactly what was written",
+        "empty files",
+        "binary data",
+        "append writes"
+      ]
+    },
+    {
+      "id": "structure_visible_in_backing",
+      "verifier_assertion": "test_outputs.py:233-238 asserts backing.isdir('docs/sub'), backing.isfile('docs/secret.bin'), and that CryptFS.listdir('docs') == ['secret.bin','sub']. The directory tree and file/dir entries must be plaintext in the backing store; only file *contents* are encrypted.",
+      "script_refs": ["s_encrypt_contents_only"],
+      "must_include": [
+        "The directory structure",
+        "stays in plaintext in the backing store",
+        "`listdir`, `walk`, `glob`, `move`, `remove`"
+      ]
+    },
+    {
+      "id": "no_plaintext_at_rest",
+      "verifier_assertion": "test_outputs.py:241-249 reads the *backing* store bytes and fails if the secret, the fragments b'launch codes'/b'banana', or b'hello world' appear. Nothing recognisable from the plaintext may survive in the stored blob.",
+      "script_refs": ["s_no_plaintext_at_rest", "s_context"],
+      "must_include": [
+        "no plaintext content may appear",
+        "file contents must be encrypted before they hit the disk",
+        "see plaintext"
+      ]
+    },
+    {
+      "id": "logical_plaintext_size",
+      "verifier_assertion": "test_outputs.py:252-274: getsize and getinfo(details).size and scandir(details).size must equal len(plaintext); empty file must report size 0; and the *backing* blob must be strictly larger than the plaintext (crypto overhead present). Reporting the raw backing size would fail 252/259/267/271.",
+      "script_refs": ["s_sizes_logical"],
+      "must_include": [
+        "Sizes must add up",
+        "getinfo`/`getsize` must be the logical size of the plaintext",
+        "the underlying ciphertext is larger than the plaintext",
+        "overhead not counted"
+      ]
+    },
+    {
+      "id": "persistence_same_key",
+      "verifier_assertion": "test_outputs.py:287-299: a second CryptFS opened over the same backing store with the same key must readbytes/readtext the previously written file and see the previously written directory. Reopen must reconstruct content and structure exactly.",
+      "script_refs": ["s_same_key_restore"],
+      "must_include": [
+        "The same key restores everything",
+        "reopening a `CryptFS` over the same backing store with the same `key`",
+        "read back the previously written directories and files exactly as they were"
+      ]
+    },
+    {
+      "id": "integrity_wrong_key_tamper_truncate",
+      "verifier_assertion": "test_outputs.py:302-324 (via _read_fails): reading with a wrong key must raise; a mid-blob byte flip must be detected on read (raise); a truncation to half length must be detected on read (raise). Silent garbage returns fail all three.",
+      "script_refs": ["s_integrity_detect"],
+      "must_include": [
+        "Integrity / wrong keys must be detectable",
+        "tampered with or truncated",
+        "reads with the wrong key",
+        "fail loudly (raise an exception)",
+        "not silently return a pile of garbage"
+      ]
+    },
+    {
+      "id": "full_conformance",
+      "verifier_assertion": "test_outputs.py:342-368 runs fs.test.FSTestCases against CryptFS over an empty MemoryFS and requires result.wasSuccessful(). This exercises the entire PyFilesystem2 contract — open modes, seeks, large transfers, getinfo namespaces, moves/copies (including multithreaded bulk copy), and all error paths — so the backend must be a faithful, fully-compliant FS, matching the repo's exception conventions.",
+      "script_refs": ["s_seamless_compliant", "s_repo_is_spec"],
+      "must_include": [
+        "fully behavior-compliant PyFilesystem2 backend",
+        "`fs.copy`, `fs.move`, `walk`, `glob`",
+        "the multithreaded workers",
+        "which exception to raise on every error path",
+        "directory not empty"
+      ]
+    },
+    {
+      "id": "added_untracked_module_and_opener",
+      "verifier_assertion": "test_outputs.py:53-110 (_restore_tracked_sources/_verify_tracked_sources) neutralises edits to pre-existing source files before anything is imported: via `git checkout HEAD -- .` when /app is a git checkout, otherwise by restoring fs/opener/__init__.py from a pristine copy shipped with the grader and failing the grade when any other file listed in tests/tracked_baseline.sha256 is missing or hash-mismatched; and _ensure_opener_registered (146-170) imports the *newly added* opener module directly instead of relying on the edited __init__.py. The work must therefore be a newly added backend module plus an added opener module — modifying existing files to pass is neutralised.",
+      "script_refs": ["s_no_modify_tracked", "s_opener"],
+      "must_include": [
+        "Do not change the original behavior of existing files already in the repo",
+        "the main work is adding code",
+        "Put the opener under `fs/opener/`"
+      ]
+    },
+    {
+      "id": "stdlib_only_crypto",
+      "verifier_assertion": "The grade never inspects the blob/MAC layout (test_outputs.py:22-24) and accepts any correct crypto design; instruction constrains that design to the Python standard library, with no third-party crypto library required. This is the fact base for the 5.2.1 / 4.4.2 / 5.2.2 dependency-and-install probes: no external package is needed to satisfy any assertion above.",
+      "script_refs": ["s_stdlib_only"],
+      "must_include": [
+        "using only the Python standard library (no third-party crypto library required)"
+      ]
+    }
+  ]
+}

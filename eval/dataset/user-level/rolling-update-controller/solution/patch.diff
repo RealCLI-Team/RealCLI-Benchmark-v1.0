@@ -1,0 +1,1864 @@
+diff --git a/docker/rollout/__init__.py b/docker/rollout/__init__.py
+new file mode 100644
+index 00000000..cbfd72fe
+--- /dev/null
++++ b/docker/rollout/__init__.py
+@@ -0,0 +1,73 @@
++"""Safe rolling / blue-green / recreate updates for docker-py services.
++
++Where :mod:`docker.orchestration` reconciles a whole declarative stack, this
++package focuses on the harder single problem of *changing the version of one
++running service without breaking it*.  It models a service as a set of
++labelled replicas and drives them from a current :class:`Revision` to a target
++one according to an :class:`UpdatePolicy`, health-gating every step and rolling
++back automatically if the new revision fails to come up.
++
++Like the rest of the project it follows a plan/apply split::
++
++    import docker
++    from docker.rollout import RolloutController, Revision, UpdatePolicy
++
++    api = docker.APIClient()
++    ctl = RolloutController(api, "web", replicas=4)
++    plan = ctl.plan(Revision.from_dict({"image": "web:2"}),
++                    UpdatePolicy(strategy="rolling", batch_size=2))
++    if not plan.is_noop:
++        result = ctl.rollout(Revision.from_dict({"image": "web:2"}),
++                             UpdatePolicy(batch_size=2))
++"""
++
++from __future__ import annotations
++
++from .analysis import (
++    AnalysisResult,
++    CanaryAnalysis,
++    Comparison,
++    MetricCheck,
++)
++from .controller import RolloutController
++from .errors import (
++    HealthTimeout,
++    RevisionError,
++    RollbackFailed,
++    RolloutError,
++    RolloutFailed,
++)
++from .history import HistoryEntry, RevisionHistory
++from .plan import (
++    Batch,
++    RolloutPlan,
++    RolloutResult,
++    Step,
++    StepKind,
++)
++from .revision import Revision, Strategy, UpdatePolicy
++from .spec import RolloutSpec
++
++__all__ = [
++    "RolloutSpec",
++    "RolloutController",
++    "Revision",
++    "UpdatePolicy",
++    "Strategy",
++    "RolloutPlan",
++    "RolloutResult",
++    "Batch",
++    "Step",
++    "StepKind",
++    "RolloutError",
++    "RevisionError",
++    "RolloutFailed",
++    "HealthTimeout",
++    "RollbackFailed",
++    "CanaryAnalysis",
++    "AnalysisResult",
++    "MetricCheck",
++    "Comparison",
++    "RevisionHistory",
++    "HistoryEntry",
++]
+diff --git a/docker/rollout/analysis.py b/docker/rollout/analysis.py
+new file mode 100644
+index 00000000..c946e424
+--- /dev/null
++++ b/docker/rollout/analysis.py
+@@ -0,0 +1,200 @@
++"""Metric-driven analysis for canary rollouts.
++
++A rolling or blue/green update gates only on *health* -- "did the container come
++up?".  A canary asks a harder question: "is the new revision actually behaving
++acceptably under real traffic?".  That decision is made by comparing observed
++metrics (error rate, latency, a custom success signal) against thresholds over
++a number of measurement intervals.
++
++The metrics themselves come from *outside* this library -- Prometheus, a log
++pipeline, whatever -- so the analysis is parameterised by a *provider*: any
++callable that, given a canary replica name and the measurement index, returns a
++mapping of metric-name to value.  That keeps :mod:`docker.rollout` free of any
++particular monitoring backend while still letting it make a real go/no-go call.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from enum import Enum
++
++from .errors import RevisionError
++
++
++class Comparison(str, Enum):
++    """How a measured metric is compared against its threshold."""
++
++    LESS_THAN = "lt"           # measured < threshold  -> ok
++    LESS_OR_EQUAL = "le"       # measured <= threshold -> ok
++    GREATER_THAN = "gt"        # measured > threshold  -> ok
++    GREATER_OR_EQUAL = "ge"    # measured >= threshold -> ok
++
++    def passes(self, measured, threshold):
++        if self is Comparison.LESS_THAN:
++            return measured < threshold
++        if self is Comparison.LESS_OR_EQUAL:
++            return measured <= threshold
++        if self is Comparison.GREATER_THAN:
++            return measured > threshold
++        if self is Comparison.GREATER_OR_EQUAL:
++            return measured >= threshold
++        raise ValueError("unhandled comparison {!r}".format(self))
++
++    @classmethod
++    def coerce(cls, value):
++        if isinstance(value, cls):
++            return value
++        text = str(value).lower()
++        aliases = {
++            "<": cls.LESS_THAN, "lt": cls.LESS_THAN,
++            "<=": cls.LESS_OR_EQUAL, "le": cls.LESS_OR_EQUAL,
++            ">": cls.GREATER_THAN, "gt": cls.GREATER_THAN,
++            ">=": cls.GREATER_OR_EQUAL, "ge": cls.GREATER_OR_EQUAL,
++        }
++        if text not in aliases:
++            raise RevisionError("unknown comparison {!r}".format(value))
++        return aliases[text]
++
++
++@dataclass
++class MetricCheck:
++    """A single metric threshold the canary must satisfy.
++
++    ``name`` is looked up in the provider's returned mapping; ``threshold`` and
++    ``comparison`` decide whether the measured value is acceptable.  A check for
++    which the provider returns no value is treated as failing when
++    ``required`` (the default) and skipped otherwise.
++    """
++
++    name: str
++    threshold: float
++    comparison: Comparison = Comparison.LESS_THAN
++    required: bool = True
++
++    @classmethod
++    def from_dict(cls, data):
++        if not isinstance(data, dict):
++            raise RevisionError("metric check must be a mapping")
++        if "name" not in data:
++            raise RevisionError("metric check is missing 'name'")
++        if "threshold" not in data:
++            raise RevisionError(
++                "metric check {!r} is missing 'threshold'".format(data["name"])
++            )
++        return cls(
++            name=str(data["name"]),
++            threshold=float(data["threshold"]),
++            comparison=Comparison.coerce(data.get("comparison", "lt")),
++            required=bool(data.get("required", True)),
++        )
++
++    def evaluate(self, measured):
++        """Return ``(ok, detail)`` for a measured value (or ``None``)."""
++        if measured is None:
++            if self.required:
++                return False, "{}: no measurement".format(self.name)
++            return True, "{}: skipped (no measurement)".format(self.name)
++        ok = self.comparison.passes(float(measured), self.threshold)
++        detail = "{}: {} {} {} -> {}".format(
++            self.name, measured, self.comparison.value, self.threshold,
++            "ok" if ok else "FAIL",
++        )
++        return ok, detail
++
++
++@dataclass
++class AnalysisResult:
++    """The outcome of evaluating the canary over all its intervals."""
++
++    passed: bool = False
++    intervals_run: int = 0
++    failures: list = field(default_factory=list)   # human-readable strings
++    measurements: list = field(default_factory=list)  # per-interval dicts
++
++    def summary(self):
++        if self.passed:
++            return "canary analysis passed after {} interval(s)".format(
++                self.intervals_run
++            )
++        return "canary analysis failed: {}".format(
++            "; ".join(self.failures) or "unknown"
++        )
++
++
++@dataclass
++class CanaryAnalysis:
++    """A metric-threshold policy evaluated over repeated intervals.
++
++    The canary must satisfy every check for ``intervals`` consecutive
++    measurements.  A single failed *required* check aborts early (there is no
++    point continuing to measure a revision we have already decided to reject),
++    which is what lets a canary rollout fail fast and roll back.
++    """
++
++    checks: list = field(default_factory=list)       # [MetricCheck]
++    intervals: int = 3
++    interval_seconds: float = 0.0
++    max_failures: int = 0        # tolerated failing intervals before abort
++
++    @classmethod
++    def from_dict(cls, data):
++        data = data or {}
++        checks = [MetricCheck.from_dict(c) for c in data.get("metrics", [])]
++        intervals = int(data.get("intervals", 3))
++        if intervals < 1:
++            raise RevisionError("canary 'intervals' must be >= 1")
++        return cls(
++            checks=checks,
++            intervals=intervals,
++            interval_seconds=float(data.get("interval_seconds", 0.0)),
++            max_failures=int(data.get("max_failures", 0)),
++        )
++
++    def is_empty(self):
++        return not self.checks
++
++    def evaluate_interval(self, metrics):
++        """Evaluate one measurement mapping; return ``(ok, details)``."""
++        details = []
++        ok = True
++        for check in self.checks:
++            measured = (metrics or {}).get(check.name)
++            passed, detail = check.evaluate(measured)
++            details.append(detail)
++            if not passed:
++                ok = False
++        return ok, details
++
++    def run(self, provider, canary_name, sleeper=None):
++        """Drive the analysis to completion.
++
++        *provider* is called as ``provider(canary_name, interval_index)`` and
++        must return a metric mapping.  Returns an :class:`AnalysisResult`.
++        """
++        result = AnalysisResult()
++        if self.is_empty():
++            # No metrics configured: analysis is vacuously satisfied.
++            result.passed = True
++            return result
++
++        failing_intervals = 0
++        for i in range(self.intervals):
++            metrics = provider(canary_name, i) or {}
++            result.measurements.append(dict(metrics))
++            result.intervals_run += 1
++            ok, details = self.evaluate_interval(metrics)
++            if not ok:
++                failing_intervals += 1
++                result.failures.extend(
++                    d for d in details if d.endswith("FAIL")
++                    or "no measurement" in d
++                )
++                if failing_intervals > self.max_failures:
++                    result.passed = False
++                    return result
++            if self.interval_seconds and sleeper is not None \
++                    and i + 1 < self.intervals:
++                sleeper(self.interval_seconds)
++
++        result.passed = True
++        return result
+diff --git a/docker/rollout/controller.py b/docker/rollout/controller.py
+new file mode 100644
+index 00000000..08f14ea0
+--- /dev/null
++++ b/docker/rollout/controller.py
+@@ -0,0 +1,728 @@
++"""Drive a service from one revision to another, safely.
++
++:class:`RolloutController` is the counterpart to the stack orchestrator: where
++the orchestrator reconciles a *set* of services to a declared state, the
++controller manages the *lifecycle of one service's replicas* across a version
++change.  It supports three strategies -- rolling (replace a few replicas at a
++time), blue/green (stand up a whole parallel set, then cut over) and recreate
++(tear everything down, then rebuild) -- and, crucially, it health-gates each
++step and rolls back automatically when a new revision fails to come up
++healthy, so a bad deploy leaves the service on its previous, working version.
++
++As everywhere in this package the design is plan-then-apply: :meth:`plan`
++computes the batching without side effects, and :meth:`rollout` executes it.
++"""
++
++from __future__ import annotations
++
++import time
++
++from . import naming
++from .errors import (
++    HealthTimeout,
++    RollbackFailed,
++    RolloutFailed,
++)
++from .history import RevisionHistory
++from .plan import (
++    Batch,
++    RolloutPlan,
++    RolloutResult,
++    Step,
++    StepKind,
++)
++from .revision import Revision, Strategy, UpdatePolicy
++from .state import ServiceState
++
++
++class RolloutController:
++    """Manage rolling / blue-green / recreate updates of one service."""
++
++    def __init__(self, api_client, service_name, replicas=None, sleeper=None,
++                 metric_provider=None):
++        self.api = api_client
++        self.service = service_name
++        # Desired replica count; if None it is inferred from current state at
++        # plan time (falling back to 1 for a brand-new service).
++        self.replicas = replicas
++        self._sleep = sleeper if sleeper is not None else time.sleep
++        # Callable(canary_name, interval_index) -> metric mapping, used by the
++        # canary strategy.  Optional; a canary policy with no provider treats
++        # its analysis as vacuously satisfied.
++        self.metric_provider = metric_provider
++        # Reconstructed lazily; records the revision transitions this
++        # controller has driven so callers can roll back to an earlier one.
++        self._history = None
++
++    # ------------------------------------------------------------------
++    # Planning (pure)
++    # ------------------------------------------------------------------
++
++    def plan(self, revision, policy=None):
++        """Compute the :class:`RolloutPlan` to reach *revision*.
++
++        Reads current state once; performs no mutation.  The plan reflects the
++        chosen strategy's batching and is a no-op when every desired replica is
++        already on the target revision.
++        """
++        revision = self._coerce_revision(revision)
++        policy = self._coerce_policy(policy)
++        state = ServiceState.observe(self.api, self.service)
++
++        target = revision.revision_id()
++        desired = self._desired_replicas(state)
++        current_rev = state.dominant_revision()
++
++        plan = RolloutPlan(
++            strategy=policy.strategy,
++            from_revision=current_rev or "",
++            to_revision=target,
++        )
++
++        # Already fully on target with the right replica count: no-op.
++        on_target = state.by_revision(target)
++        if len(on_target) == desired and state.count() == desired:
++            return plan
++
++        if policy.strategy == Strategy.BLUE_GREEN:
++            self._plan_blue_green(plan, state, target, desired, policy)
++        elif policy.strategy == Strategy.RECREATE:
++            self._plan_recreate(plan, state, target, desired, policy)
++        elif policy.strategy == Strategy.CANARY:
++            self._plan_canary(plan, state, target, desired, policy)
++        else:
++            self._plan_rolling(plan, state, target, desired, policy)
++
++        return plan
++
++    def _desired_replicas(self, state):
++        if self.replicas is not None:
++            return max(1, int(self.replicas))
++        if state.count():
++            return state.count()
++        return 1
++
++    def _plan_rolling(self, plan, state, target, desired, policy):
++        """Replace old replicas with new ones, ``batch_size`` at a time.
++
++        Each slot is a stable identity 1..desired.  Slots already on the
++        target revision are left alone; the rest are grouped into batches, and
++        within a batch every slot is removed and recreated, then health-gated.
++        """
++        old = [r for r in state.replicas if r.revision != target]
++        # Map slots that need updating (preserve existing slots; add new ones
++        # if we are scaling up as part of the rollout).
++        slots_to_update = sorted({r.slot for r in old if r.slot > 0})
++        existing_target_slots = {r.slot for r in state.by_revision(target)}
++
++        # Fill in any missing slots up to the desired count.
++        all_slots = set(slots_to_update) | existing_target_slots
++        next_slot = 1
++        while len(all_slots) < desired:
++            if next_slot not in all_slots:
++                all_slots.add(next_slot)
++                slots_to_update.append(next_slot)
++            next_slot += 1
++        slots_to_update = sorted(set(slots_to_update))
++
++        # Also plan removal of surplus old replicas if scaling down.
++        surplus = []
++        if state.count() > desired:
++            extra = state.count() - desired
++            # Remove the highest-slot old replicas first.
++            removable = sorted(old, key=lambda r: r.slot, reverse=True)
++            surplus = removable[:extra]
++        surplus_names = {r.name for r in surplus}
++
++        old_by_slot = {r.slot: r for r in old}
++
++        batch_index = 0
++        size = policy.batch_size
++        for start in range(0, len(slots_to_update), size):
++            chunk = slots_to_update[start:start + size]
++            batch = Batch(index=batch_index)
++            for slot in chunk:
++                existing = old_by_slot.get(slot)
++                if existing is not None and existing.name not in surplus_names:
++                    batch.remove.append(existing.name)
++                    plan.steps.append(Step(StepKind.REMOVE, existing.name,
++                                           {"slot": slot}))
++                name = naming.replica_name(self.service, slot)
++                batch.create.append(name)
++                plan.steps.append(Step(StepKind.CREATE, name,
++                                       {"slot": slot, "revision": target}))
++                if policy.require_health:
++                    plan.steps.append(Step(StepKind.HEALTHCHECK, name,
++                                           {"slot": slot}))
++            plan.batches.append(batch)
++            if policy.pause_between_batches and \
++                    start + size < len(slots_to_update):
++                plan.steps.append(Step(StepKind.PAUSE, "",
++                                       {"seconds": policy.pause_between_batches}))
++            batch_index += 1
++
++        # Surplus removals form a final batch.
++        if surplus:
++            batch = Batch(index=batch_index)
++            for rep in surplus:
++                batch.remove.append(rep.name)
++                plan.steps.append(Step(StepKind.REMOVE, rep.name,
++                                       {"slot": rep.slot}))
++            plan.batches.append(batch)
++
++    def _plan_blue_green(self, plan, state, target, desired, policy):
++        """Stand up a full parallel ('green') set, gate it, then retire blue.
++
++        Traffic cutover is represented by a PROMOTE step; only after it does
++        the old ('blue') set get removed.
++        """
++        current_color = self._current_color(state)
++        new_color = "green" if current_color != "green" else "blue"
++
++        create_batch = Batch(index=0)
++        for slot in range(1, desired + 1):
++            name = naming.replica_name(self.service, slot, new_color)
++            create_batch.create.append(name)
++            plan.steps.append(Step(StepKind.CREATE, name,
++                                   {"slot": slot, "revision": target,
++                                    "color": new_color}))
++            if policy.require_health:
++                plan.steps.append(Step(StepKind.HEALTHCHECK, name,
++                                       {"slot": slot}))
++        plan.batches.append(create_batch)
++
++        plan.steps.append(Step(StepKind.PROMOTE, new_color,
++                               {"color": new_color}))
++
++        remove_batch = Batch(index=1)
++        for rep in state.replicas:
++            remove_batch.remove.append(rep.name)
++            plan.steps.append(Step(StepKind.REMOVE, rep.name,
++                                   {"slot": rep.slot}))
++        if remove_batch.remove:
++            plan.batches.append(remove_batch)
++
++    def _plan_recreate(self, plan, state, target, desired, policy):
++        """Tear everything down, then build the new revision from scratch."""
++        remove_batch = Batch(index=0)
++        for rep in state.replicas:
++            remove_batch.remove.append(rep.name)
++            plan.steps.append(Step(StepKind.REMOVE, rep.name,
++                                   {"slot": rep.slot}))
++        if remove_batch.remove:
++            plan.batches.append(remove_batch)
++
++        create_batch = Batch(index=1)
++        for slot in range(1, desired + 1):
++            name = naming.replica_name(self.service, slot)
++            create_batch.create.append(name)
++            plan.steps.append(Step(StepKind.CREATE, name,
++                                   {"slot": slot, "revision": target}))
++            if policy.require_health:
++                plan.steps.append(Step(StepKind.HEALTHCHECK, name,
++                                       {"slot": slot}))
++        plan.batches.append(create_batch)
++
++    def _plan_canary(self, plan, state, target, desired, policy):
++        """Bring up a small canary, analyse it, then roll out the remainder.
++
++        The canary occupies the highest ``canary_slots`` slots on the new
++        revision.  After it is created and (optionally) health-gated, an
++        ANALYZE step marks the go/no-go decision point; only if analysis
++        passes does the plan continue to migrate the remaining slots exactly
++        as a rolling update would.  Representing analysis as an explicit step
++        keeps :meth:`plan` pure and lets callers see the gate before it runs.
++        """
++        canary_slots = min(policy.canary_slots, desired)
++        canary_slot_ids = list(range(1, canary_slots + 1))
++        rest_slot_ids = list(range(canary_slots + 1, desired + 1))
++
++        old_by_slot = {r.slot: r for r in state.replicas
++                       if r.revision != target}
++
++        # Canary batch.
++        canary_batch = Batch(index=0)
++        for slot in canary_slot_ids:
++            existing = old_by_slot.get(slot)
++            if existing is not None:
++                canary_batch.remove.append(existing.name)
++                plan.steps.append(Step(StepKind.REMOVE, existing.name,
++                                       {"slot": slot}))
++            name = naming.replica_name(self.service, slot)
++            canary_batch.create.append(name)
++            plan.steps.append(Step(StepKind.CREATE, name,
++                                   {"slot": slot, "revision": target,
++                                    "canary": True}))
++            if policy.require_health:
++                plan.steps.append(Step(StepKind.HEALTHCHECK, name,
++                                       {"slot": slot}))
++        plan.batches.append(canary_batch)
++
++        # The analysis gate.
++        canary_name = naming.replica_name(self.service, canary_slot_ids[0]) \
++            if canary_slot_ids else ""
++        plan.steps.append(Step(StepKind.ANALYZE, canary_name,
++                               {"canary_slots": canary_slots}))
++
++        # Remaining slots, batched like a rolling update.
++        size = policy.batch_size
++        batch_index = 1
++        for start in range(0, len(rest_slot_ids), size):
++            chunk = rest_slot_ids[start:start + size]
++            batch = Batch(index=batch_index)
++            for slot in chunk:
++                existing = old_by_slot.get(slot)
++                if existing is not None:
++                    batch.remove.append(existing.name)
++                    plan.steps.append(Step(StepKind.REMOVE, existing.name,
++                                           {"slot": slot}))
++                name = naming.replica_name(self.service, slot)
++                batch.create.append(name)
++                plan.steps.append(Step(StepKind.CREATE, name,
++                                       {"slot": slot, "revision": target}))
++                if policy.require_health:
++                    plan.steps.append(Step(StepKind.HEALTHCHECK, name,
++                                           {"slot": slot}))
++            plan.batches.append(batch)
++            batch_index += 1
++
++    def _current_color(self, state):
++        for rep in state.replicas:
++            if rep.color:
++                return rep.color
++        return ""
++
++    # ------------------------------------------------------------------
++    # Applying
++    # ------------------------------------------------------------------
++
++    def rollout(self, revision, policy=None):
++        """Execute a rollout to *revision*, returning a :class:`RolloutResult`.
++
++        On any failure during the update, and when ``policy.auto_rollback`` is
++        set, the controller restores the previous revision before raising, so
++        the service is never left stranded on a half-broken new version.
++        """
++        revision = self._coerce_revision(revision)
++        policy = self._coerce_policy(policy)
++        state_before = ServiceState.observe(self.api, self.service)
++        previous_revision = state_before.dominant_revision()
++
++        plan = self.plan(revision, policy)
++        result = RolloutResult(
++            from_revision=plan.from_revision,
++            to_revision=plan.to_revision,
++        )
++        if plan.is_noop:
++            result.ok = True
++            result.final_revision = plan.to_revision
++            result.record("already at target revision")
++            self._record_history(revision, state_before)
++            return result
++
++        # Remember the config of the previous revision so we can rebuild it on
++        # rollback.  We reconstruct it from a surviving old replica's create
++        # kwargs when possible; otherwise the caller-supplied previous revision
++        # object (if any) is used.
++        rollback_revision = self._snapshot_previous(state_before,
++                                                     previous_revision)
++
++        try:
++            self._apply_plan(plan, revision, policy, result)
++        except RolloutFailed as exc:
++            if policy.auto_rollback and rollback_revision is not None:
++                self._rollback(rollback_revision, policy, result, exc)
++                result.ok = False
++                result.rolled_back = True
++                exc.rolled_back = True
++                raise
++            raise
++        result.ok = True
++        result.final_revision = plan.to_revision
++        self._record_history(revision)
++        return result
++
++    def _apply_plan(self, plan, revision, policy, result):
++        batch_index = 0
++        for batch in plan.batches:
++            self._apply_batch(batch, revision, policy, result, batch_index)
++            result.batches_completed += 1
++            # For a canary rollout the analysis gate sits between the first
++            # (canary) batch and the rest; run it there and fail fast.
++            if policy.strategy == Strategy.CANARY and batch_index == 0 \
++                    and policy.canary is not None:
++                self._run_canary_analysis(plan, policy, result, batch_index)
++            if policy.pause_between_batches:
++                self._sleep(policy.pause_between_batches)
++            batch_index += 1
++
++    def _run_canary_analysis(self, plan, policy, result, batch_index):
++        """Evaluate the canary's metrics; raise :class:`RolloutFailed` if bad.
++
++        A missing metric provider means we cannot judge the canary; rather
++        than promote blindly we treat that as a configured-but-unmeasurable
++        canary and fail (the caller can drop ``policy.canary`` to opt out).
++        An empty analysis (no metric checks) passes vacuously.
++        """
++        analyze_step = next(
++            (s for s in plan.steps if s.kind == StepKind.ANALYZE), None
++        )
++        canary_name = analyze_step.target if analyze_step else ""
++        if policy.canary.is_empty():
++            result.record("canary analysis: no metrics configured, proceeding")
++            return
++        if self.metric_provider is None:
++            raise RolloutFailed(
++                "canary analysis requires a metric_provider but none was set",
++                batch_index=batch_index,
++            )
++        analysis = policy.canary.run(
++            self.metric_provider, canary_name, sleeper=self._sleep
++        )
++        result.analysis = analysis
++        result.record(analysis.summary())
++        if not analysis.passed:
++            raise RolloutFailed(
++                "canary rejected: {}".format(analysis.summary()),
++                batch_index=batch_index,
++            )
++
++    def _apply_batch(self, batch, revision, policy, result, batch_index):
++        # For a rolling batch we remove old replicas first (respecting
++        # max_unavailable by removing before creating), then create the new
++        # ones, then gate on health.
++        created_names = []
++        for name in batch.remove:
++            self._retire(name)
++            result.removed.append(name)
++
++        for name in batch.create:
++            slot = self._slot_of(name)
++            self._launch(revision, slot, name, color=self._color_of(name))
++            result.created.append(name)
++            created_names.append(name)
++
++        if policy.require_health:
++            for name in created_names:
++                try:
++                    self._wait_healthy(name, policy)
++                except HealthTimeout as exc:
++                    exc.batch_index = batch_index
++                    raise RolloutFailed(
++                        "batch {} failed: {}".format(batch_index, exc),
++                        batch_index=batch_index,
++                        cause=exc,
++                    ) from exc
++
++    # -- rollback --------------------------------------------------------
++
++    def _snapshot_previous(self, state, previous_revision):
++        """Best-effort reconstruction of the previous revision to roll back to.
++
++        We read a representative old replica's create kwargs (recorded by the
++        controller when it launched them) via ``inspect_container`` so that a
++        rollback rebuilds byte-for-byte what was running before.
++        """
++        if not previous_revision:
++            return None
++        olds = state.by_revision(previous_revision)
++        if not olds:
++            return None
++        info = self.api.inspect_container(olds[0].id or olds[0].name)
++        config = (info or {}).get("Config", {}) or {}
++        image = config.get("Image")
++        if not image:
++            return None
++        env = {}
++        for entry in config.get("Env", []) or []:
++            if "=" in entry:
++                k, v = entry.split("=", 1)
++                env[k] = v
++        return Revision(
++            image=image,
++            command=config.get("Cmd"),
++            entrypoint=config.get("Entrypoint"),
++            environment=env,
++            labels={k: v for k, v in (config.get("Labels") or {}).items()
++                    if not k.startswith(naming.LABEL_PREFIX)},
++        )
++
++    def _rollback(self, rollback_revision, policy, result, original):
++        """Restore the previous revision after a failed rollout."""
++        result.record("rolling back to revision {}".format(
++            rollback_revision.revision_id()))
++        try:
++            # A rollback is itself a recreate of the previous revision over
++            # whatever is currently running, with health gating but never a
++            # nested rollback.
++            safe_policy = UpdatePolicy(
++                strategy=Strategy.RECREATE,
++                batch_size=policy.batch_size,
++                health_attempts=policy.health_attempts,
++                require_health=policy.require_health,
++                auto_rollback=False,
++            )
++            state = ServiceState.observe(self.api, self.service)
++            desired = self._desired_replicas(state)
++            # Remove everything currently present, then rebuild previous.
++            for rep in state.replicas:
++                self._retire(rep.name)
++            for slot in range(1, desired + 1):
++                name = naming.replica_name(self.service, slot)
++                self._launch(rollback_revision, slot, name)
++                if safe_policy.require_health:
++                    self._wait_healthy(name, safe_policy)
++        except Exception as exc:
++            raise RollbackFailed(
++                "rollback after failed rollout also failed: {}".format(exc),
++                original=original,
++                cause=exc,
++            ) from exc
++
++    # -- primitive engine operations ------------------------------------
++
++    def _launch(self, revision, slot, name, color=None):
++        host_config = self._build_host_config(revision)
++        labels = naming.replica_labels(
++            self.service, revision.revision_id(), slot, color, revision.labels
++        )
++        kwargs = dict(
++            image=revision.image,
++            name=name,
++            command=revision.command,
++            entrypoint=revision.entrypoint,
++            environment=(dict(sorted(revision.environment.items()))
++                         if revision.environment else None),
++            labels=labels,
++            host_config=host_config,
++        )
++        if revision.user is not None:
++            kwargs["user"] = revision.user
++        if revision.working_dir is not None:
++            kwargs["working_dir"] = revision.working_dir
++        if revision.healthcheck is not None:
++            kwargs["healthcheck"] = revision.healthcheck
++        created = self.api.create_container(**kwargs)
++        cid = created.get("Id") if isinstance(created, dict) else created
++        self.api.start(cid or name)
++        return cid or name
++
++    def _build_host_config(self, revision):
++        hc = {}
++        if revision.restart and revision.restart != "no":
++            hc["restart_policy"] = {"Name": revision.restart}
++        return self.api.create_host_config(**hc)
++
++    def _retire(self, name_or_id):
++        self.api.stop(name_or_id)
++        self.api.remove_container(name_or_id, force=True)
++
++    def _wait_healthy(self, container, policy):
++        for _ in range(policy.health_attempts):
++            info = self.api.inspect_container(container)
++            state = (info or {}).get("State", {}) or {}
++            health = state.get("Health", {}) or {}
++            status = health.get("Status")
++            if status == "healthy":
++                return
++            if status is None and state.get("Running"):
++                return
++            self._sleep(1)
++        raise HealthTimeout(container, policy.health_attempts)
++
++    # -- helpers ---------------------------------------------------------
++
++    def _slot_of(self, name):
++        try:
++            return int(name.rsplit("_", 1)[-1])
++        except (ValueError, IndexError):
++            return 0
++
++    def _color_of(self, name):
++        parts = name.split("_")
++        if len(parts) >= 3 and parts[-2] in ("blue", "green"):
++            return parts[-2]
++        return None
++
++    def _coerce_revision(self, revision):
++        if isinstance(revision, Revision):
++            return revision
++        return Revision.from_dict(revision)
++
++    def _coerce_policy(self, policy):
++        if isinstance(policy, UpdatePolicy):
++            return policy
++        return UpdatePolicy.from_dict(policy)
++
++    # ------------------------------------------------------------------
++    # Introspection
++    # ------------------------------------------------------------------
++
++    def status(self):
++        """Return the current replicas grouped by revision."""
++        state = ServiceState.observe(self.api, self.service)
++        grouped = {}
++        for rep in state.replicas:
++            grouped.setdefault(rep.revision, []).append(rep.name)
++        return grouped
++
++    # ------------------------------------------------------------------
++    # Scaling (no version change)
++    # ------------------------------------------------------------------
++
++    def plan_scale(self, count):
++        """Compute a plan that only adds or removes replicas of the *current*
++        revision -- no image change.
++
++        Scaling and version rollout are deliberately separate operations: this
++        one keeps every surviving replica exactly as it is and merely brings
++        the replica count to ``count``, adding new replicas of the dominant
++        revision or retiring surplus ones (highest slot first).
++        """
++        count = max(0, int(count))
++        state = ServiceState.observe(self.api, self.service)
++        current_rev = state.dominant_revision()
++        plan = RolloutPlan(
++            strategy="scale",
++            from_revision=current_rev or "",
++            to_revision=current_rev or "",
++        )
++        if state.count() == count:
++            return plan
++
++        occupied = {r.slot for r in state.replicas if r.slot > 0}
++        if count > state.count():
++            # Scale up: fill the lowest free slots.
++            batch = Batch(index=0)
++            slot = 1
++            added = 0
++            while state.count() + added < count:
++                if slot not in occupied:
++                    name = naming.replica_name(self.service, slot)
++                    batch.create.append(name)
++                    plan.steps.append(Step(StepKind.CREATE, name,
++                                           {"slot": slot,
++                                            "revision": current_rev}))
++                    occupied.add(slot)
++                    added += 1
++                slot += 1
++            plan.batches.append(batch)
++        else:
++            # Scale down: retire the highest-slot replicas first.
++            surplus = sorted(state.replicas, key=lambda r: r.slot,
++                             reverse=True)[:state.count() - count]
++            batch = Batch(index=0)
++            for rep in surplus:
++                batch.remove.append(rep.name)
++                plan.steps.append(Step(StepKind.REMOVE, rep.name,
++                                       {"slot": rep.slot}))
++            plan.batches.append(batch)
++        return plan
++
++    def scale(self, count):
++        """Execute :meth:`plan_scale`, returning a :class:`RolloutResult`.
++
++        The controller's desired replica count is updated to *count* so a
++        subsequent rollout keeps the new size.  Newly-added replicas are
++        launched on whatever revision the surviving replicas already run, which
++        is reconstructed from a live replica's config (as with rollback).
++        """
++        plan = self.plan_scale(count)
++        result = RolloutResult(
++            from_revision=plan.from_revision,
++            to_revision=plan.to_revision,
++        )
++        self.replicas = max(0, int(count))
++        if plan.is_noop:
++            result.ok = True
++            result.final_revision = plan.to_revision
++            result.record("already at {} replica(s)".format(count))
++            return result
++
++        state = ServiceState.observe(self.api, self.service)
++        current_rev = state.dominant_revision()
++        revision = self._snapshot_previous(state, current_rev)
++
++        for batch in plan.batches:
++            for name in batch.remove:
++                self._retire(name)
++                result.removed.append(name)
++            for name in batch.create:
++                if revision is None:
++                    raise RolloutFailed(
++                        "cannot scale up: no existing replica to copy the "
++                        "revision from"
++                    )
++                slot = self._slot_of(name)
++                self._launch(revision, slot, name)
++                result.created.append(name)
++        result.ok = True
++        result.final_revision = plan.to_revision
++        return result
++
++    # ------------------------------------------------------------------
++    # History and explicit rollback
++    # ------------------------------------------------------------------
++
++    def history(self):
++        """The :class:`RevisionHistory` this controller has accumulated.
++
++        Seeded from the currently-observable state the first time it is
++        requested, then advanced by every successful :meth:`rollout`.
++        """
++        if self._history is None:
++            state = ServiceState.observe(self.api, self.service)
++            self._history = RevisionHistory.from_state(self.service, state)
++        return self._history
++
++    def _record_history(self, revision, state=None):
++        history = self.history()
++        if state is None:
++            state = ServiceState.observe(self.api, self.service)
++        count = len(state.by_revision(revision.revision_id())) or state.count()
++        history.record(revision, replica_count=count)
++
++    def rollback_to(self, revision, policy=None):
++        """Explicitly move the service back to a known previous *revision*.
++
++        Unlike the automatic rollback that fires inside :meth:`rollout` on
++        failure, this is a deliberate, caller-initiated operation: "take me
++        back to what I was running before".  It is a normal rollout of the old
++        revision (so it is health-gated and idempotent), but with automatic
++        rollback disabled -- if the old revision will not come up, that is a
++        genuine failure the caller must see, not something to paper over.
++        """
++        revision = self._coerce_revision(revision)
++        policy = self._coerce_policy(policy)
++        # Force a safe, non-nesting policy for the reversion itself.
++        revert_policy = UpdatePolicy(
++            strategy=policy.strategy if policy.strategy != Strategy.CANARY
++            else Strategy.ROLLING,
++            batch_size=policy.batch_size,
++            health_attempts=policy.health_attempts,
++            require_health=policy.require_health,
++            auto_rollback=False,
++        )
++        return self.rollout(revision, revert_policy)
++
++    def rollback_steps(self, steps=1, image_for=None, policy=None):
++        """Roll back *steps* transitions using the recorded history.
++
++        *image_for* is an optional callable mapping a recorded revision id to a
++        full :class:`Revision` (or dict) to launch; when omitted the history's
++        recorded image is used to build a minimal revision.  Returns the
++        :class:`RolloutResult`, or ``None`` if the history does not reach back
++        that far.
++        """
++        history = self.history()
++        target_id = history.rollback_target(steps)
++        if target_id is None:
++            return None
++        entry = history.find(target_id)
++        if image_for is not None:
++            revision = image_for(target_id)
++        elif entry is not None and entry.image:
++            revision = Revision(image=entry.image)
++        else:
++            return None
++        return self.rollback_to(revision, policy)
+diff --git a/docker/rollout/errors.py b/docker/rollout/errors.py
+new file mode 100644
+index 00000000..c35872d8
+--- /dev/null
++++ b/docker/rollout/errors.py
+@@ -0,0 +1,63 @@
++"""Exceptions raised by the rolling-update controller.
++
++Every failure mode of a rollout has its own type so a caller can react
++differently to, say, "your update description is malformed" versus "the new
++version came up unhealthy and I rolled you back".  They all share
++:class:`RolloutError` as a base for coarse-grained handling.
++"""
++
++from __future__ import annotations
++
++
++class RolloutError(Exception):
++    """Base class for every error raised by :mod:`docker.rollout`."""
++
++
++class RevisionError(RolloutError):
++    """The revision / update description is malformed or self-inconsistent."""
++
++
++class RolloutFailed(RolloutError):
++    """A rollout could not be completed.
++
++    Carries the batch index at which things went wrong (when applicable) and
++    whether a rollback was performed, so the caller can report precisely what
++    state the service is in.
++    """
++
++    def __init__(self, message, batch_index=None, rolled_back=False,
++                 cause=None):
++        self.batch_index = batch_index
++        self.rolled_back = rolled_back
++        self.cause = cause
++        super().__init__(message)
++
++
++class HealthTimeout(RolloutFailed):
++    """A replica never became healthy within the configured budget."""
++
++    def __init__(self, container, attempts, batch_index=None,
++                 rolled_back=False):
++        self.container = container
++        self.attempts = attempts
++        super().__init__(
++            "container {!r} did not become healthy after {} checks".format(
++                container, attempts
++            ),
++            batch_index=batch_index,
++            rolled_back=rolled_back,
++        )
++
++
++class RollbackFailed(RolloutError):
++    """A rollback was attempted but itself failed -- the worst case.
++
++    Distinct from :class:`RolloutFailed` because the service may now be in a
++    partially-updated state that needs manual attention; we never want to
++    swallow this into an ordinary rollout failure.
++    """
++
++    def __init__(self, message, original=None, cause=None):
++        self.original = original
++        self.cause = cause
++        super().__init__(message)
+diff --git a/docker/rollout/history.py b/docker/rollout/history.py
+new file mode 100644
+index 00000000..8f4bb354
+--- /dev/null
++++ b/docker/rollout/history.py
+@@ -0,0 +1,171 @@
++"""Track the sequence of revisions a service has run.
++
++A rollout controller that can only move *forward* is half a tool: in practice
++you also need to answer "what did we run before?", "roll me back to the release
++from two deploys ago", and "is this new revision actually different from what's
++live?".  Because the controller keeps no state of its own, the history is
++reconstructed on demand from the labels the running (and, where available,
++recently-stopped) replicas carry, plus an optional in-memory journal the caller
++can thread through successive rollouts.
++
++None of this talks to Docker directly beyond what the controller already reads;
++:class:`RevisionHistory` operates on the observed
++:class:`~docker.rollout.state.ServiceState` and a list of recorded entries.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++
++
++@dataclass
++class HistoryEntry:
++    """One recorded revision transition."""
++
++    revision_id: str
++    image: str
++    sequence: int
++    active: bool = False
++    replica_count: int = 0
++
++    def as_dict(self):
++        return {
++            "revision": self.revision_id,
++            "image": self.image,
++            "sequence": self.sequence,
++            "active": self.active,
++            "replicas": self.replica_count,
++        }
++
++
++class RevisionHistory:
++    """An ordered, de-duplicated record of a service's revisions.
++
++    Entries are ordered oldest-first.  The most recent entry is the one that
++    is currently (or was most recently) active.  Re-recording the currently
++    active revision is a no-op, so appending the same revision twice in a row
++    does not inflate the history -- only genuine transitions advance it.
++    """
++
++    def __init__(self, service):
++        self.service = service
++        self._entries = []           # list[HistoryEntry], oldest first
++        self._seq = 0
++
++    # -- recording -------------------------------------------------------
++
++    def record(self, revision, replica_count=0):
++        """Append *revision* as the new active entry, if it is a real change.
++
++        Returns the :class:`HistoryEntry` that is now active.
++        """
++        rev_id = revision.revision_id() if hasattr(revision, "revision_id") \
++            else str(revision)
++        image = getattr(revision, "image", "")
++
++        if self._entries and self._entries[-1].revision_id == rev_id:
++            # No change: just refresh the active entry's replica count, and
++            # backfill the image if we now know it (a history seeded from live
++            # state cannot recover images, but a subsequent record() with a
++            # real Revision can).
++            self._entries[-1].active = True
++            self._entries[-1].replica_count = replica_count
++            if not self._entries[-1].image and image:
++                self._entries[-1].image = image
++            return self._entries[-1]
++
++        for entry in self._entries:
++            entry.active = False
++
++        self._seq += 1
++        entry = HistoryEntry(
++            revision_id=rev_id,
++            image=image,
++            sequence=self._seq,
++            active=True,
++            replica_count=replica_count,
++        )
++        self._entries.append(entry)
++        return entry
++
++    # -- queries ---------------------------------------------------------
++
++    def entries(self):
++        return list(self._entries)
++
++    def current(self):
++        for entry in reversed(self._entries):
++            if entry.active:
++                return entry
++        return self._entries[-1] if self._entries else None
++
++    def previous(self):
++        """The entry immediately before the current active one, if any."""
++        active_index = None
++        for i, entry in enumerate(self._entries):
++            if entry.active:
++                active_index = i
++        if active_index is None or active_index == 0:
++            # Fall back to the second-to-last recorded revision.
++            if len(self._entries) >= 2:
++                return self._entries[-2]
++            return None
++        return self._entries[active_index - 1]
++
++    def at_sequence(self, sequence):
++        for entry in self._entries:
++            if entry.sequence == sequence:
++                return entry
++        return None
++
++    def find(self, revision_id):
++        for entry in self._entries:
++            if entry.revision_id == revision_id:
++                return entry
++        return None
++
++    def rollback_target(self, steps=1):
++        """The revision id we would land on rolling back *steps* transitions.
++
++        ``steps=1`` is the previous revision, ``steps=2`` the one before that,
++        and so on.  Returns ``None`` if the history does not go back that far.
++        """
++        if steps < 1:
++            raise ValueError("steps must be >= 1")
++        active_index = len(self._entries) - 1
++        for i, entry in enumerate(self._entries):
++            if entry.active:
++                active_index = i
++        target_index = active_index - steps
++        if target_index < 0:
++            return None
++        return self._entries[target_index].revision_id
++
++    def as_list(self):
++        return [entry.as_dict() for entry in self._entries]
++
++    @classmethod
++    def from_state(cls, service, state):
++        """Seed a history from whatever revisions are currently observable.
++
++        The ordering between distinct observed revisions is by first
++        appearance in the (colour, slot)-sorted replica list; the dominant
++        revision is marked active.  This gives a useful starting point even
++        when no journal was threaded through previous rollouts.
++        """
++        history = cls(service)
++        dominant = state.dominant_revision()
++        counts = {}
++        images = {}
++        for rep in state.replicas:
++            counts[rep.revision] = counts.get(rep.revision, 0) + 1
++        for rev in state.revisions():
++            history._seq += 1
++            history._entries.append(HistoryEntry(
++                revision_id=rev,
++                image=images.get(rev, ""),
++                sequence=history._seq,
++                active=(rev == dominant),
++                replica_count=counts.get(rev, 0),
++            ))
++        return history
+diff --git a/docker/rollout/naming.py b/docker/rollout/naming.py
+new file mode 100644
+index 00000000..ce329ec5
+--- /dev/null
++++ b/docker/rollout/naming.py
+@@ -0,0 +1,37 @@
++"""Deterministic replica names and the labels that track a rollout.
++
++The controller must be able to look at a running service and tell, for each
++replica, which revision it belongs to and which "colour" (blue/green) it is
++part of.  It does that purely from labels, so -- exactly as with the
++orchestrator -- there is a single authoritative place that defines the naming
++and labelling convention.
++"""
++
++from __future__ import annotations
++
++LABEL_PREFIX = "com.rollout"
++
++LABEL_SERVICE = LABEL_PREFIX + ".service"
++LABEL_REVISION = LABEL_PREFIX + ".revision"
++LABEL_SLOT = LABEL_PREFIX + ".slot"
++LABEL_COLOR = LABEL_PREFIX + ".color"
++
++
++def replica_name(service, slot, color=None):
++    if color:
++        return "{}_{}_{}".format(service, color, slot)
++    return "{}_{}".format(service, slot)
++
++
++def replica_labels(service, revision_id, slot, color=None, user_labels=None):
++    labels = dict(user_labels or {})
++    labels[LABEL_SERVICE] = service
++    labels[LABEL_REVISION] = revision_id
++    labels[LABEL_SLOT] = str(slot)
++    if color:
++        labels[LABEL_COLOR] = color
++    return labels
++
++
++def service_filter(service):
++    return {"label": "{}={}".format(LABEL_SERVICE, service)}
+diff --git a/docker/rollout/plan.py b/docker/rollout/plan.py
+new file mode 100644
+index 00000000..5d11f807
+--- /dev/null
++++ b/docker/rollout/plan.py
+@@ -0,0 +1,125 @@
++"""The batching plan for a rollout, and the record of what happened.
++
++As with the orchestrator, the controller separates *deciding* from *doing*: it
++first computes a :class:`RolloutPlan` -- how the replicas will be divided into
++batches and, for a blue/green update, how the cutover is staged -- and only
++then executes it.  The plan is plain data so it can be inspected and asserted
++about before anything touches the Engine.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from enum import Enum
++
++
++class StepKind(str, Enum):
++    CREATE = "create"        # bring up a new-revision replica
++    REMOVE = "remove"        # tear down an old-revision replica
++    HEALTHCHECK = "health"   # gate on a replica becoming healthy
++    PROMOTE = "promote"      # cutover (blue/green): direct traffic to new set
++    PAUSE = "pause"          # inter-batch pause
++    ANALYZE = "analyze"      # canary: evaluate metrics before proceeding
++
++
++@dataclass(frozen=True)
++class Step:
++    kind: StepKind
++    target: str = ""          # replica name / slot the step concerns
++    detail: dict = field(default_factory=dict, compare=False)
++
++    def describe(self):
++        return "{} {}".format(self.kind.value, self.target).strip()
++
++
++@dataclass
++class Batch:
++    """One wave of a rolling update."""
++
++    index: int
++    remove: list = field(default_factory=list)   # replica names to retire
++    create: list = field(default_factory=list)    # replica slots to create
++
++    def is_empty(self):
++        return not self.remove and not self.create
++
++
++@dataclass
++class RolloutPlan:
++    """The full plan: an ordered list of batches plus flat steps."""
++
++    strategy: str = ""
++    batches: list = field(default_factory=list)   # [Batch]
++    steps: list = field(default_factory=list)      # [Step] (flattened)
++    from_revision: str = ""
++    to_revision: str = ""
++
++    @property
++    def is_noop(self):
++        """True when current and target revisions already match."""
++        return self.from_revision == self.to_revision and not self.steps
++
++    def batch_count(self):
++        return len(self.batches)
++
++    def summary(self):
++        if self.is_noop:
++            return "no-op (already at revision {})".format(self.to_revision)
++        lines = ["{} rollout {} -> {}".format(
++            self.strategy, self.from_revision or "-", self.to_revision)]
++        for batch in self.batches:
++            lines.append("  batch {}: -{} +{}".format(
++                batch.index, len(batch.remove), len(batch.create)))
++        return "\n".join(lines)
++
++
++@dataclass
++class RolloutResult:
++    """What actually happened during a rollout."""
++
++    ok: bool = False
++    from_revision: str = ""
++    to_revision: str = ""
++    final_revision: str = ""
++    batches_completed: int = 0
++    rolled_back: bool = False
++    created: list = field(default_factory=list)
++    removed: list = field(default_factory=list)
++    events: list = field(default_factory=list)
++    analysis: object = None      # AnalysisResult for canary rollouts, else None
++
++    def record(self, message):
++        self.events.append(message)
++
++    def summary(self):
++        """A one-line human summary of the rollout outcome."""
++        if self.ok and not self.rolled_back:
++            return "rollout {} -> {} ok ({} created, {} removed)".format(
++                self.from_revision or "-", self.final_revision or "-",
++                len(self.created), len(self.removed),
++            )
++        if self.rolled_back:
++            return "rollout {} -> {} FAILED, rolled back to {}".format(
++                self.from_revision or "-", self.to_revision or "-",
++                self.from_revision or "-",
++            )
++        return "rollout {} -> {} incomplete after {} batch(es)".format(
++            self.from_revision or "-", self.to_revision or "-",
++            self.batches_completed,
++        )
++
++    def to_dict(self):
++        """A JSON-serialisable record of the rollout, e.g. for CI logs."""
++        return {
++            "ok": self.ok,
++            "from_revision": self.from_revision,
++            "to_revision": self.to_revision,
++            "final_revision": self.final_revision,
++            "batches_completed": self.batches_completed,
++            "rolled_back": self.rolled_back,
++            "created": list(self.created),
++            "removed": list(self.removed),
++            "events": list(self.events),
++            "analysis": (self.analysis.summary()
++                         if self.analysis is not None else None),
++        }
+diff --git a/docker/rollout/revision.py b/docker/rollout/revision.py
+new file mode 100644
+index 00000000..f9b47211
+--- /dev/null
++++ b/docker/rollout/revision.py
+@@ -0,0 +1,176 @@
++"""The description of *what* to run and *how* to roll it out.
++
++A rollout is driven by two pieces of data kept deliberately separate:
++
++* a :class:`Revision` -- the desired container configuration (image, command,
++  environment, ...) plus a content-derived identity so two revisions that
++  describe the same thing compare equal; and
++* an :class:`UpdatePolicy` -- the knobs that govern *how* the transition from
++  the current revision to the new one is carried out (batch size, health
++  gating, rollback behaviour, strategy).
++
++Neither talks to Docker; they are plain, validated data so the controller can
++reason about a rollout before performing it.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass, field
++
++from .analysis import CanaryAnalysis
++from .errors import RevisionError
++
++
++def _validate_positive(value, what):
++    if not isinstance(value, int) or value < 1:
++        raise RevisionError("{} must be an integer >= 1".format(what))
++    return value
++
++
++@dataclass
++class Revision:
++    """An immutable, content-addressed container specification."""
++
++    image: str
++    command: object = None
++    entrypoint: object = None
++    environment: dict = field(default_factory=dict)
++    labels: dict = field(default_factory=dict)
++    ports: list = field(default_factory=list)
++    healthcheck: object = None       # dict payload or None
++    restart: str = "no"
++    user: object = None
++    working_dir: object = None
++
++    @classmethod
++    def from_dict(cls, data):
++        if not isinstance(data, dict):
++            raise RevisionError("revision must be a mapping")
++        if "image" not in data or not data["image"]:
++            raise RevisionError("revision is missing 'image'")
++
++        env = data.get("environment") or {}
++        if isinstance(env, (list, tuple)):
++            parsed = {}
++            for item in env:
++                text = str(item)
++                if "=" in text:
++                    k, v = text.split("=", 1)
++                else:
++                    k, v = text, ""
++                parsed[k] = v
++            env = parsed
++        elif isinstance(env, dict):
++            env = {str(k): ("" if v is None else str(v))
++                   for k, v in env.items()}
++        else:
++            raise RevisionError("'environment' must be a list or mapping")
++
++        return cls(
++            image=str(data["image"]),
++            command=data.get("command"),
++            entrypoint=data.get("entrypoint"),
++            environment=env,
++            labels=dict(data.get("labels") or {}),
++            ports=list(data.get("ports") or []),
++            healthcheck=data.get("healthcheck"),
++            restart=str(data.get("restart", "no")),
++            user=data.get("user"),
++            working_dir=data.get("working_dir"),
++        )
++
++    def canonical(self):
++        return {
++            "image": self.image,
++            "command": self.command,
++            "entrypoint": self.entrypoint,
++            "environment": dict(sorted(self.environment.items())),
++            "labels": dict(sorted(self.labels.items())),
++            "ports": sorted(str(p) for p in self.ports),
++            "healthcheck": self.healthcheck,
++            "restart": self.restart,
++            "user": self.user,
++            "working_dir": self.working_dir,
++        }
++
++    def revision_id(self):
++        """A short, stable content hash identifying this revision.
++
++        Independent of dict ordering, so re-deriving a revision from an
++        equivalent description yields the same id -- which is what lets the
++        controller decide that "the running version already is the target".
++        """
++        blob = json.dumps(
++            self.canonical(), sort_keys=True, separators=(",", ":")
++        )
++        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
++
++    def __eq__(self, other):
++        return isinstance(other, Revision) and \
++            self.revision_id() == other.revision_id()
++
++    def __hash__(self):
++        return hash(self.revision_id())
++
++
++class Strategy:
++    ROLLING = "rolling"
++    BLUE_GREEN = "blue_green"
++    RECREATE = "recreate"
++    CANARY = "canary"
++
++    ALL = (ROLLING, BLUE_GREEN, RECREATE, CANARY)
++
++
++@dataclass
++class UpdatePolicy:
++    """How to carry out the transition to a new revision."""
++
++    strategy: str = Strategy.ROLLING
++    batch_size: int = 1                 # replicas updated per rolling batch
++    max_unavailable: int = 1            # replicas allowed down at once
++    health_attempts: int = 30           # inspects before giving up on health
++    require_health: bool = True         # gate promotion on healthiness
++    auto_rollback: bool = True          # revert to old revision on failure
++    pause_between_batches: float = 0.0  # seconds (uses injected sleeper)
++    canary_slots: int = 1               # replicas run at canary weight first
++    canary: object = None               # CanaryAnalysis or None
++
++    @classmethod
++    def from_dict(cls, data):
++        data = data or {}
++        strategy = str(data.get("strategy", Strategy.ROLLING))
++        if strategy not in Strategy.ALL:
++            raise RevisionError(
++                "unknown strategy {!r}; expected one of {}".format(
++                    strategy, Strategy.ALL
++                )
++            )
++        canary_spec = data.get("canary")
++        canary = None
++        if canary_spec is not None:
++            canary = canary_spec if isinstance(canary_spec, CanaryAnalysis) \
++                else CanaryAnalysis.from_dict(canary_spec)
++        canary_slots = int(data.get("canary_slots", 1))
++        if canary_slots < 1:
++            raise RevisionError("canary_slots must be >= 1")
++        policy = cls(
++            strategy=strategy,
++            batch_size=_validate_positive(
++                int(data.get("batch_size", 1)), "batch_size"
++            ),
++            max_unavailable=int(data.get("max_unavailable", 1)),
++            health_attempts=_validate_positive(
++                int(data.get("health_attempts", 30)), "health_attempts"
++            ),
++            require_health=bool(data.get("require_health", True)),
++            auto_rollback=bool(data.get("auto_rollback", True)),
++            pause_between_batches=float(data.get("pause_between_batches", 0.0)),
++            canary_slots=canary_slots,
++            canary=canary,
++        )
++        if policy.max_unavailable < 0:
++            raise RevisionError("max_unavailable must be >= 0")
++        return policy
+diff --git a/docker/rollout/spec.py b/docker/rollout/spec.py
+new file mode 100644
+index 00000000..86a91c71
+--- /dev/null
++++ b/docker/rollout/spec.py
+@@ -0,0 +1,153 @@
++"""Declarative rollout manifests.
++
++The controller's Python API takes a :class:`~docker.rollout.revision.Revision`
++and an :class:`~docker.rollout.revision.UpdatePolicy` as separate arguments.
++In practice a rollout is usually described *as a document* -- checked into a
++repo, reviewed, applied by CI -- that names the service, the target revision
++and the update policy together.  :class:`RolloutSpec` is that document's
++in-memory form: it validates the manifest, cross-checks it for consistency and
++hands back the objects the controller consumes.
++
++The manifest shape (as a plain dict, e.g. parsed from YAML/JSON)::
++
++    version: 1
++    service: web
++    replicas: 4
++    revision:
++      image: web:2
++      environment: {LOG_LEVEL: info}
++    policy:
++      strategy: canary
++      batch_size: 2
++      canary_slots: 1
++      canary:
++        intervals: 3
++        metrics:
++          - {name: error_rate, threshold: 0.01, comparison: lt}
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from .errors import RevisionError
++from .revision import Revision, Strategy, UpdatePolicy
++
++SUPPORTED_VERSIONS = (1,)
++
++_KNOWN_TOP_KEYS = {"version", "service", "replicas", "revision", "policy"}
++
++
++@dataclass
++class RolloutSpec:
++    """A validated, self-consistent rollout manifest."""
++
++    service: str
++    revision: Revision
++    policy: UpdatePolicy
++    replicas: object = None      # int or None (infer from live state)
++    version: int = 1
++
++    @classmethod
++    def from_dict(cls, data):
++        if not isinstance(data, dict):
++            raise RevisionError("rollout spec must be a mapping")
++
++        unknown = set(data) - _KNOWN_TOP_KEYS
++        if unknown:
++            raise RevisionError(
++                "unknown rollout-spec key(s): {}".format(
++                    ", ".join(sorted(unknown))
++                )
++            )
++
++        version = int(data.get("version", 1))
++        if version not in SUPPORTED_VERSIONS:
++            raise RevisionError(
++                "unsupported rollout-spec version {!r}; supported: {}".format(
++                    version, SUPPORTED_VERSIONS
++                )
++            )
++
++        service = data.get("service")
++        if not service or not isinstance(service, str):
++            raise RevisionError("rollout spec requires a 'service' name")
++
++        if "revision" not in data:
++            raise RevisionError("rollout spec requires a 'revision'")
++        revision = Revision.from_dict(data["revision"])
++
++        policy = UpdatePolicy.from_dict(data.get("policy") or {})
++
++        replicas = data.get("replicas")
++        if replicas is not None:
++            replicas = int(replicas)
++            if replicas < 1:
++                raise RevisionError("'replicas' must be >= 1")
++
++        spec = cls(
++            service=service,
++            revision=revision,
++            policy=policy,
++            replicas=replicas,
++            version=version,
++        )
++        spec._cross_validate()
++        return spec
++
++    def _cross_validate(self):
++        """Reject manifests that are individually valid but jointly nonsense."""
++        policy = self.policy
++        # A canary strategy with a canary block but no metrics can never make a
++        # real go/no-go decision -- allow it (it degrades to health-only) but a
++        # canary_slots larger than the fleet is a mistake we can catch here.
++        if self.replicas is not None and policy.canary_slots > self.replicas:
++            raise RevisionError(
++                "canary_slots ({}) exceeds replicas ({})".format(
++                    policy.canary_slots, self.replicas
++                )
++            )
++        if policy.strategy != Strategy.CANARY and policy.canary is not None:
++            raise RevisionError(
++                "a 'canary' analysis block is only valid with "
++                "strategy: canary (got {!r})".format(policy.strategy)
++            )
++        if policy.max_unavailable > 0 and self.replicas is not None \
++                and policy.max_unavailable > self.replicas:
++            raise RevisionError(
++                "max_unavailable ({}) exceeds replicas ({})".format(
++                    policy.max_unavailable, self.replicas
++                )
++            )
++
++    def build_controller(self, api_client, controller_cls=None,
++                         metric_provider=None, sleeper=None):
++        """Instantiate a controller wired to this spec's service/replicas.
++
++        Imported lazily to avoid a circular import between spec and controller.
++        """
++        if controller_cls is None:
++            from .controller import RolloutController as controller_cls
++        return controller_cls(
++            api_client,
++            self.service,
++            replicas=self.replicas,
++            sleeper=sleeper,
++            metric_provider=metric_provider,
++        )
++
++    def as_dict(self):
++        return {
++            "version": self.version,
++            "service": self.service,
++            "replicas": self.replicas,
++            "revision": self.revision.canonical(),
++            "policy": {
++                "strategy": self.policy.strategy,
++                "batch_size": self.policy.batch_size,
++                "max_unavailable": self.policy.max_unavailable,
++                "require_health": self.policy.require_health,
++                "auto_rollback": self.policy.auto_rollback,
++                "canary_slots": self.policy.canary_slots,
++            },
++        }
+diff --git a/docker/rollout/state.py b/docker/rollout/state.py
+new file mode 100644
+index 00000000..91960cbc
+--- /dev/null
++++ b/docker/rollout/state.py
+@@ -0,0 +1,78 @@
++"""Observe the replicas of a service currently known to the Engine.
++
++Reads exclusively through ``APIClient.containers`` with a label filter, so it
++behaves identically against a real daemon and a test double.  The controller
++uses this to learn the current revision distribution before planning an
++update, and to find what to roll back to if one fails.
++"""
++
++from __future__ import annotations
++
++from . import naming
++
++
++class Replica:
++    """A single managed container of a service."""
++
++    __slots__ = ("id", "name", "service", "slot", "revision", "color",
++                 "status", "labels", "raw")
++
++    def __init__(self, raw):
++        self.raw = raw
++        self.id = raw.get("Id") or raw.get("ID") or ""
++        names = raw.get("Names") or []
++        self.name = names[0].lstrip("/") if names else raw.get("Name", "")
++        labels = raw.get("Labels") or {}
++        self.labels = labels
++        self.service = labels.get(naming.LABEL_SERVICE, "")
++        self.revision = labels.get(naming.LABEL_REVISION, "")
++        self.color = labels.get(naming.LABEL_COLOR, "")
++        try:
++            self.slot = int(labels.get(naming.LABEL_SLOT, "0"))
++        except (TypeError, ValueError):
++            self.slot = 0
++        self.status = raw.get("State") or raw.get("Status") or ""
++
++
++class ServiceState:
++    """The set of replicas currently backing a service."""
++
++    def __init__(self, replicas):
++        self.replicas = replicas  # list[Replica]
++
++    @classmethod
++    def observe(cls, api, service):
++        flt = naming.service_filter(service)
++        replicas = []
++        for raw in api.containers(all=True, filters=flt):
++            rep = Replica(raw)
++            if rep.service == service:
++                replicas.append(rep)
++        replicas.sort(key=lambda r: (r.color, r.slot))
++        return cls(replicas)
++
++    def revisions(self):
++        """The distinct revision ids currently running, in first-seen order."""
++        seen = []
++        for rep in self.replicas:
++            if rep.revision and rep.revision not in seen:
++                seen.append(rep.revision)
++        return seen
++
++    def by_revision(self, revision_id):
++        return [r for r in self.replicas if r.revision == revision_id]
++
++    def by_color(self, color):
++        return [r for r in self.replicas if r.color == color]
++
++    def count(self):
++        return len(self.replicas)
++
++    def dominant_revision(self):
++        """The revision the majority of replicas are on (or None)."""
++        counts = {}
++        for rep in self.replicas:
++            counts[rep.revision] = counts.get(rep.revision, 0) + 1
++        if not counts:
++            return None
++        return max(counts, key=lambda rev: counts[rev])

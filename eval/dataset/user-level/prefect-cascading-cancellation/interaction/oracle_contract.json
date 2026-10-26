@@ -1,0 +1,161 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test_outputs.py"],
+  "requirements": [
+    {
+      "id": "r_exec_entry_point",
+      "verifier_assertion": "test_outputs.py fixtures spawn `prefect flow-run execute <flow-run-id>` (line 239) as the sole exec entry point; the assertion contract fires against that subprocess's exit code and the flow-run states it produces. Info_slices must carry the entry-point name and its process-worker path parity.",
+      "script_refs": ["s_arch_execute"],
+      "must_include": [
+        "prefect flow-run execute",
+        "process-type workers",
+        "same path"
+      ]
+    },
+    {
+      "id": "r_return_code_zero_cancel",
+      "verifier_assertion": "test_outputs.py:359 `assert result[\"return_code\"] == 0` — the `prefect flow-run execute` subprocess must exit cleanly after cancellation. Line 431 asserts the same for the normal-completion path.",
+      "script_refs": ["s_contract_exit_code", "s_preserve_normal_completion"],
+      "must_include": [
+        "execution process must exit cleanly (exit code 0)",
+        "execution process exiting 0"
+      ]
+    },
+    {
+      "id": "r_parent_cancelled",
+      "verifier_assertion": "test_outputs.py:365 `assert parent_state is not None and parent_state.is_cancelled()` — the top-level flow run's final state must be Cancelled after the API-side flip to Cancelling.",
+      "script_refs": ["s_contract_exit_code"],
+      "must_include": [
+        "top-level's final state is Cancelled"
+      ]
+    },
+    {
+      "id": "r_child_cancelled_not_crashed",
+      "verifier_assertion": "test_outputs.py:371 `assert child_state is not None and child_state.is_cancelled()` — nested subflow's final state must be Cancelled, not Crashed. Tested for both sync (test_sync_subflow_cancellation_cascades) and async (test_async_subflow_cancellation_cascades) parents.",
+      "script_refs": ["s_contract_subflow_state", "s_target"],
+      "must_include": [
+        "sync AND async subflows alike",
+        "Cancelling -> Cancelled",
+        "Cancelled, not Crashed",
+        "cascading"
+      ]
+    },
+    {
+      "id": "r_parent_hook_marker",
+      "verifier_assertion": "test_outputs.py:380 `assert parent_marker.exists()` and :388 `assert parent_marker.read_text() == str(result[\"parent_id\"])` — the parent's on_cancellation hook must fire and receive its own flow_run (marker file contents == parent flow_run.id).",
+      "script_refs": ["s_contract_hooks"],
+      "must_include": [
+        "on_cancellation hooks",
+        "actually be invoked",
+        "parent hook gets parent's flow_run"
+      ]
+    },
+    {
+      "id": "r_child_hook_marker",
+      "verifier_assertion": "test_outputs.py:384 `assert child_marker.exists()` and :393 `assert child_marker.read_text() == str(result[\"child_id\"])` — the subflow's on_cancellation hook must fire and receive its own flow_run (marker contents == child flow_run.id).",
+      "script_refs": ["s_contract_hooks"],
+      "must_include": [
+        "child hook gets child's flow_run",
+        "flow_run each hook receives must correspond to its own run"
+      ]
+    },
+    {
+      "id": "r_blocked_code_interrupted",
+      "verifier_assertion": "The FLOWS_SOURCE fixtures (test_outputs.py:71-93) block via `while True: time.sleep(0.2)` (sync child) and `while True: await asyncio.sleep(0.2)` (async child); the whole assertion contract only reaches its terminal-state phase if that blocking is interrupted by cancellation within EXECUTE_EXIT_TIMEOUT (150s). Info_slices must carry the interruption obligation.",
+      "script_refs": ["s_contract_interrupt"],
+      "must_include": [
+        "user code currently blocking inside a subflow",
+        "sleep, infinite loops",
+        "must be interrupted by this cancellation",
+        "must not hang forever"
+      ]
+    },
+    {
+      "id": "r_normal_completion_unchanged",
+      "verifier_assertion": "test_outputs.py:448 `assert parent_terminal.state.is_completed()` and :461 `assert child_state is not None and child_state.is_completed()` — the normal-completion path (quick_parent + quick_child) still ends Completed for both parent and child. Line 459 also asserts `len(child_runs) == 1`.",
+      "script_refs": ["s_preserve_normal_completion"],
+      "must_include": [
+        "flow that finishes normally",
+        "still ends Completed",
+        "Failed semantics of ordinary failures stay unchanged"
+      ]
+    },
+    {
+      "id": "r_sigterm_reschedule_preserved",
+      "verifier_assertion": "instruction.md 'must not break' clause: with PREFECT_FLOW_RUN_EXECUTE_SIGTERM_BEHAVIOR=reschedule, the exec process must still push the run to AwaitingRetry on SIGTERM. Info_slices must carry this constraint — dropping it would violate the covering invariant.",
+      "script_refs": ["s_preserve_sigterm_reschedule"],
+      "must_include": [
+        "PREFECT_FLOW_RUN_EXECUTE_SIGTERM_BEHAVIOR=reschedule",
+        "SIGTERM",
+        "reschedule the run (AwaitingRetry)",
+        "must not be hijacked"
+      ]
+    },
+    {
+      "id": "r_startup_race_fallback",
+      "verifier_assertion": "instruction.md 'must not break' clause: if cancellation arrives before the exec process is ready to handle it gracefully, the existing forceful-termination fallback path applies. Do NOT swallow external SIGTERM to enable graceful cancellation. Info_slices must carry this constraint.",
+      "script_refs": ["s_preserve_startup_fallback"],
+      "must_include": [
+        "forceful-termination fallback",
+        "wind it down as a crash",
+        "Graceful cancellation is not required at the instant of startup",
+        "Do not swallow external SIGTERM"
+      ]
+    },
+    {
+      "id": "r_runner_side_parity",
+      "verifier_assertion": "instruction.md 'must not break' clause: the runner-side cancellation responsibilities (marking managed top-level runs Cancelled, running runner-side hooks) must remain functional; `prefect flow-run execute` and the process worker share the same cancellation path. Info_slices must carry this constraint.",
+      "script_refs": ["s_preserve_runner_side"],
+      "must_include": [
+        "runner side's existing cancellation responsibilities",
+        "share the same cancellation path",
+        "don't fix one side and break the other"
+      ]
+    },
+    {
+      "id": "r_verification_server",
+      "verifier_assertion": "test_outputs.py:146-207 the `prefect_server` fixture spins up `prefect server start --host 127.0.0.1 --port 4487` and waits for /health; PREFECT_API_URL is set to that server. Info_slices carry the verification-step-1 instructions so the agent can reproduce the setup locally.",
+      "script_refs": ["s_verify_server"],
+      "must_include": [
+        "prefect server start",
+        "PREFECT_API_URL"
+      ]
+    },
+    {
+      "id": "r_verification_deploy",
+      "verifier_assertion": "test_outputs.py:210-233 `_prepare_deployment` creates a process work pool and deploys a flow with parent+child on_cancellation hooks that drop marker files; the parameters carry the marker_dir. Info_slices carry the verification-step-2 instructions.",
+      "script_refs": ["s_verify_deploy"],
+      "must_include": [
+        "process-type work pool",
+        "flow with nested subflows",
+        "on_cancellation hooks",
+        "drop a marker file",
+        "prefect flow-run execute"
+      ]
+    },
+    {
+      "id": "r_verification_confirm",
+      "verifier_assertion": "test_outputs.py test cases confirm — after both runs enter Running, API-side cancel via `set_flow_run_state(parent_id, Cancelling())`, then wait for terminal states, assert exit 0 + both Cancelled + markers contain the correct flow_run ids. Verified for both sync (test_sync_...) and async (test_async_...) parents.",
+      "script_refs": ["s_verify_confirm"],
+      "must_include": [
+        "set the parent run to Cancelling via the API",
+        "execution process exit code 0",
+        "parent run final state Cancelled",
+        "child run final state Cancelled",
+        "marker file contents correspond to their respective run ids",
+        "sync subflow",
+        "async subflow"
+      ]
+    },
+    {
+      "id": "r_regression_gates",
+      "verifier_assertion": "instruction.md verification step 4: run the repo's relevant tests (tests/runner/, tests/test_flow_engine.py) to confirm no regressions. This is not directly asserted by test_outputs.py but is authoritative per instruction.md — the covering invariant requires info_slices to carry it.",
+      "script_refs": ["s_verify_regress"],
+      "must_include": [
+        "tests/runner/",
+        "tests/test_flow_engine.py",
+        "no regressions"
+      ]
+    }
+  ]
+}

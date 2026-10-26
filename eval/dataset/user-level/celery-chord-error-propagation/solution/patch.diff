@@ -1,0 +1,2604 @@
+diff --git a/celery/app/builtins.py b/celery/app/builtins.py
+index 1a79c4093..52c446f60 100644
+--- a/celery/app/builtins.py
++++ b/celery/app/builtins.py
+@@ -40,8 +40,8 @@ def add_unlock_chord_task(app):
+     Will joins chord by creating a task chain polling the header
+     for completion.
+     """
++    from celery.backends.base import _chord_error_with_cause
+     from celery.canvas import maybe_signature
+-    from celery.exceptions import ChordError
+     from celery.result import allow_join_result, result_from_tuple
+ 
+     @app.task(name='celery.chord_unlock', max_retries=None, shared=False,
+@@ -86,7 +86,8 @@ def add_unlock_chord_task(app):
+             except StopIteration:
+                 reason = repr(exc)
+             logger.exception('Chord %r raised: %r', group_id, exc)
+-            app.backend.chord_error_from_stack(callback, ChordError(reason))
++            app.backend.chord_error_from_stack(
++                callback, _chord_error_with_cause(reason, exc))
+         else:
+             try:
+                 callback.delay(ret)
+@@ -94,7 +95,7 @@ def add_unlock_chord_task(app):
+                 logger.exception('Chord %r raised: %r', group_id, exc)
+                 app.backend.chord_error_from_stack(
+                     callback,
+-                    exc=ChordError(f'Callback error: {exc!r}'),
++                    exc=_chord_error_with_cause(f'Callback error: {exc!r}', exc),
+                 )
+     return unlock_chord
+ 
+diff --git a/celery/backends/base.py b/celery/backends/base.py
+index dc79f4ebd..891e54753 100644
+--- a/celery/backends/base.py
++++ b/celery/backends/base.py
+@@ -41,6 +41,37 @@ logger = get_logger(__name__)
+ 
+ MESSAGE_BUFFER_MAX = 8192
+ 
++
++def _chord_error_with_cause(message, cause=None):
++    """Build a :class:`~celery.exceptions.ChordError` chaining the original exception.
++
++    Whenever a chord fails because one of its dependencies raised, the
++    :class:`~celery.exceptions.ChordError` delivered to errbacks and stored as
++    the chord body result must keep the original exception available as
++    ``__cause__`` so that error handling code can inspect the underlying
++    failure.  Non-exception causes (or no cause at all) are ignored.
++    """
++    error = ChordError(message)
++    if isinstance(cause, BaseException):
++        error.__cause__ = cause
++    return error
++
++
++def _chord_errback_request(task_id, errbacks=None, task_name='unknown', **extra):
++    """Build a best-effort fake request context for chord error callbacks.
++
++    When a chord fails we do not have a real request for the body (the body
++    never ran), but new-style errbacks still expect a request-like object with
++    ``id``, ``errbacks`` and ``delivery_info`` attributes.
++    """
++    return Context({
++        "id": task_id,
++        "errbacks": errbacks or [],
++        "delivery_info": dict(),
++        "task": task_name,
++        **extra
++    })
++
+ pending_results_t = namedtuple('pending_results_t', (
+     'concrete', 'weak',
+ ))
+@@ -285,6 +316,12 @@ class Backend:
+             backend = app._tasks[callback.task].backend
+         except KeyError:
+             backend = self
++        # A chord whose body is a group needs dedicated handling: marking only
++        # the group id as failed leaves every member task of the body in
++        # PENDING state forever, so any consumer joining them (or waiting on
++        # the group result) hangs indefinitely.
++        if isinstance(callback, group):
++            return self._fail_chord_group_body(callback, backend, exc=exc)
+         # We have to make a fake request since either the callback failed or
+         # we're pretending it did since we don't have information about the
+         # chord part(s) which failed. This request is constructed as a best
+@@ -301,7 +338,78 @@ class Backend:
+         except Exception as eb_exc:  # pylint: disable=broad-except
+             return backend.fail_from_current_stack(callback.id, exc=eb_exc)
+         else:
++            return backend.fail_from_current_stack(
++                self._chord_callback_result_id(callback), exc=exc)
++
++    @staticmethod
++    def _chord_callback_result_id(callback):
++        """Resolve the result id a failed chord body should be stored under.
++
++        Plain task signatures know their id, but complex bodies (e.g. a
++        chain) have no id of their own: the meaningful result is the one
++        produced by their final task, which freezing resolves without
++        changing any already assigned task ids.
++        """
++        if callback.id:
++            return callback.id
++        try:
++            return callback.freeze().id
++        except Exception:  # pylint: disable=broad-except
++            logger.exception(
++                'Chord %r: unable to resolve body result id', callback.id)
++            return callback.id
++
++    def _fail_chord_group_body(self, callback, backend, exc=None):
++        """Propagate a chord failure to every member of a group body.
++
++        When the body of a chord is a :class:`~celery.canvas.group` and the
++        chord fails, we must:
++
++        1. call the body errbacks once for each member task, with a request
++           context identifying that member, and
++        2. store a failure result for every member task, so no consumer of
++           the member results (or of the group result) blocks forever.
++
++        The group result itself is also marked as failed.  Any unexpected
++        error while doing so falls back to the legacy single-result
++        behaviour so the failure is never silently swallowed.
++        """
++        try:
++            body_result = callback.freeze()
++        except Exception:  # pylint: disable=broad-except
++            logger.exception(
++                'Chord %r: unable to freeze group body, '
++                'falling back to single result failure', callback.id)
+             return backend.fail_from_current_stack(callback.id, exc=exc)
++        errbacks = callback.options.get("link_error", [])
++        for result in body_result.results:
++            try:
++                fake_request = _chord_errback_request(
++                    task_id=result.id,
++                    errbacks=errbacks,
++                    task_name=getattr(result, 'task', None) or 'unknown',
++                )
++                self._call_task_errbacks(fake_request, exc, None)
++            except Exception:  # pylint: disable=broad-except
++                # Keep going: every member must be failed even if an
++                # individual errback blows up.
++                logger.exception(
++                    'Chord %r: error callback for body task %r raised',
++                    callback.id, result.id)
++            try:
++                backend.mark_as_failure(result.id, exc)
++            except Exception:  # pylint: disable=broad-except
++                logger.exception(
++                    'Chord %r: unable to store failure for body task %r',
++                    callback.id, result.id)
++        if body_result.id:
++            try:
++                backend.mark_as_failure(body_result.id, exc)
++            except Exception:  # pylint: disable=broad-except
++                logger.exception(
++                    'Chord %r: unable to store failure for group body %r',
++                    callback.id, body_result.id)
++        return None
+ 
+     def fail_from_current_stack(self, task_id, exc=None):
+         type_, real_exc, tb = sys.exc_info()
+@@ -1031,7 +1139,7 @@ class BaseKeyValueStoreBackend(Backend):
+             logger.exception('Chord %r raised: %r', gid, exc)
+             return self.chord_error_from_stack(
+                 callback,
+-                ChordError(f'Cannot restore group: {exc!r}'),
++                _chord_error_with_cause(f'Cannot restore group: {exc!r}', exc),
+             )
+         if deps is None:
+             try:
+@@ -1041,7 +1149,8 @@ class BaseKeyValueStoreBackend(Backend):
+                 logger.exception('Chord callback %r raised: %r', gid, exc)
+                 return self.chord_error_from_stack(
+                     callback,
+-                    ChordError(f'GroupResult {gid} no longer exists'),
++                    _chord_error_with_cause(
++                        f'GroupResult {gid} no longer exists', exc),
+                 )
+         val = self.incr(key)
+         # Set the chord size to the value defined in the request, or fall back
+@@ -1070,7 +1179,8 @@ class BaseKeyValueStoreBackend(Backend):
+                     reason = repr(exc)
+ 
+                 logger.exception('Chord %r raised: %r', gid, reason)
+-                self.chord_error_from_stack(callback, ChordError(reason))
++                self.chord_error_from_stack(
++                    callback, _chord_error_with_cause(reason, exc))
+             else:
+                 try:
+                     callback.delay(ret)
+@@ -1078,7 +1188,7 @@ class BaseKeyValueStoreBackend(Backend):
+                     logger.exception('Chord %r raised: %r', gid, exc)
+                     self.chord_error_from_stack(
+                         callback,
+-                        ChordError(f'Callback error: {exc!r}'),
++                        _chord_error_with_cause(f'Callback error: {exc!r}', exc),
+                     )
+             finally:
+                 deps.delete()
+diff --git a/celery/backends/gcs.py b/celery/backends/gcs.py
+index d667a9ccc..2580ae7ce 100644
+--- a/celery/backends/gcs.py
++++ b/celery/backends/gcs.py
+@@ -8,8 +8,9 @@ from kombu.utils.encoding import bytes_to_str
+ from kombu.utils.functional import dictfilter
+ from kombu.utils.url import url_to_parts
+ 
++from celery.backends.base import _chord_error_with_cause
+ from celery.canvas import maybe_signature
+-from celery.exceptions import ChordError, ImproperlyConfigured
++from celery.exceptions import ImproperlyConfigured
+ from celery.result import GroupResult, allow_join_result
+ from celery.utils.log import get_logger
+ 
+@@ -293,7 +294,8 @@ class GCSBackend(GCSBackendBase):
+                     reason = repr(exc)
+ 
+                 logger.exception('Chord %r raised: %r', gid, reason)
+-                self.chord_error_from_stack(callback, ChordError(reason))
++                self.chord_error_from_stack(
++                    callback, _chord_error_with_cause(reason, exc))
+             else:
+                 try:
+                     callback.delay(ret)
+@@ -301,7 +303,7 @@ class GCSBackend(GCSBackendBase):
+                     logger.exception('Chord %r raised: %r', gid, exc)
+                     self.chord_error_from_stack(
+                         callback,
+-                        ChordError(f'Callback error: {exc!r}'),
++                        _chord_error_with_cause(f'Callback error: {exc!r}', exc),
+                     )
+             finally:
+                 deps.delete()
+@@ -317,7 +319,7 @@ class GCSBackend(GCSBackendBase):
+             logger.exception('Chord %r raised: %r', gid, exc)
+             self.chord_error_from_stack(
+                 callback,
+-                ChordError(f'Cannot restore group: {exc!r}'),
++                _chord_error_with_cause(f'Cannot restore group: {exc!r}', exc),
+             )
+             return
+         if deps is None:
+@@ -328,7 +330,8 @@ class GCSBackend(GCSBackendBase):
+                 logger.exception('Chord callback %r raised: %r', gid, exc)
+                 self.chord_error_from_stack(
+                     callback,
+-                    ChordError(f'GroupResult {gid} no longer exists'),
++                    _chord_error_with_cause(
++                        f'GroupResult {gid} no longer exists', exc),
+                 )
+         return deps
+ 
+diff --git a/celery/backends/redis.py b/celery/backends/redis.py
+index 3e3ef737f..93c27c426 100644
+--- a/celery/backends/redis.py
++++ b/celery/backends/redis.py
+@@ -19,7 +19,7 @@ from celery.utils.log import get_logger
+ from celery.utils.time import humanize_seconds
+ 
+ from .asynchronous import AsyncBackendMixin, BaseResultConsumer
+-from .base import BaseKeyValueStoreBackend
++from .base import BaseKeyValueStoreBackend, _chord_error_with_cause
+ 
+ try:
+     import redis.connection
+@@ -436,7 +436,8 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
+         if state in EXCEPTION_STATES:
+             retval = self.exception_to_python(retval)
+         if state in PROPAGATE_STATES:
+-            raise ChordError(f'Dependency {tid} raised {retval!r}')
++            raise _chord_error_with_cause(
++                f'Dependency {tid} raised {retval!r}', retval)
+         return retval
+ 
+     def set_chord_size(self, group_id, chord_size):
+@@ -538,7 +539,7 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
+                             'Chord callback for %r raised: %r', request.group, exc)
+                         return self.chord_error_from_stack(
+                             callback,
+-                            ChordError(f'Callback error: {exc!r}'),
++                            _chord_error_with_cause(f'Callback error: {exc!r}', exc),
+                         )
+                     finally:
+                         with client.pipeline() as pipe:
+@@ -554,7 +555,7 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
+                 logger.exception('Chord %r raised: %r', request.group, exc)
+                 return self.chord_error_from_stack(
+                     callback,
+-                    ChordError(f'Join error: {exc!r}'),
++                    _chord_error_with_cause(f'Join error: {exc!r}', exc),
+                 )
+ 
+     def _create_client(self, **params):
+diff --git a/celery/exceptions.py b/celery/exceptions.py
+index 3203e9f49..fd0c83d57 100644
+--- a/celery/exceptions.py
++++ b/celery/exceptions.py
+@@ -259,6 +259,28 @@ class InvalidTaskError(TaskError):
+ class ChordError(TaskError):
+     """A task part of the chord raised an exception."""
+ 
++    def __reduce__(self):
++        # BaseException.__reduce__() does not persist ``__cause__``, but for
++        # ChordError the chained original exception is an essential part of
++        # the error: it is the only way for consumers reading the failure
++        # from a result backend to find out what actually went wrong in the
++        # chord header.  Route pickling through a rebuild helper so the
++        # exception chain survives a round trip through the result backend.
++        return (_rebuild_chord_error, (self.__class__, self.args,
++                                       self.__cause__))
++
++
++def _rebuild_chord_error(cls, args, cause):
++    """Rebuild a :class:`ChordError` from its pickled state.
++
++    Reattaches ``__cause__`` since the default exception pickling protocol
++    silently drops it.
++    """
++    exc = cls(*args)
++    if cause is not None:
++        exc.__cause__ = cause
++    return exc
++
+ 
+ class CPendingDeprecationWarning(PendingDeprecationWarning):
+     """Warning of pending deprecation."""
+diff --git a/docs/userguide/canvas.rst b/docs/userguide/canvas.rst
+index a39a2d65f..4fcbec073 100644
+--- a/docs/userguide/canvas.rst
++++ b/docs/userguide/canvas.rst
+@@ -987,6 +987,48 @@ or errbacks just once if any task in the chord header or body fails.
+ This behavior can be manipulated to allow error handling of the chord header using the :ref:`task_allow_error_cb_on_chord_header <task_allow_error_cb_on_chord_header>` flag.
+ Enabling this flag will cause the chord header to invoke the errback for the body (default behavior) *and* any task in the chord's header that fails.
+ 
++.. _chord-group-body-errors:
++
++Group bodies and error propagation
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++When the body of a chord is itself a :class:`~@group`, a header failure is
++propagated to *every* member of that body group:
++
++* each member task's result transitions to the ``FAILURE`` state with the
++  :exc:`~@ChordError` as its result, so consumers waiting on individual
++  member results (or on the body :class:`~@GroupResult`) will never block
++  forever,
++* the errbacks linked to the body are called once per body member, with the
++  request context of that member,
++* the group result itself is marked as failed as well.
++
++This applies uniformly to all result backends, both to backends with native
++chord support (e.g. Redis, cache) and to backends relying on the
++``celery.chord_unlock`` fallback polling task.
++
++.. _chord-error-cause:
++
++Inspecting the original failure
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Whenever a chord fails, the resulting :exc:`~@ChordError` keeps the original
++exception available as ``__cause__`` (standard :keyword:`raise ... from`
++chaining).  This holds for the exception delivered to errbacks as well as for
++the one read back from the result backend, provided the result backend
++serializes results with an exception-capable serializer (e.g. ``pickle``):
++
++.. code-block:: pycon
++
++    >>> result.get(propagate=False)
++    ChordError("Dependency 97de6f3f raised ValueError('something something')")
++    >>> result.result.__cause__
++    ValueError('something something')
++
++If the chord callback itself raised when being executed, the
++:exc:`~@ChordError` message is prefixed with ``Callback error:`` and the
++callback's exception is available as ``__cause__`` in the same way.
++
+ .. _chord-important-notes:
+ 
+ Important Notes
+diff --git a/t/unit/backends/test_chord_error_propagation.py b/t/unit/backends/test_chord_error_propagation.py
+new file mode 100644
+index 000000000..f47f3befd
+--- /dev/null
++++ b/t/unit/backends/test_chord_error_propagation.py
+@@ -0,0 +1,1051 @@
++"""Tests for chord failure propagation semantics.
++
++Covers the behaviour when a chord fails:
++
++* every member of a group body must end up in FAILURE state instead of
++  hanging in PENDING forever,
++* the body errbacks must be called (once per group body member),
++* the :class:`~celery.exceptions.ChordError` must keep the original
++  exception chained as ``__cause__``, even after a round trip through a
++  result backend,
++* single-task and chain bodies keep their historical behaviour,
++* the success path of chords is unchanged.
++
++All tests run against the in-memory cache backend; no broker is required.
++"""
++import pickle
++
++import pytest
++
++from celery import Celery, chord, group, signature, states, uuid
++from celery.app.task import Context
++from celery.backends.base import _chord_error_with_cause, _chord_errback_request
++from celery.exceptions import ChordError
++from celery.result import GroupResult
++
++# ----------------------------------------------------------------------
++# shared in-process recorders: errbacks executed eagerly append here.
++# ----------------------------------------------------------------------
++
++ERRBACK_CALLS = []
++BODY_EXECUTIONS = []
++
++
++def _make_app(**conf):
++    app = Celery(
++        'chord_error_propagation_tests',
++        broker='memory://',
++        backend='cache+memory://',
++    )
++    app.conf.update(
++        task_always_eager=True,
++        task_eager_propagates=True,
++        task_store_eager_result=True,
++        result_serializer='pickle',
++        accept_content=['pickle', 'json'],
++        **conf,
++    )
++    return app
++
++
++def _register_tasks(app):
++    @app.task(name='tests.record_errback')
++    def record_errback(*args, **kwargs):
++        # both old-style (task_id) and new-style (request, exc, tb)
++        # errbacks are normalized to the id of the failed unit
++        first = args[0] if args else None
++        ERRBACK_CALLS.append(getattr(first, 'id', first))
++        return True
++
++    @app.task(name='tests.record_new_style_errback')
++    def record_new_style_errback(request, exc, traceback):
++        ERRBACK_CALLS.append((request, exc, traceback))
++        return True
++
++    @app.task(name='tests.add')
++    def add(x, y):
++        return x + y
++
++    @app.task(name='tests.record_body_execution')
++    def record_body_execution(*args, **kwargs):
++        BODY_EXECUTIONS.append((args, kwargs))
++        return 'body-ran'
++
++    @app.task(name='tests.explode')
++    def explode(*args, **kwargs):
++        raise RuntimeError('body exploded')
++
++    return {
++        'record_errback': record_errback,
++        'record_new_style_errback': record_new_style_errback,
++        'add': add,
++        'record_body_execution': record_body_execution,
++        'explode': explode,
++    }
++
++
++@pytest.fixture
++def capp():
++    ERRBACK_CALLS.clear()
++    BODY_EXECUTIONS.clear()
++    app = _make_app()
++    tasks = _register_tasks(app)
++    yield app, tasks
++    ERRBACK_CALLS.clear()
++    BODY_EXECUTIONS.clear()
++
++
++# ----------------------------------------------------------------------
++# chord builders
++# ----------------------------------------------------------------------
++
++def _build_chord(app, tasks, header_size=3, body=None, link_error=True):
++    """Build and freeze a chord with a header of `add` tasks."""
++    header = group(
++        [tasks['add'].s(i, i) for i in range(header_size)], app=app,
++    )
++    if body is None:
++        body = group(
++            [tasks['record_body_execution'].s(), tasks['record_body_execution'].s()],
++            app=app,
++        )
++    if link_error:
++        body = body.set(link_error=[tasks['record_errback'].s()])
++    c = chord(header, body, app=app)
++    body_result = c.freeze()
++    return c, body_result
++
++
++def _header_results(app, c):
++    return [app.AsyncResult(t.options['task_id']) for t in c.tasks.tasks]
++
++
++def _store_header_results(app, c, failing_index, exc=None):
++    """Persist header results: all succeed except `failing_index`."""
++    backend = app.backend
++    results = _header_results(app, c)
++    for i, res in enumerate(results):
++        if i == failing_index:
++            backend.mark_as_failure(res.id, exc or ValueError('kaboom'))
++        else:
++            backend.store_result(res.id, i * 2, states.SUCCESS)
++    return results
++
++
++# ----------------------------------------------------------------------
++# drivers: the three real-world paths that end in chord_error_from_stack()
++# ----------------------------------------------------------------------
++
++def drive_kv_backend(app, c, failing_index, exc=None):
++    """Simulate a worker calling on_chord_part_return for every header task.
++
++    This is the path taken by backends with native chord counter support
++    (cache, redis-style increment based backends).
++    """
++    backend = app.backend
++    results = _store_header_results(app, c, failing_index, exc=exc)
++    deps = app.GroupResult(c.tasks.id, results)
++    backend.apply_chord((c.tasks.id, deps), c.body)
++    for res in results:
++        request = Context({
++            'id': res.id,
++            'group': c.tasks.id,
++            'chord': dict(c.body),
++        })
++        state = states.FAILURE if res is results[failing_index] else states.SUCCESS
++        backend.on_chord_part_return(request, state, None)
++
++
++def drive_unlock_chord(app, c, failing_index, exc=None):
++    """Simulate the celery.chord_unlock fallback polling task.
++
++    This is the path taken by backends without native chord support:
++    the ``celery.chord_unlock`` task joins the header result and calls the
++    body, or reports the failure when the join propagates.
++    """
++    results = _store_header_results(app, c, failing_index, exc=exc)
++    deps = app.GroupResult(c.tasks.id, results)
++    app.backend.apply_chord((c.tasks.id, deps), c.body)
++    unlock = app.tasks['celery.chord_unlock']
++    unlock.apply(
++        args=(c.tasks.id, dict(c.body)),
++        kwargs={'result': [r.as_tuple() for r in results]},
++    )
++
++
++def drive_direct(app, c, failing_index, exc=None):
++    """Call Backend.chord_error_from_stack directly, as backend internals do.
++
++    Like every production call site, this happens while the original
++    exception is being handled.
++    """
++    exc = exc or ValueError('kaboom')
++    try:
++        raise exc
++    except exc.__class__ as original:
++        app.backend.chord_error_from_stack(
++            signature(c.body, app=app),
++            _chord_error_with_cause(repr(original), original),
++        )
++
++
++ALL_DRIVERS = [drive_kv_backend, drive_unlock_chord, drive_direct]
++WORKER_DRIVERS = [drive_kv_backend, drive_unlock_chord]
++
++
++def _body_task_ids(c):
++    return [t.options['task_id'] for t in c.body.tasks]
++
++
++# ----------------------------------------------------------------------
++# ChordError pickling
++# ----------------------------------------------------------------------
++
++class _CustomChordError(ChordError):
++    """Module-level ChordError subclass used by the pickling tests."""
++
++
++class test_ChordError_pickling:
++
++    def test_cause_survives_pickle_roundtrip(self):
++        err = ChordError('Dependency x raised')
++        cause = ValueError('original failure')
++        err.__cause__ = cause
++        clone = pickle.loads(pickle.dumps(err))
++        assert isinstance(clone, ChordError)
++        assert clone.__cause__ is not None
++        assert type(clone.__cause__) is ValueError
++        assert clone.__cause__.args == cause.args
++
++    def test_args_preserved(self):
++        err = ChordError('some message', 'extra')
++        clone = pickle.loads(pickle.dumps(err))
++        assert clone.args == ('some message', 'extra')
++        assert str(clone) == str(('some message', 'extra'))
++
++    def test_no_cause_roundtrip(self):
++        err = ChordError('plain')
++        clone = pickle.loads(pickle.dumps(err))
++        assert isinstance(clone, ChordError)
++        assert clone.__cause__ is None
++        assert clone.args == ('plain',)
++
++    def test_chained_cause_roundtrip(self):
++        root = KeyError('root')
++        intermediate = ChordError('mid')
++        intermediate.__cause__ = root
++        err = ChordError('top')
++        err.__cause__ = intermediate
++        clone = pickle.loads(pickle.dumps(err))
++        assert type(clone.__cause__) is ChordError
++        assert type(clone.__cause__.__cause__) is KeyError
++
++    def test_pickle_protocols(self):
++        err = ChordError('msg')
++        err.__cause__ = ValueError('boom')
++        for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
++            clone = pickle.loads(pickle.dumps(err, protocol=protocol))
++            assert isinstance(clone, ChordError)
++            assert type(clone.__cause__) is ValueError
++
++    def test_subclass_preserved(self):
++        err = _CustomChordError('custom')
++        err.__cause__ = ValueError('boom')
++        clone = pickle.loads(pickle.dumps(err))
++        assert isinstance(clone, _CustomChordError)
++        assert type(clone.__cause__) is ValueError
++
++    def test_deepcopy_keeps_cause(self):
++        import copy
++        err = ChordError('msg')
++        err.__cause__ = ValueError('boom')
++        clone = copy.deepcopy(err)
++        assert type(clone.__cause__) is ValueError
++
++    def test_str_and_repr_unchanged(self):
++        err = ChordError('Dependency abc raised ValueError()')
++        assert str(err) == 'Dependency abc raised ValueError()'
++        assert 'ChordError' in repr(err)
++
++    def test_raise_from_still_works(self):
++        try:
++            try:
++                raise ValueError('inner')
++            except ValueError as e:
++                raise ChordError('outer') from e
++        except ChordError as err:
++            assert type(err.__cause__) is ValueError
++            clone = pickle.loads(pickle.dumps(err))
++            assert type(clone.__cause__) is ValueError
++
++
++class test_chord_error_helpers:
++
++    def test_helper_builds_chord_error(self):
++        err = _chord_error_with_cause('msg')
++        assert isinstance(err, ChordError)
++        assert str(err) == 'msg'
++        assert err.__cause__ is None
++
++    def test_helper_chains_exception(self):
++        cause = ValueError('x')
++        err = _chord_error_with_cause('msg', cause)
++        assert err.__cause__ is cause
++
++    def test_helper_ignores_non_exception_cause(self):
++        err = _chord_error_with_cause('msg', 'not-an-exception')
++        assert err.__cause__ is None
++
++    def test_helper_ignores_none_cause(self):
++        err = _chord_error_with_cause('msg', None)
++        assert err.__cause__ is None
++
++    def test_helper_accepts_base_exceptions(self):
++        cause = KeyboardInterrupt()
++        err = _chord_error_with_cause('msg', cause)
++        assert err.__cause__ is cause
++
++    def test_errback_request_defaults(self):
++        req = _chord_errback_request('tid')
++        assert req.id == 'tid'
++        assert req.errbacks == []
++        assert req.delivery_info == {}
++        assert req.task == 'unknown'
++
++    def test_errback_request_full(self):
++        req = _chord_errback_request(
++            'tid', errbacks=['e1'], task_name='task.name', extra=1,
++        )
++        assert req.id == 'tid'
++        assert req.errbacks == ['e1']
++        assert req.task == 'task.name'
++        assert req.extra == 1
++
++
++# ----------------------------------------------------------------------
++# group body failure propagation
++# ----------------------------------------------------------------------
++
++class test_group_body_failure:
++    """A chord whose body is a group must fail every body member."""
++
++    @pytest.mark.parametrize('driver', ALL_DRIVERS,
++                             ids=[d.__name__ for d in ALL_DRIVERS])
++    def test_all_body_members_marked_failure(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=1)
++        for tid in _body_task_ids(c):
++            res = app.AsyncResult(tid)
++            assert res.state == states.FAILURE, (
++                f'{driver.__name__}: body member {tid} left in {res.state}')
++
++    @pytest.mark.parametrize('driver', ALL_DRIVERS,
++                             ids=[d.__name__ for d in ALL_DRIVERS])
++    def test_body_members_hold_chord_error(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=0)
++        for tid in _body_task_ids(c):
++            err = app.AsyncResult(tid).result
++            assert isinstance(err, ChordError), (
++                f'{driver.__name__}: got {type(err).__name__}')
++
++    @pytest.mark.parametrize('driver', ALL_DRIVERS,
++                             ids=[d.__name__ for d in ALL_DRIVERS])
++    def test_chord_error_message_mentions_original_failure(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=2, exc=ValueError('kaboom'))
++        for tid in _body_task_ids(c):
++            err = app.AsyncResult(tid).result
++            assert 'kaboom' in str(err)
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_chord_error_cause_is_original_exception(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=1, exc=RuntimeError('the real reason'))
++        for tid in _body_task_ids(c):
++            err = app.AsyncResult(tid).result
++            assert isinstance(err, ChordError)
++            assert err.__cause__ is not None, (
++                f'{driver.__name__}: ChordError lost its __cause__')
++            assert type(err.__cause__) is RuntimeError
++            assert err.__cause__.args == ('the real reason',)
++
++    @pytest.mark.parametrize('driver', ALL_DRIVERS,
++                             ids=[d.__name__ for d in ALL_DRIVERS])
++    def test_errbacks_called_once_per_member(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=0)
++        assert len(ERRBACK_CALLS) == len(c.body.tasks), (
++            f'{driver.__name__}: expected {len(c.body.tasks)} errback calls, '
++            f'got {len(ERRBACK_CALLS)}')
++
++    @pytest.mark.parametrize('driver', ALL_DRIVERS,
++                             ids=[d.__name__ for d in ALL_DRIVERS])
++    def test_errback_called_with_member_task_id(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=0)
++        assert set(ERRBACK_CALLS) == set(_body_task_ids(c))
++
++    @pytest.mark.parametrize('driver', ALL_DRIVERS,
++                             ids=[d.__name__ for d in ALL_DRIVERS])
++    def test_group_result_is_failed(self, capp, driver):
++        app, tasks = capp
++        c, body_result = _build_chord(app, tasks)
++        driver(app, c, failing_index=1)
++        gres = app.GroupResult(
++            c.body.id,
++            [app.AsyncResult(tid) for tid in _body_task_ids(c)],
++        )
++        assert gres.ready()
++        assert gres.failed()
++        assert not gres.successful()
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_body_never_executes(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=0)
++        assert BODY_EXECUTIONS == []
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_successful_header_results_untouched(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        results = _header_results(app, c)
++        driver(app, c, failing_index=1)
++        for i, res in enumerate(results):
++            if i == 1:
++                assert res.state == states.FAILURE
++                assert type(res.result) is ValueError
++            else:
++                assert res.state == states.SUCCESS
++                assert res.result == i * 2
++
++    @pytest.mark.parametrize('driver', ALL_DRIVERS,
++                             ids=[d.__name__ for d in ALL_DRIVERS])
++    def test_body_members_do_not_hang_on_get(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=0)
++        for tid in _body_task_ids(c):
++            with pytest.raises(ChordError):
++                app.AsyncResult(tid).get(timeout=1, interval=0)
++
++    def test_single_member_group_body(self, capp):
++        app, tasks = capp
++        body = group([tasks['record_body_execution'].s()], app=app)
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        drive_kv_backend(app, c, failing_index=0)
++        tid = c.body.tasks[0].options['task_id']
++        res = app.AsyncResult(tid)
++        assert res.state == states.FAILURE
++        assert isinstance(res.result, ChordError)
++        assert len(ERRBACK_CALLS) == 1
++
++    def test_large_group_body(self, capp):
++        app, tasks = capp
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(25)], app=app,
++        )
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        drive_unlock_chord(app, c, failing_index=0)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++        assert len(ERRBACK_CALLS) == 25
++
++    def test_group_body_without_errbacks(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks, link_error=False)
++        drive_kv_backend(app, c, failing_index=1)
++        for tid in _body_task_ids(c):
++            res = app.AsyncResult(tid)
++            assert res.state == states.FAILURE
++            assert isinstance(res.result, ChordError)
++        assert ERRBACK_CALLS == []
++
++    def test_multiple_errbacks_all_called(self, capp):
++        app, tasks = capp
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(2)], app=app,
++        )
++        body = body.set(link_error=[
++            tasks['record_errback'].s(),
++            tasks['record_errback'].s(),
++        ])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        drive_kv_backend(app, c, failing_index=0)
++        # 2 members x 2 errbacks
++        assert len(ERRBACK_CALLS) == 4
++
++    def test_new_style_errback_receives_request_and_exc(self, capp):
++        app, tasks = capp
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(2)], app=app,
++        )
++        body = body.set(link_error=[tasks['record_new_style_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        drive_kv_backend(app, c, failing_index=0, exc=ValueError('kaboom'))
++        assert len(ERRBACK_CALLS) == 2
++        member_ids = set(_body_task_ids(c))
++        for request, exc, tb in ERRBACK_CALLS:
++            assert request.id in member_ids
++            assert isinstance(exc, ChordError)
++            assert 'kaboom' in str(exc)
++
++    def test_errback_receives_chained_cause_in_process(self, capp):
++        app, tasks = capp
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(2)], app=app,
++        )
++        body = body.set(link_error=[tasks['record_new_style_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        drive_kv_backend(app, c, failing_index=1, exc=KeyError('missing'))
++        for request, exc, tb in ERRBACK_CALLS:
++            assert isinstance(exc, ChordError)
++            assert type(exc.__cause__) is KeyError
++
++    def test_group_id_marked_failure(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        drive_kv_backend(app, c, failing_index=0)
++        meta = app.backend.get_task_meta(c.body.id)
++        assert meta['status'] == states.FAILURE
++        assert isinstance(meta['result'], ChordError)
++
++    def test_repeated_failure_report_is_stable(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        drive_direct(app, c, failing_index=0)
++        first = [app.AsyncResult(tid).state for tid in _body_task_ids(c)]
++        ERRBACK_CALLS.clear()
++        drive_direct(app, c, failing_index=0)
++        second = [app.AsyncResult(tid).state for tid in _body_task_ids(c)]
++        assert first == second == [states.FAILURE] * len(c.body.tasks)
++
++    @pytest.mark.parametrize('failing_index', [0, 1, 2])
++    def test_every_failing_position(self, capp, failing_index):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        drive_kv_backend(app, c, failing_index=failing_index)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++
++
++class test_group_body_failure_kv_cleanup:
++    """The KV backend must clean chord bookkeeping keys after a failure."""
++
++    def test_chord_counter_key_removed(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        key = app.backend.get_key_for_chord(c.tasks.id)
++        drive_kv_backend(app, c, failing_index=0)
++        assert app.backend.get(key) is None
++
++    def test_header_group_result_removed(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        drive_kv_backend(app, c, failing_index=0)
++        assert GroupResult.restore(c.tasks.id, backend=app.backend) is None
++
++    def test_failure_after_full_success_of_other_members(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks, header_size=5)
++        drive_kv_backend(app, c, failing_index=4)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++
++
++# ----------------------------------------------------------------------
++# single task body: historical behaviour must not regress
++# ----------------------------------------------------------------------
++
++class test_single_task_body:
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_errback_called_once(self, capp, driver):
++        app, tasks = capp
++        body = tasks['record_body_execution'].s()
++        c, _ = _build_chord(app, tasks, body=body)
++        driver(app, c, failing_index=0)
++        assert len(ERRBACK_CALLS) == 1
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_body_marked_failure_with_chord_error(self, capp, driver):
++        app, tasks = capp
++        body = tasks['record_body_execution'].s()
++        c, _ = _build_chord(app, tasks, body=body)
++        driver(app, c, failing_index=1)
++        res = app.AsyncResult(c.body.options['task_id'])
++        assert res.state == states.FAILURE
++        assert isinstance(res.result, ChordError)
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_chord_error_keeps_cause(self, capp, driver):
++        app, tasks = capp
++        body = tasks['record_body_execution'].s()
++        c, _ = _build_chord(app, tasks, body=body)
++        driver(app, c, failing_index=0, exc=LookupError('nope'))
++        err = app.AsyncResult(c.body.options['task_id']).result
++        assert type(err.__cause__) is LookupError
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_errback_receives_body_task_id(self, capp, driver):
++        app, tasks = capp
++        body = tasks['record_body_execution'].s()
++        c, _ = _build_chord(app, tasks, body=body)
++        driver(app, c, failing_index=0)
++        assert ERRBACK_CALLS[0] == c.body.options['task_id']
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_body_never_executes(self, capp, driver):
++        app, tasks = capp
++        body = tasks['record_body_execution'].s()
++        c, _ = _build_chord(app, tasks, body=body)
++        driver(app, c, failing_index=2)
++        assert BODY_EXECUTIONS == []
++
++
++class test_chain_body:
++    """A chain body must keep its historical error behaviour."""
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_errback_called_once_for_chain_body(self, capp, driver):
++        app, tasks = capp
++        body = (
++            tasks['record_body_execution'].s() |
++            tasks['record_body_execution'].s()
++        )
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        driver(app, c, failing_index=0)
++        assert len(ERRBACK_CALLS) == 1
++        assert BODY_EXECUTIONS == []
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_chain_body_failure_does_not_raise(self, capp, driver):
++        app, tasks = capp
++        body = (
++            tasks['record_body_execution'].s() |
++            tasks['record_body_execution'].s()
++        )
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        driver(app, c, failing_index=0)
++        # the result of the last chain link carries the failure
++        last = c.body.tasks[-1].options['task_id']
++        res = app.AsyncResult(last)
++        assert res.state == states.FAILURE
++        assert isinstance(res.result, ChordError)
++
++
++# ----------------------------------------------------------------------
++# callback error path: the header succeeded but the body itself raised
++# ----------------------------------------------------------------------
++
++def _drive_callback_error(app, c):
++    """Header succeeds; body raises when the chord tries to run it."""
++    results = _store_header_results(app, c, failing_index=-1)
++    deps = app.GroupResult(c.tasks.id, results)
++    deps.save(backend=app.backend)
++    unlock = app.tasks['celery.chord_unlock']
++    unlock.apply(
++        args=(c.tasks.id, dict(c.body)),
++        kwargs={'result': [r.as_tuple() for r in results]},
++    )
++
++
++class test_callback_error:
++
++    def test_single_body_callback_error_message(self, capp):
++        app, tasks = capp
++        body = tasks['explode'].s()
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        _drive_callback_error(app, c)
++        res = app.AsyncResult(c.body.options['task_id'])
++        assert res.state == states.FAILURE
++        err = res.result
++        assert isinstance(err, ChordError)
++        assert 'Callback error' in str(err)
++
++    def test_single_body_callback_error_cause(self, capp):
++        app, tasks = capp
++        body = tasks['explode'].s()
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        _drive_callback_error(app, c)
++        err = app.AsyncResult(c.body.options['task_id']).result
++        assert type(err.__cause__) is RuntimeError
++        assert err.__cause__.args == ('body exploded',)
++
++    def test_single_body_callback_error_calls_errback(self, capp):
++        app, tasks = capp
++        body = tasks['explode'].s()
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        _drive_callback_error(app, c)
++        assert len(ERRBACK_CALLS) == 1
++
++
++# ----------------------------------------------------------------------
++# success path: must not regress
++# ----------------------------------------------------------------------
++
++class test_success_path:
++
++    def _run_success(self, app, c, driver):
++        results = _store_header_results(app, c, failing_index=-1)
++        deps = app.GroupResult(c.tasks.id, results)
++        app.backend.apply_chord((c.tasks.id, deps), c.body)
++        if driver is drive_kv_backend:
++            for res in results:
++                request = Context({
++                    'id': res.id,
++                    'group': c.tasks.id,
++                    'chord': dict(c.body),
++                })
++                app.backend.on_chord_part_return(request, states.SUCCESS, 1)
++        else:
++            unlock = app.tasks['celery.chord_unlock']
++            unlock.apply(
++                args=(c.tasks.id, dict(c.body)),
++                kwargs={'result': [r.as_tuple() for r in results]},
++            )
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_group_body_executes_on_success(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks, link_error=False)
++        self._run_success(app, c, driver)
++        assert len(BODY_EXECUTIONS) == len(c.body.tasks)
++        assert ERRBACK_CALLS == []
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_single_body_executes_on_success(self, capp, driver):
++        app, tasks = capp
++        body = tasks['record_body_execution'].s()
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        self._run_success(app, c, driver)
++        assert len(BODY_EXECUTIONS) == 1
++        assert ERRBACK_CALLS == []
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_no_failure_results_on_success(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks, link_error=False)
++        self._run_success(app, c, driver)
++        for tid in _body_task_ids(c):
++            state = app.AsyncResult(tid).state
++            assert state in (states.SUCCESS, states.PENDING), state
++
++
++# ----------------------------------------------------------------------
++# direct chord_error_from_stack contract
++# ----------------------------------------------------------------------
++
++class test_chord_error_from_stack_direct:
++
++    def test_group_callback_marks_all_members(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        err = ChordError('direct failure')
++        app.backend.chord_error_from_stack(signature(c.body, app=app), err)
++        for tid in _body_task_ids(c):
++            res = app.AsyncResult(tid)
++            assert res.state == states.FAILURE
++            assert isinstance(res.result, ChordError)
++
++    def test_group_callback_calls_errbacks_per_member(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        app.backend.chord_error_from_stack(
++            signature(c.body, app=app), ChordError('direct failure'))
++        assert len(ERRBACK_CALLS) == len(c.body.tasks)
++
++    def test_non_group_callback_unchanged(self, capp):
++        app, tasks = capp
++        body = tasks['record_body_execution'].s()
++        c, _ = _build_chord(app, tasks, body=body)
++        try:
++            raise ChordError('direct failure')
++        except ChordError as err:
++            app.backend.chord_error_from_stack(
++                signature(c.body, app=app), err)
++        assert len(ERRBACK_CALLS) == 1
++        res = app.AsyncResult(c.body.options['task_id'])
++        assert res.state == states.FAILURE
++
++    def test_failing_errback_does_not_prevent_member_failures(self, capp):
++        app, tasks = capp
++
++        @app.task(name='tests.bad_errback')
++        def bad_errback(*args, **kwargs):
++            raise RuntimeError('errback blew up')
++
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(2)], app=app,
++        )
++        body = body.set(link_error=[bad_errback.s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        app.conf.task_eager_propagates = False
++        app.backend.chord_error_from_stack(
++            signature(c.body, app=app), ChordError('direct failure'))
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++
++    def test_group_callback_group_meta_failed(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        app.backend.chord_error_from_stack(
++            signature(c.body, app=app), ChordError('direct failure'))
++        meta = app.backend.get_task_meta(c.body.id)
++        assert meta['status'] == states.FAILURE
++
++    def test_empty_group_body_does_not_raise(self, capp):
++        app, tasks = capp
++        body = group([], app=app)
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        app.backend.chord_error_from_stack(
++            signature(c.body, app=app), ChordError('direct failure'))
++
++
++# ----------------------------------------------------------------------
++# redis backend dependency unpacking (no redis server needed)
++# ----------------------------------------------------------------------
++
++class test_redis_chord_result_unpacking:
++    """RedisBackend._unpack_chord_result must chain the original exception."""
++
++    @pytest.fixture
++    def redis_backend(self, capp):
++        redis = pytest.importorskip('redis')
++        app, tasks = capp
++        from celery.backends.redis import RedisBackend
++        return RedisBackend(app=app)
++
++    def _encode_meta(self, backend, tid, state, result):
++        encoded = backend.encode_result(result, state)
++        return backend.encode([1, tid, state, encoded])
++
++    def test_failed_dependency_raises_chained_chord_error(self, redis_backend):
++        backend = redis_backend
++        original = ValueError('redis dep failed')
++        tup = self._encode_meta(backend, 'tid-1', states.FAILURE, original)
++        with pytest.raises(ChordError) as exc_info:
++            backend._unpack_chord_result(tup, backend.decode)
++        err = exc_info.value
++        assert 'tid-1' in str(err)
++        assert err.__cause__ is not None
++        assert type(err.__cause__) is ValueError
++
++    def test_failed_dependency_message_format(self, redis_backend):
++        backend = redis_backend
++        original = KeyError('missing')
++        tup = self._encode_meta(backend, 'tid-2', states.FAILURE, original)
++        with pytest.raises(ChordError) as exc_info:
++            backend._unpack_chord_result(tup, backend.decode)
++        assert str(exc_info.value).startswith('Dependency tid-2 raised')
++
++    def test_successful_dependency_passes_through(self, redis_backend):
++        backend = redis_backend
++        tup = self._encode_meta(backend, 'tid-3', states.SUCCESS, 123)
++        assert backend._unpack_chord_result(tup, backend.decode) == 123
++
++    def test_revoked_dependency_chained(self, redis_backend):
++        backend = redis_backend
++        from celery.exceptions import TaskRevokedError
++        original = TaskRevokedError('revoked')
++        tup = self._encode_meta(backend, 'tid-4', states.REVOKED, original)
++        with pytest.raises(ChordError) as exc_info:
++            backend._unpack_chord_result(tup, backend.decode)
++        assert exc_info.value.__cause__ is not None
++
++
++class test_chord_error_equality_semantics:
++    """ChordError construction must behave like any other exception."""
++
++    def test_message_as_single_arg(self):
++        err = ChordError('Dependency x raised ValueError(1)')
++        assert err.args == ('Dependency x raised ValueError(1)',)
++
++    def test_empty_message(self):
++        err = ChordError()
++        assert err.args == ()
++        clone = pickle.loads(pickle.dumps(err))
++        assert clone.args == ()
++
++    def test_multiple_args(self):
++        err = ChordError('a', 'b', 3)
++        clone = pickle.loads(pickle.dumps(err))
++        assert clone.args == ('a', 'b', 3)
++
++    def test_is_task_error(self):
++        from celery.exceptions import TaskError
++        assert issubclass(ChordError, TaskError)
++
++    def test_cause_none_by_default(self):
++        assert ChordError('x').__cause__ is None
++
++    def test_explicit_cause_assignment(self):
++        err = ChordError('x')
++        cause = RuntimeError('y')
++        err.__cause__ = cause
++        assert err.__cause__ is cause
++
++    @pytest.mark.parametrize('exc_factory', [
++        lambda: ValueError('v'),
++        lambda: KeyError('k'),
++        lambda: RuntimeError('r'),
++        lambda: OSError('o'),
++        lambda: TypeError('t'),
++    ], ids=['ValueError', 'KeyError', 'RuntimeError', 'OSError', 'TypeError'])
++    def test_various_cause_types_roundtrip(self, exc_factory):
++        cause = exc_factory()
++        err = ChordError('msg')
++        err.__cause__ = cause
++        clone = pickle.loads(pickle.dumps(err))
++        assert type(clone.__cause__) is type(cause)
++        assert clone.__cause__.args == cause.args
++
++
++class test_group_body_get_contract:
++    """Consumer-facing contract: getting a failed body result raises."""
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_get_raises_chord_error_with_cause(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=0, exc=ValueError('kaboom'))
++        with pytest.raises(ChordError) as exc_info:
++            app.AsyncResult(_body_task_ids(c)[0]).get(timeout=1, interval=0)
++        assert type(exc_info.value.__cause__) is ValueError
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_get_propagate_false_returns_error(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=0)
++        res = app.AsyncResult(_body_task_ids(c)[0]).get(
++            timeout=1, interval=0, propagate=False)
++        assert isinstance(res, ChordError)
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_group_join_raises(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=0)
++        gres = app.GroupResult(
++            c.body.id,
++            [app.AsyncResult(tid) for tid in _body_task_ids(c)],
++        )
++        with pytest.raises(ChordError):
++            gres.join(timeout=1, interval=0)
++
++    @pytest.mark.parametrize('driver', WORKER_DRIVERS,
++                             ids=[d.__name__ for d in WORKER_DRIVERS])
++    def test_group_join_propagate_false(self, capp, driver):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        driver(app, c, failing_index=0)
++        gres = app.GroupResult(
++            c.body.id,
++            [app.AsyncResult(tid) for tid in _body_task_ids(c)],
++        )
++        values = gres.join(timeout=1, interval=0, propagate=False)
++        assert len(values) == len(c.body.tasks)
++        assert all(isinstance(v, ChordError) for v in values)
++
++
++class test_group_body_errback_isolation:
++    """One failing errback must not prevent other members' handling."""
++
++    def test_failing_errback_other_members_still_failed(self, capp):
++        app, tasks = capp
++
++        @app.task(name='tests.bad_errback_isolation')
++        def bad_errback(*args, **kwargs):
++            raise RuntimeError('errback exploded')
++
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(3)], app=app,
++        )
++        body = body.set(link_error=[bad_errback.s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        app.conf.task_eager_propagates = False
++        results = _header_results(app, c)
++        for i, res in enumerate(results):
++            if i == 0:
++                app.backend.mark_as_failure(res.id, ValueError('kaboom'))
++            else:
++                app.backend.store_result(res.id, i * 2, states.SUCCESS)
++        deps = app.GroupResult(c.tasks.id, results)
++        app.backend.apply_chord((c.tasks.id, deps), c.body)
++        for i, res in enumerate(results):
++            state = states.FAILURE if i == 0 else states.SUCCESS
++            request = Context({
++                'id': res.id, 'group': c.tasks.id, 'chord': dict(c.body),
++            })
++            app.backend.on_chord_part_return(request, state, None)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++
++    def test_one_bad_one_good_errback(self, capp):
++        app, tasks = capp
++
++        @app.task(name='tests.bad_errback_isolation2')
++        def bad_errback(*args, **kwargs):
++            raise RuntimeError('errback exploded')
++
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(2)], app=app,
++        )
++        # the well-behaved errback comes first: errbacks are invoked in
++        # order and a later one blowing up must not undo earlier ones nor
++        # prevent the failure results from being stored.
++        body = body.set(link_error=[
++            tasks['record_errback'].s(),
++            bad_errback.s(),
++        ])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        app.conf.task_eager_propagates = False
++        results = _header_results(app, c)
++        for i, res in enumerate(results):
++            if i == 0:
++                app.backend.mark_as_failure(res.id, ValueError('kaboom'))
++            else:
++                app.backend.store_result(res.id, i * 2, states.SUCCESS)
++        deps = app.GroupResult(c.tasks.id, results)
++        app.backend.apply_chord((c.tasks.id, deps), c.body)
++        for i, res in enumerate(results):
++            state = states.FAILURE if i == 0 else states.SUCCESS
++            request = Context({
++                'id': res.id, 'group': c.tasks.id, 'chord': dict(c.body),
++            })
++            app.backend.on_chord_part_return(request, state, None)
++        # the good errback still ran for every member
++        assert set(ERRBACK_CALLS) == set(_body_task_ids(c))
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
+diff --git a/t/unit/backends/test_chord_failure_backends.py b/t/unit/backends/test_chord_failure_backends.py
+new file mode 100644
+index 000000000..c9eab8e26
+--- /dev/null
++++ b/t/unit/backends/test_chord_failure_backends.py
+@@ -0,0 +1,560 @@
++"""Backend-level tests for chord failure propagation.
++
++These tests exercise the *fallback* chord completion path used by result
++backends without native chord counter support (database, filesystem, ...):
++the ``celery.chord_unlock`` task joins the header result and either invokes
++the chord body or reports the failure through
++:meth:`~celery.backends.base.Backend.chord_error_from_stack`.
++
++They also cover serializer edge cases (JSON result serialization cannot
++round-trip exception objects) and the retry semantics of the unlock task.
++
++Everything runs locally: the cache backend is in-memory and the filesystem
++backend writes to a temporary directory; no broker is ever contacted.
++"""
++import pickle
++
++import pytest
++
++from celery import Celery, chord, group, signature, states
++from celery.exceptions import ChordError, Retry
++
++ERRBACK_CALLS = []
++BODY_EXECUTIONS = []
++
++
++def _register_tasks(app):
++    @app.task(name='tests2.record_errback')
++    def record_errback(*args, **kwargs):
++        first = args[0] if args else None
++        ERRBACK_CALLS.append(getattr(first, 'id', first))
++        return True
++
++    @app.task(name='tests2.record_new_style_errback')
++    def record_new_style_errback(request, exc, traceback):
++        ERRBACK_CALLS.append((request, exc, traceback))
++        return True
++
++    @app.task(name='tests2.add')
++    def add(x, y):
++        return x + y
++
++    @app.task(name='tests2.record_body_execution')
++    def record_body_execution(*args, **kwargs):
++        BODY_EXECUTIONS.append((args, kwargs))
++        return 'body-ran'
++
++    @app.task(name='tests2.explode')
++    def explode(*args, **kwargs):
++        raise RuntimeError('body exploded')
++
++    return {
++        'record_errback': record_errback,
++        'record_new_style_errback': record_new_style_errback,
++        'add': add,
++        'record_body_execution': record_body_execution,
++        'explode': explode,
++    }
++
++
++def _base_conf(**extra):
++    conf = dict(
++        task_always_eager=True,
++        task_eager_propagates=True,
++        task_store_eager_result=True,
++        accept_content=['pickle', 'json'],
++    )
++    conf.update(extra)
++    return conf
++
++
++@pytest.fixture
++def cache_app():
++    ERRBACK_CALLS.clear()
++    BODY_EXECUTIONS.clear()
++    app = Celery('chord_backend_tests_cache', broker='memory://',
++                 backend='cache+memory://')
++    app.conf.update(_base_conf(result_serializer='pickle'))
++    tasks = _register_tasks(app)
++    yield app, tasks
++    ERRBACK_CALLS.clear()
++    BODY_EXECUTIONS.clear()
++
++
++@pytest.fixture
++def fs_app(tmp_path):
++    ERRBACK_CALLS.clear()
++    BODY_EXECUTIONS.clear()
++    app = Celery('chord_backend_tests_fs', broker='memory://',
++                 backend=f'file://{tmp_path}')
++    app.conf.update(_base_conf(result_serializer='pickle'))
++    tasks = _register_tasks(app)
++    yield app, tasks
++    ERRBACK_CALLS.clear()
++    BODY_EXECUTIONS.clear()
++
++
++@pytest.fixture
++def json_app():
++    ERRBACK_CALLS.clear()
++    BODY_EXECUTIONS.clear()
++    app = Celery('chord_backend_tests_json', broker='memory://',
++                 backend='cache+memory://')
++    app.conf.update(_base_conf(result_serializer='json'))
++    tasks = _register_tasks(app)
++    yield app, tasks
++    ERRBACK_CALLS.clear()
++    BODY_EXECUTIONS.clear()
++
++
++def _build_chord(app, tasks, header_size=3, body=None, link_error=True):
++    header = group(
++        [tasks['add'].s(i, i) for i in range(header_size)], app=app,
++    )
++    if body is None:
++        body = group(
++            [tasks['record_body_execution'].s(), tasks['record_body_execution'].s()],
++            app=app,
++        )
++    if link_error:
++        body = body.set(link_error=[tasks['record_errback'].s()])
++    c = chord(header, body, app=app)
++    body_result = c.freeze()
++    return c, body_result
++
++
++def _header_results(app, c):
++    return [app.AsyncResult(t.options['task_id']) for t in c.tasks.tasks]
++
++
++def _store_header_results(app, c, failing_index, exc=None):
++    backend = app.backend
++    results = _header_results(app, c)
++    for i, res in enumerate(results):
++        if i == failing_index:
++            backend.mark_as_failure(res.id, exc or ValueError('kaboom'))
++        else:
++            backend.store_result(res.id, i * 2, states.SUCCESS)
++    deps = app.GroupResult(c.tasks.id, results)
++    backend.apply_chord((c.tasks.id, deps), c.body)
++    return results
++
++
++def _run_unlock(app, c, failing_index, exc=None):
++    results = _store_header_results(app, c, failing_index, exc=exc)
++    # Backends with native chord counter support need an explicit
++    # celery.chord_unlock run; for the others apply_chord() above has
++    # already triggered the fallback unlock task.
++    if app.backend.implements_incr:
++        unlock = app.tasks['celery.chord_unlock']
++        return unlock.apply(
++            args=(c.tasks.id, dict(c.body)),
++            kwargs={'result': [r.as_tuple() for r in results]},
++        )
++
++
++def _body_task_ids(c):
++    return [t.options['task_id'] for t in c.body.tasks]
++
++
++# ----------------------------------------------------------------------
++# filesystem backend: the non-incr fallback path
++# ----------------------------------------------------------------------
++
++class test_filesystem_backend_failure:
++
++    def test_group_body_members_failed(self, fs_app):
++        app, tasks = fs_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=1)
++        for tid in _body_task_ids(c):
++            res = app.AsyncResult(tid)
++            assert res.state == states.FAILURE
++            assert isinstance(res.result, ChordError)
++
++    def test_group_body_errbacks_per_member(self, fs_app):
++        app, tasks = fs_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        assert set(ERRBACK_CALLS) == set(_body_task_ids(c))
++
++    def test_group_body_chord_error_cause(self, fs_app):
++        app, tasks = fs_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=2, exc=IOError('disk gone'))
++        for tid in _body_task_ids(c):
++            err = app.AsyncResult(tid).result
++            assert isinstance(err, ChordError)
++            assert type(err.__cause__) is IOError
++            assert err.__cause__.args == ('disk gone',)
++
++    def test_group_body_result_persisted_on_disk(self, fs_app, tmp_path):
++        app, tasks = fs_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        # results must survive a brand new backend instance (they are files)
++        app2 = Celery('chord_backend_tests_fs2', broker='memory://',
++                      backend=f'file://{tmp_path}')
++        app2.conf.update(_base_conf(result_serializer='pickle'))
++        for tid in _body_task_ids(c):
++            res = app2.AsyncResult(tid)
++            assert res.state == states.FAILURE
++            assert isinstance(res.result, ChordError)
++
++    def test_single_body_failed(self, fs_app):
++        app, tasks = fs_app
++        body = tasks['record_body_execution'].s()
++        c, _ = _build_chord(app, tasks, body=body)
++        _run_unlock(app, c, failing_index=1)
++        res = app.AsyncResult(c.body.options['task_id'])
++        assert res.state == states.FAILURE
++        assert isinstance(res.result, ChordError)
++        assert len(ERRBACK_CALLS) == 1
++
++    def test_body_not_executed_on_failure(self, fs_app):
++        app, tasks = fs_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        assert BODY_EXECUTIONS == []
++
++    def test_successful_header_results_kept(self, fs_app):
++        app, tasks = fs_app
++        c, _ = _build_chord(app, tasks)
++        results = _header_results(app, c)
++        _run_unlock(app, c, failing_index=1)
++        for i, res in enumerate(results):
++            if i == 1:
++                assert res.state == states.FAILURE
++            else:
++                assert res.state == states.SUCCESS
++                assert res.result == i * 2
++
++    def test_group_result_failed(self, fs_app):
++        app, tasks = fs_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        gres = app.GroupResult(
++            c.body.id,
++            [app.AsyncResult(tid) for tid in _body_task_ids(c)],
++        )
++        assert gres.ready()
++        assert gres.failed()
++
++
++class test_filesystem_backend_success:
++
++    def test_group_body_runs_on_success(self, fs_app):
++        app, tasks = fs_app
++        c, _ = _build_chord(app, tasks, link_error=False)
++        _run_unlock(app, c, failing_index=-1)
++        assert len(BODY_EXECUTIONS) == len(c.body.tasks)
++        assert ERRBACK_CALLS == []
++
++    def test_single_body_runs_on_success(self, fs_app):
++        app, tasks = fs_app
++        body = tasks['record_body_execution'].s()
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        _run_unlock(app, c, failing_index=-1)
++        assert len(BODY_EXECUTIONS) == 1
++
++
++# ----------------------------------------------------------------------
++# JSON serializer: exceptions cannot round-trip, but states must be right
++# ----------------------------------------------------------------------
++
++class test_json_serializer_failure:
++
++    def test_group_body_members_failed_with_json(self, json_app):
++        app, tasks = json_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++
++    def test_errbacks_still_fire_with_json(self, json_app):
++        app, tasks = json_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        assert set(ERRBACK_CALLS) == set(_body_task_ids(c))
++
++    def test_json_result_exception_type_preserved(self, json_app):
++        app, tasks = json_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        err = app.AsyncResult(_body_task_ids(c)[0]).result
++        # JSON backends rebuild a plain exception carrying the original
++        # type name: consumers must still be able to tell it was a
++        # chord-level failure.
++        assert 'ChordError' in type(err).__name__
++
++    def test_group_result_failed_with_json(self, json_app):
++        app, tasks = json_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=1)
++        gres = app.GroupResult(
++            c.body.id,
++            [app.AsyncResult(tid) for tid in _body_task_ids(c)],
++        )
++        assert gres.ready()
++        assert gres.failed()
++
++
++# ----------------------------------------------------------------------
++# celery.chord_unlock retry semantics
++# ----------------------------------------------------------------------
++
++class test_unlock_chord_retry:
++
++    def test_retries_when_header_not_ready(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        results = _header_results(app, c)
++        # only store a subset of header results: the group is not ready
++        app.backend.store_result(results[0].id, 0, states.SUCCESS)
++        deps = app.GroupResult(c.tasks.id, results)
++        app.backend.apply_chord((c.tasks.id, deps), c.body)
++        unlock = app.tasks['celery.chord_unlock']
++        with pytest.raises(Retry):
++            unlock.apply(
++                args=(c.tasks.id, dict(c.body)),
++                kwargs={'result': [r.as_tuple() for r in results]},
++            )
++        # no failure propagation may happen while the chord is incomplete
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.PENDING
++        assert ERRBACK_CALLS == []
++
++    def test_no_errbacks_before_header_completes(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        results = _header_results(app, c)
++        app.backend.store_result(results[0].id, 0, states.SUCCESS)
++        app.backend.store_result(results[1].id, 2, states.SUCCESS)
++        deps = app.GroupResult(c.tasks.id, results)
++        app.backend.apply_chord((c.tasks.id, deps), c.body)
++        unlock = app.tasks['celery.chord_unlock']
++        with pytest.raises(Retry):
++            unlock.apply(
++                args=(c.tasks.id, dict(c.body)),
++                kwargs={'result': [r.as_tuple() for r in results]},
++            )
++        assert ERRBACK_CALLS == []
++        assert BODY_EXECUTIONS == []
++
++
++# ----------------------------------------------------------------------
++# pathological exceptions
++# ----------------------------------------------------------------------
++
++class test_unpickleable_cause:
++
++    def test_store_failure_with_unpickleable_cause(self, cache_app):
++        app, tasks = cache_app
++
++        class WeirdError(Exception):
++            def __reduce__(self):
++                raise TypeError('cannot pickle me')
++
++        app.backend.chord_error_from_stack(
++            signature(group([tasks['add'].s(1, 1)], app=app), app=app),
++            ChordError('weird'),
++        )
++
++    def test_chord_error_with_lambda_cause_still_stores(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        err = ChordError('lambda cause')
++        try:
++            err.__cause__ = type('Local', (Exception,), {})('x')
++        except Exception:
++            pytest.skip('cannot build local exception')
++        try:
++            raise err
++        except ChordError as e:
++            # must not blow up even if the cause cannot be pickled:
++            # storing falls back to a pickleable approximation
++            app.backend.chord_error_from_stack(signature(c.body, app=app), e)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++
++
++# ----------------------------------------------------------------------
++# group result bookkeeping
++# ----------------------------------------------------------------------
++
++class test_group_bookkeeping:
++
++    def test_group_meta_failure_visible_via_restore(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        meta = app.backend.get_task_meta(c.body.id)
++        assert meta['status'] == states.FAILURE
++        assert 'date_done' in meta
++
++    def test_failure_meta_has_traceback_or_none(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        meta = app.backend.get_task_meta(_body_task_ids(c)[0])
++        assert meta['status'] == states.FAILURE
++        assert 'traceback' in meta
++
++    def test_get_raises_chord_error(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        with pytest.raises(ChordError):
++            app.AsyncResult(_body_task_ids(c)[0]).get(timeout=1, interval=0)
++
++    def test_get_on_group_raises(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        gres = app.GroupResult(
++            c.body.id,
++            [app.AsyncResult(tid) for tid in _body_task_ids(c)],
++        )
++        with pytest.raises(ChordError):
++            gres.join(timeout=1, interval=0)
++
++    def test_forget_clears_failure(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        res = app.AsyncResult(_body_task_ids(c)[0])
++        assert res.state == states.FAILURE
++        res.forget()
++        assert app.AsyncResult(res.id).state == states.PENDING
++
++
++# ----------------------------------------------------------------------
++# more backend/serializer combinations
++# ----------------------------------------------------------------------
++
++class test_json_on_filesystem:
++
++    @pytest.fixture
++    def json_fs_app(self, tmp_path):
++        ERRBACK_CALLS.clear()
++        BODY_EXECUTIONS.clear()
++        app = Celery('chord_backend_tests_json_fs', broker='memory://',
++                     backend=f'file://{tmp_path}')
++        app.conf.update(_base_conf(result_serializer='json'))
++        tasks = _register_tasks(app)
++        yield app, tasks
++        ERRBACK_CALLS.clear()
++        BODY_EXECUTIONS.clear()
++
++    def test_group_body_members_failed(self, json_fs_app):
++        app, tasks = json_fs_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++
++    def test_errbacks_fired(self, json_fs_app):
++        app, tasks = json_fs_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        assert set(ERRBACK_CALLS) == set(_body_task_ids(c))
++
++
++class test_group_body_shapes:
++
++    def test_single_member_group_via_unlock(self, cache_app):
++        app, tasks = cache_app
++        body = group([tasks['record_body_execution'].s()], app=app)
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        _run_unlock(app, c, failing_index=0)
++        tid = _body_task_ids(c)[0]
++        res = app.AsyncResult(tid)
++        assert res.state == states.FAILURE
++        assert isinstance(res.result, ChordError)
++        assert ERRBACK_CALLS == [tid]
++
++    def test_five_member_group_body(self, cache_app):
++        app, tasks = cache_app
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(5)], app=app,
++        )
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False,
++                            header_size=5)
++        _run_unlock(app, c, failing_index=3)
++        assert len(ERRBACK_CALLS) == 5
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++
++    def test_body_members_with_kwargs(self, cache_app):
++        app, tasks = cache_app
++        body = group(
++            [tasks['record_body_execution'].s(key='value') for _ in range(2)],
++            app=app,
++        )
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        _run_unlock(app, c, failing_index=0)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++
++    def test_repeated_unlock_keeps_failure_state(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        _run_unlock(app, c, failing_index=0)
++        for tid in _body_task_ids(c):
++            res = app.AsyncResult(tid)
++            assert res.state == states.FAILURE
++            assert isinstance(res.result, ChordError)
++
++    def test_group_body_failure_does_not_touch_other_chords(self, cache_app):
++        app, tasks = cache_app
++        c1, _ = _build_chord(app, tasks)
++        c2, _ = _build_chord(app, tasks)
++        _run_unlock(app, c1, failing_index=0)
++        # the second chord's body is untouched
++        for tid in _body_task_ids(c2):
++            assert app.AsyncResult(tid).state == states.PENDING
++        # and completes fine on its own
++        _run_unlock(app, c2, failing_index=-1)
++        assert all(
++            isinstance(args, tuple) for args, _ in BODY_EXECUTIONS
++        )
++
++
++class test_failure_meta_contents:
++
++    def test_meta_has_task_id(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        for tid in _body_task_ids(c):
++            meta = app.backend.get_task_meta(tid)
++            assert meta['task_id'] == tid
++
++    def test_meta_has_date_done(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        for tid in _body_task_ids(c):
++            meta = app.backend.get_task_meta(tid)
++            assert meta.get('date_done') is not None
++
++    def test_meta_result_is_chord_error(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        for tid in _body_task_ids(c):
++            meta = app.backend.get_task_meta(tid)
++            assert isinstance(meta['result'], ChordError)
++            assert 'kaboom' in str(meta['result'])
++
++    def test_meta_children_empty(self, cache_app):
++        app, tasks = cache_app
++        c, _ = _build_chord(app, tasks)
++        _run_unlock(app, c, failing_index=0)
++        for tid in _body_task_ids(c):
++            meta = app.backend.get_task_meta(tid)
++            assert meta.get('children') in (None, [])
+diff --git a/t/unit/backends/test_chord_unlock_edges.py b/t/unit/backends/test_chord_unlock_edges.py
+new file mode 100644
+index 000000000..81213037c
+--- /dev/null
++++ b/t/unit/backends/test_chord_unlock_edges.py
+@@ -0,0 +1,590 @@
++"""Edge-case tests for chord completion and failure semantics.
++
++Covers the native chord-counter path (``on_chord_part_return``) in detail:
++ordering guarantees, partial arrival behaviour, the ``chord_size`` option,
++the group-body *callback* error path (header succeeded but running the body
++failed), and the different errback calling conventions.
++
++Everything runs against the in-memory cache backend; no broker is needed.
++"""
++import pytest
++
++from celery import Celery, chord, group, signature, states
++from celery.app.task import Context
++from celery.exceptions import ChordError
++
++ERRBACK_CALLS = []
++BODY_EXECUTIONS = []
++
++
++def _register_tasks(app):
++    @app.task(name='tests3.record_errback')
++    def record_errback(*args, **kwargs):
++        first = args[0] if args else None
++        ERRBACK_CALLS.append(getattr(first, 'id', first))
++        return True
++
++    @app.task(name='tests3.record_new_style_errback')
++    def record_new_style_errback(request, exc, traceback):
++        ERRBACK_CALLS.append((request, exc, traceback))
++        return True
++
++    @app.task(name='tests3.old_style_errback')
++    def old_style_errback(task_id):
++        ERRBACK_CALLS.append(task_id)
++        return True
++
++    @app.task(name='tests3.add')
++    def add(x, y):
++        return x + y
++
++    @app.task(name='tests3.record_body_execution')
++    def record_body_execution(*args, **kwargs):
++        BODY_EXECUTIONS.append((args, kwargs))
++        return 'body-ran'
++
++    @app.task(name='tests3.explode')
++    def explode(*args, **kwargs):
++        raise RuntimeError('body exploded')
++
++    return {
++        'record_errback': record_errback,
++        'record_new_style_errback': record_new_style_errback,
++        'old_style_errback': old_style_errback,
++        'add': add,
++        'record_body_execution': record_body_execution,
++        'explode': explode,
++    }
++
++
++@pytest.fixture
++def capp():
++    ERRBACK_CALLS.clear()
++    BODY_EXECUTIONS.clear()
++    app = Celery('chord_edge_tests', broker='memory://',
++                 backend='cache+memory://')
++    app.conf.update(
++        task_always_eager=True,
++        task_eager_propagates=True,
++        task_store_eager_result=True,
++        result_serializer='pickle',
++        accept_content=['pickle', 'json'],
++    )
++    tasks = _register_tasks(app)
++    yield app, tasks
++    ERRBACK_CALLS.clear()
++    BODY_EXECUTIONS.clear()
++
++
++def _build_chord(app, tasks, header_size=3, body=None, link_error=True):
++    header = group(
++        [tasks['add'].s(i, i) for i in range(header_size)], app=app,
++    )
++    if body is None:
++        body = group(
++            [tasks['record_body_execution'].s(), tasks['record_body_execution'].s()],
++            app=app,
++        )
++    if link_error:
++        body = body.set(link_error=[tasks['record_errback'].s()])
++    c = chord(header, body, app=app)
++    body_result = c.freeze()
++    return c, body_result
++
++
++def _header_results(app, c):
++    return [app.AsyncResult(t.options['task_id']) for t in c.tasks.tasks]
++
++
++def _body_task_ids(c):
++    return [t.options['task_id'] for t in c.body.tasks]
++
++
++def _chord_request(c, result):
++    return Context({
++        'id': result.id,
++        'group': c.tasks.id,
++        'chord': dict(c.body),
++    })
++
++
++def _setup(app, c):
++    """Save the header group result and initialise the chord counter."""
++    results = _header_results(app, c)
++    deps = app.GroupResult(c.tasks.id, results)
++    app.backend.apply_chord((c.tasks.id, deps), c.body)
++    return results
++
++
++# ----------------------------------------------------------------------
++# native counter path: failure only propagates once all parts returned
++# ----------------------------------------------------------------------
++
++class test_native_path_partial_arrivals:
++
++    def test_no_propagation_before_last_part(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        results = _setup(app, c)
++        # the FIRST part fails, but two parts have not returned yet
++        app.backend.mark_as_failure(results[0].id, ValueError('early'))
++        app.backend.on_chord_part_return(
++            _chord_request(c, results[0]), states.FAILURE, None)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.PENDING
++        assert ERRBACK_CALLS == []
++
++    def test_failure_waits_for_all_parts(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        results = _setup(app, c)
++        app.backend.mark_as_failure(results[0].id, ValueError('early'))
++        app.backend.on_chord_part_return(
++            _chord_request(c, results[0]), states.FAILURE, None)
++        app.backend.store_result(results[1].id, 2, states.SUCCESS)
++        app.backend.on_chord_part_return(
++            _chord_request(c, results[1]), states.SUCCESS, 2)
++        # still one part missing: nothing may happen yet
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.PENDING
++        assert ERRBACK_CALLS == []
++        # last part arrives: now the failure must propagate
++        app.backend.store_result(results[2].id, 4, states.SUCCESS)
++        app.backend.on_chord_part_return(
++            _chord_request(c, results[2]), states.SUCCESS, 4)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++        assert len(ERRBACK_CALLS) == 2
++
++    def test_failure_arriving_last(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        results = _setup(app, c)
++        for i in (0, 1):
++            app.backend.store_result(results[i].id, i * 2, states.SUCCESS)
++            app.backend.on_chord_part_return(
++                _chord_request(c, results[i]), states.SUCCESS, i * 2)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.PENDING
++        app.backend.mark_as_failure(results[2].id, ValueError('late'))
++        app.backend.on_chord_part_return(
++            _chord_request(c, results[2]), states.FAILURE, None)
++        for tid in _body_task_ids(c):
++            res = app.AsyncResult(tid)
++            assert res.state == states.FAILURE
++            assert isinstance(res.result, ChordError)
++            assert type(res.result.__cause__) is ValueError
++
++    def test_single_task_body_partial_arrivals(self, capp):
++        app, tasks = capp
++        body = tasks['record_body_execution'].s()
++        c, _ = _build_chord(app, tasks, body=body)
++        results = _setup(app, c)
++        app.backend.mark_as_failure(results[0].id, ValueError('x'))
++        app.backend.on_chord_part_return(
++            _chord_request(c, results[0]), states.FAILURE, None)
++        assert app.AsyncResult(c.body.options['task_id']).state == states.PENDING
++        for i in (1, 2):
++            app.backend.store_result(results[i].id, i * 2, states.SUCCESS)
++            app.backend.on_chord_part_return(
++                _chord_request(c, results[i]), states.SUCCESS, i * 2)
++        res = app.AsyncResult(c.body.options['task_id'])
++        assert res.state == states.FAILURE
++        assert isinstance(res.result, ChordError)
++
++
++class test_native_path_success_ordering:
++
++    def test_group_body_receives_header_results_in_order(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks, link_error=False)
++        results = _setup(app, c)
++        # return parts out of order
++        for i in (2, 0, 1):
++            app.backend.store_result(results[i].id, i * 2, states.SUCCESS)
++            app.backend.on_chord_part_return(
++                _chord_request(c, results[i]), states.SUCCESS, i * 2)
++        assert len(BODY_EXECUTIONS) == 2
++        for args, kwargs in BODY_EXECUTIONS:
++            assert args[0] == [0, 2, 4]
++
++    def test_success_does_not_call_errbacks(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        results = _setup(app, c)
++        for i, res in enumerate(results):
++            app.backend.store_result(res.id, i * 2, states.SUCCESS)
++            app.backend.on_chord_part_return(
++                _chord_request(c, res), states.SUCCESS, i * 2)
++        assert ERRBACK_CALLS == []
++        assert len(BODY_EXECUTIONS) == 2
++
++
++# ----------------------------------------------------------------------
++# group body callback errors (header fine, body blows up when called)
++# ----------------------------------------------------------------------
++
++class test_group_body_callback_error:
++
++    def _drive(self, app, c):
++        results = _setup(app, c)
++        for i, res in enumerate(results):
++            app.backend.store_result(res.id, i * 2, states.SUCCESS)
++            app.backend.on_chord_part_return(
++                _chord_request(c, res), states.SUCCESS, i * 2)
++
++    def test_unexecuted_members_failed_on_callback_error(self, capp):
++        app, tasks = capp
++        # the exploding member comes first: the second member never runs
++        body = group(
++            [tasks['explode'].s(), tasks['record_body_execution'].s()],
++            app=app,
++        )
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        self._drive(app, c)
++        res = app.AsyncResult(_body_task_ids(c)[1])
++        assert res.state == states.FAILURE
++        assert isinstance(res.result, ChordError)
++        assert 'Callback error' in str(res.result)
++
++    def test_completed_member_keeps_success_on_callback_error(self, capp):
++        app, tasks = capp
++        # the first member completes before the second one explodes:
++        # its stored SUCCESS result must survive (result backend dedup
++        # protection), while the uncompleted members are failed.
++        body = group(
++            [tasks['record_body_execution'].s(), tasks['explode'].s()],
++            app=app,
++        )
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        self._drive(app, c)
++        assert app.AsyncResult(_body_task_ids(c)[0]).state == states.SUCCESS
++        res = app.AsyncResult(_body_task_ids(c)[1])
++        assert res.state == states.FAILURE
++        assert isinstance(res.result, ChordError)
++
++    def test_callback_error_chains_body_exception(self, capp):
++        app, tasks = capp
++        body = group(
++            [tasks['explode'].s(), tasks['record_body_execution'].s()],
++            app=app,
++        )
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        self._drive(app, c)
++        err = app.AsyncResult(_body_task_ids(c)[1]).result
++        assert type(err.__cause__) is RuntimeError
++        assert err.__cause__.args == ('body exploded',)
++
++    def test_callback_error_errbacks_per_member(self, capp):
++        app, tasks = capp
++        body = group(
++            [tasks['explode'].s(), tasks['record_body_execution'].s()],
++            app=app,
++        )
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        self._drive(app, c)
++        assert set(ERRBACK_CALLS) == set(_body_task_ids(c))
++
++
++# ----------------------------------------------------------------------
++# errback calling conventions
++# ----------------------------------------------------------------------
++
++class test_errback_conventions:
++
++    def test_old_style_errback_gets_task_id(self, capp):
++        app, tasks = capp
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(2)], app=app,
++        )
++        body = body.set(link_error=[tasks['old_style_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        results = _setup(app, c)
++        app.backend.mark_as_failure(results[0].id, ValueError('x'))
++        for i, res in enumerate(results):
++            state = states.FAILURE if i == 0 else states.SUCCESS
++            app.backend.on_chord_part_return(
++                _chord_request(c, res), state, None)
++        assert set(ERRBACK_CALLS) == set(_body_task_ids(c))
++        assert all(isinstance(tid, str) for tid in ERRBACK_CALLS)
++
++    def test_new_style_errback_gets_request_exc_tb(self, capp):
++        app, tasks = capp
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(2)], app=app,
++        )
++        body = body.set(link_error=[tasks['record_new_style_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        results = _setup(app, c)
++        app.backend.mark_as_failure(results[1].id, ValueError('x'))
++        for i, res in enumerate(results):
++            state = states.FAILURE if i == 1 else states.SUCCESS
++            app.backend.on_chord_part_return(
++                _chord_request(c, res), state, None)
++        assert len(ERRBACK_CALLS) == 2
++        member_ids = set(_body_task_ids(c))
++        for request, exc, tb in ERRBACK_CALLS:
++            assert request.id in member_ids
++            assert isinstance(exc, ChordError)
++
++    def test_serialized_errback_signature(self, capp):
++        app, tasks = capp
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(2)], app=app,
++        )
++        # errback given in its serialized (dict) form, as it would appear
++        # after a message round trip
++        eb = dict(tasks['record_errback'].s())
++        body = body.set(link_error=[eb])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        results = _setup(app, c)
++        app.backend.mark_as_failure(results[0].id, ValueError('x'))
++        for i, res in enumerate(results):
++            state = states.FAILURE if i == 0 else states.SUCCESS
++            app.backend.on_chord_part_return(
++                _chord_request(c, res), state, None)
++        assert set(ERRBACK_CALLS) == set(_body_task_ids(c))
++
++    def test_mixed_errback_styles(self, capp):
++        app, tasks = capp
++        body = group(
++            [tasks['record_body_execution'].s() for _ in range(2)], app=app,
++        )
++        body = body.set(link_error=[
++            tasks['old_style_errback'].s(),
++            tasks['record_errback'].s(),
++        ])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        results = _setup(app, c)
++        app.backend.mark_as_failure(results[0].id, ValueError('x'))
++        for i, res in enumerate(results):
++            state = states.FAILURE if i == 0 else states.SUCCESS
++            app.backend.on_chord_part_return(
++                _chord_request(c, res), state, None)
++        # 2 members x 2 errbacks; every recorded id is a member id
++        assert len(ERRBACK_CALLS) == 4
++        assert set(ERRBACK_CALLS) == set(_body_task_ids(c))
++
++
++# ----------------------------------------------------------------------
++# chord_size option handling
++# ----------------------------------------------------------------------
++
++class test_chord_size_option:
++
++    def _request_with_size(self, c, result, size):
++        req = _chord_request(c, result)
++        req.chord = dict(req.chord)
++        req.chord.setdefault('options', {})
++        req.chord['options'] = dict(req.chord['options'])
++        req.chord['options']['chord_size'] = size
++        req.chord['chord_size'] = size
++        return req
++
++    def test_explicit_chord_size_respected(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks, header_size=3)
++        results = _setup(app, c)
++        # claim the chord only has 2 parts: failure after the second one
++        app.backend.store_result(results[0].id, 0, states.SUCCESS)
++        app.backend.on_chord_part_return(
++            self._request_with_size(c, results[0], 2), states.SUCCESS, 0)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.PENDING
++        app.backend.mark_as_failure(results[1].id, ValueError('x'))
++        app.backend.on_chord_part_return(
++            self._request_with_size(c, results[1], 2), states.FAILURE, None)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++
++
++# ----------------------------------------------------------------------
++# immutability of header results
++# ----------------------------------------------------------------------
++
++class test_header_result_immutability:
++
++    @pytest.mark.parametrize('failing_index', [0, 1, 2])
++    def test_other_header_results_not_overwritten(self, capp, failing_index):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        results = _setup(app, c)
++        for i, res in enumerate(results):
++            if i == failing_index:
++                app.backend.mark_as_failure(res.id, ValueError('x'))
++            else:
++                app.backend.store_result(res.id, i * 2, states.SUCCESS)
++        for i, res in enumerate(results):
++            state = states.FAILURE if i == failing_index else states.SUCCESS
++            app.backend.on_chord_part_return(
++                _chord_request(c, res), state, None)
++        for i, res in enumerate(results):
++            fresh = app.AsyncResult(res.id)
++            if i == failing_index:
++                assert fresh.state == states.FAILURE
++                assert type(fresh.result) is ValueError
++            else:
++                assert fresh.state == states.SUCCESS
++                assert fresh.result == i * 2
++
++
++# ----------------------------------------------------------------------
++# completed members are never overwritten by failure propagation
++# ----------------------------------------------------------------------
++
++class test_completed_work_survives:
++
++    def test_succeeded_member_keeps_result_on_header_failure(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        results = _setup(app, c)
++        # simulate a body member that somehow completed before the chord
++        # failed (e.g. a redelivered chord after partial body execution)
++        app.backend.store_result(_body_task_ids(c)[0], 'already-done',
++                                 states.SUCCESS)
++        app.backend.mark_as_failure(results[0].id, ValueError('x'))
++        for i, res in enumerate(results):
++            state = states.FAILURE if i == 0 else states.SUCCESS
++            app.backend.on_chord_part_return(
++                _chord_request(c, res), state, None)
++        assert app.AsyncResult(_body_task_ids(c)[0]).result == 'already-done'
++        res = app.AsyncResult(_body_task_ids(c)[1])
++        assert res.state == states.FAILURE
++        assert isinstance(res.result, ChordError)
++
++    def test_group_result_failed_even_with_one_success(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        results = _setup(app, c)
++        app.backend.store_result(_body_task_ids(c)[0], 'already-done',
++                                 states.SUCCESS)
++        app.backend.mark_as_failure(results[0].id, ValueError('x'))
++        for i, res in enumerate(results):
++            state = states.FAILURE if i == 0 else states.SUCCESS
++            app.backend.on_chord_part_return(
++                _chord_request(c, res), state, None)
++        gres = app.GroupResult(
++            c.body.id,
++            [app.AsyncResult(tid) for tid in _body_task_ids(c)],
++        )
++        assert gres.ready()
++        assert gres.failed()
++        with pytest.raises(ChordError):
++            gres.join(timeout=1, interval=0)
++
++
++# ----------------------------------------------------------------------
++# custom task ids are honoured
++# ----------------------------------------------------------------------
++
++class test_custom_task_ids:
++
++    def test_group_body_with_explicit_task_ids(self, capp):
++        app, tasks = capp
++        body = group([
++            tasks['record_body_execution'].s().set(task_id='custom-body-1'),
++            tasks['record_body_execution'].s().set(task_id='custom-body-2'),
++        ], app=app)
++        body = body.set(link_error=[tasks['record_errback'].s()])
++        c, _ = _build_chord(app, tasks, body=body, link_error=False)
++        results = _setup(app, c)
++        app.backend.mark_as_failure(results[0].id, ValueError('x'))
++        for i, res in enumerate(results):
++            state = states.FAILURE if i == 0 else states.SUCCESS
++            app.backend.on_chord_part_return(
++                _chord_request(c, res), state, None)
++        for tid in ('custom-body-1', 'custom-body-2'):
++            res = app.AsyncResult(tid)
++            assert res.state == states.FAILURE
++            assert isinstance(res.result, ChordError)
++        assert set(ERRBACK_CALLS) == {'custom-body-1', 'custom-body-2'}
++
++
++# ----------------------------------------------------------------------
++# on_chord_part_return no-op guards (regression)
++# ----------------------------------------------------------------------
++
++class test_native_path_guards:
++
++    def test_no_group_on_request_is_noop(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        request = Context({'id': 'whatever', 'group': None,
++                           'chord': dict(c.body)})
++        # must not raise and must not touch anything
++        app.backend.on_chord_part_return(request, states.SUCCESS, 1)
++        assert ERRBACK_CALLS == []
++
++    def test_missing_group_result_reports_error(self, capp):
++        app, tasks = capp
++        c, _ = _build_chord(app, tasks)
++        # chord counter initialised but the header group result is gone:
++        # the backend must report a chord error instead of hanging
++        deps = app.GroupResult(c.tasks.id, _header_results(app, c))
++        app.backend.apply_chord((c.tasks.id, deps), c.body)
++        deps.delete()
++        results = _header_results(app, c)
++        # a single part arriving is enough to trigger the error report
++        app.backend.on_chord_part_return(
++            _chord_request(c, results[0]), states.SUCCESS, 1)
++        assert len(ERRBACK_CALLS) == len(c.body.tasks)
++        for tid in _body_task_ids(c):
++            assert app.AsyncResult(tid).state == states.FAILURE
++
++
++# ----------------------------------------------------------------------
++# prepare_exception round trips
++# ----------------------------------------------------------------------
++
++class test_prepare_exception_contracts:
++
++    def test_pickle_roundtrip_keeps_type_and_cause(self, capp):
++        app, tasks = capp
++        err = ChordError('Dependency abc raised ValueError(1)')
++        err.__cause__ = ValueError('original')
++        prepared = app.backend.prepare_exception(err, 'pickle')
++        restored = app.backend.exception_to_python(prepared)
++        assert isinstance(restored, ChordError)
++        assert type(restored.__cause__) is ValueError
++
++    def test_json_roundtrip_keeps_type_name(self, capp):
++        app, tasks = capp
++        err = ChordError('some failure')
++        prepared = app.backend.prepare_exception(err, 'json')
++        assert prepared['exc_type'] == 'ChordError'
++        restored = app.backend.exception_to_python(prepared)
++        assert type(restored).__name__ == 'ChordError'
++        assert 'some failure' in str(restored)
++
++    def test_chord_error_unicode_message(self, capp):
++        app, tasks = capp
++        err = ChordError('依赖任务失败: 数值错误')
++        err.__cause__ = ValueError('原始异常')
++        clone = app.backend.exception_to_python(
++            app.backend.prepare_exception(err, 'pickle'))
++        assert str(clone) == '依赖任务失败: 数值错误'
++        assert type(clone.__cause__) is ValueError
++
++
++# ----------------------------------------------------------------------
++# unlock task registration contract (regression)
++# ----------------------------------------------------------------------
++
++class test_unlock_task_registration:
++
++    def test_unlock_task_registered(self, capp):
++        app, tasks = capp
++        assert 'celery.chord_unlock' in app.tasks
++
++    def test_unlock_task_configuration(self, capp):
++        app, tasks = capp
++        unlock = app.tasks['celery.chord_unlock']
++        assert unlock.max_retries is None
++        assert unlock.ignore_result is True
++
++    def test_backend_cleanup_registered(self, capp):
++        app, tasks = capp
++        assert 'celery.backend_cleanup' in app.tasks

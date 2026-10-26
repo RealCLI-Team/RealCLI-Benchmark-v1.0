@@ -1,0 +1,2070 @@
+diff --git a/core/sweep/__init__.py b/core/sweep/__init__.py
+new file mode 100644
+index 00000000..7a2d8241
+--- /dev/null
++++ b/core/sweep/__init__.py
+@@ -0,0 +1,139 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Retention-policy sweeper for dupeGuru's ``core``.
++
++A scriptable, offline retention engine layered on dupeGuru's own file model
++(:mod:`core.fs`) and directory-state walk (:mod:`core.directories`). Declarative
++policies decide what to give up -- by age, idle time, size, glob, extension --
++honouring protected/pinned paths, keep-counts and byte budgets, in a chosen
++eviction order. A run produces a **pure plan** you can preview (dry run) before
++you **apply** it; the executor is the only part that touches the filesystem, and
++it refuses protected targets, guards against stale plans, and is idempotent.
++
++Everything a caller needs is re-exported here for
++``from core.sweep import ...``.
++"""
++
++from __future__ import annotations
++
++from .errors import (
++    InvalidPolicyError,
++    InvalidScanRootError,
++    ProtectedPathError,
++    StalePlanError,
++    SweepConfigError,
++    SweepError,
++    SweepExecutionError,
++    UnknownOrderingError,
++    UnknownRuleError,
++)
++from .executor import (
++    ActionOutcome,
++    SweepExecutor,
++    SweepRunReport,
++)
++from .item import SweepItem
++from .loader import (
++    DEFAULT_SETTINGS,
++    load_policy,
++    load_session,
++    load_settings,
++    merge_documents,
++)
++from .ordering import (
++    ORDERINGS,
++    EvictionOrdering,
++    LargestFirst,
++    LeastRecentlyUsed,
++    MostRecentlyUsed,
++    NewestFirst,
++    OldestFirst,
++    SmallestFirst,
++    make_ordering,
++)
++from .plan import SweepAction, SweepPlan, build_plan
++from .policy import ACTION_DELETE, ACTION_TRASH, RetentionPolicy
++from .report import SweepReport
++from .rules import (
++    EVICT,
++    KEEP,
++    AgeRule,
++    ExtensionRule,
++    GlobRule,
++    IdleRule,
++    MatchAllRule,
++    RetentionRule,
++    RuleSet,
++    SizeRule,
++    Verdict,
++    make_rule,
++)
++from .scanner import ScanSpec, SweepScanner
++from .session import SweepSession
++
++__all__ = [
++    # errors
++    "SweepError",
++    "SweepConfigError",
++    "InvalidPolicyError",
++    "UnknownRuleError",
++    "UnknownOrderingError",
++    "InvalidScanRootError",
++    "SweepExecutionError",
++    "ProtectedPathError",
++    "StalePlanError",
++    # item
++    "SweepItem",
++    # scanner
++    "ScanSpec",
++    "SweepScanner",
++    # rules
++    "KEEP",
++    "EVICT",
++    "Verdict",
++    "RetentionRule",
++    "AgeRule",
++    "IdleRule",
++    "SizeRule",
++    "GlobRule",
++    "ExtensionRule",
++    "MatchAllRule",
++    "make_rule",
++    "RuleSet",
++    # ordering
++    "EvictionOrdering",
++    "OldestFirst",
++    "NewestFirst",
++    "LargestFirst",
++    "SmallestFirst",
++    "LeastRecentlyUsed",
++    "MostRecentlyUsed",
++    "ORDERINGS",
++    "make_ordering",
++    # policy
++    "ACTION_DELETE",
++    "ACTION_TRASH",
++    "RetentionPolicy",
++    # plan
++    "SweepAction",
++    "SweepPlan",
++    "build_plan",
++    # executor
++    "ActionOutcome",
++    "SweepRunReport",
++    "SweepExecutor",
++    # session
++    "SweepSession",
++    # loader
++    "DEFAULT_SETTINGS",
++    "merge_documents",
++    "load_settings",
++    "load_policy",
++    "load_session",
++    # report
++    "SweepReport",
++]
+diff --git a/core/sweep/errors.py b/core/sweep/errors.py
+new file mode 100644
+index 00000000..e612817c
+--- /dev/null
++++ b/core/sweep/errors.py
+@@ -0,0 +1,69 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Exceptions for the retention-policy sweeper.
++
++Configuration problems (an unknown rule kind, a bad ordering name, a missing
++scan root) are kept distinct from execution problems (a file changed under us,
++a protected path targeted for eviction), so a policy can be fully validated
++before a single file is touched.
++"""
++
++
++class SweepError(Exception):
++    """Root of every error raised by :mod:`core.sweep`."""
++
++
++# --- Configuration errors (raised before any filesystem mutation) -------------
++class SweepConfigError(SweepError):
++    """The policy or run was misconfigured. Detectable up-front."""
++
++
++class InvalidPolicyError(SweepConfigError):
++    """A retention policy is malformed (bad rule spec, contradictory budget)."""
++
++
++class UnknownRuleError(SweepConfigError):
++    """A rule was requested by a kind we don't recognise."""
++
++
++class UnknownOrderingError(SweepConfigError):
++    """An eviction ordering was requested by a name we don't recognise."""
++
++
++class InvalidScanRootError(SweepConfigError):
++    """A path handed to the scanner is missing or is not a directory."""
++
++
++# --- Execution errors (raised while applying a plan) --------------------------
++class SweepExecutionError(SweepError):
++    """A sweep action failed while being applied.
++
++    Carries the offending ``action`` and, when relevant, the underlying
++    ``cause`` so a caller can log precisely what went wrong.
++    """
++
++    def __init__(self, message, action=None, cause=None):
++        super().__init__(message)
++        self.action = action
++        self.cause = cause
++
++
++class ProtectedPathError(SweepExecutionError):
++    """An action tried to evict a protected (reference / pinned) path.
++
++    A well-formed plan never contains such an action; hitting one means a
++    hand-crafted or corrupted plan, and it is a hard error.
++    """
++
++
++class StalePlanError(SweepExecutionError):
++    """A target changed on disk since the plan was built.
++
++    Raised at apply time when a file's size / mtime no longer matches the
++    snapshot the plan was computed against, unless the caller opted to ignore
++    staleness.
++    """
+diff --git a/core/sweep/executor.py b/core/sweep/executor.py
+new file mode 100644
+index 00000000..2ad0c839
+--- /dev/null
++++ b/core/sweep/executor.py
+@@ -0,0 +1,229 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Applying a :class:`~core.sweep.plan.SweepPlan` to the filesystem.
++
++This is the *only* module in :mod:`core.sweep` that mutates anything. Everything
++else -- scanning, rules, ordering, policy, plan -- is read-only or pure. The
++executor enforces the safety contract:
++
++* **Dry run** (the default) performs no I/O and reports exactly what a real run
++  would do.
++* **Protected** targets are a hard error (:class:`ProtectedPathError`): a
++  well-formed plan never contains one, so hitting one means a corrupted or
++  hand-edited plan and we refuse the whole run.
++* **Staleness**: if a target changed on disk since the plan was built, we raise
++  :class:`StalePlanError` -- unless ``ignore_stale`` is set, in which case the
++  stale action is skipped and recorded.
++* **Idempotency**: a target that has already vanished is not an error; it is
++  reported as ``already-gone`` so re-applying a plan converges.
++
++Deletion uses :func:`os.remove`; trashing delegates to an injectable
++``trash_func`` (defaulting to ``send2trash`` when available) so tests can run
++fully offline without a real desktop trash.
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++from .errors import ProtectedPathError, StalePlanError, SweepExecutionError
++from .policy import ACTION_DELETE, ACTION_TRASH
++
++__all__ = ["ActionOutcome", "SweepExecutor", "SweepRunReport"]
++
++# Outcome codes for a single action.
++OUTCOME_DELETED = "deleted"
++OUTCOME_TRASHED = "trashed"
++OUTCOME_PLANNED = "planned"  # dry-run: would have acted
++OUTCOME_ALREADY_GONE = "already-gone"
++OUTCOME_SKIPPED_STALE = "skipped-stale"
++
++
++def _default_trash(path):
++    """Best-effort desktop-trash a path, falling back to removal offline.
++
++    dupeGuru ships Send2Trash as a dependency; when present we use it. In a
++    headless CI box it may be unusable, so we degrade to :func:`os.remove` --
++    the caller can always inject a strict trash function instead.
++    """
++    try:
++        from send2trash import send2trash  # type: ignore
++
++        send2trash(str(path))
++        return
++    except Exception:
++        # Fall back to a plain removal so offline / headless runs still work.
++        os.remove(str(path))
++
++
++class ActionOutcome:
++    """What happened (or would happen) to one action."""
++
++    __slots__ = ("action", "outcome", "detail")
++
++    def __init__(self, action, outcome, detail=""):
++        self.action = action
++        self.outcome = outcome
++        self.detail = detail
++
++    @property
++    def path(self):
++        return self.action.item.path
++
++    @property
++    def freed_size(self):
++        """Apparent bytes actually freed by this outcome (0 if nothing happened)."""
++        if self.outcome in (OUTCOME_DELETED, OUTCOME_TRASHED):
++            return self.action.item.size
++        return 0
++
++    @property
++    def freed_allocated(self):
++        if self.outcome in (OUTCOME_DELETED, OUTCOME_TRASHED):
++            return self.action.item.allocated_size
++        return 0
++
++    def as_dict(self):
++        return {
++            "path": str(self.action.item.path),
++            "verb": self.action.verb,
++            "outcome": self.outcome,
++            "detail": self.detail,
++        }
++
++    def __repr__(self):
++        return f"<ActionOutcome {self.outcome} {str(self.action.item.path)!r}>"
++
++
++class SweepRunReport:
++    """The result of executing (or dry-running) a plan."""
++
++    def __init__(self, outcomes, dry_run):
++        self.outcomes = list(outcomes)
++        self.dry_run = dry_run
++
++    def of_outcome(self, code):
++        return [o for o in self.outcomes if o.outcome == code]
++
++    @property
++    def acted(self):
++        """Outcomes that actually removed a file (empty on a dry run)."""
++        return [o for o in self.outcomes if o.outcome in (OUTCOME_DELETED, OUTCOME_TRASHED)]
++
++    @property
++    def planned(self):
++        return self.of_outcome(OUTCOME_PLANNED)
++
++    @property
++    def already_gone(self):
++        return self.of_outcome(OUTCOME_ALREADY_GONE)
++
++    @property
++    def skipped_stale(self):
++        return self.of_outcome(OUTCOME_SKIPPED_STALE)
++
++    @property
++    def freed_size(self):
++        return sum(o.freed_size for o in self.outcomes)
++
++    @property
++    def freed_allocated(self):
++        return sum(o.freed_allocated for o in self.outcomes)
++
++    def outcome_counts(self):
++        counts = {}
++        for o in self.outcomes:
++            counts[o.outcome] = counts.get(o.outcome, 0) + 1
++        return counts
++
++    def as_dict(self):
++        return {
++            "dry_run": self.dry_run,
++            "freed_size": self.freed_size,
++            "freed_allocated": self.freed_allocated,
++            "outcome_counts": self.outcome_counts(),
++            "outcomes": [o.as_dict() for o in self.outcomes],
++        }
++
++    def __len__(self):
++        return len(self.outcomes)
++
++    def __iter__(self):
++        return iter(self.outcomes)
++
++    def __repr__(self):
++        kind = "dry-run" if self.dry_run else "apply"
++        return f"<SweepRunReport {kind} {len(self.outcomes)} actions freed={self.freed_allocated}b>"
++
++
++class SweepExecutor:
++    """Applies plans, enforcing the dry-run / protected / stale / idempotent contract."""
++
++    def __init__(self, dry_run=True, ignore_stale=False, trash_func=None, delete_func=None):
++        self.dry_run = dry_run
++        self.ignore_stale = ignore_stale
++        self._trash_func = trash_func if trash_func is not None else _default_trash
++        self._delete_func = delete_func if delete_func is not None else (lambda p: os.remove(str(p)))
++
++    def _validate(self, plan):
++        """Pre-flight: refuse the whole plan if it targets a protected path."""
++        for action in plan.actions:
++            if getattr(action.item, "protected", False):
++                raise ProtectedPathError(
++                    f"plan targets a protected path: {action.item.path}", action=action
++                )
++
++    def _apply_one(self, action):
++        item = action.item
++        path = Path(item.path)
++        # Idempotency: already gone -> converge silently.
++        if not item.exists():
++            return ActionOutcome(action, OUTCOME_ALREADY_GONE)
++        # Staleness: content drifted since planning.
++        if item.is_stale():
++            if not self.ignore_stale:
++                raise StalePlanError(
++                    f"target changed since plan was built: {path}", action=action
++                )
++            return ActionOutcome(action, OUTCOME_SKIPPED_STALE, detail="ignored stale target")
++        if self.dry_run:
++            return ActionOutcome(action, OUTCOME_PLANNED)
++        try:
++            if action.verb == ACTION_TRASH:
++                self._trash_func(path)
++                return ActionOutcome(action, OUTCOME_TRASHED)
++            elif action.verb == ACTION_DELETE:
++                self._delete_func(path)
++                return ActionOutcome(action, OUTCOME_DELETED)
++            else:
++                raise SweepExecutionError(f"unknown action verb {action.verb!r}", action=action)
++        except (ProtectedPathError, StalePlanError, SweepExecutionError):
++            raise
++        except OSError as exc:
++            raise SweepExecutionError(
++                f"failed to {action.verb} {path}: {exc}", action=action, cause=exc
++            )
++
++    def run(self, plan):
++        """Execute (or dry-run) ``plan`` and return a :class:`SweepRunReport`.
++
++        Protected-path validation happens up-front, so a plan that would touch a
++        protected path fails before any file is removed.
++        """
++        self._validate(plan)
++        outcomes = [self._apply_one(action) for action in plan.actions]
++        return SweepRunReport(outcomes, dry_run=self.dry_run)
++
++    def preview(self, plan):
++        """Dry-run ``plan`` regardless of this executor's ``dry_run`` flag."""
++        saved = self.dry_run
++        self.dry_run = True
++        try:
++            return self.run(plan)
++        finally:
++            self.dry_run = saved
+diff --git a/core/sweep/item.py b/core/sweep/item.py
+new file mode 100644
+index 00000000..90d1efd0
+--- /dev/null
++++ b/core/sweep/item.py
+@@ -0,0 +1,214 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""The unit a retention policy acts on: a sweepable item.
++
++A :class:`SweepItem` wraps one file with the facts a retention decision needs --
++its size (both apparent and allocated), its age and idle time, whether it's
++protected -- snapshotted at scan time. It is built from a
++:class:`core.fs.File`, so the sweeper stays layered on dupeGuru's file model
++rather than re-statting paths itself. The snapshot is also what
++staleness-checking compares against at apply time.
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++from core import fs
++
++# A stat block is 512 bytes by POSIX definition (see the disk analyzer, which
++# uses the same convention). We inline the tiny helper here to avoid a
++# cross-package dependency between two independent add-on packages.
++_STAT_BLOCK_SIZE = 512
++
++
++def _allocated_of(stat_result):
++    st_blocks = getattr(stat_result, "st_blocks", None)
++    if st_blocks is None:
++        return int(getattr(stat_result, "st_size", 0) or 0)
++    return int(st_blocks) * _STAT_BLOCK_SIZE
++
++
++class SweepItem:
++    """One candidate file for retention, with its facts snapshotted.
++
++    ``mtime`` / ``atime`` are snapshotted so age and idle time are computed
++    against a single reference clock shared by the whole run. ``size`` (the
++    apparent length) and ``mtime`` are also the fields staleness-checking
++    watches -- if either changes on disk, the plan built from this snapshot is
++    considered stale.
++    """
++
++    __slots__ = (
++        "path",
++        "size",
++        "allocated_size",
++        "mtime",
++        "atime",
++        "protected",
++        "_ref_time",
++    )
++
++    def __init__(
++        self,
++        path,
++        size,
++        allocated_size,
++        mtime,
++        atime=None,
++        protected=False,
++        ref_time=None,
++    ):
++        self.path = Path(path)
++        self.size = int(size)
++        self.allocated_size = int(allocated_size)
++        self.mtime = float(mtime)
++        self.atime = float(atime) if atime is not None else float(mtime)
++        self.protected = bool(protected)
++        self._ref_time = float(ref_time) if ref_time is not None else None
++
++    # --- Construction ---------------------------------------------------------
++    @classmethod
++    def from_file(cls, file, ref_time=None, protected=None):
++        """Build an item from a :class:`core.fs.File`.
++
++        ``protected`` defaults to the file's ``is_ref`` flag (a reference-folder
++        file), but may be forced by the caller (e.g. a pinned path).
++        """
++        path = Path(file.path)
++        size = int(file.size)
++        mtime = float(file.mtime)
++        atime = mtime
++        allocated = size
++        try:
++            st = path.stat()
++            size = int(st.st_size)
++            allocated = _allocated_of(st)
++            mtime = float(st.st_mtime)
++            atime = float(st.st_atime)
++        except OSError:
++            pass
++        if protected is None:
++            protected = bool(getattr(file, "is_ref", False))
++        return cls(
++            path=path,
++            size=size,
++            allocated_size=allocated,
++            mtime=mtime,
++            atime=atime,
++            protected=protected,
++            ref_time=ref_time,
++        )
++
++    @classmethod
++    def from_path(cls, path, ref_time=None, protected=False):
++        path = Path(path)
++        file = fs.get_file(path)
++        if file is None:
++            st = path.stat()
++            return cls(
++                path=path,
++                size=int(st.st_size),
++                allocated_size=_allocated_of(st),
++                mtime=float(st.st_mtime),
++                atime=float(st.st_atime),
++                protected=protected,
++                ref_time=ref_time,
++            )
++        return cls.from_file(file, ref_time=ref_time, protected=protected)
++
++    def with_ref_time(self, ref_time):
++        return SweepItem(
++            path=self.path,
++            size=self.size,
++            allocated_size=self.allocated_size,
++            mtime=self.mtime,
++            atime=self.atime,
++            protected=self.protected,
++            ref_time=ref_time,
++        )
++
++    # --- Derived facts --------------------------------------------------------
++    @property
++    def name(self):
++        return self.path.name
++
++    @property
++    def extension(self):
++        suffix = self.path.suffix
++        return suffix.lower().lstrip(".") if suffix else ""
++
++    @property
++    def ref_time(self):
++        return self._ref_time
++
++    def age_seconds(self, ref_time=None):
++        """Seconds since last modification, against ``ref_time`` or the anchor."""
++        anchor = ref_time if ref_time is not None else self._ref_time
++        if anchor is None:
++            raise ValueError("age_seconds requires a reference time")
++        return max(0.0, float(anchor) - self.mtime)
++
++    def idle_seconds(self, ref_time=None):
++        """Seconds since last access, against ``ref_time`` or the anchor."""
++        anchor = ref_time if ref_time is not None else self._ref_time
++        if anchor is None:
++            raise ValueError("idle_seconds requires a reference time")
++        return max(0.0, float(anchor) - self.atime)
++
++    # --- Staleness ------------------------------------------------------------
++    def is_stale(self):
++        """True if the file changed (size / mtime) or vanished since the snapshot.
++
++        Used by the executor to refuse acting on a plan whose assumptions no
++        longer hold. A vanished file is *not* stale in the "changed" sense -- it
++        is handled as "already-swept" by the executor -- so this only reports
++        content drift for files that still exist.
++        """
++        try:
++            st = self.path.stat()
++        except OSError:
++            return False
++        if int(st.st_size) != self.size:
++            return True
++        # mtime is a float; compare with a small tolerance for fs granularity.
++        return abs(float(st.st_mtime) - self.mtime) > 1e-6
++
++    def exists(self):
++        try:
++            return self.path.exists()
++        except OSError:
++            return False
++
++    # --- Dict / equality ------------------------------------------------------
++    def as_dict(self):
++        d = {
++            "path": str(self.path),
++            "name": self.name,
++            "size": self.size,
++            "allocated_size": self.allocated_size,
++            "mtime": self.mtime,
++            "atime": self.atime,
++            "protected": self.protected,
++        }
++        if self._ref_time is not None:
++            d["age_seconds"] = self.age_seconds()
++            d["idle_seconds"] = self.idle_seconds()
++        return d
++
++    def __eq__(self, other):
++        if not isinstance(other, SweepItem):
++            return NotImplemented
++        return self.path == other.path
++
++    def __hash__(self):
++        return hash(self.path)
++
++    def __repr__(self):
++        prot = " protected" if self.protected else ""
++        return f"<SweepItem {str(self.path)} {self.size}b{prot}>"
+diff --git a/core/sweep/loader.py b/core/sweep/loader.py
+new file mode 100644
+index 00000000..7227b79a
+--- /dev/null
++++ b/core/sweep/loader.py
+@@ -0,0 +1,156 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Layered configuration for retention runs.
++
++Real fleets carry retention rules in layered config: a shared *base* plus
++per-machine / per-user *overlays*. :func:`merge_documents` deep-merges those
++documents into one; :func:`load_session` turns the merged document into a ready
++:class:`~core.sweep.session.SweepSession`.
++
++Merge semantics (identical to the reclaim / diskscan loaders so operators learn
++them once):
++
++* later documents override earlier **scalars**;
++* **list**-valued keys in a known set (``roots``, ``include_ext`` ...) are
++  **appended** and de-duplicated, not replaced;
++* a key set explicitly to ``None`` **deletes** it;
++* everything else (nested dicts) merges recursively.
++"""
++
++from __future__ import annotations
++
++from .errors import InvalidPolicyError
++from .ordering import make_ordering
++from .policy import ACTION_TRASH, RetentionPolicy
++from .rules import RuleSet, make_rule
++from .scanner import ScanSpec
++from .session import SweepSession
++
++__all__ = [
++    "DEFAULT_SETTINGS",
++    "merge_documents",
++    "load_settings",
++    "load_policy",
++    "load_session",
++]
++
++# List-valued keys that append across layers rather than replace.
++_APPEND_LIST_KEYS = frozenset(
++    {
++        "roots",
++        "paths",
++        "reference_roots",
++        "references",
++        "excluded_roots",
++        "excludes",
++        "include_ext",
++        "exclude_ext",
++        "include_globs",
++        "exclude_globs",
++        "rules",
++    }
++)
++
++DEFAULT_SETTINGS = {
++    "scan": {},
++    "policy": {
++        "action": ACTION_TRASH,
++        "ordering": "oldest-first",
++        "keep_last": 0,
++        "max_total_bytes": 0,
++        "default_action": "keep",
++        "rules": [],
++    },
++}
++
++
++def _merge_two(base, overlay):
++    """Deep-merge ``overlay`` onto ``base`` returning a new dict."""
++    result = dict(base)
++    for key, value in overlay.items():
++        if value is None:
++            # Explicit deletion.
++            result.pop(key, None)
++            continue
++        if key in _APPEND_LIST_KEYS and isinstance(value, list):
++            existing = result.get(key)
++            if isinstance(existing, list):
++                merged = list(existing)
++                for elem in value:
++                    # De-dupe scalars; always append dicts (rule specs).
++                    if isinstance(elem, (dict, list)):
++                        merged.append(elem)
++                    elif elem not in merged:
++                        merged.append(elem)
++                result[key] = merged
++            else:
++                result[key] = list(value)
++            continue
++        if isinstance(value, dict) and isinstance(result.get(key), dict):
++            result[key] = _merge_two(result[key], value)
++            continue
++        result[key] = value
++    return result
++
++
++def merge_documents(*documents):
++    """Deep-merge any number of config documents left-to-right."""
++    merged = {}
++    for doc in documents:
++        if doc is None:
++            continue
++        if not isinstance(doc, dict):
++            raise InvalidPolicyError(f"config document must be a mapping, got {type(doc).__name__}")
++        merged = _merge_two(merged, doc)
++    return merged
++
++
++def load_settings(*documents):
++    """Merge ``documents`` on top of :data:`DEFAULT_SETTINGS`."""
++    return merge_documents(DEFAULT_SETTINGS, *documents)
++
++
++def _policy_from_settings(policy_settings):
++    """Build a :class:`RetentionPolicy` from the ``policy`` config block."""
++    settings = policy_settings or {}
++    rule_specs = settings.get("rules", [])
++    if rule_specs and not isinstance(rule_specs, list):
++        raise InvalidPolicyError("policy 'rules' must be a list of rule specs")
++    rules = [make_rule(spec) for spec in rule_specs]
++    default_action = settings.get("default_action", "keep")
++    rule_set = RuleSet(rules, default_action=default_action)
++    ordering = make_ordering(settings.get("ordering", "oldest-first"))
++    return RetentionPolicy(
++        name=settings.get("name", "retention"),
++        rule_set=rule_set,
++        ordering=ordering,
++        keep_last=settings.get("keep_last", 0),
++        max_total_bytes=settings.get("max_total_bytes", 0),
++        action=settings.get("action", ACTION_TRASH),
++    )
++
++
++def load_policy(*documents):
++    """Merge documents and build just the :class:`RetentionPolicy`."""
++    settings = load_settings(*documents)
++    return _policy_from_settings(settings.get("policy", {}))
++
++
++def _scan_spec_from_settings(scan_settings):
++    settings = scan_settings or {}
++    roots = settings.get("roots", settings.get("paths", []))
++    if not roots:
++        raise InvalidPolicyError("configuration must specify at least one scan root ('roots')")
++    return ScanSpec.from_dict(settings)
++
++
++def load_session(*documents, clock=None):
++    """Merge documents and build a ready :class:`SweepSession`."""
++    settings = load_settings(*documents)
++    spec = _scan_spec_from_settings(settings.get("scan", {}))
++    policy = _policy_from_settings(settings.get("policy", {}))
++    return SweepSession(spec, policy, clock=clock)
+diff --git a/core/sweep/ordering.py b/core/sweep/ordering.py
+new file mode 100644
+index 00000000..6c9c426b
+--- /dev/null
++++ b/core/sweep/ordering.py
+@@ -0,0 +1,136 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Eviction orderings.
++
++Once the rules have decided *which* items may be evicted, count- and budget-based
++retention needs to decide *in what order* to give them up: keep the newest N,
++free space by dropping the biggest first, evict least-recently-used first, and
++so on. An ordering is just a deterministic sort key over items -- the item that
++should be evicted **first** sorts **first**.
++
++Every ordering breaks ties on the item's path so the result is stable and does
++not wobble with directory-walk order.
++"""
++
++from __future__ import annotations
++
++from .errors import UnknownOrderingError
++
++__all__ = [
++    "EvictionOrdering",
++    "OldestFirst",
++    "NewestFirst",
++    "LargestFirst",
++    "SmallestFirst",
++    "LeastRecentlyUsed",
++    "MostRecentlyUsed",
++    "ORDERINGS",
++    "make_ordering",
++]
++
++
++class EvictionOrdering:
++    """Base class: sorts items so the *first-to-evict* comes first.
++
++    Subclasses provide :meth:`sort_key`. The path tie-breaker is applied by
++    :meth:`order` so subclasses need only express their primary criterion.
++    """
++
++    name = "ordering"
++
++    def sort_key(self, item):  # pragma: no cover - abstract
++        raise NotImplementedError
++
++    def order(self, items):
++        """Return a new list of ``items`` in eviction order (first = evict first)."""
++        return sorted(items, key=lambda it: (self.sort_key(it), str(it.path)))
++
++    def __repr__(self):
++        return f"<{type(self).__name__} {self.name!r}>"
++
++
++class OldestFirst(EvictionOrdering):
++    """Evict the oldest (largest modification age) first.
++
++    This is the natural ordering for a "keep the most recent N" policy.
++    """
++
++    name = "oldest-first"
++
++    def sort_key(self, item):
++        # Larger age should sort first -> negate.
++        return -item.age_seconds()
++
++
++class NewestFirst(EvictionOrdering):
++    """Evict the newest first (rarely what you want, provided for symmetry)."""
++
++    name = "newest-first"
++
++    def sort_key(self, item):
++        return item.age_seconds()
++
++
++class LargestFirst(EvictionOrdering):
++    """Evict the largest (by allocated size) first -- frees space fastest."""
++
++    name = "largest-first"
++
++    def sort_key(self, item):
++        return -item.allocated_size
++
++
++class SmallestFirst(EvictionOrdering):
++    """Evict the smallest first."""
++
++    name = "smallest-first"
++
++    def sort_key(self, item):
++        return item.allocated_size
++
++
++class LeastRecentlyUsed(EvictionOrdering):
++    """Evict the least-recently-*accessed* first (classic LRU by atime)."""
++
++    name = "lru"
++
++    def sort_key(self, item):
++        # Largest idle time first.
++        return -item.idle_seconds()
++
++
++class MostRecentlyUsed(EvictionOrdering):
++    """Evict the most-recently-accessed first (MRU)."""
++
++    name = "mru"
++
++    def sort_key(self, item):
++        return item.idle_seconds()
++
++
++ORDERINGS = {
++    OldestFirst.name: OldestFirst,
++    NewestFirst.name: NewestFirst,
++    LargestFirst.name: LargestFirst,
++    SmallestFirst.name: SmallestFirst,
++    LeastRecentlyUsed.name: LeastRecentlyUsed,
++    "least-recently-used": LeastRecentlyUsed,
++    MostRecentlyUsed.name: MostRecentlyUsed,
++    "most-recently-used": MostRecentlyUsed,
++}
++
++
++def make_ordering(name):
++    """Resolve an ordering by name (``oldest-first``, ``largest-first``, ``lru`` ...)."""
++    if isinstance(name, EvictionOrdering):
++        return name
++    if name is None:
++        return OldestFirst()
++    cls = ORDERINGS.get(str(name).strip().lower())
++    if cls is None:
++        raise UnknownOrderingError(f"unknown eviction ordering {name!r}")
++    return cls()
+diff --git a/core/sweep/plan.py b/core/sweep/plan.py
+new file mode 100644
+index 00000000..198012b3
+--- /dev/null
++++ b/core/sweep/plan.py
+@@ -0,0 +1,141 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""The sweep plan: an ordered, serialisable list of eviction actions.
++
++A :class:`SweepPlan` is what a policy produces and an executor consumes. It is
++**pure data** -- building or inspecting a plan never touches the filesystem.
++Each :class:`SweepAction` names a target item, the action verb (delete / trash),
++and carries the snapshot needed for staleness-checking at apply time.
++
++Keeping the plan separate from execution is what makes "dry run" honest: the
++same object the executor would run is the one you print and diff.
++"""
++
++from __future__ import annotations
++
++from .policy import ACTION_DELETE, ACTION_TRASH
++
++__all__ = ["SweepAction", "SweepPlan", "build_plan"]
++
++
++class SweepAction:
++    """A single intended eviction."""
++
++    __slots__ = ("item", "verb", "reason")
++
++    def __init__(self, item, verb, reason=""):
++        self.item = item
++        self.verb = verb
++        self.reason = reason
++
++    @property
++    def path(self):
++        return self.item.path
++
++    @property
++    def size(self):
++        return self.item.size
++
++    @property
++    def allocated_size(self):
++        return self.item.allocated_size
++
++    def as_dict(self):
++        return {
++            "path": str(self.item.path),
++            "verb": self.verb,
++            "size": self.item.size,
++            "allocated_size": self.item.allocated_size,
++            "reason": self.reason,
++        }
++
++    def __repr__(self):
++        return f"<SweepAction {self.verb} {str(self.item.path)!r}>"
++
++
++class SweepPlan:
++    """An ordered set of :class:`SweepAction` plus book-keeping."""
++
++    def __init__(self, actions=None, policy_name="retention", root=None):
++        self.actions = list(actions or [])
++        self.policy_name = policy_name
++        self.root = root
++
++    # --- Accounting -----------------------------------------------------------
++    @property
++    def action_count(self):
++        return len(self.actions)
++
++    @property
++    def is_empty(self):
++        return not self.actions
++
++    @property
++    def reclaimable_size(self):
++        """Apparent bytes freed if the plan is fully applied."""
++        return sum(a.size for a in self.actions)
++
++    @property
++    def reclaimable_allocated(self):
++        """Allocated (on-disk) bytes freed if the plan is fully applied."""
++        return sum(a.allocated_size for a in self.actions)
++
++    @property
++    def paths(self):
++        return [str(a.item.path) for a in self.actions]
++
++    def by_verb(self, verb):
++        return [a for a in self.actions if a.verb == verb]
++
++    def verb_counts(self):
++        counts = {}
++        for a in self.actions:
++            counts[a.verb] = counts.get(a.verb, 0) + 1
++        return counts
++
++    # --- Serialisation --------------------------------------------------------
++    def as_dict(self):
++        return {
++            "policy": self.policy_name,
++            "root": str(self.root) if self.root is not None else None,
++            "action_count": self.action_count,
++            "reclaimable_size": self.reclaimable_size,
++            "reclaimable_allocated": self.reclaimable_allocated,
++            "verb_counts": self.verb_counts(),
++            "actions": [a.as_dict() for a in self.actions],
++        }
++
++    def __len__(self):
++        return len(self.actions)
++
++    def __iter__(self):
++        return iter(self.actions)
++
++    def __repr__(self):
++        return (
++            f"<SweepPlan {self.policy_name!r} {self.action_count} actions "
++            f"{self.reclaimable_allocated}b>"
++        )
++
++
++def build_plan(policy, items, root=None):
++    """Turn a policy + items into a :class:`SweepPlan` (pure; no I/O).
++
++    The action verb comes from the policy (``delete`` / ``trash``); the reason
++    is the winning rule's reason as recorded on the item's verdict.
++    """
++    verb = ACTION_DELETE if policy.action == ACTION_DELETE else ACTION_TRASH
++    selected = policy.select(items)
++    # Reasons: classify the selected items so each action carries its "why".
++    reason_by_path = {}
++    for verdict in policy.rule_set.classify_all(selected):
++        reason_by_path[verdict.item.path] = verdict.reason
++    actions = [
++        SweepAction(item, verb, reason=reason_by_path.get(item.path, ""))
++        for item in selected
++    ]
++    return SweepPlan(actions=actions, policy_name=policy.name, root=root)
+diff --git a/core/sweep/policy.py b/core/sweep/policy.py
+new file mode 100644
+index 00000000..cee36450
+--- /dev/null
++++ b/core/sweep/policy.py
+@@ -0,0 +1,154 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""The declarative retention policy: rules + limits + ordering.
++
++A :class:`RetentionPolicy` bundles everything that decides *what to give up*:
++
++* a :class:`~core.sweep.rules.RuleSet` -- the per-item keep/evict votes;
++* an :class:`~core.sweep.ordering.EvictionOrdering` -- the order to sacrifice
++  candidates in;
++* a **keep count** (``keep_last``) -- always retain at least the N best items
++  (the "best" being the ones the ordering evicts *last*);
++* a **budget** -- an upper bound on retained allocated bytes; evict from the
++  ordering until the survivors fit.
++* an **action** -- ``delete`` or ``trash`` -- how survivors of the plan get
++  removed (the policy expresses intent; the executor carries it out).
++
++The policy is *pure data + selection logic*: :meth:`select` turns a list of
++items into the ordered list that should be evicted, honouring protection, rule
++votes, the keep-count and the budget together. It never touches the filesystem.
++"""
++
++from __future__ import annotations
++
++from .errors import InvalidPolicyError
++from .ordering import EvictionOrdering, OldestFirst, make_ordering
++from .rules import EVICT, KEEP, RuleSet
++
++__all__ = ["ACTION_DELETE", "ACTION_TRASH", "RetentionPolicy"]
++
++ACTION_DELETE = "delete"
++ACTION_TRASH = "trash"
++_ACTIONS = (ACTION_DELETE, ACTION_TRASH)
++
++
++class RetentionPolicy:
++    """A named, declarative retention policy."""
++
++    def __init__(
++        self,
++        name="retention",
++        rule_set=None,
++        ordering=None,
++        keep_last=0,
++        max_total_bytes=0,
++        action=ACTION_TRASH,
++    ):
++        self.name = name
++        self.rule_set = rule_set if rule_set is not None else RuleSet()
++        self.ordering = self._coerce_ordering(ordering)
++        self.keep_last = int(keep_last or 0)
++        if self.keep_last < 0:
++            raise InvalidPolicyError("keep_last must not be negative")
++        self.max_total_bytes = int(max_total_bytes or 0)
++        if self.max_total_bytes < 0:
++            raise InvalidPolicyError("max_total_bytes must not be negative")
++        if action not in _ACTIONS:
++            raise InvalidPolicyError(f"unknown action {action!r} (expected 'delete' or 'trash')")
++        self.action = action
++
++    @staticmethod
++    def _coerce_ordering(ordering):
++        if ordering is None:
++            return OldestFirst()
++        if isinstance(ordering, EvictionOrdering):
++            return ordering
++        return make_ordering(ordering)
++
++    @property
++    def has_budget(self):
++        return self.max_total_bytes > 0
++
++    # --- Selection ------------------------------------------------------------
++    def _rule_evictable(self, items):
++        """Items the rule set votes to evict (protected already excluded)."""
++        evictable = []
++        for verdict in self.rule_set.classify_all(items):
++            if verdict.is_evict:
++                evictable.append(verdict.item)
++        return evictable
++
++    def select(self, items):
++        """Return the items to evict, in eviction order.
++
++        Combines, in order:
++
++        1. **Rules** decide the pool of candidates (protected items are never in
++           it).
++        2. **keep_last** removes the N items the ordering would sacrifice *last*
++           from that pool (they are the ones most worth keeping).
++        3. **budget** -- if set, we additionally evict from the *kept* items,
++           worst-first, until retained allocated bytes fit under the budget.
++           Protected items still count toward the retained total but are never
++           themselves evicted.
++        """
++        ordered_candidates = self.ordering.order(self._rule_evictable(items))
++
++        # keep_last: spare the best `keep_last` candidates (evicted last).
++        if self.keep_last and ordered_candidates:
++            if self.keep_last >= len(ordered_candidates):
++                spared = list(ordered_candidates)
++                to_evict = []
++            else:
++                to_evict = ordered_candidates[: len(ordered_candidates) - self.keep_last]
++                spared = ordered_candidates[len(ordered_candidates) - self.keep_last :]
++        else:
++            to_evict = list(ordered_candidates)
++            spared = []
++
++        if not self.has_budget:
++            return to_evict
++
++        # Budget pass: figure out what is being retained if we evict `to_evict`,
++        # then, if that still exceeds the budget, evict more of the *spared*
++        # candidates (worst-first) until it fits.
++        evict_set = {it.path for it in to_evict}
++        retained = [it for it in items if it.path not in evict_set]
++        retained_bytes = sum(it.allocated_size for it in retained)
++
++        if retained_bytes <= self.max_total_bytes:
++            return to_evict
++
++        # Evict additional spared candidates in eviction order until we fit.
++        # `spared` is already the tail of the ordering; iterate it worst-first.
++        extra = []
++        spared_worst_first = self.ordering.order(spared)
++        for it in spared_worst_first:
++            if retained_bytes <= self.max_total_bytes:
++                break
++            extra.append(it)
++            retained_bytes -= it.allocated_size
++        # Preserve overall eviction order: recompute over the union.
++        final = to_evict + extra
++        return self.ordering.order(final)
++
++    def as_dict(self):
++        return {
++            "name": self.name,
++            "action": self.action,
++            "ordering": self.ordering.name,
++            "keep_last": self.keep_last,
++            "max_total_bytes": self.max_total_bytes,
++            "rules": self.rule_set.as_dict(),
++        }
++
++    def __repr__(self):
++        return (
++            f"<RetentionPolicy {self.name!r} action={self.action} "
++            f"ordering={self.ordering.name} keep_last={self.keep_last} "
++            f"budget={self.max_total_bytes}>"
++        )
+diff --git a/core/sweep/report.py b/core/sweep/report.py
+new file mode 100644
+index 00000000..246ee779
+--- /dev/null
++++ b/core/sweep/report.py
+@@ -0,0 +1,91 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Human- and machine-readable rendering of a plan and its execution.
++
++:class:`SweepReport` bundles a :class:`~core.sweep.plan.SweepPlan` with an
++optional :class:`~core.sweep.executor.SweepRunReport` and knows how to turn the
++pair into a dict, JSON, or a compact text summary -- the kind of thing an
++operator pastes into a ticket.
++"""
++
++from __future__ import annotations
++
++import json
++
++__all__ = ["SweepReport"]
++
++
++def _format_size(num_bytes):
++    """Binary-ladder human size (KiB / MiB ...), matching the disk analyzer."""
++    value = float(num_bytes)
++    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
++        if abs(value) < 1024.0 or unit == "PiB":
++            if unit == "B":
++                return f"{int(value)} {unit}"
++            return f"{value:.1f} {unit}"
++        value /= 1024.0
++    return f"{value:.1f} PiB"  # pragma: no cover
++
++
++class SweepReport:
++    """A serialisable view over a plan (and, optionally, its run result)."""
++
++    def __init__(self, plan, run=None, policy=None):
++        self.plan = plan
++        self.run = run
++        self.policy = policy
++
++    def as_dict(self, include_actions=True):
++        d = {
++            "policy": self.plan.policy_name,
++            "root": str(self.plan.root) if self.plan.root is not None else None,
++            "action_count": self.plan.action_count,
++            "reclaimable_size": self.plan.reclaimable_size,
++            "reclaimable_allocated": self.plan.reclaimable_allocated,
++            "verb_counts": self.plan.verb_counts(),
++        }
++        if self.policy is not None:
++            d["policy_detail"] = self.policy.as_dict()
++        if include_actions:
++            d["actions"] = [a.as_dict() for a in self.plan.actions]
++        if self.run is not None:
++            d["run"] = self.run.as_dict()
++        return d
++
++    def as_json(self, include_actions=True, indent=2):
++        return json.dumps(self.as_dict(include_actions=include_actions), indent=indent, sort_keys=True)
++
++    def render_text(self):
++        lines = []
++        lines.append(f"Retention policy: {self.plan.policy_name}")
++        if self.plan.root is not None:
++            lines.append(f"Root: {self.plan.root}")
++        lines.append(
++            f"Planned actions: {self.plan.action_count} "
++            f"(reclaim {_format_size(self.plan.reclaimable_allocated)} allocated, "
++            f"{_format_size(self.plan.reclaimable_size)} apparent)"
++        )
++        counts = self.plan.verb_counts()
++        if counts:
++            verb_str = ", ".join(f"{v}: {n}" for v, n in sorted(counts.items()))
++            lines.append(f"  by action -> {verb_str}")
++        if self.run is not None:
++            kind = "DRY RUN" if self.run.dry_run else "APPLIED"
++            lines.append(
++                f"Run [{kind}]: freed {_format_size(self.run.freed_allocated)} allocated"
++            )
++            oc = self.run.outcome_counts()
++            if oc:
++                oc_str = ", ".join(f"{k}: {n}" for k, n in sorted(oc.items()))
++                lines.append(f"  outcomes -> {oc_str}")
++        # A few example targets, biggest first, for a human eyeball.
++        top = sorted(self.plan.actions, key=lambda a: -a.allocated_size)[:10]
++        if top:
++            lines.append("Largest targets:")
++            for a in top:
++                lines.append(f"  {_format_size(a.allocated_size):>10}  {a.verb:<7} {a.item.path}")
++        return "\n".join(lines)
+diff --git a/core/sweep/rules.py b/core/sweep/rules.py
+new file mode 100644
+index 00000000..3b5ddcc7
+--- /dev/null
++++ b/core/sweep/rules.py
+@@ -0,0 +1,404 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Declarative retention rules and their precedence.
++
++A retention *rule* looks at one :class:`~core.sweep.item.SweepItem` and, if it
++matches, casts a vote: **keep** it or **evict** it. A :class:`RuleSet` holds an
++ordered list of rules and reduces every item to a single :class:`Verdict`.
++
++Precedence is deliberately **safety-first**:
++
++* An item that is ``protected`` (a reference-folder or pinned file) is *always*
++  kept -- no rule can override that.
++* Among matching rules, the one with the highest ``priority`` wins; ties are
++  broken **in favour of keeping** (a ``keep`` beats an ``evict`` of equal
++  priority), then by declaration order.
++* An item no rule matches falls through to the set's ``default_action`` (which
++  is ``keep`` -- a sweeper that isn't told to evict something leaves it alone).
++
++Count- and budget-based retention ("keep the newest 10", "stay under 5 GiB")
++are *not* per-item predicates, so they live in the ordering / planning layer,
++not here.
++"""
++
++from __future__ import annotations
++
++import fnmatch
++
++from .errors import InvalidPolicyError, UnknownRuleError
++
++__all__ = [
++    "KEEP",
++    "EVICT",
++    "SECONDS_PER_DAY",
++    "Verdict",
++    "RetentionRule",
++    "AgeRule",
++    "IdleRule",
++    "SizeRule",
++    "GlobRule",
++    "ExtensionRule",
++    "MatchAllRule",
++    "make_rule",
++    "RuleSet",
++]
++
++KEEP = "keep"
++EVICT = "evict"
++_ACTIONS = (KEEP, EVICT)
++
++SECONDS_PER_MINUTE = 60.0
++SECONDS_PER_HOUR = 3600.0
++SECONDS_PER_DAY = 86400.0
++SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY
++
++_DURATION_KEYS = {
++    "seconds": 1.0,
++    "minutes": SECONDS_PER_MINUTE,
++    "hours": SECONDS_PER_HOUR,
++    "days": SECONDS_PER_DAY,
++    "weeks": SECONDS_PER_WEEK,
++}
++
++
++def _coerce_action(action):
++    if action not in _ACTIONS:
++        raise InvalidPolicyError(f"unknown rule action {action!r} (expected 'keep' or 'evict')")
++    return action
++
++
++def _duration_from_spec(spec, base_key):
++    """Resolve a duration in seconds from ``<base>_seconds`` / ``_days`` / ... keys.
++
++    Exactly one unit form must be present; e.g. for ``base_key='max_age'`` a spec
++    may carry ``max_age_seconds`` **or** ``max_age_days`` (etc.), not both.
++    """
++    found = []
++    for unit, factor in _DURATION_KEYS.items():
++        key = f"{base_key}_{unit}"
++        if key in spec and spec[key] is not None:
++            found.append((key, float(spec[key]) * factor))
++    if not found:
++        raise InvalidPolicyError(f"rule is missing a duration; expected one of {base_key}_days / _hours / ...")
++    if len(found) > 1:
++        names = ", ".join(k for k, _ in found)
++        raise InvalidPolicyError(f"rule has more than one duration ({names}); give exactly one")
++    seconds = found[0][1]
++    if seconds < 0:
++        raise InvalidPolicyError(f"duration for {base_key} must not be negative")
++    return seconds
++
++
++class Verdict:
++    """The decision for a single item: keep or evict, and why."""
++
++    __slots__ = ("item", "action", "rule", "matched_rules", "reason")
++
++    def __init__(self, item, action, rule=None, matched_rules=None, reason=""):
++        self.item = item
++        self.action = action
++        self.rule = rule
++        self.matched_rules = list(matched_rules or [])
++        self.reason = reason
++
++    @property
++    def is_evict(self):
++        return self.action == EVICT
++
++    @property
++    def is_keep(self):
++        return self.action == KEEP
++
++    def as_dict(self):
++        return {
++            "path": str(self.item.path),
++            "action": self.action,
++            "rule": self.rule.name if self.rule is not None else None,
++            "matched_rules": [r.name for r in self.matched_rules],
++            "reason": self.reason,
++        }
++
++    def __repr__(self):
++        return f"<Verdict {self.action} {self.item.name!r} by {self.rule.name if self.rule else '-'}>"
++
++
++class RetentionRule:
++    """Base class: a named, prioritised predicate over items casting a vote.
++
++    Subclasses implement :meth:`matches`. ``priority`` orders rules when several
++    match the same item (higher wins); ``reason`` is a human string recorded on
++    the verdict.
++    """
++
++    kind = "rule"
++
++    def __init__(self, name, action, priority=0, reason=None):
++        self.name = name
++        self.action = _coerce_action(action)
++        self.priority = int(priority)
++        self.reason = reason if reason is not None else self._default_reason()
++
++    def _default_reason(self):
++        return f"{self.kind} rule {self.name!r}"
++
++    def matches(self, item):  # pragma: no cover - abstract
++        raise NotImplementedError
++
++    def as_dict(self):
++        return {
++            "name": self.name,
++            "kind": self.kind,
++            "action": self.action,
++            "priority": self.priority,
++            "reason": self.reason,
++        }
++
++    def __repr__(self):
++        return f"<{type(self).__name__} {self.name!r} {self.action} p{self.priority}>"
++
++
++class AgeRule(RetentionRule):
++    """Matches items whose *modification age* is at least ``max_age`` seconds."""
++
++    kind = "age"
++
++    def __init__(self, name, action, max_age, priority=0, reason=None):
++        self.max_age = float(max_age)
++        super().__init__(name, action, priority=priority, reason=reason)
++
++    def _default_reason(self):
++        return f"older than {self.max_age:g}s"
++
++    def matches(self, item):
++        return item.age_seconds() >= self.max_age
++
++
++class IdleRule(RetentionRule):
++    """Matches items *idle* (unaccessed) for at least ``max_idle`` seconds."""
++
++    kind = "idle"
++
++    def __init__(self, name, action, max_idle, priority=0, reason=None):
++        self.max_idle = float(max_idle)
++        super().__init__(name, action, priority=priority, reason=reason)
++
++    def _default_reason(self):
++        return f"idle for more than {self.max_idle:g}s"
++
++    def matches(self, item):
++        return item.idle_seconds() >= self.max_idle
++
++
++class SizeRule(RetentionRule):
++    """Matches items whose apparent size falls in ``[min_size, max_size]``.
++
++    Either bound may be ``0`` / unset to leave that side open.
++    """
++
++    kind = "size"
++
++    def __init__(self, name, action, min_size=0, max_size=0, priority=0, reason=None):
++        self.min_size = int(min_size or 0)
++        self.max_size = int(max_size or 0)
++        if self.max_size and self.min_size and self.max_size < self.min_size:
++            raise InvalidPolicyError(f"size rule {name!r}: max_size < min_size")
++        super().__init__(name, action, priority=priority, reason=reason)
++
++    def _default_reason(self):
++        if self.min_size and self.max_size:
++            return f"size in [{self.min_size}, {self.max_size}]"
++        if self.min_size:
++            return f"size >= {self.min_size}"
++        if self.max_size:
++            return f"size <= {self.max_size}"
++        return "any size"
++
++    def matches(self, item):
++        if self.min_size and item.size < self.min_size:
++            return False
++        if self.max_size and item.size > self.max_size:
++            return False
++        return True
++
++
++class GlobRule(RetentionRule):
++    """Matches items whose *name* matches any of the given glob patterns."""
++
++    kind = "glob"
++
++    def __init__(self, name, action, patterns, priority=0, reason=None, match_full_path=False):
++        if isinstance(patterns, str):
++            patterns = [patterns]
++        self.patterns = [str(p) for p in patterns]
++        if not self.patterns:
++            raise InvalidPolicyError(f"glob rule {name!r} has no patterns")
++        self.match_full_path = bool(match_full_path)
++        super().__init__(name, action, priority=priority, reason=reason)
++
++    def _default_reason(self):
++        return "matches " + " | ".join(self.patterns)
++
++    def matches(self, item):
++        target = str(item.path) if self.match_full_path else item.name
++        return any(fnmatch.fnmatch(target, pat) for pat in self.patterns)
++
++
++class ExtensionRule(RetentionRule):
++    """Matches items whose extension is in the configured set."""
++
++    kind = "extension"
++
++    def __init__(self, name, action, extensions, priority=0, reason=None):
++        if isinstance(extensions, str):
++            extensions = [extensions]
++        self.extensions = {e.lower().lstrip(".") for e in extensions}
++        if not self.extensions:
++            raise InvalidPolicyError(f"extension rule {name!r} has no extensions")
++        super().__init__(name, action, priority=priority, reason=reason)
++
++    def _default_reason(self):
++        return "extension in {" + ", ".join(sorted(self.extensions)) + "}"
++
++    def matches(self, item):
++        return item.extension in self.extensions
++
++
++class MatchAllRule(RetentionRule):
++    """Matches every item -- a catch-all, typically a low-priority default."""
++
++    kind = "all"
++
++    def _default_reason(self):
++        return "matches all items"
++
++    def matches(self, item):
++        return True
++
++
++_RULE_KINDS = {
++    "age": AgeRule,
++    "idle": IdleRule,
++    "size": SizeRule,
++    "glob": GlobRule,
++    "extension": ExtensionRule,
++    "all": MatchAllRule,
++}
++
++
++def make_rule(spec):
++    """Build a :class:`RetentionRule` from a plain-dict spec.
++
++    The spec's ``kind`` selects the rule class; remaining keys are the rule's
++    parameters. Unknown kinds raise :class:`UnknownRuleError`; malformed specs
++    raise :class:`InvalidPolicyError`.
++    """
++    if not isinstance(spec, dict):
++        raise InvalidPolicyError(f"rule spec must be a mapping, got {type(spec).__name__}")
++    kind = spec.get("kind")
++    if kind is None:
++        raise InvalidPolicyError("rule spec is missing 'kind'")
++    cls = _RULE_KINDS.get(kind)
++    if cls is None:
++        raise UnknownRuleError(f"unknown rule kind {kind!r}")
++    name = spec.get("name", kind)
++    action = spec.get("action", EVICT)
++    priority = spec.get("priority", 0)
++    reason = spec.get("reason")
++    if cls is AgeRule:
++        return AgeRule(name, action, _duration_from_spec(spec, "max_age"), priority=priority, reason=reason)
++    if cls is IdleRule:
++        return IdleRule(name, action, _duration_from_spec(spec, "max_idle"), priority=priority, reason=reason)
++    if cls is SizeRule:
++        return SizeRule(
++            name,
++            action,
++            min_size=spec.get("min_size", 0),
++            max_size=spec.get("max_size", 0),
++            priority=priority,
++            reason=reason,
++        )
++    if cls is GlobRule:
++        patterns = spec.get("patterns", spec.get("pattern"))
++        if patterns is None:
++            raise InvalidPolicyError(f"glob rule {name!r} needs 'patterns'")
++        return GlobRule(
++            name,
++            action,
++            patterns,
++            priority=priority,
++            reason=reason,
++            match_full_path=spec.get("match_full_path", False),
++        )
++    if cls is ExtensionRule:
++        extensions = spec.get("extensions", spec.get("ext"))
++        if extensions is None:
++            raise InvalidPolicyError(f"extension rule {name!r} needs 'extensions'")
++        return ExtensionRule(name, action, extensions, priority=priority, reason=reason)
++    # MatchAllRule
++    return MatchAllRule(name, action, priority=priority, reason=reason)
++
++
++class RuleSet:
++    """An ordered collection of rules reducing items to verdicts.
++
++    See the module docstring for the precedence contract. ``default_action``
++    applies to items no rule matches (``keep`` unless overridden).
++    """
++
++    def __init__(self, rules=None, default_action=KEEP):
++        self.rules = list(rules or [])
++        self.default_action = _coerce_action(default_action)
++
++    def add(self, rule):
++        self.rules.append(rule)
++        return rule
++
++    @classmethod
++    def from_specs(cls, specs, default_action=KEEP):
++        return cls([make_rule(s) for s in (specs or [])], default_action=default_action)
++
++    def matching_rules(self, item):
++        """All rules that match ``item``, in declaration order."""
++        return [r for r in self.rules if r.matches(item)]
++
++    def classify(self, item):
++        """Reduce ``item`` to a single :class:`Verdict`."""
++        # Hard protection: nothing evicts a protected item.
++        if getattr(item, "protected", False):
++            matched = self.matching_rules(item)
++            return Verdict(item, KEEP, rule=None, matched_rules=matched, reason="protected")
++        matched = self.matching_rules(item)
++        if not matched:
++            return Verdict(item, self.default_action, rule=None, matched_rules=[], reason="default")
++        # Highest priority wins; tie -> keep beats evict; then declaration order.
++        # We sort a copy by a key that encodes those rules, stable on order.
++        def _key(indexed):
++            idx, rule = indexed
++            keep_bias = 0 if rule.action == KEEP else 1  # keep sorts first on ties
++            return (-rule.priority, keep_bias, idx)
++
++        best_idx, best = min(enumerate(matched), key=_key)
++        return Verdict(item, best.action, rule=best, matched_rules=matched, reason=best.reason)
++
++    def classify_all(self, items):
++        return [self.classify(it) for it in items]
++
++    def evictable(self, items):
++        """Items this rule set votes to evict (before count / budget limits)."""
++        return [v.item for v in self.classify_all(items) if v.is_evict]
++
++    def as_dict(self):
++        return {
++            "default_action": self.default_action,
++            "rules": [r.as_dict() for r in self.rules],
++        }
++
++    def __len__(self):
++        return len(self.rules)
++
++    def __iter__(self):
++        return iter(self.rules)
+diff --git a/core/sweep/scanner.py b/core/sweep/scanner.py
+new file mode 100644
+index 00000000..8a2cb4e2
+--- /dev/null
++++ b/core/sweep/scanner.py
+@@ -0,0 +1,156 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""Walking directories into a flat list of :class:`SweepItem`.
++
++Layers on :class:`core.directories.Directories` (tree walk + normal / reference
++/ excluded folder states) exactly like the reclaim and diskscan scanners, so a
++retention run honours the same folder-state vocabulary. Files in a *reference*
++folder come back ``protected=True`` -- the sweeper will never evict them.
++
++The scanner captures one **reference time** at the start of the walk so every
++age / idle computation in the run shares a single clock.
++"""
++
++from __future__ import annotations
++
++import fnmatch
++from pathlib import Path
++
++from hscommon.jobprogress import job
++
++from core import fs
++from core.directories import Directories, DirectoryState, InvalidPathError
++
++from .errors import InvalidScanRootError
++from .item import SweepItem
++
++__all__ = ["ScanSpec", "SweepScanner"]
++
++
++class ScanSpec:
++    """Declarative description of *what* to scan for a retention run."""
++
++    __slots__ = (
++        "roots",
++        "reference_roots",
++        "excluded_roots",
++        "include_ext",
++        "exclude_ext",
++        "include_globs",
++        "exclude_globs",
++        "min_size",
++        "max_size",
++    )
++
++    def __init__(
++        self,
++        roots,
++        reference_roots=None,
++        excluded_roots=None,
++        include_ext=None,
++        exclude_ext=None,
++        include_globs=None,
++        exclude_globs=None,
++        min_size=0,
++        max_size=0,
++    ):
++        self.roots = [Path(p) for p in roots]
++        self.reference_roots = [Path(p) for p in (reference_roots or [])]
++        self.excluded_roots = [Path(p) for p in (excluded_roots or [])]
++        self.include_ext = {e.lower().lstrip(".") for e in (include_ext or [])}
++        self.exclude_ext = {e.lower().lstrip(".") for e in (exclude_ext or [])}
++        self.include_globs = list(include_globs or [])
++        self.exclude_globs = list(exclude_globs or [])
++        self.min_size = min_size
++        self.max_size = max_size
++
++    @classmethod
++    def from_dict(cls, data):
++        return cls(
++            roots=data.get("roots", data.get("paths", [])),
++            reference_roots=data.get("reference_roots", data.get("references", [])),
++            excluded_roots=data.get("excluded_roots", data.get("excludes", [])),
++            include_ext=data.get("include_ext"),
++            exclude_ext=data.get("exclude_ext"),
++            include_globs=data.get("include_globs"),
++            exclude_globs=data.get("exclude_globs"),
++            min_size=data.get("min_size", 0),
++            max_size=data.get("max_size", 0),
++        )
++
++    def _name_allowed(self, name):
++        ext = Path(name).suffix.lower().lstrip(".")
++        if self.include_ext and ext not in self.include_ext:
++            return False
++        if self.exclude_ext and ext in self.exclude_ext:
++            return False
++        if self.include_globs and not any(fnmatch.fnmatch(name, g) for g in self.include_globs):
++            return False
++        if self.exclude_globs and any(fnmatch.fnmatch(name, g) for g in self.exclude_globs):
++            return False
++        return True
++
++    def _size_allowed(self, size):
++        if self.min_size and size < self.min_size:
++            return False
++        if self.max_size and size > self.max_size:
++            return False
++        return True
++
++
++class SweepScanner:
++    """Collects :class:`SweepItem` for a :class:`ScanSpec`."""
++
++    def __init__(self, spec, ref_time=None):
++        self.spec = spec
++        self._ref_time = ref_time
++
++    def _build_directories(self):
++        dirs = Directories()
++        for root in self.spec.roots:
++            if not root.exists() or not root.is_dir():
++                raise InvalidScanRootError(f"scan root does not exist or is not a directory: {root}")
++            try:
++                dirs.add_path(root)
++            except InvalidPathError:
++                raise InvalidScanRootError(f"invalid scan root: {root}")
++        for ref in self.spec.reference_roots:
++            if not ref.exists() or not ref.is_dir():
++                raise InvalidScanRootError(f"reference root does not exist: {ref}")
++            if ref not in dirs:
++                try:
++                    dirs.add_path(ref)
++                except InvalidPathError:
++                    raise InvalidScanRootError(f"invalid reference root: {ref}")
++            dirs.set_state(ref, DirectoryState.REFERENCE)
++        for exc in self.spec.excluded_roots:
++            dirs.set_state(Path(exc), DirectoryState.EXCLUDED)
++        return dirs
++
++    def scan(self, ref_time=None, j=job.nulljob):
++        """Return the list of :class:`SweepItem` matching the spec.
++
++        Reference-folder files come back with ``protected=True``.
++        """
++        anchor = ref_time if ref_time is not None else self._ref_time
++        dirs = self._build_directories()
++        items = []
++        for file in dirs.get_files(fileclasses=[fs.File], j=j):
++            name = file.path.name
++            if not self.spec._name_allowed(name):
++                continue
++            if not self.spec._size_allowed(file.size):
++                continue
++            items.append(
++                SweepItem.from_file(
++                    file,
++                    ref_time=anchor,
++                    protected=bool(getattr(file, "is_ref", False)) or None,
++                )
++            )
++        items.sort(key=lambda it: str(it.path))
++        return items
+diff --git a/core/sweep/session.py b/core/sweep/session.py
+new file mode 100644
+index 00000000..39ca4f16
+--- /dev/null
++++ b/core/sweep/session.py
+@@ -0,0 +1,109 @@
++# Copyright 2016 Hardcoded Software (http://www.hardcoded.net)
++#
++# This software is licensed under the "GPLv3" License as described in the "LICENSE" file,
++# which should be included with this package. The terms are also available at
++# http://www.gnu.org/licenses/gpl-3.0.html
++
++"""The high-level retention session tying scan -> policy -> plan -> apply.
++
++A :class:`SweepSession` is the one object a caller normally holds. It scans once
++(the only read of the disk), builds a plan from the policy, and lets the caller
++**preview** (always a dry run) before **apply** (the real mutation). The scan and
++its reference time are captured once and reused so a preview and the apply that
++follows it act on the *same* snapshot -- the plan you saw is the plan that runs.
++
++The clock is injectable (``clock=lambda: ...``) so tests get a deterministic
++reference time without monkeypatching :mod:`time`.
++"""
++
++from __future__ import annotations
++
++import time
++
++from hscommon.jobprogress import job
++
++from .executor import SweepExecutor
++from .plan import build_plan
++from .policy import RetentionPolicy
++from .scanner import ScanSpec, SweepScanner
++
++__all__ = ["SweepSession"]
++
++
++class SweepSession:
++    """Orchestrates a retention run over a :class:`ScanSpec` and policy."""
++
++    def __init__(self, spec, policy, clock=None):
++        self.spec = spec
++        self.policy = policy if policy is not None else RetentionPolicy()
++        self._clock = clock if clock is not None else time.time
++        self._items = None
++        self._ref_time = None
++        self._plan = None
++
++    # --- Scanning -------------------------------------------------------------
++    def scan(self, force=False, ref_time=None, j=job.nulljob):
++        """Scan the disk once (cached). Returns the list of items."""
++        if self._items is not None and not force:
++            return self._items
++        self._ref_time = float(ref_time) if ref_time is not None else float(self._clock())
++        scanner = SweepScanner(self.spec, ref_time=self._ref_time)
++        self._items = scanner.scan(ref_time=self._ref_time, j=j)
++        self._plan = None  # invalidate any cached plan
++        return self._items
++
++    @property
++    def items(self):
++        if self._items is None:
++            self.scan()
++        return self._items
++
++    @property
++    def ref_time(self):
++        if self._ref_time is None:
++            self.scan()
++        return self._ref_time
++
++    # --- Planning -------------------------------------------------------------
++    def plan(self, force=False):
++        """Build (and cache) the sweep plan for the current scan."""
++        if self._plan is not None and not force:
++            return self._plan
++        items = self.items
++        root = self.spec.roots[0] if self.spec.roots else None
++        self._plan = build_plan(self.policy, items, root=root)
++        return self._plan
++
++    # --- Preview / apply ------------------------------------------------------
++    def preview(self):
++        """Dry-run the current plan; performs no filesystem mutation."""
++        executor = SweepExecutor(dry_run=True)
++        return executor.run(self.plan())
++
++    def apply(self, ignore_stale=False, trash_func=None, delete_func=None):
++        """Execute the current plan for real, returning the run report.
++
++        The plan is built from the cached scan, so callers should
++        :meth:`preview` first if they want to show intent before mutating.
++        """
++        executor = SweepExecutor(
++            dry_run=False,
++            ignore_stale=ignore_stale,
++            trash_func=trash_func,
++            delete_func=delete_func,
++        )
++        return executor.run(self.plan())
++
++    @classmethod
++    def from_dict(cls, data, clock=None):
++        """Build a session from a plain-dict spec + policy sub-dicts.
++
++        Kept thin -- the layered loader (:mod:`core.sweep.loader`) is the richer
++        entry point. Here we accept ``{"scan": {...}, "policy": {...}}``.
++        """
++        from .loader import _policy_from_settings  # local import to avoid cycle
++
++        scan_data = data.get("scan", data)
++        spec = ScanSpec.from_dict(scan_data)
++        policy = _policy_from_settings(data.get("policy", {}))
++        return cls(spec, policy, clock=clock)

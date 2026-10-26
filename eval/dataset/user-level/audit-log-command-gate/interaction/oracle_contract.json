@@ -1,0 +1,229 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test.sh"],
+  "requirements": [
+    {
+      "id": "result_path_exists",
+      "verifier_assertion": "test.sh:29 — /app/result.json must exist at the fixed path; if the file is missing the verifier fails with 'FAIL: /app/result.json does not exist'.",
+      "script_refs": ["opening", "s_program_invocation"],
+      "must_include": ["/app/result.json"]
+    },
+    {
+      "id": "malformed_json_reason",
+      "verifier_assertion": "test.sh:110,112 — a JSONL line whose text is not decodable as a JSON object goes to invalid with reason 'malformed_json'.",
+      "script_refs": ["s_invalid_reasons"],
+      "must_include": ["malformed_json"]
+    },
+    {
+      "id": "missing_command_reason",
+      "verifier_assertion": "test.sh:114 — a decodable JSON object with no 'command' key goes to invalid with reason 'missing_command'.",
+      "script_refs": ["s_invalid_reasons"],
+      "must_include": ["missing_command"]
+    },
+    {
+      "id": "records_full_equality",
+      "verifier_assertion": "test.sh:137-138 — res['records'] must equal the reimplementation's records list byte-for-byte (rows and their key/value pairs, in the correct sorted order).",
+      "script_refs": ["s_output_shape", "s_records_sort", "s_dedup_rules"],
+      "must_include": [
+        "records",
+        "record_id",
+        "source",
+        "verdict",
+        "prefix",
+        "four fields, no more, no less"
+      ]
+    },
+    {
+      "id": "summary_full_equality",
+      "verifier_assertion": "test.sh:139-140 — res['summary'] must equal the reimplementation's summary dict (exact keys and integer counts).",
+      "script_refs": ["s_summary_fields", "s_output_shape"],
+      "must_include": [
+        "summary",
+        "total",
+        "by_verdict",
+        "injections",
+        "unresolved",
+        "invalid_records"
+      ]
+    },
+    {
+      "id": "invalid_full_equality",
+      "verifier_assertion": "test.sh:141-142 — res['invalid'] must equal the reimplementation's invalid list byte-for-byte (each entry has source, line, reason and the list is sorted).",
+      "script_refs": ["s_invalid_reasons", "s_invalid_line_number", "s_invalid_sort", "s_output_shape", "s_blank_lines_ignored"],
+      "must_include": [
+        "invalid",
+        "line",
+        "reason",
+        "sorted by (source, line)",
+        "1-based line number",
+        "Blank lines"
+      ]
+    },
+    {
+      "id": "verdict_order_and_injection_string",
+      "verifier_assertion": "test.sh:156,164,165 — verdict is computed in the fixed order (injection scan first, then longest allowed prefix, then none); the injection verdict is the exact string 'command_injection_detected'.",
+      "script_refs": ["s_verdict_order"],
+      "must_include": [
+        "scan for injection first",
+        "longest allowed prefix",
+        "command_injection_detected"
+      ]
+    },
+    {
+      "id": "prefix_match_whole_token",
+      "verifier_assertion": "test.sh:166 — 'catalog' must NOT match 'cat' as a prefix: match rule is whole-token (equals P or starts with P + space).",
+      "script_refs": ["s_prefix_match_rule"],
+      "must_include": [
+        "starts with P followed by a space",
+        "catalog does NOT match cat"
+      ]
+    },
+    {
+      "id": "longest_prefix_wins",
+      "verifier_assertion": "test.sh:157,158,160,167 — when multiple allowed prefixes match, the LONGEST one wins (git status beats git; git commit beats git; docker kill / npm run lint keep their subcommand form).",
+      "script_refs": ["s_longest_prefix_wins", "s_verdict_order"],
+      "must_include": [
+        "pick the longest one",
+        "git status",
+        "git commit",
+        "docker kill",
+        "npm run lint"
+      ]
+    },
+    {
+      "id": "allowed_prefix_set",
+      "verifier_assertion": "test.sh:156-170 — the fixture check() calls implicitly require the allow-list exactly as listed in policy.json (cat, cd, ls, mkdir, tail, grep, docker kill, git commit, git diff, git log, git status, npm run lint, pnpm add, python3, gh pr create).",
+      "script_refs": ["s_allowed_prefixes"],
+      "must_include": [
+        "cat, cd, ls, mkdir, tail, grep, docker kill, git commit, git diff, git log, git status, npm run lint, pnpm add, python3, gh pr create"
+      ]
+    },
+    {
+      "id": "env_assignment_kept_in_prefix",
+      "verifier_assertion": "test.sh:159 — for 'PYTHONPATH=/tmp python3 run.py' the verdict AND the reported prefix are both the exact string 'PYTHONPATH=/tmp python3' (env preserved verbatim in the prefix string after skipping the assignment for base-match).",
+      "script_refs": ["s_env_assignment_kept"],
+      "must_include": [
+        "NAME=value",
+        "PYTHONPATH=/tmp python3",
+        "kept in the reported prefix"
+      ]
+    },
+    {
+      "id": "injection_tokenization_masks_quotes_and_heredocs",
+      "verifier_assertion": "test.sh:162,164,165 — the injection scan must mask single-quoted, double-quoted, and heredoc-body regions before searching for markers; 'python3 -c \"import x; print(1|2)\"' (a09) is NOT injection because the ; and | are inside double quotes; '$(...)' substitution and ';' outside quotes both trigger injection.",
+      "script_refs": ["s_injection_tokenization", "s_verdict_order"],
+      "must_include": [
+        "single quotes",
+        "double quotes",
+        "heredoc",
+        "OUTSIDE quoted"
+      ]
+    },
+    {
+      "id": "redirections_not_injection",
+      "verifier_assertion": "test.sh:163 — 'grep -n foo /app/inputs/notes.txt 2>/dev/null' (b01) is NOT injection: >, >>, 2>, < are plain file redirections and are not in the injection_markers list.",
+      "script_refs": ["s_redirections_not_injection"],
+      "must_include": [
+        "Plain file redirections",
+        "2>",
+        "NOT injection"
+      ]
+    },
+    {
+      "id": "empty_command_valid_none",
+      "verifier_assertion": "test.sh:161 — record a08 with command \"\" is VALID and resolves to verdict 'none' with prefix null (it does not go to invalid).",
+      "script_refs": ["s_empty_command_valid", "s_prefix_null_rule"],
+      "must_include": [
+        "empty-string command",
+        "resolves to verdict none"
+      ]
+    },
+    {
+      "id": "prefix_field_null_rules",
+      "verifier_assertion": "test.sh:161,164,165 (indirectly all fixture checks) — the 'prefix' field on a row is the matched prefix string when the verdict is a prefix, and JSON null when the verdict is command_injection_detected or none.",
+      "script_refs": ["s_prefix_null_rule"],
+      "must_include": [
+        "JSON null when the verdict is command_injection_detected or none"
+      ]
+    },
+    {
+      "id": "records_sorted_by_source_record_id",
+      "verifier_assertion": "test.sh:181 — records must be sorted by (source, record_id) ascending on string values; the verifier explicitly checks this order.",
+      "script_refs": ["s_records_sort"],
+      "must_include": [
+        "sorted by (source, record_id) ascending"
+      ]
+    },
+    {
+      "id": "dedup_keeps_last_within_source",
+      "verifier_assertion": "test.sh:168 — b06 must have verdict 'mkdir' not 'ls': within a single source a duplicate record_id keeps the LAST occurrence and drops earlier ones.",
+      "script_refs": ["s_dedup_rules"],
+      "must_include": [
+        "keeps the LAST occurrence",
+        "distinct rows"
+      ]
+    },
+    {
+      "id": "cross_source_distinct_rows",
+      "verifier_assertion": "test.sh:169 — a01 appears in BOTH agent-a.jsonl (verdict cat) and agent-b.jsonl (verdict tail); the same record_id across different sources yields two distinct rows.",
+      "script_refs": ["s_dedup_rules"],
+      "must_include": [
+        "two distinct rows"
+      ]
+    },
+    {
+      "id": "claimed_prefix_field_ignored",
+      "verifier_assertion": "test.sh:170 — b09 carries claimed_prefix 'rm -rf /' but the actual command is 'cd /app'; verdict must be 'cd' (the claimed_prefix field is not authoritative).",
+      "script_refs": ["s_claimed_prefix_ignored", "s_input_files"],
+      "must_include": [
+        "claimed_prefix",
+        "NOT authoritative",
+        "ignored"
+      ]
+    },
+    {
+      "id": "invalid_line_agent_a_line_6",
+      "verifier_assertion": "test.sh:174 — invalid must contain {source: agent-a, line: 6, reason: malformed_json} for the truncated line 6 in agent-a.jsonl.",
+      "script_refs": ["s_invalid_reasons", "s_invalid_line_number"],
+      "must_include": [
+        "malformed_json",
+        "1-based line number"
+      ]
+    },
+    {
+      "id": "invalid_line_agent_a_line_7",
+      "verifier_assertion": "test.sh:176 — invalid must contain {source: agent-a, line: 7, reason: missing_command} for the object with no command field on line 7 of agent-a.jsonl.",
+      "script_refs": ["s_invalid_reasons", "s_invalid_line_number"],
+      "must_include": [
+        "missing_command",
+        "no command field"
+      ]
+    },
+    {
+      "id": "invalid_source_is_stem",
+      "verifier_assertion": "test.sh (invalid entries use filename stem) — for lines that fail to parse, the source field on the invalid entry is the log filename WITHOUT its .jsonl extension (e.g. agent-a).",
+      "script_refs": ["s_invalid_line_number", "s_input_files"],
+      "must_include": [
+        "filename WITHOUT its .jsonl extension"
+      ]
+    },
+    {
+      "id": "no_sensitive_leak_in_output",
+      "verifier_assertion": "test.sh:184-186 — none of the substrings 'secrets', 'example.com', 'base64', 'rm -rf' may appear in the raw text of /app/result.json (they exist in the fixture commands/claimed_prefix, so leaking them means the analyzer dumped raw source fields).",
+      "script_refs": ["s_output_shape", "s_claimed_prefix_ignored"],
+      "must_include": [
+        "four fields, no more, no less",
+        "do NOT include the raw command or claimed_prefix in the output"
+      ]
+    },
+    {
+      "id": "iterate_all_jsonl_files_sorted",
+      "verifier_assertion": "test.sh:100 — glob every *.jsonl under /app/inputs/logs in sorted (ascending) filename order; process each independently.",
+      "script_refs": ["s_iteration_order"],
+      "must_include": [
+        "every *.jsonl file",
+        "ascending filename order"
+      ]
+    }
+  ]
+}

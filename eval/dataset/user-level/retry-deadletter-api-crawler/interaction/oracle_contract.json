@@ -1,0 +1,72 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test.sh", "tests/test_outputs.py"],
+  "requirements": [
+    {
+      "id": "retry_scope",
+      "verifier_assertion": "tests/test_outputs.py:84-85 assert fetch_counts[page1] == 2 (429 retried once) and fetch_counts[detail_a] == 2 (500 retried once); implies retry logic covers HTTP 429 and 5xx up to the configured max_retries budget.",
+      "script_refs": ["slice_retry_scope"],
+      "must_include": ["429", "5xx", "max_retries", "retry budget"]
+    },
+    {
+      "id": "retry_after_semantics",
+      "verifier_assertion": "tests/test_outputs.py:88 asserts clock.sleeps == [2, 1] — 2 seconds for the 429 (from Retry-After: 2 header) and 1 second for the 500 (from backoff_seconds=1 config). Confirms honor-Retry-After-first, then backoff_seconds fallback.",
+      "script_refs": ["slice_retry_after"],
+      "must_include": ["Retry-After", "backoff_seconds"]
+    },
+    {
+      "id": "deadletter_4xx_reason",
+      "verifier_assertion": "tests/test_outputs.py:80-83 asserts read_deadletters() == [{kind: detail, reason: http_404, status: 404, url: detail_b}] — 4xx path writes dead-letter with reason=http_<status>.",
+      "script_refs": ["slice_deadletter_4xx"],
+      "must_include": ["http_404", "http_<status>", "4xx"]
+    },
+    {
+      "id": "deadletter_exhausted_reason",
+      "verifier_assertion": "Instruction contract (instruction.md:22-24): when a request exhausts its retry budget, use reason=retry_exhausted_http_<status> instead of the plain http_<status>. Not exercised as a distinct case by the deterministic fixtures directly, but part of the operator contract.",
+      "script_refs": ["slice_deadletter_exhausted"],
+      "must_include": ["retry_exhausted_http_<status>"]
+    },
+    {
+      "id": "deadletter_api_signature",
+      "verifier_assertion": "tests/test_outputs.py:118 asserts 'write_deadletter' string is present in combined crawler/*.py source; lines 80-83 assert the resulting dead-letter record's exact schema — implies write_deadletter(request, response, reason) API is used with the required positional signature.",
+      "script_refs": ["slice_deadletter_api"],
+      "must_include": ["JsonlPipeline.write_deadletter(request, response, reason)"]
+    },
+    {
+      "id": "stats_keys_exact",
+      "verifier_assertion": "tests/test_outputs.py lines 78, 89, 109, 110 read stats['emitted'] and stats['deadletters']; the stats dict must include keys 'fetched', 'emitted', and 'deadletters' exactly, with deadletters counting dead-letter writes (not derived from fetched minus emitted).",
+      "script_refs": ["slice_stats_keys"],
+      "must_include": ["fetched", "emitted", "deadletters"]
+    },
+    {
+      "id": "queue_dedupe",
+      "verifier_assertion": "tests/test_outputs.py:86-87 assert fetch_counts[page2] == 1 (though the page2 fixture returns next=page2 pointing back at itself) and fetch_counts[detail_b] == 1 (though two list pages reference detail_b) — implies the request queue drops both pagination loops and duplicate detail requests.",
+      "script_refs": ["slice_queue_dedupe"],
+      "must_include": ["pagination loops", "duplicate detail requests"]
+    },
+    {
+      "id": "emit_once",
+      "verifier_assertion": "tests/test_outputs.py:78-79 assert emitted == 1 and the records list is a single-item list for detail_a — though the fixture at page2 also references detail_a, detail records are emitted exactly once per detail URL.",
+      "script_refs": ["slice_emit_once"],
+      "must_include": ["exactly once", "same detail URL"]
+    },
+    {
+      "id": "preserve_happy_path",
+      "verifier_assertion": "tests/test_outputs.py:109-111 (second test method) assert emitted == 1, deadletters == 0, and records[0] == {item_id: ok, name: Cable, stock: 3} — the happy-path list/detail crawl still produces the same JSONL record shape.",
+      "script_refs": ["slice_preserve_success"],
+      "must_include": ["existing successful", "JSONL"]
+    },
+    {
+      "id": "use_existing_abstractions",
+      "verifier_assertion": "tests/test_outputs.py:119-121 assert 'clock.sleep' present and 'time.sleep' absent in combined crawler/*.py source; line 120 asserts 'RequestQueue' present — implies the implementation uses the existing scheduler.RequestQueue and clock.sleep abstractions rather than real sleeps or a bespoke queue.",
+      "script_refs": ["slice_use_abstractions"],
+      "must_include": ["downloader", "scheduler", "parser", "pipeline", "clock"]
+    },
+    {
+      "id": "no_live_network",
+      "verifier_assertion": "Instruction contract (instruction.md:37-38): tests run against deterministic in-memory API fixtures; agent must not add live network access. Environmental precondition — verifier itself never exercises the network.",
+      "script_refs": ["slice_offline_only"],
+      "must_include": ["in-memory", "live network access"]
+    }
+  ]
+}

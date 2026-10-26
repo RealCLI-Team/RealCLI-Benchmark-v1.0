@@ -1,0 +1,393 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "instance_id": "duplicate-reclaim-planner",
+  "source_files": [
+    "instruction.md",
+    "tests/test_outputs.py"
+  ],
+  "requirements": [
+    {
+      "id": "action_constants",
+      "verifier_assertion": "Verifier passes DELETE/TRASH/HARDLINK/SYMLINK action constants through actions and checks each disposition's landing effect.",
+      "script_refs": [
+        "planning"
+      ],
+      "must_include": [
+        "DELETE (unlink directly)",
+        "TRASH (move to trash via an injectable callable)",
+        "HARDLINK (delete the copy, then hardlink to the keeper)",
+        "SYMLINK (delete the copy, then symlink to the keeper)"
+      ]
+    },
+    {
+      "id": "strength_constants",
+      "verifier_assertion": "Verifier checks SIZE_ONLY vs FULL identity strengths (and tolerates PARTIAL).",
+      "script_refs": [
+        "content_identity"
+      ],
+      "must_include": [
+        "SIZE_ONLY (judge sameness by size only)",
+        "FULL (compare up to full content, sampled digests for big files)",
+        "there may also be PARTIAL"
+      ]
+    },
+    {
+      "id": "scanspec_signature",
+      "verifier_assertion": "Verifier constructs ScanSpec with keyword args and checks filtering by ext.",
+      "script_refs": [
+        "scanning"
+      ],
+      "must_include": [
+        "ScanSpec(roots, reference_roots=None, excluded_roots=None,",
+        "min_size=0, max_size=0)",
+        "include_ext: keep only these extensions"
+      ]
+    },
+    {
+      "id": "candidate_scanner",
+      "verifier_assertion": "Verifier calls CandidateScanner(spec).scan() and expects InvalidScanRootError for a missing root.",
+      "script_refs": [
+        "scanning"
+      ],
+      "must_include": [
+        "CandidateScanner(spec)",
+        ".scan() returns a list of candidates in deterministic order",
+        "raises InvalidScanRootError when a scan root does not exist"
+      ]
+    },
+    {
+      "id": "candidate_factory",
+      "verifier_assertion": "Verifier builds candidates via candidate_from_path and checks .identity() and same_content().",
+      "script_refs": [
+        "content_identity"
+      ],
+      "must_include": [
+        "candidate_from_path(path, protected=False)",
+        ".identity()",
+        "same_content(file_a, file_b)"
+      ]
+    },
+    {
+      "id": "content_tiered",
+      "verifier_assertion": "Verifier checks the tiered size->partial->full comparison semantics.",
+      "script_refs": [
+        "content_identity"
+      ],
+      "must_include": [
+        "Comparison must be tiered",
+        "first compare size",
+        "then partial digests",
+        "only full digests for survivors"
+      ]
+    },
+    {
+      "id": "grouping_fn",
+      "verifier_assertion": "Verifier calls group_identical and checks per-group reclaimable bytes and protected-group zero.",
+      "script_refs": [
+        "grouping"
+      ],
+      "must_include": [
+        "group_identical(candidates, ...)",
+        "the reclaimable bytes (total size of all copies except the keeper",
+        "if the whole group is protected, reclaimable is 0",
+        "groups that can free more space listed first"
+      ]
+    },
+    {
+      "id": "small_file_threshold",
+      "verifier_assertion": "Verifier checks tiny/empty files ignored by default and the adjustable threshold down to 0.",
+      "script_refs": [
+        "grouping"
+      ],
+      "must_include": [
+        "Files too small (below a very small default threshold, e.g. empty files) are ignored by default",
+        "adjustable by the caller (including down to 0)"
+      ]
+    },
+    {
+      "id": "deterministic_scan",
+      "verifier_assertion": "Verifier checks scan result order is deterministic.",
+      "script_refs": [
+        "scanning"
+      ],
+      "must_include": [
+        "Scan result order must be deterministic"
+      ]
+    },
+    {
+      "id": "reference_and_excluded",
+      "verifier_assertion": "Verifier checks reference-dir files are protected/never reclaimed and excluded dirs not scanned.",
+      "script_refs": [
+        "scanning"
+      ],
+      "must_include": [
+        "files in directories marked 'reference' are protected",
+        "are never reclaimed",
+        "Excluded directories are not scanned at all"
+      ]
+    },
+    {
+      "id": "make_strategy_fn",
+      "verifier_assertion": "Verifier calls make_strategy and expects UnknownStrategyError for bad names.",
+      "script_refs": [
+        "keeper_strategy"
+      ],
+      "must_include": [
+        "make_strategy(spec)",
+        "raises UnknownStrategyError for unrecognized names"
+      ]
+    },
+    {
+      "id": "strategy_names",
+      "verifier_assertion": "Verifier checks each named keeper strategy.",
+      "script_refs": [
+        "keeper_strategy"
+      ],
+      "must_include": [
+        "\"oldest\", \"newest\", \"shortest_path\", \"longest_path\", \"cleanest_name\", \"biggest\"",
+        "the parameterized \"preferred_dir\""
+      ]
+    },
+    {
+      "id": "strategy_combination",
+      "verifier_assertion": "Verifier checks composed strategies with preferred_dir tuple and tie-breaking.",
+      "script_refs": [
+        "keeper_strategy"
+      ],
+      "must_include": [
+        "earlier ones take priority, later ones break ties",
+        "(\"preferred_dir\", [dir_path, ...])",
+        "strategy=[(\"preferred_dir\", [pref]), \"cleanest_name\"]"
+      ]
+    },
+    {
+      "id": "cleanest_name",
+      "verifier_assertion": "Verifier checks cleanest_name picks the non-copy-looking name.",
+      "script_refs": [
+        "keeper_strategy"
+      ],
+      "must_include": [
+        "photo.jpg beats photo (1).jpg / photo copy.jpg"
+      ]
+    },
+    {
+      "id": "strategy_protected",
+      "verifier_assertion": "Verifier checks protected/reference files are always kept, never reclaimed.",
+      "script_refs": [
+        "keeper_strategy"
+      ],
+      "must_include": [
+        "Protected (reference) files are always kept preferentially and never become reclaim targets"
+      ]
+    },
+    {
+      "id": "planner_action",
+      "verifier_assertion": "Verifier builds a plan via ReclaimPlanner and checks ReclaimAction.reclaimed_bytes.",
+      "script_refs": [
+        "planning"
+      ],
+      "must_include": [
+        "ReclaimPlanner(strategy=\"oldest\", action=DELETE)",
+        "ReclaimAction(kind, victim, keeper)",
+        ".reclaimed_bytes"
+      ]
+    },
+    {
+      "id": "reclaim_plan",
+      "verifier_assertion": "Verifier checks ReclaimPlan.actions ordering, .keepers, .victim_count.",
+      "script_refs": [
+        "planning"
+      ],
+      "must_include": [
+        "ReclaimPlan(actions, keepers, strategy_name=\"\")",
+        ".victim_count",
+        "actions[0].reclaimed_bytes is the single-copy size of the largest group",
+        ".keepers"
+      ]
+    },
+    {
+      "id": "planning_pure",
+      "verifier_assertion": "Verifier checks planning/previewing never modifies the filesystem.",
+      "script_refs": [
+        "planning"
+      ],
+      "must_include": [
+        "Planning is purely functional",
+        "never modifies the filesystem"
+      ]
+    },
+    {
+      "id": "executor_protect",
+      "verifier_assertion": "Verifier checks ReclaimExecutor().execute(plan) raises ProtectedPathError on a protected target.",
+      "script_refs": [
+        "executor"
+      ],
+      "must_include": [
+        "ReclaimExecutor()",
+        ".execute(plan)",
+        "raising ProtectedPathError"
+      ]
+    },
+    {
+      "id": "executor_dryrun",
+      "verifier_assertion": "Verifier checks dry-run makes no changes but returns same-structure result.",
+      "script_refs": [
+        "executor"
+      ],
+      "must_include": [
+        "Dry-run performs all checks a real execution would but skips actual changes"
+      ]
+    },
+    {
+      "id": "executor_stale",
+      "verifier_assertion": "Verifier checks staleness refusal by default and skip when ignored.",
+      "script_refs": [
+        "executor"
+      ],
+      "must_include": [
+        "re-verify each file to be reclaimed still matches the planning snapshot",
+        "refuse and raise an error by default",
+        "recorded as skipped rather than crashing"
+      ]
+    },
+    {
+      "id": "executor_idempotent",
+      "verifier_assertion": "Verifier checks re-running an executed plan is a no-op / already-reclaimed.",
+      "script_refs": [
+        "executor"
+      ],
+      "must_include": [
+        "re-running an already-executed plan is a no-op",
+        "treated as already reclaimed, not an error"
+      ]
+    },
+    {
+      "id": "executor_trash",
+      "verifier_assertion": "Verifier injects a fake trash callable for TRASH actions.",
+      "script_refs": [
+        "executor"
+      ],
+      "must_include": [
+        "Trash actions must go through an injectable, replaceable callable"
+      ]
+    },
+    {
+      "id": "session_signature",
+      "verifier_assertion": "Verifier constructs ReclaimSession with keyword args including strength=FULL.",
+      "script_refs": [
+        "session"
+      ],
+      "must_include": [
+        "ReclaimSession(spec, strategy=\"oldest\", action=DELETE,",
+        "min_size=None, strength=FULL, big_file_size=...)"
+      ]
+    },
+    {
+      "id": "session_analyze",
+      "verifier_assertion": "Verifier checks analyze() result fields group_count/duplicate_count/reclaimable_bytes/plan.",
+      "script_refs": [
+        "session"
+      ],
+      "must_include": [
+        ".group_count",
+        ".duplicate_count",
+        ".reclaimable_bytes",
+        ".plan (the ReclaimPlan)"
+      ]
+    },
+    {
+      "id": "session_apply",
+      "verifier_assertion": "Verifier checks apply() uses exactly the previewed plan and staleness behavior.",
+      "script_refs": [
+        "session"
+      ],
+      "must_include": [
+        ".apply(dry_run=False, ignore_stale=False, keep_going=False, trash_func=None)",
+        "using exactly the plan from analyze()",
+        "raise StalePlanError by default",
+        "with ignore_stale=True it is recorded as skipped"
+      ]
+    },
+    {
+      "id": "session_report",
+      "verifier_assertion": "Verifier checks execution report .dry_run/.done_count/.skipped_count.",
+      "script_refs": [
+        "session"
+      ],
+      "must_include": [
+        ".dry_run (bool)",
+        ".done_count",
+        ".skipped_count"
+      ]
+    },
+    {
+      "id": "duplicate_count_def",
+      "verifier_assertion": "Verifier checks duplicate_count equals member count minus one summed.",
+      "script_refs": [
+        "session"
+      ],
+      "must_include": [
+        "redundant copies = sum of each group's member count minus one"
+      ]
+    },
+    {
+      "id": "load_settings",
+      "verifier_assertion": "Verifier checks deep-merge: scalar override, list append, None delete.",
+      "script_refs": [
+        "layered_config"
+      ],
+      "must_include": [
+        "load_settings(documents)",
+        "list-type fields (such as roots, include_ext, etc.) are append-merged",
+        "a key explicitly set to None means delete that key"
+      ]
+    },
+    {
+      "id": "load_session",
+      "verifier_assertion": "Verifier checks load_session builds a session from layered documents.",
+      "script_refs": [
+        "layered_config"
+      ],
+      "must_include": [
+        "load_session(documents)",
+        "action takes one of the action constants"
+      ]
+    },
+    {
+      "id": "exception_hierarchy",
+      "verifier_assertion": "Verifier checks the four exported exception types.",
+      "script_refs": [
+        "exceptions"
+      ],
+      "must_include": [
+        "UnknownStrategyError",
+        "InvalidScanRootError",
+        "StalePlanError",
+        "ProtectedPathError"
+      ]
+    },
+    {
+      "id": "report_as_dict",
+      "verifier_assertion": "Verifier checks report.as_dict includes plan.victim_count and plan.reclaimable_bytes.",
+      "script_refs": [
+        "report_submodule"
+      ],
+      "must_include": [
+        "report.as_dict(analysis)",
+        "d[\"plan\"][\"victim_count\"]",
+        "d[\"plan\"][\"reclaimable_bytes\"]"
+      ]
+    },
+    {
+      "id": "report_render_text",
+      "verifier_assertion": "Verifier checks report.render_text output contains 'Reclaimable'.",
+      "script_refs": [
+        "report_submodule"
+      ],
+      "must_include": [
+        "report.render_text(analysis)",
+        "containing the text Reclaimable"
+      ]
+    }
+  ]
+}

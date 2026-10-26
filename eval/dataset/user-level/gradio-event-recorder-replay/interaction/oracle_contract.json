@@ -1,0 +1,270 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test.sh", "tests/test_outputs.py"],
+  "requirements": [
+    {
+      "id": "public_api_exports",
+      "verifier_assertion": "gradio module exposes EventRecorder, replay_events, load_events, ReplayReport, ReplayResult at the top level (test_public_api_exported).",
+      "script_refs": ["apis_top_level"],
+      "must_include": ["EventRecorder", "replay_events", "load_events", "ReplayReport", "ReplayResult", "top level of gradio"]
+    },
+    {
+      "id": "recorder_constructor_signature",
+      "verifier_assertion": "EventRecorder constructor accepts blocks, path, include, exclude, redact keyword arguments (test_include_and_exclude_filters, test_redaction_by_exact_label).",
+      "script_refs": ["recorder_signature", "filters_include_exclude", "redact_semantics"],
+      "must_include": ["EventRecorder(blocks, path, include=None, exclude=None, redact=None)"]
+    },
+    {
+      "id": "recorder_is_recording_property",
+      "verifier_assertion": "is_recording property reflects state: False before start, True after start, False after stop (test_basic_event_fields_and_file_format, test_not_recording_before_start_and_after_stop).",
+      "script_refs": ["recorder_lifecycle"],
+      "must_include": ["is_recording", "read-only property"]
+    },
+    {
+      "id": "recorder_idempotent_start_stop",
+      "verifier_assertion": "start() and stop() are idempotent — calling either repeatedly does not error and does not corrupt state (test_not_recording_before_start_and_after_stop).",
+      "script_refs": ["recorder_lifecycle"],
+      "must_include": ["start() and stop()", "idempotent"]
+    },
+    {
+      "id": "recorder_start_returns_self",
+      "verifier_assertion": "start() returns the recorder itself, enabling chaining like gr.EventRecorder(demo, path).start() (used throughout test_outputs.py).",
+      "script_refs": ["recorder_lifecycle"],
+      "must_include": ["start() returns self"]
+    },
+    {
+      "id": "recorder_context_manager",
+      "verifier_assertion": "The `with gr.EventRecorder(demo, path) as rec:` form starts recording on enter and stops+detaches on exit (test_context_manager_records_and_detaches).",
+      "script_refs": ["recorder_lifecycle"],
+      "must_include": ["Context manager form works", "exits stopping+detaching"]
+    },
+    {
+      "id": "recorder_close_detaches_fully",
+      "verifier_assertion": "close() stops recording and removes every hook — after close(), demo.get_call_hooks() is empty (test_recorder_registers_as_call_hook, test_context_manager_records_and_detaches).",
+      "script_refs": ["recorder_lifecycle"],
+      "must_include": ["close() stops recording and fully detaches", "not a single hook of the recorder remains attached"]
+    },
+    {
+      "id": "recorder_file_created_on_start_only",
+      "verifier_assertion": "The recording file appears on disk only after start() — mere construction of EventRecorder does not create the file (test_not_recording_before_start_and_after_stop).",
+      "script_refs": ["recorder_file_semantics"],
+      "must_include": ["the recording file is created only when start() is called", "constructing the recorder must not create it on disk"]
+    },
+    {
+      "id": "recorder_parent_dirs_auto_created",
+      "verifier_assertion": "Missing parent directories of the recording path are auto-created (used implicitly by tmp_path/'rec.jsonl' patterns; verified in the loader's happy path).",
+      "script_refs": ["recorder_file_semantics"],
+      "must_include": ["Missing parent directories of the path must be auto-created"]
+    },
+    {
+      "id": "recorder_flush_immediately",
+      "verifier_assertion": "Each recorded event is flushed to disk immediately so a mid-run crash does not lose recorded events (contract, backed by the sync-write semantics required by concurrency test).",
+      "script_refs": ["recorder_file_semantics"],
+      "must_include": ["Every event, once written, is flushed to disk immediately"]
+    },
+    {
+      "id": "recorder_multiple_independent",
+      "verifier_assertion": "Multiple recorders may be attached to the same app at once, each writing its own file (test_multiple_recorders_independent_files).",
+      "script_refs": ["recorder_file_semantics"],
+      "must_include": ["Multiple recorders may attach to the same app at the same time, each writing to its own file"]
+    },
+    {
+      "id": "recorder_events_returns_copy",
+      "verifier_assertion": "rec.events returns a copy of the recorded events; callers may inspect and mutate without affecting the recorder's internal list (test_basic_event_fields_and_file_format uses `assert events == rec.events`).",
+      "script_refs": ["recorder_events_property"],
+      "must_include": ["rec.events returns a copy of the recorded events"]
+    },
+    {
+      "id": "filters_by_api_or_fn_name",
+      "verifier_assertion": "include filter admits only listed api/fn names; exclude filter removes listed names from recording (test_include_and_exclude_filters).",
+      "script_refs": ["filters_include_exclude"],
+      "must_include": ["include=[...] is a whitelist of api_name / fn_name", "exclude=[...] is a blacklist"]
+    },
+    {
+      "id": "redact_by_exact_label_placeholder",
+      "verifier_assertion": "redact= list masks inputs by exact component label; recorded value is the placeholder \"***\"; the function receives real inputs (test_redaction_by_exact_label).",
+      "script_refs": ["redact_semantics"],
+      "must_include": ["masks sensitive fields by exact component label", "\"***\"", "the function still receives the real inputs"]
+    },
+    {
+      "id": "hook_layer_process_api",
+      "verifier_assertion": "Recording works at the Blocks.process_api layer regardless of trigger origin (direct call, HTTP route, queue); no server required (test_http_queue_calls_are_recorded, test_basic_event_fields_and_file_format).",
+      "script_refs": ["hook_layer"],
+      "must_include": ["The recording hook sits at the Blocks call layer (the process_api layer)", "Recording itself must not depend on starting a server"]
+    },
+    {
+      "id": "plain_component_value_layer",
+      "verifier_assertion": "Plain inputs recorded as raw frontend payload; plain outputs recorded as post-processed value (test_basic_event_fields_and_file_format).",
+      "script_refs": ["plain_value_layer"],
+      "must_include": ["record the raw payload sent from the frontend for inputs", "post-processed value for outputs"]
+    },
+    {
+      "id": "stateful_component_value_layer",
+      "verifier_assertion": "State inputs recorded as the session value the function saw; State outputs recorded as the new session value after the call finishes (test_stateful_effective_values_recorded).",
+      "script_refs": ["stateful_value_layer"],
+      "must_include": ["record the session value the function saw", "record the new session value after the call finishes"]
+    },
+    {
+      "id": "exception_event_recorded",
+      "verifier_assertion": "On exception, event is recorded with outputs=None and error=exception class name string (test_error_event_recorded_and_exception_propagates).",
+      "script_refs": ["exception_semantics"],
+      "must_include": ["outputs=null", "exception's class name", "\"ValueError\""]
+    },
+    {
+      "id": "exception_propagates_unchanged",
+      "verifier_assertion": "Exception must propagate unchanged — recorder never swallows it (test_error_event_recorded_and_exception_propagates).",
+      "script_refs": ["exception_semantics"],
+      "must_include": ["The exception itself must propagate unchanged", "never swallowed by the recorder"]
+    },
+    {
+      "id": "generator_first_only",
+      "verifier_assertion": "Generators: only the first call recorded; follow-up iterator calls not recorded (test_generator_records_first_call_only).",
+      "script_refs": ["generator_semantics"],
+      "must_include": ["only the first call is recorded", "Follow-up calls that carry an already-live iterator are not recorded"]
+    },
+    {
+      "id": "serialization_fallback_strings",
+      "verifier_assertion": "Non-serializable values fall back to their string representation (contract; used implicitly in canonical helper serialization).",
+      "script_refs": ["serialization_fallback"],
+      "must_include": ["Every recorded value must be JSON-serializable", "fall back to their string form"]
+    },
+    {
+      "id": "concurrency_intact_jsonl",
+      "verifier_assertion": "Under multi-threaded concurrent calls: file remains valid JSONL, no lost events, no half/interleaved lines, dense unique indices (test_concurrent_recording_stays_intact).",
+      "script_refs": ["concurrency_guarantees"],
+      "must_include": ["no lost events", "no half or interleaved lines", "no duplicate indices"]
+    },
+    {
+      "id": "no_recorder_no_change",
+      "verifier_assertion": "With no recorder attached, process_api behavior unchanged: same result dict keys, same signatures (test_existing_behavior_unchanged_without_recorder).",
+      "script_refs": ["no_op_when_empty"],
+      "must_include": ["With no recorder (and no hook) attached, existing app behavior must not change", "data", "is_generating", "average_duration", "render_config", "changed_state_ids"]
+    },
+    {
+      "id": "no_hooks_fast_path_impl",
+      "verifier_assertion": "With no hooks attached, process_api enters _process_api_impl directly (test_no_hooks_no_overhead_path): replacing type(demo)._process_api_impl wholesale is observed by every call.",
+      "script_refs": ["fast_path_contract"],
+      "must_include": ["real implementation body lives on the class attribute _process_api_impl", "type(blocks)._process_api_impl", "no wrapping layers may sit in between"]
+    },
+    {
+      "id": "file_is_jsonl_line_per_object",
+      "verifier_assertion": "Recording file is JSONL: header first, one event per subsequent line; content stable across repeated reads and repeated field ordering (test_basic_event_fields_and_file_format, test_event_and_header_have_canonical_field_order).",
+      "script_refs": ["file_format_lines"],
+      "must_include": ["one JSON object per line", "First line is the file header", "even field order must not jump around"]
+    },
+    {
+      "id": "header_line_schema",
+      "verifier_assertion": "Header line has type='header', format_version=1, gradio_version (non-empty string), created_at (test_basic_event_fields_and_file_format).",
+      "script_refs": ["header_fields"],
+      "must_include": ["\"type\": \"header\"", "\"format_version\": 1", "\"gradio_version\"", "\"created_at\""]
+    },
+    {
+      "id": "event_line_schema",
+      "verifier_assertion": "Event line contains type, index (0-based), api_name, fn_name, session_hash, inputs, outputs, error, duration, timestamp — with duration>=0, timestamp>0, error null when no exception (test_basic_event_fields_and_file_format, test_event_and_header_have_canonical_field_order).",
+      "script_refs": ["event_fields"],
+      "must_include": ["\"type\": \"event\"", "\"index\": <0-based sequence>", "\"api_name\"", "\"fn_name\"", "\"session_hash\"", "\"inputs\"", "\"outputs\"", "\"error\"", "\"duration\"", "\"timestamp\"", "duration is elapsed time in seconds and must be >= 0", "timestamp is the unix timestamp", "> 0", "error is null when no exception was raised"]
+    },
+    {
+      "id": "canonical_key_order_and_flags",
+      "verifier_assertion": "canonical_json_dumps orders keys alphabetically, keeps non-ASCII characters (ensure_ascii=False), rejects NaN/Infinity, tuples become lists, and uses the json.dumps default separators (\", \" between items, \": \" after keys) so canonical({\"b\":1,\"a\":2}) == '{\"a\": 2, \"b\": 1}' (test_canonical_json_dumps_is_public_helper).",
+      "script_refs": ["canonical_form_spec"],
+      "must_include": ["keys serialized in strictly alphabetical order", "ensure_ascii=False", "reject NaN / Infinity", "normalize tuples to lists", "json.dumps default separators"]
+    },
+    {
+      "id": "canonical_helper_is_public",
+      "verifier_assertion": "gradio.utils.canonical_json_dumps is a public helper; the recording writer uses it (test_canonical_json_dumps_is_public_helper).",
+      "script_refs": ["canonical_helper_public"],
+      "must_include": ["gradio.utils.canonical_json_dumps"]
+    },
+    {
+      "id": "record_file_tamper_evident",
+      "verifier_assertion": "The loader refuses tampered/reordered/dropped-event files (test_record_file_is_tamper_evident, test_record_file_rejects_reordered_events, test_record_file_rejects_dropped_event).",
+      "script_refs": ["tamper_evident"],
+      "must_include": ["Recording files must be tamper-evident", "any reordering of event lines", "any silent drop of an event line", "loader refuses such files"]
+    },
+    {
+      "id": "load_events_return_shape",
+      "verifier_assertion": "load_events(path) returns the events list excluding header (test_basic_event_fields_and_file_format uses assert events == rec.events).",
+      "script_refs": ["load_events_api"],
+      "must_include": ["load_events(path) returns the events list (excluding the header line)"]
+    },
+    {
+      "id": "load_events_error_types",
+      "verifier_assertion": "load_events raises FileNotFoundError on missing file; raises ValueError on empty file, corrupt header, wrong format_version, corrupt event line (test_load_events_missing_file, test_load_events_rejects_bad_files).",
+      "script_refs": ["load_events_api"],
+      "must_include": ["raises FileNotFoundError if the file does not exist", "raises ValueError", "empty file", "corrupt header", "wrong format_version", "corrupt event line"]
+    },
+    {
+      "id": "replay_events_signature",
+      "verifier_assertion": "replay_events(blocks, path, api_names=None) is the signature (test_replay_identical_app_matches, test_replay_api_names_filter).",
+      "script_refs": ["replay_events_api"],
+      "must_include": ["replay_events(blocks, path, api_names=None)", "api_names, when passed, restricts replay"]
+    },
+    {
+      "id": "replay_new_session_and_restore",
+      "verifier_assertion": "Replay uses a fresh session and restores recorded stateful inputs before running (test_replay_restores_stateful_inputs).",
+      "script_refs": ["replay_session_isolation"],
+      "must_include": ["Each event is replayed with a new session", "stateful input values that were recorded at capture time must be restored"]
+    },
+    {
+      "id": "replay_calls_not_re_recorded",
+      "verifier_assertion": "Calls produced during replay are not recorded by other recorders attached to the same app (test_replay_is_not_recorded).",
+      "script_refs": ["replay_no_nesting"],
+      "must_include": ["Calls produced during replay must not be nested-recorded"]
+    },
+    {
+      "id": "replay_comparison_semantics",
+      "verifier_assertion": "Plain outputs compared by strict structural equality; exceptions compared by class name; empty report has ok=False (test_replay_identical_app_matches, test_replay_error_events_compared_by_exception_type, test_replay_empty_record_not_ok).",
+      "script_refs": ["comparison_rules"],
+      "must_include": ["plain outputs compared by strict structural equality", "exceptions compared by class name only", "A report has ok=True only if everything matched", "a report with zero events has ok=False"]
+    },
+    {
+      "id": "report_type_fields",
+      "verifier_assertion": "ReplayReport exposes total, matched, mismatched, missing, errors, results, mismatches, ok, summary(), to_dict(), __bool__ (test_replay_identical_app_matches, test_replay_detects_behavior_change).",
+      "script_refs": ["report_type"],
+      "must_include": ["ReplayReport exposes: total", "matched", "mismatched", "missing", "errors", "results", "mismatches", "ok", "summary()", "to_dict()", "__bool__"]
+    },
+    {
+      "id": "result_type_fields",
+      "verifier_assertion": "ReplayResult carries index, api_name, fn_name, status, expected, actual — status is one of match/mismatch/missing/error (test_replay_identical_app_matches, test_replay_missing_function).",
+      "script_refs": ["result_type"],
+      "must_include": ["ReplayResult carries: index", "api_name", "fn_name", "status", "expected", "actual", "\"match\"", "\"mismatch\"", "\"missing\"", "\"error\""]
+    },
+    {
+      "id": "hook_registry_public_api",
+      "verifier_assertion": "Blocks.add_call_hook(name, hook), remove_call_hook(name), get_call_hooks() are public (test_blocks_call_hooks_are_public_api, test_recorder_registers_as_call_hook).",
+      "script_refs": ["hook_registry_api"],
+      "must_include": ["add_call_hook(name, hook)", "remove_call_hook(name)", "get_call_hooks() returns the list of currently attached hook names"]
+    },
+    {
+      "id": "hook_signature_contract",
+      "verifier_assertion": "Hook is hook(phase, ctx) with phase 'before'/'after' and ctx dict of api_name/fn_name/session_hash/inputs/outputs/error/duration (test_blocks_call_hooks_are_public_api, test_call_hooks_receive_error_phase).",
+      "script_refs": ["hook_signature"],
+      "must_include": ["hook(phase, ctx)", "\"before\" or \"after\"", "api_name", "fn_name", "session_hash", "inputs", "outputs", "error", "duration"]
+    },
+    {
+      "id": "hook_phase_before_after",
+      "verifier_assertion": "'before' phase has ctx.outputs=None; 'after' phase has ctx.error=exception class-name string when raised (test_blocks_call_hooks_are_public_api, test_call_hooks_receive_error_phase).",
+      "script_refs": ["hook_phase_details"],
+      "must_include": ["At the \"before\" phase, ctx['outputs'] is None", "At the \"after\" phase, ctx['error'] is the exception's class-name string when the call raised"]
+    },
+    {
+      "id": "session_state_snapshot_restore",
+      "verifier_assertion": "SessionState.snapshot()/restore(snapshot) are public; snapshot() returns a copy (mutating it doesn't touch the live session); restore reinstates exactly (test_session_state_snapshot_and_restore_public_api).",
+      "script_refs": ["snapshot_restore_api"],
+      "must_include": ["gradio.state_holder.SessionState exposes a public snapshot()/restore(snapshot)", "snapshot() returns a copy", "restore(snapshot) reinstates that snapshot exactly"]
+    },
+    {
+      "id": "backwards_compat_public_apis",
+      "verifier_assertion": "Existing gr.Blocks / SessionState APIs and repo unit tests must keep working (contract; test_existing_behavior_unchanged_without_recorder).",
+      "script_refs": ["compat_and_placement"],
+      "must_include": ["Existing gr.Blocks / gradio.state_holder.SessionState APIs, method signatures, and behavior must keep working", "existing unit tests must not break"]
+    },
+    {
+      "id": "code_placement_and_tests",
+      "verifier_assertion": "Contract for placement and style: code goes into appropriate gradio locations with consistent style and pytest coverage (final paragraph of instruction).",
+      "script_refs": ["compat_and_placement"],
+      "must_include": ["Put the code in appropriate locations inside the gradio package", "add adequate pytest unit tests"]
+    }
+  ]
+}

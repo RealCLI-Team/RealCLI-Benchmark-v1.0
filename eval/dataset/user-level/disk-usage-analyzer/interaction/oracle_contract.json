@@ -1,0 +1,252 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test_outputs.py"],
+  "requirements": [
+    {
+      "id": "req_total_files",
+      "verifier_assertion": "report.total_files equals the number of files scanned",
+      "script_refs": ["info_slice_toplevel_exports", "info_slice_session", "info_slice_usagetree"],
+      "must_include": ["total_files", "AnalysisReport"]
+    },
+    {
+      "id": "req_total_apparent",
+      "verifier_assertion": "report.total_apparent equals the sum of all scanned files' st_size values",
+      "script_refs": ["info_slice_fileentry", "info_slice_serialization", "info_slice_usagetree"],
+      "must_include": ["total_apparent", "apparent_size", "st_size"]
+    },
+    {
+      "id": "req_total_allocated_gte_apparent",
+      "verifier_assertion": "report.total_allocated >= report.total_apparent for non-sparse file sets",
+      "script_refs": ["info_slice_allocated", "info_slice_usagetree"],
+      "must_include": ["total_allocated", "total_apparent"]
+    },
+    {
+      "id": "req_allocated_formula",
+      "verifier_assertion": "FileEntry.allocated_size == allocated_size_of(stat) == st_blocks * 512, falling back to st_size when no st_blocks",
+      "script_refs": ["info_slice_allocated"],
+      "must_include": ["st_blocks", "512", "st_size", "allocated_size_of"]
+    },
+    {
+      "id": "req_slack_bytes_formula",
+      "verifier_assertion": "FileEntry.slack_bytes == max(0, allocated_size - apparent_size)",
+      "script_refs": ["info_slice_fileentry"],
+      "must_include": ["slack_bytes", "max(0", "allocated_size", "apparent_size"]
+    },
+    {
+      "id": "req_sparse_file",
+      "verifier_assertion": "When allocated_size < apparent_size: is_sparse is True; slack_bytes is 0 (clamped)",
+      "script_refs": ["info_slice_fileentry"],
+      "must_include": ["is_sparse", "allocated_size < apparent_size", "slack_bytes", "0"]
+    },
+    {
+      "id": "req_tree_rollup",
+      "verifier_assertion": "parent UsageNode total_allocated == sum(children total_allocated) + parent direct_allocated (same for total_apparent)",
+      "script_refs": ["info_slice_usagetree"],
+      "must_include": ["total_allocated", "direct_allocated", "total_apparent", "Reconciliation"]
+    },
+    {
+      "id": "req_hotspots_ordering",
+      "verifier_assertion": "hotspots sorted by total_allocated descending, stable secondary by path string ascending; root node excluded",
+      "script_refs": ["info_slice_hotspots"],
+      "must_include": ["total_allocated", "descending", "path", "root", "excluded"]
+    },
+    {
+      "id": "req_extension_breakdown",
+      "verifier_assertion": "breakdown_by_extension: row_for(key) by lowercase extension without dot; rows ordered by allocated descending; row has count and apparent",
+      "script_refs": ["info_slice_breakdown_ext"],
+      "must_include": ["row_for", "extension", "lowercase", "allocated", "descending"]
+    },
+    {
+      "id": "req_no_ext_group",
+      "verifier_assertion": "Files without extension go into one unified group in the extension breakdown",
+      "script_refs": ["info_slice_breakdown_ext"],
+      "must_include": ["without", "extension", "unified", "group"]
+    },
+    {
+      "id": "req_top_folds_other",
+      "verifier_assertion": "Breakdown.top(N) folds remaining rows into a '(other)' row; top(N).total_allocated == original.total_allocated",
+      "script_refs": ["info_slice_breakdown_ext"],
+      "must_include": ["top", "(other)", "total_allocated", "no bytes lost"]
+    },
+    {
+      "id": "req_top_directory_breakdown",
+      "verifier_assertion": "breakdown_by_top_directory(tree, depth=1) is available and uses allocated descending ordering",
+      "script_refs": ["info_slice_breakdown_ext"],
+      "must_include": ["breakdown_by_top_directory", "depth"]
+    },
+    {
+      "id": "req_age_breakdown_exhaustive",
+      "verifier_assertion": "breakdown_by_age: every file lands in exactly one bucket; total_count equals total files; totals lose no files",
+      "script_refs": ["info_slice_breakdown_age", "info_slice_breakdown_ext"],
+      "must_include": ["exhaustive", "every file", "exactly one bucket", "total_count"]
+    },
+    {
+      "id": "req_age_default_buckets",
+      "verifier_assertion": "Default age buckets include at least 'day' (files modified within 86400 seconds of ref_time) and 'older' (catch-all)",
+      "script_refs": ["info_slice_breakdown_age"],
+      "must_include": ["day", "older", "catch-all"]
+    },
+    {
+      "id": "req_age_custom_buckets",
+      "verifier_assertion": "Custom age_buckets in config: [['label', seconds], ..., ['label', null]] — null marks catch-all; row order matches the custom labels",
+      "script_refs": ["info_slice_breakdown_age", "info_slice_loadsession"],
+      "must_include": ["age_buckets", "null", "catch-all", "label"]
+    },
+    {
+      "id": "req_age_bucket_order",
+      "verifier_assertion": "by-age Breakdown row order is age-bucket order (youngest first, oldest last) not by allocated size",
+      "script_refs": ["info_slice_breakdown_age"],
+      "must_include": ["age-bucket order", "youngest", "oldest"]
+    },
+    {
+      "id": "req_cruft_categories",
+      "verifier_assertion": "CruftReport.category_totals() contains CATEGORY_EMPTY, CATEGORY_TEMP, CATEGORY_CACHE, CATEGORY_LOG, CATEGORY_BACKUP for the appropriate files",
+      "script_refs": ["info_slice_cruft_cats"],
+      "must_include": ["CATEGORY_EMPTY", "CATEGORY_TEMP", "CATEGORY_CACHE", "CATEGORY_LOG", "CATEGORY_BACKUP"]
+    },
+    {
+      "id": "req_cruft_allocated_total",
+      "verifier_assertion": "category_totals()[CATEGORY_X][1] (allocated) equals sum of .entry.allocated_size for all tags under that category",
+      "script_refs": ["info_slice_cruft_cats"],
+      "must_include": ["category_totals", "allocated_size", "sum"]
+    },
+    {
+      "id": "req_reference_exempt_from_cruft",
+      "verifier_assertion": "Files inside reference_roots are never classified as cruft when include_reference=False (the default)",
+      "script_refs": ["info_slice_reference", "info_slice_cruft_cats"],
+      "must_include": ["reference_roots", "cruft", "exempt", "include_reference"]
+    },
+    {
+      "id": "req_reference_counted_flagged",
+      "verifier_assertion": "Reference files are counted in total_apparent/total_allocated/total_files but FileEntry.is_reference is True",
+      "script_refs": ["info_slice_reference"],
+      "must_include": ["is_reference", "counted", "total_apparent", "total_allocated"]
+    },
+    {
+      "id": "req_duplicate_tiered_hashing",
+      "verifier_assertion": "find_duplicate_sets reuses core.fs tiered hashing: bucket by size → partial digest → full/sampled digest",
+      "script_refs": ["info_slice_duplicates"],
+      "must_include": ["core.fs", "tiered", "size", "partial", "full"]
+    },
+    {
+      "id": "req_duplicate_size_prefilter",
+      "verifier_assertion": "Files of different sizes are never in the same duplicate group (never read for hashing)",
+      "script_refs": ["info_slice_duplicates"],
+      "must_include": ["different sizes", "never", "group"]
+    },
+    {
+      "id": "req_duplicate_same_size_diff_content",
+      "verifier_assertion": "Files of same size but different content are not grouped as duplicates",
+      "script_refs": ["info_slice_duplicates"],
+      "must_include": ["same size", "different content", "not", "group"]
+    },
+    {
+      "id": "req_empty_not_duplicate",
+      "verifier_assertion": "Zero-byte files never count as duplicates (they are CATEGORY_EMPTY cruft)",
+      "script_refs": ["info_slice_duplicates"],
+      "must_include": ["zero-byte", "never", "duplicate", "CATEGORY_EMPTY"]
+    },
+    {
+      "id": "req_duplicate_report_fields",
+      "verifier_assertion": "DuplicateReport: group_count, duplicate_count, wasted_allocated, sets (list of DuplicateSet with count and wasted_apparent)",
+      "script_refs": ["info_slice_duplicates"],
+      "must_include": ["group_count", "duplicate_count", "wasted_allocated", "DuplicateSet", "wasted_apparent"]
+    },
+    {
+      "id": "req_empty_dirs",
+      "verifier_assertion": "UsageTree.empty_dirs() returns UsageNode objects for directories whose entire subtree has no files",
+      "script_refs": ["info_slice_usagetree"],
+      "must_include": ["empty_dirs", "subtree", "no files"]
+    },
+    {
+      "id": "req_excluded_roots",
+      "verifier_assertion": "Files inside excluded_roots are not scanned and do not appear in report.entries",
+      "script_refs": ["info_slice_scanspec"],
+      "must_include": ["excluded_roots", "not scanned"]
+    },
+    {
+      "id": "req_extension_filter",
+      "verifier_assertion": "include_ext=[...] keeps only files with those extensions (case-insensitive, no leading dot)",
+      "script_refs": ["info_slice_scanspec"],
+      "must_include": ["include_ext", "case-insensitive"]
+    },
+    {
+      "id": "req_deterministic_order",
+      "verifier_assertion": "report.entries are sorted ascending by path string; two analyses of the same tree produce identical ordering",
+      "script_refs": ["info_slice_determinism"],
+      "must_include": ["sorted", "ascending", "path", "deterministic"]
+    },
+    {
+      "id": "req_read_only",
+      "verifier_assertion": "analyze() makes no changes to the filesystem; file tree before and after analysis is identical",
+      "script_refs": ["info_slice_readonly"],
+      "must_include": ["read-only", "no", "changes", "filesystem"]
+    },
+    {
+      "id": "req_serialization",
+      "verifier_assertion": "as_dict()['totals']['files'] == total_files; as_json() produces valid JSON with same ['totals']['files']; render_text() returns non-empty string",
+      "script_refs": ["info_slice_serialization"],
+      "must_include": ["totals", "files", "as_dict", "as_json", "render_text"]
+    },
+    {
+      "id": "req_threshold_breach_names",
+      "verifier_assertion": "default_thresholds breach names correspond to limit keys: max_empty_files → 'empty-files', max_duplicate_fraction → 'duplicate-fraction'",
+      "script_refs": ["info_slice_thresholds"],
+      "must_include": ["empty-files", "duplicate-fraction", "breach", "name"]
+    },
+    {
+      "id": "req_threshold_passed",
+      "verifier_assertion": "ThresholdResult.passed is True when no WARNING-or-above breaches; INFO does not count as failure",
+      "script_refs": ["info_slice_thresholds"],
+      "must_include": ["passed", "SEVERITY_WARNING", "info", "failure"]
+    },
+    {
+      "id": "req_severity_ordering",
+      "verifier_assertion": "SEVERITY_INFO < SEVERITY_WARNING < SEVERITY_CRITICAL; breaches sorted most-severe first; worst_severity is None when clean",
+      "script_refs": ["info_slice_thresholds"],
+      "must_include": ["SEVERITY_INFO", "SEVERITY_WARNING", "SEVERITY_CRITICAL", "worst_severity"]
+    },
+    {
+      "id": "req_merge_documents_append",
+      "verifier_assertion": "merge_documents: list-type fields (roots, include_ext, etc.) are append-merged and deduplicated across documents",
+      "script_refs": ["info_slice_merge"],
+      "must_include": ["append", "deduplicated", "list", "roots", "include_ext"]
+    },
+    {
+      "id": "req_merge_documents_null_delete",
+      "verifier_assertion": "merge_documents: a key set to None means delete it; the merged result does not contain that key",
+      "script_refs": ["info_slice_merge"],
+      "must_include": ["None", "delete", "merged result"]
+    },
+    {
+      "id": "req_load_session_keys",
+      "verifier_assertion": "load_session recognizes config keys: roots, include_ext, exclude_ext, detect_duplicates, age_buckets, thresholds",
+      "script_refs": ["info_slice_loadsession"],
+      "must_include": ["roots", "detect_duplicates", "age_buckets", "thresholds", "load_session"]
+    },
+    {
+      "id": "req_thresholds_from_config",
+      "verifier_assertion": "load_thresholds(settings) builds a ThresholdSet from the 'thresholds' block; returns None when block absent",
+      "script_refs": ["info_slice_merge", "info_slice_thresholds"],
+      "must_include": ["load_thresholds", "thresholds", "None"]
+    },
+    {
+      "id": "req_invalid_root_error",
+      "verifier_assertion": "analyze() raises InvalidScanRootError (subclass of DiskScanConfigError) for nonexistent scan roots, before any disk I/O",
+      "script_refs": ["info_slice_errors"],
+      "must_include": ["InvalidScanRootError", "DiskScanConfigError", "before", "disk"]
+    },
+    {
+      "id": "req_analyze_caches",
+      "verifier_assertion": "analyze() caches the result; force=True rescans; ref_time overrides the baseline clock for the analysis",
+      "script_refs": ["info_slice_session"],
+      "must_include": ["analyze", "force", "cache", "ref_time"]
+    },
+    {
+      "id": "req_all_required_exports",
+      "verifier_assertion": "All required symbols present at core.diskscan top level: ScanSpec, DiskScanSession, FileEntry, UsageTree, AnalysisReport, breakdown_by_extension, breakdown_by_age, CruftClassifier, find_duplicate_sets, load_session, merge_documents, allocated_size_of, and all constants",
+      "script_refs": ["info_slice_toplevel_exports"],
+      "must_include": ["ScanSpec", "DiskScanSession", "FileEntry", "UsageTree", "AnalysisReport", "allocated_size_of"]
+    }
+  ]
+}

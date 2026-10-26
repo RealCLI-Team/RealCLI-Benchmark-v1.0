@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# 验证最终状态：标注清单、统计报告、离线看板
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+resolve_task_root() {
+  for candidate in "${TASK_ROOT:-}" /app /workspace "$(cd "$SCRIPT_DIR/.." && pwd)" "$(pwd)"; do
+    [ -n "$candidate" ] || continue
+    if [ -d "$candidate/inputs" ] || [ -d "$candidate/outputs" ] || [ -d "$candidate/output" ] || [ -f "$candidate/task.toml" ] || [ -d "$candidate/rootfs" ] || [ -f "$candidate/Makefile" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  cd "$SCRIPT_DIR/.." && pwd
+}
+TASK_ROOT="$(resolve_task_root)"
+cd "$TASK_ROOT"
+ROOT="$TASK_ROOT"
+ROOT_DIR="$TASK_ROOT"
+task_root="$TASK_ROOT"
+HERE="$SCRIPT_DIR"
+script_dir="$SCRIPT_DIR"
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+CSV="${ROOT}/annotated_inventory.csv"
+REPORT="${ROOT}/validation_report.json"
+HTML="${ROOT}/dashboard.html"
+
+[ -f "${CSV}" ]    || fail "missing annotated_inventory.csv"
+[ -f "${REPORT}" ] || fail "missing validation_report.json"
+[ -f "${HTML}" ]   || fail "missing dashboard.html"
+
+ZIP="${ROOT}/inputs/2023zlablearning.zip"
+[ -f "${ZIP}" ] || fail "missing input archive"
+
+python3 - "$CSV" "$REPORT" "$ZIP" << 'PYEOF'
+import sys, csv, json, zipfile
+
+csv_path, report_path, zip_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# expected file count from archive (regular files only, no dir entries)
+with zipfile.ZipFile(zip_path) as z:
+    expected = [n for n in z.namelist() if not n.endswith("/")]
+expected_count = len(expected)
+
+# --- CSV checks ---
+with open(csv_path, newline="", encoding="utf-8") as fh:
+    reader = csv.DictReader(fh)
+    cols = reader.fieldnames or []
+    rows = list(reader)
+
+for c in ["file_path", "type_tag", "size_bytes", "status"]:
+    assert c in cols, "CSV missing column: %s" % c
+
+assert len(rows) == expected_count, \
+    "CSV row count %d != archive file count %d" % (len(rows), expected_count)
+
+allowed = {"normal", "duplicate", "anomaly", "unknown"}
+counts = {k: 0 for k in allowed}
+for r in rows:
+    st = r["status"]
+    assert st in allowed, "illegal status value: %r" % st
+    counts[st] += 1
+    int(r["size_bytes"])  # size_bytes must be integer
+
+# --- JSON checks ---
+with open(report_path, encoding="utf-8") as fh:
+    rep = json.load(fh)
+
+for k in ["total_files", "duplicate_count", "anomaly_count", "type_distribution"]:
+    assert k in rep, "report missing key: %s" % k
+
+assert rep["total_files"] == expected_count, \
+    "total_files %s != archive file count %d" % (rep["total_files"], expected_count)
+
+# self-consistency: total == sum of four status classes
+assert rep["total_files"] == sum(counts.values()), \
+    "total_files != sum of status classes"
+
+assert rep["duplicate_count"] == counts["duplicate"], \
+    "duplicate_count mismatch with CSV"
+assert rep["anomaly_count"] == counts["anomaly"], \
+    "anomaly_count mismatch with CSV"
+
+td = rep["type_distribution"]
+assert isinstance(td, dict) and td, "type_distribution must be a non-empty object"
+assert sum(int(v) for v in td.values()) == rep["total_files"], \
+    "type_distribution values do not sum to total_files"
+
+# 验证分布逐桶对应真实扩展名，不能只验证总和。
+from collections import Counter
+from pathlib import PurePosixPath
+known = {"csv", "json", "txt", "md", "log", "xml"}
+def type_tag(name):
+    ext = PurePosixPath(name).suffix.lower()[1:]
+    return ext if ext in known else "unknown"
+assert sorted(r["file_path"] for r in rows) == sorted(expected), "CSV paths do not match archive entries"
+assert all(r["type_tag"] == type_tag(r["file_path"]) for r in rows), "CSV type_tag does not match extension rules"
+expected_types = Counter(type_tag(name) for name in expected)
+assert all(type(v) is int and v >= 0 for v in td.values()), "type_distribution counts must be nonnegative integers"
+assert all(k in known | {"unknown"} for k in td), "unknown type_distribution key"
+assert {k: v for k, v in td.items() if v} == dict(expected_types), "type_distribution does not match extension rules"
+
+# there is at least one duplicate and one anomaly in this archive
+assert rep["duplicate_count"] >= 1, "expected at least one duplicate"
+assert rep["anomaly_count"] >= 1, "expected at least one anomaly"
+
+print("data checks OK: total=%d dup=%d anom=%d" %
+      (rep["total_files"], rep["duplicate_count"], rep["anomaly_count"]))
+PYEOF
+
+# --- HTML checks ---
+grep -qi "<!DOCTYPE html" "${HTML}" || fail "dashboard.html missing DOCTYPE"
+grep -qi "<html" "${HTML}"          || fail "dashboard.html missing <html>"
+grep -qi "</html>" "${HTML}"        || fail "dashboard.html missing </html>"
+grep -qi "<table" "${HTML}"          || fail "dashboard.html missing a table"
+
+# 要点文字允许大小写、空白和连字符变化；不把 SVG 命名空间当远程资源。
+python3 - "${HTML}" <<'PYHTML'
+import html as html_lib
+import re
+import sys
+from pathlib import Path
+
+markup = Path(sys.argv[1]).read_text(encoding="utf-8")
+caption_text = html_lib.unescape(re.sub(r"<[^>]+>", " ", markup))
+caption_text = re.sub(r"[\s_\-\u2010-\u2015]+", " ", caption_text).casefold()
+checks = [
+    (r"总文件数|total (?:files|file count)|file count", "total metric"),
+    (r"异常|anomal", "anomaly section/metric"),
+    (r"(?:文件)?类型分布|(?:file )?type distribution|distribution (?:by|of) (?:file )?types?", "type distribution label"),
+]
+for pattern, description in checks:
+    if not re.search(pattern, caption_text):
+        raise SystemExit("FAIL: dashboard.html missing " + description)
+
+# 只移除标准 xmlns 属性中的标识 URI，src/href/CSS/脚本中的外网 URL 仍会失败。
+namespace_attribute = r"\sxmlns(?::[A-Za-z_][\w.-]*)?\s*=\s*([\"'])http://www\.w3\.org/(?:2000/svg|1999/xhtml|1999/xlink)\1"
+resource_markup = re.sub(namespace_attribute, "", markup, flags=re.I)
+if re.search(r"https?://", resource_markup, flags=re.I):
+    raise SystemExit("FAIL: dashboard.html references a remote URL (must be offline)")
+PYHTML
+
+echo "ALL TESTS PASSED"

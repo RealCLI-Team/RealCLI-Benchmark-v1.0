@@ -1,0 +1,45 @@
+import type { BaseLayoutProps } from "fumadocs-ui/layouts/shared";
+import { HARBOR_REGISTRY_URL } from "@/lib/harbor-registry";
+
+export function baseOptions(): BaseLayoutProps {
+  return {
+    nav: {
+      title: (
+        <div className="flex items-center gap-2 mr-4">
+          <p className="font-code tracking-tight text-lg font-normal">harbor</p>
+        </div>
+      ),
+    },
+    githubUrl: "https://github.com/laude-institute/harbor",
+    links: [
+      {
+        url: "https://docs.harborframework.com/",
+        text: "docs",
+        active: "none",
+        external: true,
+      },
+      {
+        url: "https://docs.harborframework.com/news",
+        text: "news",
+        active: "none",
+        external: true,
+      },
+      {
+        url: HARBOR_REGISTRY_URL,
+        text: "hub",
+        active: "none",
+        external: true,
+      },
+      {
+        url: "https://discord.gg/QVvyhRw5UQ",
+        text: "discord",
+        active: "none",
+        external: true,
+      },
+    ],
+    themeSwitch: {
+      enabled: true,
+      mode: "light-dark-system",
+    },
+  };
+}

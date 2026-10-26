@@ -1,0 +1,143 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test.sh"],
+  "requirements": [
+    {
+      "id": "cmd_signature",
+      "verifier_assertion": "test.sh:32 requires /app/solution.py to exist; test.sh:125-129 re-invokes it with the exact command shape when checking idempotency. Tool must live at /app/solution.py and accept --config, --assets, --out.",
+      "script_refs": ["IS01_cmd_signature"],
+      "must_include": [
+        "python solution.py --config inputs/data/config.json --assets inputs/data/assets --out result.json",
+        "/app/solution.py"
+      ]
+    },
+    {
+      "id": "result_json_top_shape",
+      "verifier_assertion": "test.sh:28 requires /app/result.json to exist; test.sh:59-73 asserts exact content of the four top-level fields: kept, deleted, missing, invalid.",
+      "script_refs": ["IS13_output_shape_and_sort"],
+      "must_include": [
+        "exactly these four fields: kept, deleted, missing, invalid"
+      ]
+    },
+    {
+      "id": "sort_keys",
+      "verifier_assertion": "test.sh:76-80 asserts kept and deleted are sorted ascending by path; missing sorted ascending by (id, path); invalid sorted ascending by (id, reason).",
+      "script_refs": ["IS13_output_shape_and_sort"],
+      "must_include": [
+        "kept by path",
+        "deleted by path",
+        "missing by (id, path)",
+        "invalid by (id, reason)"
+      ]
+    },
+    {
+      "id": "managed_ext_and_meta",
+      "verifier_assertion": "test.sh:93-95 requires intro/a.playable.meta to remain on disk and not appear in deleted; test.sh:210 requires note.meta to survive the independent fixture. This encodes the rule that only .playable/.prefab are managed and .meta is never touched.",
+      "script_refs": ["IS04_managed_ext_rule"],
+      "must_include": [
+        ".playable or .prefab",
+        ".meta",
+        "MUST NEVER be deleted"
+      ]
+    },
+    {
+      "id": "handauthored_survives",
+      "verifier_assertion": "test.sh:89-91 requires hand/keep.playable to stay on disk and not appear in deleted; test.sh:209 requires hand.playable to survive the independent fixture. This encodes the .handauthored exemption.",
+      "script_refs": ["IS05_handauthored_rule"],
+      "must_include": [
+        ".handauthored",
+        "hand-authored",
+        "must never be deleted"
+      ]
+    },
+    {
+      "id": "desired_set",
+      "verifier_assertion": "test.sh:59 asserts kept list content; test.sh:84-86 asserts a disabled entry's file (boss/b.playable) is deleted from disk and appears in deleted; test.sh:211 asserts the disabled entry's orphan in the independent fixture is deleted. Encodes: desired = valid-enabled entries' required lists; disabled/invalid own nothing.",
+      "script_refs": ["IS06_desired_set_rule", "IS12_kept_rule"],
+      "must_include": [
+        "BOTH valid AND enabled==true",
+        "disabled or invalid own nothing",
+        "exist on disk AND are in the desired set"
+      ]
+    },
+    {
+      "id": "invalid_reason_enum",
+      "verifier_assertion": "test.sh:66-73 asserts exact invalid records with reasons drawn from exactly {mutex_flags, bad_key, duplicate_id}; each reason has a specific triggering condition.",
+      "script_refs": ["IS07_invalid_reasons", "IS14_reason_enum"],
+      "must_include": [
+        "'mutex_flags'",
+        "'bad_key'",
+        "'duplicate_id'",
+        "use_timeline AND use_cutscene are BOTH true",
+        "does not start with the prefix 'cutscene_'",
+        "two or more entries share the same id"
+      ]
+    },
+    {
+      "id": "duplicate_id_applies_to_all",
+      "verifier_assertion": "test.sh:66-73 shows dup appears once as a dedup'd duplicate_id record but test.sh:107 asserts dup/x.playable is deleted from disk. Both dup entries are invalid; the rule is: duplicate_id flags EVERY entry carrying that id, not only the extra copies.",
+      "script_refs": ["IS07_invalid_reasons"],
+      "must_include": [
+        "for EVERY entry carrying that id"
+      ]
+    },
+    {
+      "id": "invalid_multi_reason_and_dedup",
+      "verifier_assertion": "test.sh:66-73 shows e8 emits both bad_key and mutex_flags as two separate invalid records; the two dup entries collapse into a single {dup, duplicate_id} record after dedup. Rule: one record per triggered reason, final list is UNIQUE {id, reason} pairs.",
+      "script_refs": ["IS08_invalid_dedup"],
+      "must_include": [
+        "one record per triggered reason",
+        "UNIQUE {id, reason} records"
+      ]
+    },
+    {
+      "id": "invalid_owns_nothing",
+      "verifier_assertion": "test.sh:107-111 asserts dup/x.playable, m/m.playable, bad/n.playable are all deleted from disk — because their entries are invalid and own nothing, so their required-paths become orphans and fall to the deleted list.",
+      "script_refs": ["IS09_invalid_no_side_effects"],
+      "must_include": [
+        "Invalid entries own no paths",
+        "produce no 'missing' records"
+      ]
+    },
+    {
+      "id": "missing_rule",
+      "verifier_assertion": "test.sh:64 asserts missing == [{id: e3, path: win/c.prefab}]; test.sh:101 asserts win/c.prefab is absent from disk; test.sh:214 asserts missing == [{t3, c.playable}] in the independent fixture. Rule: for each valid-enabled entry, required paths absent from disk emit missing records.",
+      "script_refs": ["IS10_missing_rule"],
+      "must_include": [
+        "valid AND enabled entry",
+        "does not currently exist on disk becomes a missing record"
+      ]
+    },
+    {
+      "id": "deleted_rule",
+      "verifier_assertion": "test.sh:61 asserts exact deleted list; test.sh:103 asserts stray/z.prefab (unowned orphan) is deleted; test.sh:212 asserts extra.prefab in the independent fixture is deleted. Rule: every managed file not in any valid-enabled desired set is deleted, unless in .handauthored.",
+      "script_refs": ["IS11_deleted_rule"],
+      "must_include": [
+        "Every managed file (.playable or .prefab) under the assets root",
+        "NOT in the desired set of any valid enabled entry",
+        "must be deleted from disk"
+      ]
+    },
+    {
+      "id": "path_prohibitions",
+      "verifier_assertion": "test.sh:116-121 asserts result.json contains no http/https URLs; no absolute paths in kept/deleted; no absolute paths in missing; no /home/, /Users/, /root/ user-home path substrings anywhere.",
+      "script_refs": ["IS02_paths_relative_no_urls"],
+      "must_include": [
+        "relative to the assets root",
+        "No absolute paths anywhere in the report",
+        "no user-home paths",
+        "no URLs"
+      ]
+    },
+    {
+      "id": "idempotency",
+      "verifier_assertion": "test.sh:125-135 (main fixture) and test.sh:216-220 (independent fixture) run the reconciler a second time on the already-reconciled directory and assert: deleted == [], and kept/missing/invalid unchanged from the first run.",
+      "script_refs": ["IS15_idempotency"],
+      "must_include": [
+        "second time on the already-reconciled directory",
+        "must delete zero further files",
+        "kept, missing, and invalid lists must be unchanged"
+      ]
+    }
+  ]
+}

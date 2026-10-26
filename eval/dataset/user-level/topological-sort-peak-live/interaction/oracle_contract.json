@@ -1,0 +1,146 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "instance_id": "topological-sort-peak-live",
+  "verifier_form": "script_asserts",
+  "source_files": ["tests/test.sh", "instruction.md"],
+  "notes": "Each requirement maps a family of frozen verifier assertions (the 7 fixed cases A/B/C/D_cycle/D_selfloop/E/F plus the 25 random-DAG reference trials in tests/test.sh) to the info_slice(s) that disclose the rule the assertion checks. must_include strings are verbatim substrings of the referenced slice content, establishing that info_slices fully cover the instruction, which fully covers the verifier. The case-specific expected numbers are computed by applying these disclosed rules to the fixtures the agent reads from /app/inputs.",
+  "requirements": [
+    {
+      "id": "req_cli_contract",
+      "verifier_assertion": "test.sh runs `python3 /app/solution.py --input <case_dir> --output <file>` for every case and reads back the written JSON; the tool must accept --input/--output and scan *.json non-recursively.",
+      "script_refs": ["cli"],
+      "must_include": [
+        "--input",
+        "--output",
+        "reads every *.json file in the --input directory non-recursively"
+      ]
+    },
+    {
+      "id": "req_output_keys",
+      "verifier_assertion": "Every case asserts the parsed output has keys status/order/cycle_nodes/peak_live/stats/errors and that status is one of ok/cycle/error.",
+      "script_refs": ["output_keys"],
+      "must_include": [
+        "status, order, cycle_nodes, peak_live, stats, errors",
+        "status is one of \"ok\", \"cycle\", or \"error\""
+      ]
+    },
+    {
+      "id": "req_fragment_union",
+      "verifier_assertion": "caseB and caseC assert results computed over the union of multiple fragment files (source_count 2, merged nodes/edges).",
+      "script_refs": ["fragment_shape"],
+      "must_include": [
+        "source_id, priority",
+        "The overall graph is the union of all fragments"
+      ]
+    },
+    {
+      "id": "req_weight_merge",
+      "verifier_assertion": "Merged-node cases assert the weight chosen by highest priority, ties broken by lexicographically smallest source_id, which the reference uses to compute order.",
+      "script_refs": ["weight_merge"],
+      "must_include": [
+        "the fragment with the highest priority",
+        "source_id is lexicographically smallest"
+      ]
+    },
+    {
+      "id": "req_implicit_null_weight",
+      "verifier_assertion": "Cases with edge-only nodes assert those nodes exist with weight null, affecting node_count and ordering (null sorts after numeric).",
+      "script_refs": ["implicit_node"],
+      "must_include": [
+        "referenced only inside an edge",
+        "created with weight equal to null"
+      ]
+    },
+    {
+      "id": "req_edge_dedup",
+      "verifier_assertion": "caseC asserts edge_count 2 after a duplicate (from,to) edge is collapsed.",
+      "script_refs": ["edge_dedup"],
+      "must_include": [
+        "de-duplicated by the (from, to) pair",
+        "A duplicated edge does not change the edge count"
+      ]
+    },
+    {
+      "id": "req_weight_domain",
+      "verifier_assertion": "The reference and cases treat weight as a non-negative integer or null, with null a legal value in ready-set ordering.",
+      "script_refs": ["weight_domain"],
+      "must_include": [
+        "non-negative integer or null",
+        "null is a valid value"
+      ]
+    },
+    {
+      "id": "req_order_kahn_tiebreak",
+      "verifier_assertion": "caseA order [B,A,C,D], caseB [X,Y,Z], caseC [P,Q,R], caseF [H,G,K] and all 25 random-DAG trials assert Kahn's order with in-degree-0 tie-break of ascending weight (numeric before null) then ascending id; order is null when not ok.",
+      "script_refs": ["order_rule"],
+      "must_include": [
+        "order is the topological order as a list of node ids when status == \"ok\", otherwise null",
+        "Kahn's algorithm",
+        "ascending weight, where any numeric weight sorts before null",
+        "then ascending id as a tie-breaker"
+      ]
+    },
+    {
+      "id": "req_cycle_semantics",
+      "verifier_assertion": "caseD_cycle asserts status cycle with cycle_nodes [A,B,C]; caseD_selfloop asserts cycle_nodes [W] for a from==to self-loop; order null in both.",
+      "script_refs": ["cycle_rule"],
+      "must_include": [
+        "including any self-loop where from == to",
+        "a non-zero remaining in-degree after Kahn's algorithm terminates",
+        "sorted ascending by id",
+        "cycle_nodes is an empty list in all other cases"
+      ]
+    },
+    {
+      "id": "req_peak_live",
+      "verifier_assertion": "caseA/B/C/F assert peak_live 2 via the liveness replay; peak_live is 0 when status is not ok.",
+      "script_refs": ["peak_rule"],
+      "must_include": [
+        "stays live until every one of its direct successors has also been emitted",
+        "a node with no successors never counts as live",
+        "maximum number of simultaneously live nodes",
+        "When status != \"ok\", set it to 0"
+      ]
+    },
+    {
+      "id": "req_stats",
+      "verifier_assertion": "caseA asserts stats {node_count 4, edge_count 3, source_count 1}; caseB node_count 3 source_count 2 edge_count 2; caseC edge_count 2.",
+      "script_refs": ["stats_rule"],
+      "must_include": [
+        "node_count (distinct merged node ids)",
+        "edge_count (distinct merged edges)",
+        "source_count (number of distinct source_id values)"
+      ]
+    },
+    {
+      "id": "req_invalid_ordering",
+      "verifier_assertion": "caseE asserts invalid input is detected and that invalidity is checked before cycle detection.",
+      "script_refs": ["invalid_defs"],
+      "must_include": [
+        "empty or missing id",
+        "edge missing from or to",
+        "Invalid input is checked before cycle detection"
+      ]
+    },
+    {
+      "id": "req_errors_semantics",
+      "verifier_assertion": "caseE asserts errors reasons [invalid_edge_endpoint, invalid_node_id] with status error, order null, cycle_nodes [], peak_live 0.",
+      "script_refs": ["errors_rule"],
+      "must_include": [
+        "invalid_node_id",
+        "invalid_edge_endpoint",
+        "set status = \"error\", order = null, cycle_nodes = [], and peak_live = 0"
+      ]
+    },
+    {
+      "id": "req_worked_example_A",
+      "verifier_assertion": "caseA pins order [B,A,C,D], peak_live 2, and stats {4,3,1} together as the canonical example.",
+      "script_refs": ["example"],
+      "must_include": [
+        "order = [\"B\", \"A\", \"C\", \"D\"]",
+        "peak_live = 2",
+        "\"node_count\": 4, \"edge_count\": 3, \"source_count\": 1"
+      ]
+    }
+  ]
+}

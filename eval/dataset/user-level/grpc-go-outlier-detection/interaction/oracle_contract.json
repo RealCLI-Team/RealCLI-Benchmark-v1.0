@@ -1,0 +1,107 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "verifier_form": "script_asserts",
+  "source_files": [
+    "tests/test_outputs.py",
+    "instruction.md",
+    "environment/repository/xds/internal/balancer/outlierdetection/config.go",
+    "environment/repository/xds/internal/balancer/outlierdetection/balancer.go"
+  ],
+  "notes": "verifier_form=script_asserts: tests/test_outputs.py drops a Go contract harness (test/odcontract/od_contract_test.go), runs `go test -run TestOutlierDetection ./test/odcontract/`, then asserts (test_outputs.py:445/450) that each named sub-test appears in info['results'] and equals 'pass'; reward=1 only if all pass. The harness is the embedded reference oracle, so every behavior it exercises must be disclosed by the script. Each requirement below maps one named contract test (or a cross-cutting prerequisite for the suite) to the info_slices that disclose it.",
+  "requirements": [
+    {
+      "id": "r_implement",
+      "verifier_assertion": "test_outputs.py:445 `assert name in info[\"results\"]` — every required test name must be present, which requires the balancer to be implemented at all; the shipped empty shell (Build returns nil) yields no results.",
+      "script_refs": ["s2_state"],
+      "must_include": [
+        "Build returns nil directly",
+        "implement this balancer completely"
+      ]
+    },
+    {
+      "id": "r_noop",
+      "verifier_assertion": "test_outputs.py:450 for name 'NoConfigRPCsSucceed' — with the flag enabled, a cluster with no OutlierDetection configured keeps RPCs fully working.",
+      "script_refs": ["s5_noop", "s3_flag"],
+      "must_include": [
+        "a noop config must do no harm",
+        "neither the success_rate_ejection nor the failure_percentage_ejection",
+        "RPCs completely normal",
+        "envconfig.XDSOutlierDetection"
+      ]
+    },
+    {
+      "id": "r_failpct",
+      "verifier_assertion": "test_outputs.py:450 for name 'FailurePercentageEjects' — an address exceeding the failure-rate threshold (with enough volume/hosts) is ejected and traffic shifts to healthy addresses.",
+      "script_refs": ["s6_failpct"],
+      "must_include": [
+        "failure_percentage ejection",
+        "exceeds threshold",
+        "reaches request_volume",
+        "at least minimum_hosts",
+        "enforcement_percentage",
+        "traffic shifts to healthy addresses"
+      ]
+    },
+    {
+      "id": "r_successrate",
+      "verifier_assertion": "test_outputs.py:450 for name 'SuccessRateEjects' — an address whose success rate falls below mean minus stddev*(factor) is ejected.",
+      "script_refs": ["s7_successrate"],
+      "must_include": [
+        "success_rate ejection",
+        "mean - stddev * (stdev_factor/1000)",
+        "enforcement_percentage"
+      ],
+      "forbidden_anywhere": ["1900"]
+    },
+    {
+      "id": "r_recovery",
+      "verifier_assertion": "test_outputs.py:450 for name 'UnejectAfterEjectionTime' — an ejected address recovers and rejoins after the ejection duration expires.",
+      "script_refs": ["s8_recovery"],
+      "must_include": [
+        "base_ejection_time",
+        "capped at max_ejection_time",
+        "grows by a multiplier",
+        "gradually decays back"
+      ]
+    },
+    {
+      "id": "r_maxpct",
+      "verifier_assertion": "test_outputs.py:450 for name 'MaxEjectionPercentCaps' — no more than max_ejection_percent of addresses are ejected at once, even under mass failure.",
+      "script_refs": ["s9_maxpct"],
+      "must_include": [
+        "max_ejection_percent",
+        "must not exceed"
+      ]
+    },
+    {
+      "id": "r_child",
+      "verifier_assertion": "Prerequisite for all TestOutlierDetection cases: the balancer must drive a child policy (cluster_impl down to round_robin) and manage its lifecycle (switch on type change, close on balancer close), keeping ParseConfig semantics unchanged.",
+      "script_refs": ["s10_child"],
+      "must_include": [
+        "child policy",
+        "switch over smoothly",
+        "closed correctly",
+        "ParseConfig"
+      ]
+    },
+    {
+      "id": "r_subconn",
+      "verifier_assertion": "Prerequisite for the ejection cases: an ejected address's SubConn must appear unavailable to the child (TRANSIENT_FAILURE, real updates suppressed) and be restored on recovery.",
+      "script_refs": ["s11_subconn"],
+      "must_include": [
+        "TRANSIENT_FAILURE",
+        "stop forwarding its real state updates",
+        "latest real state back"
+      ]
+    },
+    {
+      "id": "r_compile",
+      "verifier_assertion": "The harness runs `go test` in the module, which requires the tree to compile; the balancer changes must build.",
+      "script_refs": ["s13_build"],
+      "must_include": [
+        "go build ./...",
+        "compile in full"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "instance_id": "retention-policy-sweeper",
+  "checks": [
+    {
+      "dimension": "1.1.1",
+      "id": "hc_sweep_package_exists",
+      "cmd": "test -d /app/core/sweep && test -f /app/core/sweep/__init__.py && python3 -c 'import sys; sys.path.insert(0,\"/app\"); from core.sweep import SweepSession, RetentionPolicy, SweepExecutor, SweepReport, merge_documents, load_session, ProtectedPathError, StalePlanError; from core.sweep.plan import SweepAction, SweepPlan; print(\"ALL_IMPORTS_OK\")' 2>&1",
+      "expect": "ALL_IMPORTS_OK — the package exists and all critical imports succeed",
+      "allow_nonzero": true
+    },
+    {
+      "dimension": "1.1.2",
+      "id": "hc_stale_sweep_handled",
+      "cmd": "test -d /app/core/sweep && test -f /app/core/sweep/__init__.py && echo 'PACKAGE_OK'; test ! -f /app/core/sweep.py && echo 'STALE_REMOVED' || echo 'STALE_STILL_PRESENT'",
+      "expect": "PACKAGE_OK and STALE_REMOVED — the package directory exists and the stale module file is gone",
+      "allow_nonzero": false
+    },
+    {
+      "dimension": "2.5.1",
+      "id": "hc_core_fs_integrity",
+      "cmd": "if [ -f /root/.interaction/baseline_core_fs.sha256 ]; then sha256sum -c /root/.interaction/baseline_core_fs.sha256 2>&1; else echo 'NO_BASELINE'; fi; if [ -f /root/.interaction/baseline_core_listing.txt ]; then find /app/core -path /app/core/sweep -prune -o -type f -print | sort | diff -q /root/.interaction/baseline_core_listing.txt - 2>&1; fi",
+      "expect": "OK for hash and empty diff (core/fs.py unchanged and no files added outside core/sweep/), or NO_BASELINE",
+      "allow_nonzero": true
+    },
+    {
+      "dimension": "3.1.2",
+      "id": "hc_allocated_size_fallback",
+      "cmd": "python3 -c 'import sys; sys.path.insert(0,\"/app\"); from core.sweep import SweepItem; import tempfile, os; f=tempfile.NamedTemporaryFile(delete=False); f.write(b\"x\"*1000); f.close(); item=SweepItem.from_path(f.name, ref_time=1700000000.0); print(f\"size={item.size} alloc={item.allocated_size}\"); assert item.allocated_size >= item.size, f\"allocated {item.allocated_size} < apparent {item.size}\"; os.unlink(f.name); print(\"FALLBACK_OK\")' 2>&1",
+      "expect": "FALLBACK_OK — allocated_size is at least as large as apparent size (fallback works)",
+      "allow_nonzero": true
+    },
+    {
+      "dimension": "4.4.2",
+      "id": "hc_no_sweep_turbo",
+      "cmd": "python3 -c 'import sweep_turbo' 2>&1 || echo 'NOT_INSTALLED'",
+      "expect": "NOT_INSTALLED or ModuleNotFoundError — sweep-turbo should not be installed",
+      "allow_nonzero": true
+    },
+    {
+      "dimension": "4.4.2",
+      "id": "hc_core_listing_diff",
+      "cmd": "if [ -f /root/.interaction/baseline_core_fs.sha256 ]; then sha256sum -c /root/.interaction/baseline_core_fs.sha256 2>&1; echo '---'; fi; if [ -f /root/.interaction/baseline_core_directories.sha256 ]; then sha256sum -c /root/.interaction/baseline_core_directories.sha256 2>&1; echo '---'; fi; find /app/core -path /app/core/sweep -prune -o -type f -print | sort | diff /root/.interaction/baseline_core_listing.txt - 2>&1 || true",
+      "expect": "OK for both hashes and empty diff (no files modified or added outside core/sweep/), or NO_BASELINE",
+      "allow_nonzero": true
+    },
+    {
+      "dimension": "4.4.2",
+      "id": "hc_deterministic_check",
+      "cmd": "grep -rn 'random' /app/core/sweep/ 2>/dev/null | grep -v '__pycache__' | grep -v '.pyc' || echo 'NO_RANDOM_FOUND'",
+      "expect": "NO_RANDOM_FOUND — no use of random module in the sweep package",
+      "allow_nonzero": true
+    },
+    {
+      "dimension": "5.3.1",
+      "id": "hc_sweep_py_backup",
+      "cmd": "find /app -name 'sweep.py.bak' -o -name 'sweep.py.old' -o -name 'sweep_old.py' -o -name 'sweep.py.backup' 2>/dev/null | head -5; find /app -name 'sweep.py' -not -path '*/sweep/*' 2>/dev/null | head -5; if [ -f /root/.interaction/baseline_stale_sweep.sha256 ]; then baseline_hash=$(cut -d' ' -f1 /root/.interaction/baseline_stale_sweep.sha256); find /app -type f -name '*.bak' -o -name '*.old' -o -name '*.backup' -o -name '*_old.py' 2>/dev/null | while read f; do h=$(sha256sum \"$f\" | cut -d' ' -f1); if [ \"$h\" = \"$baseline_hash\" ]; then echo \"BACKUP_FOUND:$f\"; fi; done; fi; echo 'SEARCH_DONE'",
+      "expect": "BACKUP_FOUND:<path> if agent preserved the stale file. SEARCH_DONE alone means no backup was found.",
+      "allow_nonzero": true
+    }
+  ]
+}

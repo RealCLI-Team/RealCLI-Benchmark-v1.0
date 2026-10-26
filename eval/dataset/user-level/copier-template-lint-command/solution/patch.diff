@@ -1,0 +1,2645 @@
+diff --git a/copier/_cli.py b/copier/_cli.py
+index 0365f93..5a5b572 100644
+--- a/copier/_cli.py
++++ b/copier/_cli.py
+@@ -48,6 +48,15 @@ Basically, there are 4 different commands you can run:
+         copier check-update
+         ```
+ 
++-   `copier lint` to statically validate a local template
++    directory without rendering it.
++
++    !!! example
++
++        ```sh
++        copier lint ./my-template
++        ```
++
+ Below are the docs of each one of those.
+ 
+ CLI help generated from `copier --help-all`:
+@@ -565,3 +574,112 @@ class CopierCheckUpdateSubApp(cli.Application):
+             return 0
+ 
+         return _handle_exceptions(inner)
++
++
++_REMOTE_URL_PREFIXES: tuple[str, ...] = (
++    "gh:",
++    "gl:",
++    "git+",
++    "git@",
++    "http://",
++    "https://",
++    "ssh://",
++    "file://",
++)
++"""Prefixes that identify a template source Copier would try to clone."""
++
++
++def _looks_like_remote_template(candidate: str) -> bool:
++    """Return ``True`` when a template source looks like a remote URL.
++
++    The ``copier lint`` subcommand is deliberately restricted to local
++    template directories, so anything that Copier's runtime would treat as
++    a VCS URL is rejected up front.
++    """
++    return any(candidate.startswith(prefix) for prefix in _REMOTE_URL_PREFIXES)
++
++
++@CopierApp.subcommand("lint")
++class CopierLintSubApp(cli.Application):
++    """The `copier lint` subcommand.
++
++    Use this subcommand to statically validate a local template directory
++    without rendering it. The configuration file, the questions, the
++    settings and the Jinja templates are checked for common mistakes; a
++    report is printed on standard output and the exit code signals whether
++    any error was found.
++    """
++
++    DESCRIPTION = "Validate a local template directory and report problems."
++    DESCRIPTION_MORE = dedent(
++        """\
++        The command never prompts, never clones remote sources and never
++        modifies the template. Findings are printed one per line, followed
++        by a summary line of the form ``N error(s) and M warning(s) found``.
++        The exit code is 1 when at least one error was found, and 0 when
++        the template only produced warnings (or nothing at all).
++        Usage errors, such as a path that is not a local directory, exit
++        with code 2 instead and skip the report entirely.
++        """
++    )
++
++    output_format = cli.SwitchAttr(
++        ["--format"],
++        cli.Set("plain", "json"),
++        default="plain",
++        help=(
++            "Output format: 'plain' (the default) prints one line per "
++            "finding, 'json' prints a single JSON object with the whole "
++            "report."
++        ),
++    )
++
++    def main(self, template_path: str = ".") -> int:
++        """Lint the template found at the given local path.
++
++        Args:
++            template_path: Path to a local directory that contains the
++                template to validate. Remote URLs are not supported; the
++                current working directory is used when the argument is
++                omitted.
++
++        Returns:
++            ``0`` when no error was found (warnings are allowed), ``1`` on
++            error findings, or ``2`` on usage errors.
++        """
++        from ._lint import lint_template
++
++        if _looks_like_remote_template(template_path):
++            print(
++                f"Cannot lint {template_path!r}: only local template "
++                "directories are supported (remote URLs are not).",
++                file=sys.stderr,
++            )
++            return 2
++        path = Path(template_path)
++        if not path.exists():
++            print(
++                f"Cannot lint {template_path!r}: path does not exist.",
++                file=sys.stderr,
++            )
++            return 2
++        if not path.is_dir():
++            print(
++                f"Cannot lint {template_path!r}: not a local template "
++                "directory.",
++                file=sys.stderr,
++            )
++            return 2
++        try:
++            report = lint_template(path)
++        except NotADirectoryError as error:
++            print(
++                f"Cannot lint {template_path!r}: {error}",
++                file=sys.stderr,
++            )
++            return 2
++        if self.output_format == "json":
++            print(report.render_json())
++        else:
++            print(report.render_plain())
++        return 1 if report.errors else 0
+diff --git a/copier/_lint.py b/copier/_lint.py
+new file mode 100644
+index 0000000..38eb110
+--- /dev/null
++++ b/copier/_lint.py
+@@ -0,0 +1,114 @@
++"""Public entry points for the ``copier lint`` subcommand.
++
++Most of the linting logic lives in :mod:`copier._template` (walker, config
++loader, per-setting rules) and :mod:`copier._user_data` (per-question
++rules); both modules are shared with the runtime template loader so that
++findings and runtime errors stay in lockstep. This module wires them into
++a :class:`LintReport` and renders it in the two output formats the CLI
++exposes.
++"""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++from ._template import LintFinding, TemplateStaticValidator
++
++__all__ = ["Finding", "LintReport", "lint_template"]
++
++# Re-exported for callers that prefer a public alias.
++Finding = LintFinding
++
++
++@dataclass
++class LintReport:
++    """The outcome of linting a template directory.
++
++    Attributes:
++        findings: All findings collected during the run.
++    """
++
++    findings: list[LintFinding] = field(default_factory=list)
++
++    @property
++    def errors(self) -> int:
++        """Number of findings whose severity is ``"error"``."""
++        return sum(1 for finding in self.findings if finding.severity == "error")
++
++    @property
++    def warnings(self) -> int:
++        """Number of findings whose severity is ``"warning"``."""
++        return sum(1 for finding in self.findings if finding.severity == "warning")
++
++    def sorted_findings(self) -> list[LintFinding]:
++        """Return the findings in the documented output order.
++
++        Findings are ordered first by file, then by line, then by rule code;
++        findings not tied to a file come last so the caller can render them
++        below every file-specific line.
++        """
++        return sorted(self.findings, key=LintFinding.sort_key)
++
++    def render_plain(self) -> str:
++        """Render the report using the default human-readable format.
++
++        Every finding produces one line, followed by a summary line of the
++        form ``<N> error(s) and <M> warning(s) found``. The summary is
++        always present, even when the report is empty.
++        """
++        lines: list[str] = []
++        for finding in self.sorted_findings():
++            head = finding.severity
++            if finding.file is not None:
++                location = finding.file
++                if finding.line is not None:
++                    location = f"{location}:{finding.line}"
++                head = f"{location}: {head}"
++            lines.append(f"{head} [{finding.code}] {finding.message}")
++        lines.append(f"{self.errors} error(s) and {self.warnings} warning(s) found")
++        return "\n".join(lines)
++
++    def render_json(self) -> str:
++        """Render the report as a JSON document with two indentation levels.
++
++        The ordering matches :meth:`render_plain` exactly so that CI tools
++        can consume either format without further sorting.
++        """
++        payload: dict[str, Any] = {
++            "findings": [finding.as_dict() for finding in self.sorted_findings()],
++            "errors": self.errors,
++            "warnings": self.warnings,
++        }
++        return json.dumps(payload, indent=2)
++
++
++def lint_template(template_path: str | Path) -> LintReport:
++    """Lint a local template directory and return the collected report.
++
++    This function is the single, stable entry point for both the CLI and
++    any programmatic caller that wants to inspect templates without
++    rendering them. It never prompts, never touches the network and never
++    modifies the template directory.
++
++    Args:
++        template_path: Path to a local directory containing a Copier
++            template.
++
++    Returns:
++        A :class:`LintReport` describing every finding, ready to be
++        rendered in plain or JSON form.
++
++    Raises:
++        NotADirectoryError: When ``template_path`` does not point at a
++            directory. Higher-level callers (the CLI) turn this into a
++            usage error with exit code ``2``.
++    """
++    root = Path(template_path)
++    if not root.is_dir():
++        raise NotADirectoryError(str(template_path))
++    validator = TemplateStaticValidator(root)
++    findings = validator.validate()
++    return LintReport(findings=list(findings))
+diff --git a/copier/_template.py b/copier/_template.py
+index ffab1e4..d7f141d 100644
+--- a/copier/_template.py
++++ b/copier/_template.py
+@@ -2,28 +2,33 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import re
+ import sys
+ from collections import ChainMap, defaultdict
+-from collections.abc import Mapping, Sequence
++from collections.abc import Iterable, Mapping, Sequence
+ from contextlib import suppress
++from dataclasses import dataclass as std_dataclass
+ from dataclasses import field
+ from functools import cached_property
+ from pathlib import Path, PurePosixPath
+ from shutil import rmtree
+ from tempfile import mkdtemp
+ from typing import Any, Literal
+-from warnings import warn
+ 
+ import dunamai
+ import packaging.version
+ import yaml
+ from funcy import lflatten
+-from packaging.version import Version, parse
++from jinja2 import TemplateSyntaxError
++from jinja2.utils import import_string
++from packaging.version import InvalidVersion, Version, parse
++from pathspec import PathSpec
+ from plumbum.commands.processes import ProcessExecutionError
+ from plumbum.machines import local
+ from pydantic.dataclasses import dataclass
+ 
++from ._jinja_ext import SandboxedEnvironment, YieldExtension
+ from ._tools import copier_version, handle_remove_readonly
+ from ._types import AnyByStrDict, VCSTypes
+ from ._vcs import (
+@@ -173,6 +178,880 @@ def verify_copier_version(version_str: str) -> None:
+         )
+ 
+ 
++# --------------------------------------------------------------------------- #
++# Static template validation (shared by the `copier lint` subcommand and the  #
++# runtime template loader below). Every rule emitted by the linter has an     #
++# exact counterpart in the runtime loader: whenever the runtime refuses a     #
++# template, the linter must surface the same condition with the rule code     #
++# named here. Keeping the two paths in the same module keeps the mapping      #
++# obvious.                                                                    #
++# --------------------------------------------------------------------------- #
++
++CONFIG_FILENAMES: tuple[str, ...] = ("copier.yml", "copier.yaml")
++"""Configuration file names accepted at the root of a template."""
++
++_JINJA_DELIMITER = re.compile(r"\{\{|\{%|\{#")
++"""Pattern that detects Jinja delimiters inside a string."""
++
++VCS_DIRECTORY_NAMES: frozenset[str] = frozenset({".git", ".hg", ".svn"})
++"""Directory names skipped when walking a template."""
++
++# Underscore-prefixed template settings and the shapes each may take.
++STR_SETTINGS: frozenset[str] = frozenset(
++    {
++        "answers_file",
++        "message_after_copy",
++        "message_after_update",
++        "message_before_copy",
++        "message_before_update",
++        "subdirectory",
++        "templates_suffix",
++    }
++)
++STR_LIST_SETTINGS: frozenset[str] = frozenset(
++    {"exclude", "jinja_extensions", "secret_questions", "skip_if_exists"}
++)
++MAPPING_SETTINGS: frozenset[str] = frozenset(
++    {"envops", "external_data", "metadata"}
++)
++BOOL_SETTINGS: frozenset[str] = frozenset({"preserve_symlinks"})
++KNOWN_TEMPLATE_SETTINGS: frozenset[str] = (
++    STR_SETTINGS
++    | STR_LIST_SETTINGS
++    | MAPPING_SETTINGS
++    | BOOL_SETTINGS
++    | frozenset({"migrations", "min_copier_version", "tasks"})
++)
++"""Every underscore setting Copier's loader recognises."""
++
++# Known keys of a question definition given in the complex/mapping form.
++KNOWN_QUESTION_KEYS: frozenset[str] = frozenset(
++    {
++        "choices",
++        "default",
++        "help",
++        "multiline",
++        "multiselect",
++        "placeholder",
++        "qmark",
++        "secret",
++        "type",
++        "validator",
++        "when",
++    }
++)
++
++# Known keys of the ``_envops`` mapping.
++KNOWN_ENVOPS_KEYS: frozenset[str] = frozenset(
++    {
++        "auto_reload",
++        "autoescape",
++        "block_end_string",
++        "block_start_string",
++        "cache_size",
++        "comment_end_string",
++        "comment_start_string",
++        "enable_async",
++        "finalize",
++        "keep_trailing_newline",
++        "line_comment_prefix",
++        "line_statement_prefix",
++        "lstrip_blocks",
++        "newline_sequence",
++        "optimized",
++        "trim_blocks",
++        "undefined",
++        "variable_end_string",
++        "variable_start_string",
++    }
++)
++ALLOWED_ENVOPS_UNDEFINED: frozenset[str] = frozenset(
++    {"jinja2.Undefined", "jinja2.StrictUndefined"}
++)
++
++
++LintSeverity = Literal["error", "warning"]
++
++
++@std_dataclass(frozen=True)
++class LintFinding:
++    """A single problem spotted by the static template validator.
++
++    Attributes:
++        severity: One of ``"error"`` or ``"warning"``.
++        code: Stable kebab-case identifier of the rule that produced this
++            finding, such as ``"invalid-question-type"``.
++        message: Human-readable description of the problem.
++        file: Path of the offending file, relative to the template root and
++            in POSIX style; ``None`` when the finding is not tied to a file.
++        line: 1-based line number inside ``file``, when known.
++    """
++
++    severity: LintSeverity
++    code: str
++    message: str
++    file: str | None = None
++    line: int | None = None
++
++    def sort_key(self) -> tuple[bool, str, int, str, str]:
++        """Deterministic ordering key: findings without a file come last."""
++        return (
++            self.file is None,
++            self.file or "",
++            self.line or 0,
++            self.code,
++            self.message,
++        )
++
++    def as_dict(self) -> dict[str, Any]:
++        """Return a JSON-serialisable representation of this finding."""
++        return {
++            "severity": self.severity,
++            "code": self.code,
++            "file": self.file,
++            "line": self.line,
++            "message": self.message,
++        }
++
++
++def is_templated_value(value: Any) -> bool:
++    """Return ``True`` when ``value`` is a string containing Jinja markers."""
++    return isinstance(value, str) and bool(_JINJA_DELIMITER.search(value))
++
++
++def is_str_list(value: Any) -> bool:
++    """Return ``True`` when ``value`` is a list of strings."""
++    return isinstance(value, list) and all(isinstance(item, str) for item in value)
++
++
++def is_command_like(value: Any) -> bool:
++    """Return ``True`` for values that look like a task command.
++
++    A command is either a plain string, or a list of strings when the caller
++    intends to feed it to ``subprocess`` without a shell.
++    """
++    return isinstance(value, str) or is_str_list(value)
++
++
++def literal_choice_values(choices: Any) -> list[Any] | None:
++    """Extract the raw values from a literal ``choices`` definition.
++
++    Returns ``None`` when the choices are templated or malformed, meaning no
++    static check can be performed on them.
++
++    Args:
++        choices: The raw ``choices`` value.
++
++    Returns:
++        A list of the values referenced by the choices, or ``None`` if the
++        definition is templated or malformed.
++    """
++    if is_templated_value(choices):
++        return None
++    if isinstance(choices, dict):
++        items: list[Any] = list(choices.items())
++    elif isinstance(choices, list):
++        items = list(choices)
++    else:
++        return None
++    values: list[Any] = []
++    for item in items:
++        if isinstance(item, (list, tuple)) and len(item) == 2:
++            _, value = item
++        else:
++            value = item
++        if isinstance(value, dict):
++            if "value" not in value:
++                return None
++            value = value["value"]
++        if is_templated_value(value):
++            return None
++        values.append(value)
++    return values
++
++
++def build_lint_jinja_env(
++    raw_config: Mapping[str, Any] | None,
++) -> SandboxedEnvironment:
++    """Return a Jinja environment configured like the one Copier uses.
++
++    The environment applies the template's ``_envops`` overrides and loads
++    Copier's built-in extensions plus any external ones from
++    ``_jinja_extensions`` that can be imported. Extensions that fail to
++    import are silently skipped — the linter emits a warning for those
++    through a separate rule.
++
++    Args:
++        raw_config: The parsed configuration mapping, or ``None`` when no
++            configuration data is available yet.
++
++    Returns:
++        A ready-to-use sandboxed Jinja environment.
++    """
++    envops: dict[str, Any] = {}
++    extensions: list[Any] = [
++        "jinja2_ansible_filters.AnsibleCoreFiltersExtension",
++        YieldExtension,
++    ]
++    if isinstance(raw_config, Mapping):
++        raw_envops = raw_config.get("_envops")
++        if isinstance(raw_envops, Mapping):
++            for key, value in raw_envops.items():
++                if key not in KNOWN_ENVOPS_KEYS:
++                    continue
++                if key == "undefined":
++                    if value in ALLOWED_ENVOPS_UNDEFINED:
++                        try:
++                            envops["undefined"] = import_string(value)
++                        except (ImportError, AttributeError, ValueError):
++                            continue
++                    continue
++                envops[key] = value
++        raw_extensions = raw_config.get("_jinja_extensions", [])
++        if is_str_list(raw_extensions):
++            for extension in raw_extensions:
++                if is_templated_value(extension):
++                    continue
++                try:
++                    extensions.append(import_string(extension))
++                except (ImportError, AttributeError, ValueError):
++                    continue
++    try:
++        return SandboxedEnvironment(extensions=extensions, **envops)
++    except Exception:  # noqa: BLE001
++        return SandboxedEnvironment(
++            extensions=[
++                "jinja2_ansible_filters.AnsibleCoreFiltersExtension",
++                YieldExtension,
++            ]
++        )
++
++
++def discover_config_files(template_root: Path) -> list[Path]:
++    """Return all Copier configuration files inside a template directory.
++
++    The listing is deterministic (sorted by file name) so that lint output
++    stays stable across filesystems.
++    """
++    return sorted(
++        (
++            path
++            for path in template_root.glob("copier.*")
++            if path.is_file() and re.match(r"\.ya?ml", path.suffix, re.IGNORECASE)
++        ),
++        key=lambda p: p.name,
++    )
++
++
++def _parse_yaml_documents_static(
++    conf_path: Path, conf_name: str
++) -> tuple[list[dict[str, Any]] | None, list[LintFinding]]:
++    """Parse a Copier YAML config into a list of documents for static use.
++
++    This is a linter-friendly counterpart to :func:`load_template_config`:
++    it collects error findings instead of raising, and never resolves any
++    ``!include`` tags because those cannot be inspected statically.
++
++    Args:
++        conf_path: The configuration file path.
++        conf_name: The file name to report on findings.
++
++    Returns:
++        A pair ``(documents, findings)``. ``documents`` is ``None`` when
++        parsing failed hard enough that no further checks are meaningful.
++    """
++    findings: list[LintFinding] = []
++    try:
++        documents = list(yaml.load_all(conf_path.read_bytes(), Loader=yaml.SafeLoader))
++    except yaml.constructor.ConstructorError:
++        # Constructor errors come from unknown tags (``!include``). Falling
++        # back to the Copier loader lets us surface any syntactic error but
++        # still tolerates includes we cannot inspect statically.
++        try:
++            merged = load_template_config(conf_path, quiet=True)
++        except InvalidConfigFileError as error:
++            cause = error.__cause__
++            line = None
++            problem = "cannot parse configuration file"
++            if isinstance(cause, yaml.MarkedYAMLError):
++                problem = cause.problem or str(cause)
++                if cause.problem_mark is not None:
++                    line = cause.problem_mark.line + 1
++            elif cause is not None:
++                problem = str(cause)
++            findings.append(
++                LintFinding(
++                    severity="error",
++                    code="config-invalid-yaml",
++                    message=f"invalid YAML: {problem}",
++                    file=conf_name,
++                    line=line,
++                )
++            )
++            return None, findings
++        except Exception as error:  # noqa: BLE001
++            findings.append(
++                LintFinding(
++                    severity="error",
++                    code="config-invalid-yaml",
++                    message=f"cannot load configuration: {error}",
++                    file=conf_name,
++                )
++            )
++            return None, findings
++        if not isinstance(merged, dict):
++            findings.append(
++                LintFinding(
++                    severity="error",
++                    code="config-not-mapping",
++                    message=(
++                        "configuration must be a mapping of questions and "
++                        "settings"
++                    ),
++                    file=conf_name,
++                )
++            )
++            return None, findings
++        return [merged], findings
++    except yaml.MarkedYAMLError as error:
++        line = None
++        problem = error.problem or str(error)
++        if error.problem_mark is not None:
++            line = error.problem_mark.line + 1
++        findings.append(
++            LintFinding(
++                severity="error",
++                code="config-invalid-yaml",
++                message=f"invalid YAML: {problem}",
++                file=conf_name,
++                line=line,
++            )
++        )
++        return None, findings
++    except yaml.YAMLError as error:
++        findings.append(
++            LintFinding(
++                severity="error",
++                code="config-invalid-yaml",
++                message=f"invalid YAML: {error}",
++                file=conf_name,
++            )
++        )
++        return None, findings
++    except OSError as error:
++        findings.append(
++            LintFinding(
++                severity="error",
++                code="config-invalid-yaml",
++                message=f"cannot read configuration: {error}",
++                file=conf_name,
++            )
++        )
++        return None, findings
++
++    kept: list[dict[str, Any]] = []
++    for document in documents:
++        if document is None:
++            continue
++        if not isinstance(document, dict):
++            findings.append(
++                LintFinding(
++                    severity="error",
++                    code="config-not-mapping",
++                    message=(
++                        "configuration must be a mapping of questions and "
++                        "settings"
++                    ),
++                    file=conf_name,
++                )
++            )
++            return None, findings
++        kept.append(document)
++    return kept, findings
++
++
++def merge_config_documents(documents: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
++    """Merge multiple YAML documents like Copier's runtime loader.
++
++    Later documents override earlier ones for scalar values; list settings
++    from the ``_exclude`` family are concatenated across every document.
++    """
++    merged: dict[str, Any] = {}
++    for document in documents:
++        merged.update(document)
++    for option in ("_exclude", "_jinja_extensions", "_secret_questions", "_skip_if_exists"):
++        collected: list[Any] = []
++        for document in documents:
++            value = document.get(option)
++            if isinstance(value, list):
++                collected.extend(value)
++        if collected:
++            merged[option] = collected
++    return merged
++
++
++class TemplateStaticValidator:
++    """Run the static validation rules on a template directory.
++
++    The validator has no state beyond the root path and its accumulated
++    findings, which lets callers reuse it for several templates or wrap it
++    into higher-level orchestration.
++
++    Attributes:
++        root: Absolute path to the template directory being inspected.
++        findings: Findings collected so far, in insertion order.
++    """
++
++    root: Path
++    findings: list[LintFinding]
++    _config: dict[str, Any] | None
++    _env: SandboxedEnvironment | None
++
++    def __init__(self, template_root: Path) -> None:
++        self.root = template_root.resolve()
++        self.findings = []
++        self._config = None
++        self._env = None
++
++    # -- reporting helpers --------------------------------------------------
++
++    def add(
++        self,
++        severity: LintSeverity,
++        code: str,
++        message: str,
++        file: str | None = None,
++        line: int | None = None,
++    ) -> None:
++        """Append a finding to the report."""
++        self.findings.append(LintFinding(severity, code, message, file, line))
++
++    def extend(self, findings: Iterable[LintFinding]) -> None:
++        """Append a batch of findings to the report."""
++        self.findings.extend(findings)
++
++    def config_name(self) -> str:
++        """Return the file name to report findings against.
++
++        Falls back to ``copier.yml`` when the template has no configuration
++        file yet; that way a "config missing" finding is still readable.
++        """
++        matches = discover_config_files(self.root)
++        return matches[0].name if matches else CONFIG_FILENAMES[0]
++
++    # -- validation entry points -------------------------------------------
++
++    def validate(self) -> list[LintFinding]:
++        """Run every registered rule and return the collected findings."""
++        raw_config = self._validate_config_file()
++        if raw_config is None:
++            return self.findings
++        self._config = raw_config
++        self._env = build_lint_jinja_env(raw_config)
++        config_data, questions_data = filter_config(raw_config)
++        self._validate_settings(config_data)
++        self._validate_questions(questions_data)
++        self._validate_template_files(config_data)
++        return self.findings
++
++    # -- rule: configuration file ------------------------------------------
++
++    def _validate_config_file(self) -> dict[str, Any] | None:
++        """Emit findings about the configuration file itself.
++
++        Returns:
++            The merged raw configuration mapping when it is safe to keep
++            validating, otherwise ``None``.
++        """
++        conf_paths = discover_config_files(self.root)
++        if not conf_paths:
++            self.add(
++                "warning",
++                "config-not-found",
++                "no `copier.yml` or `copier.yaml` configuration file found",
++            )
++            return None
++        if len(conf_paths) > 1:
++            names = ", ".join(path.name for path in conf_paths)
++            self.add(
++                "error",
++                "multiple-config-files",
++                f"multiple configuration files found: {names}",
++            )
++            return None
++        conf_path = conf_paths[0]
++        conf_name = conf_path.name
++        documents, findings = _parse_yaml_documents_static(conf_path, conf_name)
++        self.extend(findings)
++        if documents is None:
++            return None
++        return merge_config_documents(documents)
++
++    # -- rule: underscore settings -----------------------------------------
++
++    def _validate_settings(self, config_data: dict[str, Any]) -> None:
++        """Emit findings about ``_xxx``-prefixed settings."""
++        conf_name = self.config_name()
++        for key, value in config_data.items():
++            if key not in KNOWN_TEMPLATE_SETTINGS:
++                self.add(
++                    "warning",
++                    "unknown-setting",
++                    f"unknown setting `_{key}`",
++                    file=conf_name,
++                )
++                continue
++            self._validate_setting_value(key, value, conf_name)
++
++    def _validate_setting_value(self, key: str, value: Any, conf_name: str) -> None:
++        """Emit findings about a single ``_xxx`` setting's shape and value."""
++        if key in STR_SETTINGS:
++            if not isinstance(value, str):
++                self.add(
++                    "error",
++                    "invalid-setting",
++                    f"setting `_{key}` must be a string",
++                    file=conf_name,
++                )
++        elif key in STR_LIST_SETTINGS:
++            if not is_str_list(value):
++                self.add(
++                    "warning" if key == "exclude" else "error",
++                    "invalid-setting",
++                    f"setting `_{key}` must be a list of strings",
++                    file=conf_name,
++                )
++        elif key in MAPPING_SETTINGS:
++            if not isinstance(value, dict):
++                self.add(
++                    "error",
++                    "invalid-setting",
++                    f"setting `_{key}` must be a mapping",
++                    file=conf_name,
++                )
++        elif key in BOOL_SETTINGS:
++            if not isinstance(value, bool):
++                self.add(
++                    "error",
++                    "invalid-setting",
++                    f"setting `_{key}` must be a boolean",
++                    file=conf_name,
++                )
++        elif key == "min_copier_version":
++            self._validate_min_copier_version(value, conf_name)
++        elif key == "tasks":
++            self._validate_tasks(value, conf_name)
++        elif key == "migrations":
++            self._validate_migrations(value, conf_name)
++        if key == "answers_file" and isinstance(value, str):
++            if PurePosixPath(value).is_absolute():
++                self.add(
++                    "error",
++                    "invalid-setting",
++                    "setting `_answers_file` must be a relative path",
++                    file=conf_name,
++                )
++        if key == "envops" and isinstance(value, dict):
++            self._validate_envops(value, conf_name)
++        if key == "jinja_extensions" and is_str_list(value):
++            self._validate_jinja_extensions(value, conf_name)
++
++    def _validate_min_copier_version(self, value: Any, conf_name: str) -> None:
++        """Emit findings for ``_min_copier_version``."""
++        if not isinstance(value, str):
++            self.add(
++                "error",
++                "invalid-setting",
++                "setting `_min_copier_version` must be a string",
++                file=conf_name,
++            )
++            return
++        try:
++            minimum = Version(value)
++        except InvalidVersion:
++            self.add(
++                "error",
++                "invalid-setting",
++                f"setting `_min_copier_version` is not a valid PEP 440 version: "
++                f"{value!r}",
++                file=conf_name,
++            )
++            return
++        current = copier_version()
++        # Copier deliberately reports version 0.0.0 in editable installs; skip
++        # the "too new" comparison in that case to avoid noisy false positives.
++        if current != Version("0.0.0") and minimum > current:
++            self.add(
++                "warning",
++                "min-copier-version-too-new",
++                f"template requires Copier >= {value}, which is newer than "
++                f"the running Copier {current}",
++                file=conf_name,
++            )
++
++    def _validate_tasks(self, value: Any, conf_name: str) -> None:
++        """Emit findings for the ``_tasks`` setting."""
++        if not isinstance(value, list):
++            self.add(
++                "error",
++                "invalid-setting",
++                "setting `_tasks` must be a list",
++                file=conf_name,
++            )
++            return
++        for task in value:
++            if is_command_like(task):
++                continue
++            if isinstance(task, dict) and is_command_like(task.get("command")):
++                continue
++            self.add(
++                "error",
++                "invalid-setting",
++                "every task in `_tasks` must be a command (string or list of "
++                "strings) or a mapping with a `command` key",
++                file=conf_name,
++            )
++
++    def _validate_migrations(self, value: Any, conf_name: str) -> None:
++        """Emit findings for the ``_migrations`` setting."""
++        if not isinstance(value, list):
++            self.add(
++                "error",
++                "invalid-setting",
++                "setting `_migrations` must be a list",
++                file=conf_name,
++            )
++            return
++        for migration in value:
++            if is_command_like(migration):
++                continue
++            if not isinstance(migration, dict):
++                self.add(
++                    "error",
++                    "invalid-setting",
++                    "every migration in `_migrations` must be a command or a mapping",
++                    file=conf_name,
++                )
++                continue
++            command = migration.get("command")
++            if command is not None and not is_command_like(command):
++                self.add(
++                    "error",
++                    "invalid-setting",
++                    "migration `command` must be a string or a list of strings",
++                    file=conf_name,
++                )
++            for stage in ("before", "after"):
++                stage_cmds = migration.get(stage)
++                if stage_cmds is not None and not is_command_like(stage_cmds):
++                    self.add(
++                        "error",
++                        "invalid-setting",
++                        f"migration `{stage}` must be a string or a list of "
++                        "strings",
++                        file=conf_name,
++                    )
++            version = migration.get("version")
++            if version is not None and not isinstance(version, str):
++                self.add(
++                    "error",
++                    "invalid-setting",
++                    "migration `version` must be a string",
++                    file=conf_name,
++                )
++            elif isinstance(version, str) and not is_templated_value(version):
++                try:
++                    Version(version)
++                except InvalidVersion:
++                    self.add(
++                        "error",
++                        "invalid-setting",
++                        f"migration `version` is not a valid PEP 440 version: "
++                        f"{version!r}",
++                        file=conf_name,
++                    )
++            when = migration.get("when")
++            if when is not None and not isinstance(when, str):
++                self.add(
++                    "error",
++                    "invalid-setting",
++                    "migration `when` must be a string",
++                    file=conf_name,
++                )
++            working_directory = migration.get("working_directory")
++            if working_directory is not None and not isinstance(working_directory, str):
++                self.add(
++                    "error",
++                    "invalid-setting",
++                    "migration `working_directory` must be a string",
++                    file=conf_name,
++                )
++
++    def _validate_envops(self, envops: dict[str, Any], conf_name: str) -> None:
++        """Emit findings for ``_envops`` entries and its ``undefined`` value."""
++        for key in envops:
++            if key not in KNOWN_ENVOPS_KEYS:
++                self.add(
++                    "error",
++                    "invalid-setting",
++                    f"unknown `_envops` key {key!r}",
++                    file=conf_name,
++                )
++        undefined = envops.get("undefined")
++        if undefined is not None and undefined not in ALLOWED_ENVOPS_UNDEFINED:
++            self.add(
++                "error",
++                "invalid-setting",
++                f"unsupported `_envops.undefined` value: {undefined!r}; "
++                'supported values are "jinja2.Undefined" and '
++                '"jinja2.StrictUndefined"',
++                file=conf_name,
++            )
++
++    def _validate_jinja_extensions(
++        self, extensions: list[str], conf_name: str
++    ) -> None:
++        """Emit warnings for Jinja extensions that cannot be imported."""
++        for extension in extensions:
++            if is_templated_value(extension):
++                continue
++            try:
++                import_string(extension)
++            except (ImportError, AttributeError, ValueError):
++                self.add(
++                    "warning",
++                    "jinja-extension-not-installed",
++                    f"Jinja extension {extension!r} cannot be imported; it must "
++                    "be installed alongside Copier",
++                    file=conf_name,
++                )
++
++    # -- rule: questions ----------------------------------------------------
++
++    def _validate_questions(self, questions_data: dict[str, Any]) -> None:
++        """Delegate per-question validation to :func:`validate_question_static`."""
++        from ._user_data import DEFAULT_DATA, validate_question_static
++
++        conf_name = self.config_name()
++        env = self._env if self._env is not None else build_lint_jinja_env(self._config)
++        for name, question in questions_data.items():
++            if name in DEFAULT_DATA:
++                self.add(
++                    "error",
++                    "reserved-question-name",
++                    f"question {name!r} conflicts with a built-in variable",
++                    file=conf_name,
++                )
++            if not isinstance(question, dict):
++                continue
++            self.extend(
++                validate_question_static(name, question, conf_name, env)
++            )
++
++    # -- rule: template files ----------------------------------------------
++
++    def _validate_template_files(self, config_data: dict[str, Any]) -> None:
++        """Emit findings about the template files and templated paths."""
++        suffix = config_data.get("templates_suffix", DEFAULT_TEMPLATES_SUFFIX)
++        if not isinstance(suffix, str):
++            suffix = DEFAULT_TEMPLATES_SUFFIX
++        subdirectory = config_data.get("subdirectory", "")
++        scan_root = self.root
++        if (
++            isinstance(subdirectory, str)
++            and subdirectory
++            and not is_templated_value(subdirectory)
++        ):
++            scan_root = (self.root / subdirectory).resolve()
++            if not scan_root.is_dir():
++                self.add(
++                    "error",
++                    "subdirectory-not-found",
++                    f"configured `_subdirectory` {subdirectory!r} does not exist",
++                )
++                return
++        exclude = config_data.get("exclude", ())
++        spec = (
++            PathSpec.from_lines("gitwildmatch", exclude)
++            if is_str_list(exclude)
++            else PathSpec.from_lines("gitwildmatch", [])
++        )
++        answers_template_found = False
++        expected_answers_name = "{{ _copier_conf.answers_file }}" + suffix
++        env = self._env if self._env is not None else build_lint_jinja_env(self._config)
++        for dirpath, dirnames, filenames in os.walk(scan_root):
++            dirnames[:] = [
++                dirname
++                for dirname in dirnames
++                if dirname not in VCS_DIRECTORY_NAMES
++                and not spec.match_file(
++                    _posix_relative(scan_root, Path(dirpath) / dirname) + "/"
++                )
++            ]
++            for filename in filenames:
++                path = Path(dirpath) / filename
++                relpath = _posix_relative(scan_root, path)
++                if spec.match_file(relpath):
++                    continue
++                self._validate_templated_path(relpath, env)
++                if relpath == expected_answers_name:
++                    answers_template_found = True
++                if suffix and not filename.endswith(suffix):
++                    continue
++                self._validate_one_template_file(path, scan_root, env)
++        if not answers_template_found:
++            self.add(
++                "warning",
++                "answers-file-missing",
++                f"no answers file template found; expected a file named "
++                f"`{{{{ _copier_conf.answers_file }}}}{suffix}` so that "
++                "generated projects can be updated later",
++            )
++
++    def _validate_templated_path(self, relpath: str, env: SandboxedEnvironment) -> None:
++        """Emit findings for invalid Jinja inside a templated path component."""
++        for part in PurePosixPath(relpath).parts:
++            if not is_templated_value(part):
++                continue
++            try:
++                env.parse(part)
++            except TemplateSyntaxError as error:
++                self.add(
++                    "error",
++                    "templated-path-syntax-error",
++                    f"invalid Jinja in templated path component {part!r}: "
++                    f"{error.message}",
++                    file=relpath,
++                )
++
++    def _validate_one_template_file(
++        self, path: Path, scan_root: Path, env: SandboxedEnvironment
++    ) -> None:
++        """Emit a finding when a template file fails to parse."""
++        relpath = _posix_relative(scan_root, path)
++        try:
++            content = path.read_bytes().decode("utf-8")
++        except (OSError, UnicodeDecodeError):
++            return
++        if "\x00" in content:
++            return
++        try:
++            env.parse(content)
++        except TemplateSyntaxError as error:
++            self.add(
++                "error",
++                "jinja-syntax-error",
++                f"invalid Jinja: {error.message}",
++                file=relpath,
++                line=error.lineno,
++            )
++
++
++def _posix_relative(scan_root: Path, path: Path) -> str:
++    """Return ``path`` relative to ``scan_root`` in POSIX form."""
++    return PurePosixPath(path.relative_to(scan_root)).as_posix()
++
++
+ @dataclass
+ class Task:
+     """Object that represents a task to execute.
+diff --git a/copier/_user_data.py b/copier/_user_data.py
+index 0702efa..18a5da2 100644
+--- a/copier/_user_data.py
++++ b/copier/_user_data.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ import json
+ import warnings
+ from collections import ChainMap
+-from collections.abc import Callable, Mapping, Sequence
++from collections.abc import Callable, Iterable, Mapping, Sequence
+ from copy import deepcopy
+ from dataclasses import field
+ from datetime import datetime, timezone
+@@ -611,3 +611,317 @@ CAST_STR_TO_NATIVE: Mapping[str, Callable[[str], Any]] = {
+     "yaml": parse_yaml_string,
+     "path": str,
+ }
++
++
++# --------------------------------------------------------------------------- #
++# Static validation for a question definition. The rules match Copier's       #
++# runtime expectations exactly, so both the linter and the runtime error      #
++# paths can share them. Keeping the helper here avoids a circular import      #
++# with `_template.py`, which owns the finding dataclass and the walker.       #
++# --------------------------------------------------------------------------- #
++
++NULLABLE_TYPES: frozenset[str] = frozenset({"yaml", "json"})
++"""Question types whose literal default may be ``None``."""
++
++
++def _has_jinja_delimiters(value: Any) -> bool:
++    """Return whether a value is a string carrying Jinja delimiters."""
++    return isinstance(value, str) and (
++        "{{" in value or "{%" in value or "{#" in value
++    )
++
++
++def _question_type_name(question: Mapping[str, Any]) -> str | None:
++    """Return the effective ``type`` for a question, following runtime rules.
++
++    Returns ``None`` when the type is templated or explicitly unknown.
++    """
++    type_value = question.get("type", "")
++    if _has_jinja_delimiters(type_value):
++        return None
++    if type_value == "":
++        default = question.get("default")
++        inferred = type(default).__name__
++        return inferred if inferred in CAST_STR_TO_NATIVE else "yaml"
++    if not isinstance(type_value, str) or type_value not in CAST_STR_TO_NATIVE:
++        return None
++    return type_value
++
++
++def _iter_choice_values(choices: Any) -> Iterable[Any]:
++    """Yield the values of a literal ``choices`` mapping/list."""
++    if isinstance(choices, dict):
++        items: Iterable[Any] = choices.items()
++    elif isinstance(choices, list):
++        items = choices
++    else:
++        return
++    for item in items:
++        if isinstance(item, (list, tuple)) and len(item) == 2:
++            _, value = item
++        else:
++            value = item
++        if isinstance(value, dict):
++            if "value" not in value:
++                continue
++            value = value["value"]
++        yield value
++
++
++def _cast_or_fail(type_name: str, value: Any) -> tuple[bool, Any]:
++    """Try to cast ``value`` to a question type; return success flag and result."""
++    try:
++        return True, CAST_STR_TO_NATIVE[type_name](value)
++    except Exception:  # noqa: BLE001
++        return False, None
++
++
++def validate_question_static(
++    name: str,
++    question: Mapping[str, Any],
++    conf_name: str,
++    jinja_env: SandboxedEnvironment,
++) -> list[Any]:
++    """Statically validate a single question definition.
++
++    Findings are returned as instances of ``copier._template.LintFinding``
++    so that callers can splice them into a wider lint report without any
++    conversion. The rules cover every branch of the runtime ``Question``
++    class that can fail before an answer is available.
++
++    Args:
++        name: The question name as it appears in the configuration.
++        question: The question definition given as a mapping.
++        conf_name: The configuration file name to report on findings.
++        jinja_env: The Jinja environment used by the template — the same
++            one Copier uses at runtime — so that lint findings mirror the
++            runtime parse behaviour when the template chooses custom
++            delimiters through ``_envops``.
++
++    Returns:
++        A list of ``LintFinding`` instances describing every problem
++        spotted in the question.
++    """
++    from copier._template import LintFinding  # local import to break cycle
++
++    findings: list[LintFinding] = []
++
++    def emit(
++        severity: str,
++        code: str,
++        message: str,
++        line: int | None = None,
++    ) -> None:
++        findings.append(LintFinding(severity, code, message, conf_name, line))
++
++    # --- unknown keys -----------------------------------------------------
++    from copier._template import KNOWN_QUESTION_KEYS
++
++    for key in question:
++        if key not in KNOWN_QUESTION_KEYS:
++            emit(
++                "warning",
++                "unknown-question-key",
++                f"unknown key {key!r} in question {name!r}",
++            )
++
++    # --- type -------------------------------------------------------------
++    type_value = question.get("type", "")
++    templated_type = _has_jinja_delimiters(type_value)
++    known_type = _question_type_name(question)
++    if (
++        not templated_type
++        and type_value != ""
++        and (not isinstance(type_value, str) or type_value not in CAST_STR_TO_NATIVE)
++    ):
++        emit(
++            "error",
++            "invalid-question-type",
++            f"unsupported type {type_value!r} in question {name!r}; "
++            f"supported types are: {', '.join(sorted(CAST_STR_TO_NATIVE))}",
++        )
++
++    # --- choices ----------------------------------------------------------
++    choices = question.get("choices")
++    multiselect = question.get("multiselect", False)
++    if multiselect is True and not choices:
++        emit(
++            "error",
++            "multiselect-without-choices",
++            f"question {name!r} is multiselect but declares no choices",
++        )
++    if choices is not None and not _has_jinja_delimiters(choices):
++        if not isinstance(choices, (dict, list)):
++            emit(
++                "error",
++                "invalid-choices",
++                f"choices of question {name!r} must be a list or a mapping",
++            )
++        else:
++            items = (
++                list(choices.items()) if isinstance(choices, dict) else list(choices)
++            )
++            for item in items:
++                if not isinstance(item, (list, tuple)) or len(item) != 2:
++                    continue
++                _, value = item
++                if not isinstance(value, dict):
++                    continue
++                if "value" not in value:
++                    emit(
++                        "error",
++                        "invalid-choices",
++                        f"extended choice in question {name!r} requires a "
++                        "`value` property",
++                    )
++                validator = value.get("validator")
++                if validator is not None and not isinstance(validator, str):
++                    emit(
++                        "error",
++                        "invalid-choices",
++                        f"choice `validator` in question {name!r} must be a "
++                        "string",
++                    )
++            # Every literal choice must be castable to the declared type.
++            if known_type is not None:
++                for value in _iter_choice_values(choices):
++                    if _has_jinja_delimiters(value):
++                        continue
++                    if isinstance(value, (dict, list)):
++                        continue
++                    ok, _ = _cast_or_fail(known_type, value)
++                    if not ok:
++                        emit(
++                            "error",
++                            "invalid-choices",
++                            f"value {value!r} in question {name!r} is not a "
++                            f"valid {known_type!r}",
++                        )
++
++    # --- default & secret -------------------------------------------------
++    has_default = "default" in question
++    default = question.get("default")
++    if question.get("secret") is True and not has_default:
++        emit(
++            "error",
++            "secret-without-default",
++            f"secret question {name!r} requires a default value",
++        )
++    if has_default and not _has_jinja_delimiters(default) and known_type is not None:
++        if default is None:
++            if known_type not in NULLABLE_TYPES:
++                emit(
++                    "error",
++                    "invalid-default",
++                    f"default of question {name!r} cannot be null for type "
++                    f"{known_type!r}",
++                )
++        else:
++            is_list_default = isinstance(default, list)
++            is_dict_default = isinstance(default, dict)
++            if multiselect is True and is_list_default:
++                for item in default:
++                    if _has_jinja_delimiters(item):
++                        continue
++                    if isinstance(item, (dict, list)):
++                        continue
++                    ok, _ = _cast_or_fail(known_type, item)
++                    if not ok:
++                        emit(
++                            "error",
++                            "invalid-default",
++                            f"value {item!r} in question {name!r} is not a "
++                            f"valid {known_type!r}",
++                        )
++            elif not (is_list_default or is_dict_default):
++                ok, _ = _cast_or_fail(known_type, default)
++                if not ok:
++                    emit(
++                        "error",
++                        "invalid-default",
++                        f"value {default!r} in question {name!r} is not a "
++                        f"valid {known_type!r}",
++                    )
++            # Default-in-choices check when both are literal.
++            if (
++                choices is not None
++                and not _has_jinja_delimiters(choices)
++                and isinstance(choices, (dict, list))
++            ):
++                cast_choices: list[Any] = []
++                choice_ok = True
++                for value in _iter_choice_values(choices):
++                    if _has_jinja_delimiters(value):
++                        choice_ok = False
++                        break
++                    if isinstance(value, (dict, list)):
++                        choice_ok = False
++                        break
++                    ok, cast = _cast_or_fail(known_type, value)
++                    if not ok:
++                        choice_ok = False
++                        break
++                    cast_choices.append(cast)
++                if choice_ok and cast_choices:
++                    candidates = default if is_list_default else [default]
++                    for candidate in candidates:
++                        if _has_jinja_delimiters(candidate):
++                            continue
++                        if isinstance(candidate, (dict, list)):
++                            continue
++                        ok, cast_candidate = _cast_or_fail(known_type, candidate)
++                        if not ok:
++                            continue
++                        if cast_candidate not in cast_choices:
++                            emit(
++                                "error",
++                                "default-not-in-choices",
++                                f"default of question {name!r} is not one of "
++                                "its choices",
++                            )
++                            break
++
++    # --- Jinja-bearing string keys ---------------------------------------
++    when = question.get("when", True)
++    if not isinstance(when, (str, bool)):
++        emit(
++            "error",
++            "invalid-when",
++            f"`when` of question {name!r} must be a boolean or a string",
++        )
++    elif isinstance(when, str) and _has_jinja_delimiters(when):
++        try:
++            jinja_env.parse(when)
++        except Exception as error:  # noqa: BLE001
++            emit(
++                "error",
++                "invalid-when",
++                f"invalid Jinja in `when` of question {name!r}: {error}",
++            )
++    validator = question.get("validator", "")
++    if not isinstance(validator, str):
++        emit(
++            "error",
++            "invalid-validator",
++            f"`validator` of question {name!r} must be a string",
++        )
++    elif validator and _has_jinja_delimiters(validator):
++        try:
++            jinja_env.parse(validator)
++        except Exception as error:  # noqa: BLE001
++            emit(
++                "error",
++                "invalid-validator",
++                f"invalid Jinja in `validator` of question {name!r}: {error}",
++            )
++
++    for key, code in (("help", "invalid-help"), ("placeholder", "invalid-placeholder")):
++        value = question.get(key)
++        if value is not None and not isinstance(value, str):
++            emit(
++                "warning",
++                code,
++                f"`{key}` of question {name!r} must be a string",
++            )
++
++    return findings
+diff --git a/docs/linting.md b/docs/linting.md
+new file mode 100644
+index 0000000..118ee37
+--- /dev/null
++++ b/docs/linting.md
+@@ -0,0 +1,98 @@
++# Linting a template
++
++Template authors can statically validate a template directory without rendering
++it, using the `copier lint` subcommand:
++
++```shell
++copier lint path/to/template
++```
++
++When no path is given, the current working directory is linted. The command
++never prompts, never clones remote sources and never modifies the template:
++only **local** template directories are supported. Remote URLs (`gh:`,
++`https://` and friends) are rejected up front with a usage error.
++
++## What is checked
++
++The linter shares its configuration loader and Jinja environment with the
++runtime template loader; that way its findings stay consistent with the errors
++you would see at `copier copy` time. Every finding carries:
++
++- a **severity**: `error` for problems that will break rendering or prompting,
++  `warning` for suspicious constructs that still work;
++- a **rule code**, a stable kebab-case identifier such as
++  `invalid-question-type` — safe to reference in CI configuration;
++- an optional **file** (relative to the template root, POSIX slashes) and a
++  1-based **line** number;
++- a human-readable **message**.
++
++Among others, the following problems are detected:
++
++- missing, duplicated or unparsable configuration file (`config-not-found`,
++  `multiple-config-files`, `config-invalid-yaml`, `config-not-mapping`);
++- unknown settings (`unknown-setting`), or settings with the wrong shape
++  (`invalid-setting`) — for example `_tasks` entries that are not commands,
++  or a `_min_copier_version` that does not parse as PEP 440;
++- a `_min_copier_version` newer than the running Copier
++  (`min-copier-version-too-new`);
++- Jinja extensions declared in `_jinja_extensions` that cannot be imported
++  (`jinja-extension-not-installed`);
++- questions named like built-in variables (`reserved-question-name`), unknown
++  question keys (`unknown-question-key`), unsupported `type` values
++  (`invalid-question-type`), defaults that cannot be cast to the declared
++  type (`invalid-default`) or that are not among the declared choices
++  (`default-not-in-choices`), `multiselect` questions without choices
++  (`multiselect-without-choices`), secret questions without a default
++  (`secret-without-default`), invalid Jinja in `when` conditions
++  (`invalid-when`) or validators (`invalid-validator`), and misuses of the
++  `help` or `placeholder` keys (`invalid-help`, `invalid-placeholder`);
++- invalid Jinja syntax in template files (`jinja-syntax-error`) and in
++  templated file or directory names (`templated-path-syntax-error`),
++  respecting `_subdirectory` (`subdirectory-not-found`), `_templates_suffix`
++  and `_exclude`;
++- a missing answers file template (`answers-file-missing`), which generated
++  projects need to support updates later.
++
++## Output formats and exit codes
++
++By default, findings are printed one per line, followed by a summary line:
++
++```text
++copier.yml: error [invalid-question-type] unsupported type 'uuid' in question 'level'
++docs/intro.md.jinja:4: error [jinja-syntax-error] invalid Jinja: unexpected '}'
++warning [answers-file-missing] no answers file template found; expected a file named `{{ _copier_conf.answers_file }}.jinja` so that generated projects can be updated later
++2 error(s) and 1 warning(s) found
++```
++
++Findings are sorted by file, then line, then rule code, with findings not tied
++to a file coming last.
++
++A machine-readable report is available with `--format json`:
++
++```shell
++copier lint --format json path/to/template
++```
++
++It prints a single JSON object with the ordered list of findings and the two
++counters:
++
++```json
++{
++  "findings": [
++    {
++      "severity": "error",
++      "code": "jinja-syntax-error",
++      "file": "docs/intro.md.jinja",
++      "line": 4,
++      "message": "invalid Jinja: unexpected '}'"
++    }
++  ],
++  "errors": 1,
++  "warnings": 0
++}
++```
++
++The exit code is `1` when at least one error was found and `0` otherwise, so
++`copier lint` can gate template changes in CI. An invocation error — such as a
++path that does not exist, a path that points at a regular file, or a remote
++URL — exits with code `2` instead and prints the reason on standard error.
+diff --git a/mkdocs.yml b/mkdocs.yml
+index f726f7e..b5e0a5a 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -10,6 +10,7 @@ nav:
+   - Creating a template: "creating.md"
+   - Configuring a template: "configuring.md"
+   - Generating a project: "generating.md"
++  - Linting a template: "linting.md"
+   - Updating a project: "updating.md"
+   - Settings: "settings.md"
+   - Reference: reference/api.md
+diff --git a/tests/test_lint.py b/tests/test_lint.py
+new file mode 100644
+index 0000000..5aee5ad
+--- /dev/null
++++ b/tests/test_lint.py
+@@ -0,0 +1,1017 @@
++"""Tests for the `copier lint` subcommand and its static validation engine.
++
++The tests exercise both the low-level :func:`copier._lint.lint_template`
++helper and the ``copier lint`` command-line entry point. Templates are
++built on the fly with :func:`build_file_tree`, matching the convention
++followed elsewhere in the test suite.
++"""
++
++from __future__ import annotations
++
++import json
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from copier._cli import CopierApp
++from copier._lint import LintReport, lint_template
++from copier._template import (
++    ALLOWED_ENVOPS_UNDEFINED,
++    CONFIG_FILENAMES,
++    KNOWN_ENVOPS_KEYS,
++    KNOWN_QUESTION_KEYS,
++    KNOWN_TEMPLATE_SETTINGS,
++    LintFinding,
++    TemplateStaticValidator,
++    build_lint_jinja_env,
++    is_command_like,
++    is_str_list,
++    is_templated_value,
++    literal_choice_values,
++)
++from copier._user_data import validate_question_static
++
++from .helpers import build_file_tree
++
++ANSWERS_FILE_TEMPLATE = """\
++# Changes here will be overwritten by Copier
++{{ _copier_answers|to_nice_yaml }}
++"""
++
++
++def make_template(root: Path, config: str, files: dict[str, str] | None = None) -> Path:
++    """Create a minimal template with the given `copier.yml` contents."""
++    tree: dict[Path, str] = {root / "copier.yml": config}
++    for relpath, content in (files or {}).items():
++        tree[root / relpath] = content
++    build_file_tree(tree)
++    return root
++
++
++def make_valid_template(tmp_path: Path) -> Path:
++    """Create a template without any lint findings."""
++    return make_template(
++        tmp_path / "valid",
++        """\
++        project_name:
++            type: str
++            help: Your project name
++            default: my-project
++
++        version:
++            type: str
++            default: 1.0.0
++
++        license:
++            type: str
++            default: MIT
++            choices:
++                - MIT
++                - Apache-2.0
++
++        use_docker:
++            type: bool
++            default: false
++            when: "{{ license == 'MIT' }}"
++
++        _exclude:
++            - "*.egg-info"
++        """,
++        {
++            "{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE,
++            "README.md.jinja": "# {{ project_name }}\n\nVersion {{ version }}\n",
++            "{{ project_name }}/__init__.py.jinja": '"""{{ project_name }}."""\n',
++        },
++    )
++
++
++def run_lint_cli(*args: str) -> tuple[str, int]:
++    """Run ``copier lint`` in-process and return ``(output, exit_code)``.
++
++    Runs the CLI through :class:`plumbum.cli.Application.run` so the
++    behaviour matches the actual subprocess invocation while keeping the
++    call cheap in the test loop.
++    """
++    import io
++    from contextlib import redirect_stderr, redirect_stdout
++
++    out = io.StringIO()
++    err = io.StringIO()
++    with redirect_stdout(out), redirect_stderr(err):
++        _, status = CopierApp.run(["copier", "lint", *args], exit=False)
++    return out.getvalue() + err.getvalue(), status
++
++
++def codes_by_severity(report: LintReport, severity: str) -> list[str]:
++    """Return sorted finding codes of one severity from a lint report."""
++    return sorted(
++        finding.code
++        for finding in report.findings
++        if finding.severity == severity
++    )
++
++
++class TestCleanTemplate:
++    """A well-formed template produces no findings at all."""
++
++    def test_no_findings(self, tmp_path: Path) -> None:
++        template = make_valid_template(tmp_path)
++        report = lint_template(template)
++        assert report.errors == 0
++        assert report.warnings == 0
++        assert report.findings == []
++
++    def test_cli_exit_zero(self, tmp_path: Path) -> None:
++        template = make_valid_template(tmp_path)
++        output, status = run_lint_cli(str(template))
++        assert status == 0
++        assert "0 error(s) and 0 warning(s) found" in output
++
++    def test_cli_defaults_to_cwd(
++        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        template = make_valid_template(tmp_path)
++        monkeypatch.chdir(template)
++        _, status = run_lint_cli()
++        assert status == 0
++
++
++class TestUsageErrors:
++    """Wrong invocation exits with code 2 and never produces a report."""
++
++    def test_missing_path(self, tmp_path: Path) -> None:
++        output, status = run_lint_cli(str(tmp_path / "does-not-exist"))
++        assert status == 2
++        assert "does not exist" in output
++
++    def test_regular_file(self, tmp_path: Path) -> None:
++        file_path = tmp_path / "hello.txt"
++        file_path.write_text("hello", encoding="utf-8")
++        output, status = run_lint_cli(str(file_path))
++        assert status == 2
++        assert "template" in output.lower()
++
++    def test_gh_prefix(self) -> None:
++        _, status = run_lint_cli("gh:copier-org/example")
++        assert status == 2
++
++    def test_https_url(self) -> None:
++        _, status = run_lint_cli("https://github.com/copier-org/example.git")
++        assert status == 2
++
++    def test_ssh_url(self) -> None:
++        _, status = run_lint_cli("git@github.com:copier-org/example.git")
++        assert status == 2
++
++
++class TestConfigFileFindings:
++    """Findings about the configuration file itself."""
++
++    def test_config_not_found(self, tmp_path: Path) -> None:
++        (tmp_path / "empty").mkdir()
++        report = lint_template(tmp_path / "empty")
++        assert codes_by_severity(report, "warning") == ["config-not-found"]
++
++    def test_multiple_configs(self, tmp_path: Path) -> None:
++        template = tmp_path / "multi"
++        build_file_tree(
++            {
++                template / "copier.yml": "foo: bar\n",
++                template / "copier.yaml": "foo: bar\n",
++            }
++        )
++        report = lint_template(template)
++        assert codes_by_severity(report, "error") == ["multiple-config-files"]
++
++    def test_invalid_yaml_line_number(self, tmp_path: Path) -> None:
++        template = make_template(tmp_path / "bad-yaml", "foo: bar\n  baz: [\n")
++        report = lint_template(template)
++        (finding,) = report.findings
++        assert finding.code == "config-invalid-yaml"
++        assert finding.file == "copier.yml"
++        assert finding.line == 2
++
++    def test_config_not_mapping(self, tmp_path: Path) -> None:
++        template = make_template(tmp_path / "list", "- one\n- two\n- three\n")
++        report = lint_template(template)
++        assert codes_by_severity(report, "error") == ["config-not-mapping"]
++
++    def test_config_include_tag_supported(self, tmp_path: Path) -> None:
++        template = tmp_path / "with-include"
++        build_file_tree(
++            {
++                template / "copier.yml": "!include included.yml\n",
++                template / "included.yml": "name:\n    type: str\n    default: x\n",
++                template / "{{ _copier_conf.answers_file }}.jinja": (
++                    ANSWERS_FILE_TEMPLATE
++                ),
++            }
++        )
++        report = lint_template(template)
++        assert report.errors == 0
++
++
++class TestQuestionRules:
++    """Rules applied to individual question definitions."""
++
++    def test_reserved_names(self, tmp_path: Path) -> None:
++        template = make_template(tmp_path / "reserved", "now: today\n")
++        report = lint_template(template)
++        assert any(
++            f.code == "reserved-question-name" for f in report.findings
++        )
++
++    def test_make_secret_reserved(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "reserved-secret",
++            "make_secret: hello\n",
++        )
++        report = lint_template(template)
++        matches = [
++            f for f in report.findings if f.code == "reserved-question-name"
++        ]
++        assert matches
++        assert "make_secret" in matches[0].message
++
++    def test_unsupported_type(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "bad-type",
++            "level:\n    type: uuid\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-question-type" for f in report.findings)
++
++    def test_type_inference_from_default(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "infer",
++            "flag:\n    default: true\n",
++            {"{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE},
++        )
++        report = lint_template(template)
++        assert report.errors == 0
++
++    def test_invalid_default_cast(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "bad-default",
++            "count:\n    type: int\n    default: not-a-number\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-default" for f in report.findings)
++
++    def test_null_default_for_scalar_type_is_error(self, tmp_path: Path) -> None:
++        for type_name in ("str", "int", "float", "bool", "path"):
++            template = make_template(
++                tmp_path / f"null-{type_name}",
++                f"value:\n    type: {type_name}\n    default: null\n",
++            )
++            report = lint_template(template)
++            assert any(f.code == "invalid-default" for f in report.findings), type_name
++
++    def test_null_default_for_document_types_is_ok(self, tmp_path: Path) -> None:
++        for type_name in ("yaml", "json"):
++            template = make_template(
++                tmp_path / f"null-doc-{type_name}",
++                f"data:\n    type: {type_name}\n    default: null\n",
++                {"{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE},
++            )
++            report = lint_template(template)
++            assert not any(
++                f.code == "invalid-default" for f in report.findings
++            ), type_name
++
++    def test_choices_must_be_list_or_mapping(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "bad-choices",
++            "level:\n    type: str\n    choices: not-a-list\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-choices" for f in report.findings)
++
++    def test_default_not_in_choices(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "default-not-in",
++            "level:\n"
++            "    type: str\n"
++            "    default: gamma\n"
++            "    choices: [alpha, beta]\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "default-not-in-choices" for f in report.findings)
++
++    def test_multiselect_needs_choices(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "multi",
++            "flavors:\n    type: str\n    multiselect: true\n",
++        )
++        report = lint_template(template)
++        assert any(
++            f.code == "multiselect-without-choices" for f in report.findings
++        )
++
++    def test_multiselect_default_list_subset(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "multi-ok",
++            "flavors:\n"
++            "    type: str\n"
++            "    multiselect: true\n"
++            "    choices: [a, b, c]\n"
++            "    default: [a, c]\n",
++            {"{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE},
++        )
++        report = lint_template(template)
++        assert not any(
++            f.code == "default-not-in-choices" for f in report.findings
++        )
++
++    def test_multiselect_default_element_not_in_choices(
++        self, tmp_path: Path
++    ) -> None:
++        template = make_template(
++            tmp_path / "multi-bad",
++            "flavors:\n"
++            "    type: str\n"
++            "    multiselect: true\n"
++            "    choices: [a, b]\n"
++            "    default: [a, z]\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "default-not-in-choices" for f in report.findings)
++
++    def test_secret_without_default(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "secret",
++            "token:\n    type: str\n    secret: true\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "secret-without-default" for f in report.findings)
++
++    def test_when_must_be_bool_or_string(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "bad-when",
++            "value:\n    when: 42\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-when" for f in report.findings)
++
++    def test_when_jinja_syntax_error(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "when-jinja",
++            "value:\n    when: '{{ unclosed'\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-when" for f in report.findings)
++
++    def test_validator_must_be_string(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "bad-validator",
++            "value:\n    validator: true\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-validator" for f in report.findings)
++
++    def test_help_and_placeholder_wrong_shape_are_warnings(
++        self, tmp_path: Path
++    ) -> None:
++        template = make_template(
++            tmp_path / "help",
++            "value:\n"
++            "    type: str\n"
++            "    help: [oops]\n"
++            "    placeholder: [oops]\n",
++        )
++        report = lint_template(template)
++        codes = {f.code for f in report.findings if f.severity == "warning"}
++        assert "invalid-help" in codes
++        assert "invalid-placeholder" in codes
++
++    def test_unknown_question_key_warning(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "unknown-key",
++            "value:\n    type: str\n    unknwon: oops\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "unknown-question-key" for f in report.findings)
++
++    def test_extended_choice_missing_value(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "extended",
++            "level:\n"
++            "    type: str\n"
++            "    choices:\n"
++            "      - - Beginner\n"
++            "        - description: bar\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-choices" for f in report.findings)
++
++    def test_extended_choice_validator_type(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "extended-validator",
++            "level:\n"
++            "    type: str\n"
++            "    choices:\n"
++            "      - - Beginner\n"
++            "        - value: b\n"
++            "          validator: 42\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-choices" for f in report.findings)
++
++
++class TestSettingRules:
++    """Rules applied to underscore-prefixed template settings."""
++
++    def test_exclude_must_be_list(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "bad-exclude",
++            "value: answer\n_exclude: not-a-list\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_envops_must_be_mapping(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "bad-envops",
++            "value: answer\n_envops: just-a-string\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_preserve_symlinks_must_be_bool(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "bad-symlinks",
++            "value: answer\n_preserve_symlinks: maybe\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_answers_file_must_be_relative(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "abs-answers",
++            "value: answer\n_answers_file: /tmp/answers.yml\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_min_copier_version_bad_shape(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "bad-min",
++            "value: answer\n_min_copier_version: 1\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_min_copier_version_not_pep440(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "not-pep440",
++            "value: answer\n_min_copier_version: 'not-a-version'\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_min_copier_version_too_new_warning(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "too-new",
++            "value: answer\n_min_copier_version: '999.0'\n",
++            {"{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE},
++        )
++        report = lint_template(template)
++        assert report.errors == 0
++        assert any(
++            f.code == "min-copier-version-too-new" for f in report.findings
++        )
++
++    def test_tasks_dict_form_ok(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "tasks-ok",
++            "value: answer\n_tasks:\n  - echo hi\n"
++            "  - command: [ls, -la]\n",
++            {"{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE},
++        )
++        report = lint_template(template)
++        assert not any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_tasks_bad_shape(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "tasks-bad",
++            "value: answer\n_tasks: single-string\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_migrations_full_schema_ok(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "mig-ok",
++            "value: answer\n_migrations:\n  - version: '1.0.0'\n"
++            "    command: ls\n    before: pwd\n    after: [echo, done]\n"
++            "    when: '{{ true }}'\n    working_directory: subdir\n",
++            {"{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE},
++        )
++        report = lint_template(template)
++        assert not any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_migration_bad_version(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "mig-bad",
++            "value: answer\n_migrations:\n  - version: not-a-version\n"
++            "    command: ls\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_envops_unknown_key(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "envops-bogus",
++            "value: answer\n_envops:\n  bogus_option: true\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_envops_bad_undefined(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "envops-undef",
++            "value: answer\n_envops:\n  undefined: custom.Undefined\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "invalid-setting" for f in report.findings)
++
++    def test_jinja_extensions_import_warning(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "ext",
++            "value: answer\n_jinja_extensions:\n  - totally.bogus.Ext\n",
++        )
++        report = lint_template(template)
++        assert report.errors == 0
++        assert any(
++            f.code == "jinja-extension-not-installed" for f in report.findings
++        )
++
++    def test_unknown_underscore_setting(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "unknown",
++            "value: answer\n_weird_setting: 1\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "unknown-setting" for f in report.findings)
++
++
++class TestTemplateFiles:
++    """Rules applied to template files and templated path components."""
++
++    def test_jinja_syntax_error(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "syntax",
++            "value: answer\n",
++            {
++                "{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE,
++                "broken.md.jinja": "line one\n{{ unclosed\n",
++            },
++        )
++        report = lint_template(template)
++        matches = [f for f in report.findings if f.code == "jinja-syntax-error"]
++        assert matches
++        assert matches[0].file == "broken.md.jinja"
++        assert matches[0].line == 2
++
++    def test_templated_path_syntax_error(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "path",
++            "value: answer\n",
++            {
++                "{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE,
++                "{{ broken.txt": "content\n",
++            },
++        )
++        report = lint_template(template)
++        assert any(
++            f.code == "templated-path-syntax-error" for f in report.findings
++        )
++
++    def test_missing_answers_template(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "no-answers",
++            "value: answer\n",
++            {"README.md.jinja": "hi\n"},
++        )
++        report = lint_template(template)
++        matches = [f for f in report.findings if f.code == "answers-file-missing"]
++        assert matches
++        assert matches[0].file is None
++
++    def test_exclude_skips_files(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "excluded",
++            "value: answer\n_exclude:\n  - broken/\n",
++            {
++                "{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE,
++                "broken/file.md.jinja": "{{ oops\n",
++            },
++        )
++        report = lint_template(template)
++        assert not any(f.code == "jinja-syntax-error" for f in report.findings)
++
++    def test_subdirectory_narrows_scope(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "subdir",
++            "value: answer\n_subdirectory: tpl\n",
++            {
++                "tpl/{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE,
++                "tpl/broken.md.jinja": "{{ oops\n",
++                "outside.md.jinja": "{{ not scanned\n",
++            },
++        )
++        report = lint_template(template)
++        files = {f.file for f in report.findings}
++        assert "broken.md.jinja" in files
++        assert "outside.md.jinja" not in files
++
++    def test_subdirectory_missing_is_error(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "missing-subdir",
++            "value: answer\n_subdirectory: missing\n",
++        )
++        report = lint_template(template)
++        assert any(f.code == "subdirectory-not-found" for f in report.findings)
++
++    def test_custom_suffix(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "suffix",
++            "value: answer\n_templates_suffix: .tpl\n",
++            {
++                "{{ _copier_conf.answers_file }}.tpl": ANSWERS_FILE_TEMPLATE,
++                "broken.tpl": "{{ oops\n",
++                "untouched.md.jinja": "{{ not parsed\n",
++            },
++        )
++        report = lint_template(template)
++        files = [f.file for f in report.findings]
++        assert files == ["broken.tpl"]
++
++    def test_empty_suffix_scans_all(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "empty-suffix",
++            "value: answer\n_templates_suffix: ''\n",
++            {
++                "{{ _copier_conf.answers_file }}": ANSWERS_FILE_TEMPLATE,
++                "broken.md": "{{ oops\n",
++            },
++        )
++        report = lint_template(template)
++        assert any(f.code == "jinja-syntax-error" for f in report.findings)
++
++    def test_vcs_directories_ignored(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "vcs",
++            "value: answer\n",
++            {
++                "{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE,
++                ".git/broken.md.jinja": "{{ oops\n",
++                ".svn/broken.md.jinja": "{{ oops\n",
++                ".hg/broken.md.jinja": "{{ oops\n",
++            },
++        )
++        report = lint_template(template)
++        assert not any(f.code == "jinja-syntax-error" for f in report.findings)
++
++    def test_binary_file_ignored(self, tmp_path: Path) -> None:
++        template = tmp_path / "binary"
++        build_file_tree(
++            {
++                template / "copier.yml": "value: answer\n",
++                template / "{{ _copier_conf.answers_file }}.jinja": (
++                    ANSWERS_FILE_TEMPLATE
++                ),
++                template / "logo.png.jinja": b"\x89PNG\r\n\x1a\n\x00\x00",
++            }
++        )
++        report = lint_template(template)
++        assert report.errors == 0
++
++
++class TestJinjaEnvironmentSharing:
++    """The linter must use the same Jinja env Copier uses at runtime."""
++
++    def test_custom_delimiters_are_respected(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "delim",
++            "value: answer\n"
++            "_envops:\n"
++            "  variable_start_string: '[['\n"
++            "  variable_end_string: ']]'\n",
++            {
++                "{{ _copier_conf.answers_file }}.jinja": (
++                    "{{ this stops being jinja }}\n"
++                ),
++                "ok.md.jinja": "hi [[ value ]]\n",
++            },
++        )
++        report = lint_template(template)
++        assert not any(f.code == "jinja-syntax-error" for f in report.findings)
++
++    def test_installed_extension_is_loaded(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "ansible",
++            "value:\n    type: str\n    default: hi\n",
++            {
++                "{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE,
++                "greeting.md.jinja": "hello {{ value | to_nice_yaml }}\n",
++            },
++        )
++        report = lint_template(template)
++        assert report.errors == 0
++
++
++class TestPlainOutput:
++    """The plain output format is stable and documented."""
++
++    CONFIG = "question:\n  type: uuid\nother: answer\n"
++    FILES = {"broken.md.jinja": "{{ oops\n"}
++
++    def test_line_shapes_and_summary(self, tmp_path: Path) -> None:
++        template = make_template(tmp_path / "dirty", self.CONFIG, self.FILES)
++        report = lint_template(template)
++        plain = report.render_plain()
++        lines = plain.splitlines()
++        assert lines[0].startswith("broken.md.jinja:1: error [jinja-syntax-error]")
++        assert lines[1].startswith("copier.yml: error [invalid-question-type]")
++        assert lines[2].startswith("warning [answers-file-missing]")
++        assert lines[3] == "2 error(s) and 1 warning(s) found"
++
++    def test_json_matches_plain_order(self, tmp_path: Path) -> None:
++        template = make_template(tmp_path / "dirty", self.CONFIG, self.FILES)
++        report = lint_template(template)
++        payload = json.loads(report.render_json())
++        assert [f["code"] for f in payload["findings"]] == [
++            "jinja-syntax-error",
++            "invalid-question-type",
++            "answers-file-missing",
++        ]
++        assert payload["errors"] == 2
++        assert payload["warnings"] == 1
++
++    def test_empty_report_still_prints_summary(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "clean",
++            "value: answer\n",
++            {"{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE},
++        )
++        report = lint_template(template)
++        assert report.render_plain().strip() == "0 error(s) and 0 warning(s) found"
++
++
++class TestReadOnly:
++    """Linting must never modify a template."""
++
++    def test_no_writes(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "ro",
++            "value:\n    type: uuid\n",
++            {"broken.md.jinja": "{{ oops\n"},
++        )
++        before = {
++            str(p.relative_to(template)): p.read_bytes()
++            for p in sorted(template.rglob("*"))
++            if p.is_file()
++        }
++        lint_template(template)
++        after = {
++            str(p.relative_to(template)): p.read_bytes()
++            for p in sorted(template.rglob("*"))
++            if p.is_file()
++        }
++        assert before == after
++
++
++class TestHelpers:
++    """The public helpers exposed for reuse."""
++
++    def test_is_templated_value(self) -> None:
++        assert is_templated_value("{{ x }}")
++        assert is_templated_value("{% if %}")
++        assert is_templated_value("{# comment #}")
++        assert not is_templated_value("plain")
++        assert not is_templated_value(42)
++
++    def test_is_str_list(self) -> None:
++        assert is_str_list(["a", "b"])
++        assert not is_str_list("a")
++        assert not is_str_list(["a", 1])
++
++    def test_is_command_like(self) -> None:
++        assert is_command_like("ls")
++        assert is_command_like(["ls", "-la"])
++        assert not is_command_like([1, 2])
++        assert not is_command_like({"command": "ls"})
++
++    def test_literal_choice_values(self) -> None:
++        assert literal_choice_values(["a", "b"]) == ["a", "b"]
++        assert literal_choice_values({"A": 1, "B": 2}) == [1, 2]
++        assert literal_choice_values("{{ dynamic }}") is None
++        assert literal_choice_values(42) is None
++
++    def test_known_settings_include_common_keys(self) -> None:
++        assert "exclude" in KNOWN_TEMPLATE_SETTINGS
++        assert "envops" in KNOWN_TEMPLATE_SETTINGS
++        assert "min_copier_version" in KNOWN_TEMPLATE_SETTINGS
++
++    def test_known_question_keys_include_common_keys(self) -> None:
++        for key in ("type", "default", "choices", "when", "validator"):
++            assert key in KNOWN_QUESTION_KEYS
++
++    def test_allowed_undefined_values(self) -> None:
++        assert "jinja2.Undefined" in ALLOWED_ENVOPS_UNDEFINED
++        assert "jinja2.StrictUndefined" in ALLOWED_ENVOPS_UNDEFINED
++
++    def test_config_filenames(self) -> None:
++        assert set(CONFIG_FILENAMES) == {"copier.yml", "copier.yaml"}
++
++    def test_known_envops_keys(self) -> None:
++        for key in ("variable_start_string", "block_end_string", "undefined"):
++            assert key in KNOWN_ENVOPS_KEYS
++
++
++class TestReportShape:
++    """`LintReport` produces stable and complete output structures."""
++
++    def test_render_json_shape(self, tmp_path: Path) -> None:
++        template = make_template(tmp_path / "shape", "value: answer\n")
++        report = lint_template(template)
++        payload = json.loads(report.render_json())
++        assert set(payload) == {"findings", "errors", "warnings"}
++        for finding in payload["findings"]:
++            assert set(finding) == {"severity", "code", "file", "line", "message"}
++
++    def test_finding_sort_key_stable(self) -> None:
++        first = LintFinding("error", "a-code", "msg", "file.py", 1)
++        second = LintFinding("error", "b-code", "msg", "file.py", 1)
++        third = LintFinding("warning", "a-code", "msg", None, None)
++        report = LintReport(findings=[third, second, first])
++        assert [f.code for f in report.sorted_findings()] == [
++            "a-code",
++            "b-code",
++            "a-code",
++        ]
++
++    def test_counts_ignore_ordering(self) -> None:
++        findings = [
++            LintFinding("error", "a", "msg"),
++            LintFinding("warning", "b", "msg"),
++            LintFinding("error", "c", "msg"),
++        ]
++        report = LintReport(findings=findings)
++        assert report.errors == 2
++        assert report.warnings == 1
++
++
++class TestValidateQuestionStatic:
++    """Direct use of the shared per-question validator."""
++
++    def test_returns_finding_instances(self) -> None:
++        env = build_lint_jinja_env(None)
++        findings = validate_question_static(
++            "q",
++            {"type": "uuid"},
++            "copier.yml",
++            env,
++        )
++        assert findings
++        assert isinstance(findings[0], LintFinding)
++        assert findings[0].code == "invalid-question-type"
++
++    def test_valid_question_returns_empty(self) -> None:
++        env = build_lint_jinja_env(None)
++        findings = validate_question_static(
++            "q",
++            {"type": "str", "default": "hi"},
++            "copier.yml",
++            env,
++        )
++        assert findings == []
++
++    def test_unknown_key_is_warning(self) -> None:
++        env = build_lint_jinja_env(None)
++        findings = validate_question_static(
++            "q",
++            {"type": "str", "unknwon": "oops"},
++            "copier.yml",
++            env,
++        )
++        assert any(f.code == "unknown-question-key" for f in findings)
++        assert all(
++            f.severity == "warning"
++            for f in findings
++            if f.code == "unknown-question-key"
++        )
++
++
++class TestCliIntegration:
++    """Behaviour of the CLI wrapper."""
++
++    def test_lint_visible_in_help(self) -> None:
++        import io
++        from contextlib import redirect_stdout
++
++        out = io.StringIO()
++        with redirect_stdout(out):
++            _, status = CopierApp.run(["copier", "--help"], exit=False)
++        assert status == 0
++        assert "lint" in out.getvalue()
++
++    def test_lint_returns_1_on_errors(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "err",
++            "value:\n    type: uuid\n",
++            {"{{ _copier_conf.answers_file }}.jinja": ANSWERS_FILE_TEMPLATE},
++        )
++        _, status = run_lint_cli(str(template))
++        assert status == 1
++
++    def test_lint_returns_0_on_warnings_only(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "warn",
++            "value:\n    type: str\n    help: [oops]\n",
++        )
++        _, status = run_lint_cli(str(template))
++        assert status == 0
++
++    def test_lint_returns_0_when_clean(self, tmp_path: Path) -> None:
++        template = make_valid_template(tmp_path)
++        _, status = run_lint_cli(str(template))
++        assert status == 0
++
++
++class TestParityWithRuntime:
++    """Templates the runtime accepts must not be flagged; and vice-versa."""
++
++    def _run_copy(
++        self, template: Path, destination: Path
++    ) -> subprocess.CompletedProcess[str]:
++        return subprocess.run(
++            [
++                sys.executable,
++                "-m",
++                "copier",
++                "copy",
++                "--defaults",
++                "--quiet",
++                str(template),
++                str(destination),
++            ],
++            capture_output=True,
++            text=True,
++            stdin=subprocess.DEVNULL,
++            timeout=120,
++        )
++
++    def test_clean_template_still_renders(self, tmp_path: Path) -> None:
++        template = make_valid_template(tmp_path)
++        destination = tmp_path / "out"
++        proc = self._run_copy(template, destination)
++        assert proc.returncode == 0, proc.stderr
++
++    def test_multi_config_errors_both(self, tmp_path: Path) -> None:
++        template = tmp_path / "both"
++        build_file_tree(
++            {
++                template / "copier.yml": "value: answer\n",
++                template / "copier.yaml": "value: answer\n",
++            }
++        )
++        destination = tmp_path / "out"
++        proc = self._run_copy(template, destination)
++        assert proc.returncode != 0
++        report = lint_template(template)
++        assert any(
++            f.code == "multiple-config-files" for f in report.findings
++        )
++
++
++class TestStaticValidatorClass:
++    """Direct exercises of :class:`TemplateStaticValidator`."""
++
++    def test_root_is_resolved(self, tmp_path: Path) -> None:
++        template = make_valid_template(tmp_path)
++        validator = TemplateStaticValidator(template)
++        assert validator.root == template.resolve()
++
++    def test_findings_accumulate(self, tmp_path: Path) -> None:
++        template = make_template(
++            tmp_path / "acc",
++            "value:\n    type: uuid\n",
++            {"broken.md.jinja": "{{ oops\n"},
++        )
++        validator = TemplateStaticValidator(template)
++        findings = validator.validate()
++        assert len(findings) >= 2
++        codes = {f.code for f in findings}
++        assert "invalid-question-type" in codes
++        assert "jinja-syntax-error" in codes
++
++    def test_config_missing_short_circuits(self, tmp_path: Path) -> None:
++        (tmp_path / "empty-dir").mkdir()
++        validator = TemplateStaticValidator(tmp_path / "empty-dir")
++        findings = validator.validate()
++        assert len(findings) == 1
++        assert findings[0].code == "config-not-found"

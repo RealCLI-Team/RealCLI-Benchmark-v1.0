@@ -1,0 +1,124 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": [
+    "instruction.md",
+    "tests/test.sh",
+    "tests/test_outputs.py"
+  ],
+  "requirements": [
+    {
+      "id": "analyzer_script_path",
+      "verifier_assertion": "tests/test_outputs.py:20 asserts `python /app/analyze_pipelines.py` runs with returncode == 0 — the analyzer script must exist at the exact path /app/analyze_pipelines.py.",
+      "script_refs": ["slice_entry_point", "slice_run_command"],
+      "must_include": ["/app/analyze_pipelines.py"]
+    },
+    {
+      "id": "input_yaml_glob",
+      "verifier_assertion": "The analyzer must discover the three fixture workflows under /app/pipelines/ by reading .yml files (implicit precondition of tests/test_outputs.py:40/57/84 — the three named pipelines only appear if their yml files were parsed).",
+      "script_refs": ["slice_input_directory"],
+      "must_include": [".yml", "/app/pipelines/"]
+    },
+    {
+      "id": "report_output_path",
+      "verifier_assertion": "tests/test_outputs.py:25 asserts REPORT_PATH exists at /app/report.json — the analyzer must write its output to exactly that path.",
+      "script_refs": ["slice_output_path", "slice_run_command"],
+      "must_include": ["/app/report.json"]
+    },
+    {
+      "id": "report_pipelines_key",
+      "verifier_assertion": "tests/test_outputs.py:32 asserts `pipelines` is a top-level key in the report JSON.",
+      "script_refs": ["slice_report_schema"],
+      "must_include": ["\"pipelines\""]
+    },
+    {
+      "id": "workflow_names_present",
+      "verifier_assertion": "tests/test_outputs.py:40/57/84 and 123 assert the pipelines dict contains the exact keys `SafeProductionDeploy`, `RiskyDeploy`, and `UnsafeDeploy` — those keys must equal the `name:` field of the corresponding YAML files, not the file names.",
+      "script_refs": ["slice_pipeline_naming"],
+      "must_include": ["SafeProductionDeploy", "RiskyDeploy", "UnsafeDeploy", "name:"]
+    },
+    {
+      "id": "per_pipeline_required_fields",
+      "verifier_assertion": "tests/test_outputs.py:127-130 assert each pipeline object has `safe`, `score`, and `violations` (list).",
+      "script_refs": ["slice_report_schema"],
+      "must_include": ["safe", "score", "violations"]
+    },
+    {
+      "id": "violation_object_fields",
+      "verifier_assertion": "tests/test_outputs.py:132-135 assert each violation dict has the four keys `rule`, `detail`, `job`, `step`.",
+      "script_refs": ["slice_violation_schema", "slice_report_schema"],
+      "must_include": ["rule", "detail", "job", "step"]
+    },
+    {
+      "id": "score_is_integer",
+      "verifier_assertion": "tests/test_outputs.py:139 asserts each pipeline's `score` is an int, with round-down floor behavior implied by the instruction.md scoring section.",
+      "script_refs": ["slice_score_integer_rule"],
+      "must_include": ["integer", "round down"]
+    },
+    {
+      "id": "score_range_0_100",
+      "verifier_assertion": "tests/test_outputs.py:143/147 assert every pipeline score is between 0 and 100 inclusive.",
+      "script_refs": ["slice_score_integer_rule", "slice_scoring_formula"],
+      "must_include": ["100", "12.5"]
+    },
+    {
+      "id": "score_formula_12_5_per_rule",
+      "verifier_assertion": "Implicit from tests/test_outputs.py:50/77/94 (score>=75 for safe, score<75 for risky, score<=50 for unsafe) plus instruction.md scoring formula — each of 8 rules is worth 12.5, and each violated rule deducts 12.5.",
+      "script_refs": ["slice_scoring_formula"],
+      "must_include": ["12.5"]
+    },
+    {
+      "id": "safe_criterion_and_r3_r4_block",
+      "verifier_assertion": "tests/test_outputs.py:46/50 (SafeProductionDeploy safe=True + score>=75), 63 (RiskyDeploy safe=False despite score>0), 90 (UnsafeDeploy safe=False): `safe` is `true` only when score>=75 AND no R3 and no R4 violations exist.",
+      "script_refs": ["slice_safe_definition"],
+      "must_include": ["score >= 75", "R3", "R4"]
+    },
+    {
+      "id": "rule_r1_pinned_action_refs",
+      "verifier_assertion": "R1 detection fires on `@main`, `@latest`, `@dev` refs and passes on 40-char SHA / semver — RiskyDeploy uses actions/checkout@main; UnsafeDeploy uses actions/checkout@latest. This drives their score drops (:77, :94) below the safe threshold.",
+      "script_refs": ["slice_rule_r1"],
+      "must_include": ["R1", "40-char hex", "@vN.M.P", "@main", "@latest", "@dev"]
+    },
+    {
+      "id": "rule_r2_test_step",
+      "verifier_assertion": "tests/test_outputs.py:104 asserts UnsafeDeploy has >=1 R2 violation. Detection requires at least one step whose `name` or `run` contains `test`.",
+      "script_refs": ["slice_rule_r2"],
+      "must_include": ["R2", "test", "name", "run"]
+    },
+    {
+      "id": "rule_r3_prod_needs_staging",
+      "verifier_assertion": "tests/test_outputs.py:73 asserts RiskyDeploy has >=1 R3 violation (deploy-production without staging in needs:). Prod-deploy jobs must depend on staging.",
+      "script_refs": ["slice_rule_r3"],
+      "must_include": ["R3", "prod", "staging", "needs"]
+    },
+    {
+      "id": "rule_r4_hardcoded_secrets",
+      "verifier_assertion": "tests/test_outputs.py:68 (Risky >=1 R4) and :99 (Unsafe >=3 R4) require R4 to flag env-block variables whose NAME (case-insensitive) matches password / secret / token / api_key / api-key / access_key / access-key / aws_secret when the value is not a `${{ secrets.* }}` reference. Each variable counts as one violation — critical for Unsafe's >=3 assertion.",
+      "script_refs": ["slice_rule_r4"],
+      "must_include": ["R4", "password", "secret", "token", "api_key", "access_key", "aws_secret", "case-insensitive", "${{ secrets.", "one violation"]
+    },
+    {
+      "id": "rule_r5_notification_step",
+      "verifier_assertion": "R5 detection contributes to score drops on RiskyDeploy and UnsafeDeploy (asserted indirectly via score<75 at :77 and score<=50 at :94). Detection needs a step with `name` or `run` containing `notify`, `slack`, `email`, `teams`, or `webhook`.",
+      "script_refs": ["slice_rule_r5"],
+      "must_include": ["R5", "notify", "slack", "email", "teams", "webhook"]
+    },
+    {
+      "id": "rule_r6_deploy_resource_limits",
+      "verifier_assertion": "R6 detection contributes to RiskyDeploy and UnsafeDeploy score drops. Deploy jobs need `cpus` or `memory` on `runs-on` options, or a `container:` block with `options: --memory` / `--cpus`.",
+      "script_refs": ["slice_rule_r6"],
+      "must_include": ["R6", "cpus", "memory", "container", "--memory", "--cpus"]
+    },
+    {
+      "id": "rule_r7_concurrency",
+      "verifier_assertion": "tests/test_outputs.py:109 asserts UnsafeDeploy has >=1 R7 violation. Detection requires `concurrency` defined at workflow or job level.",
+      "script_refs": ["slice_rule_r7"],
+      "must_include": ["R7", "concurrency", "workflow", "job"]
+    },
+    {
+      "id": "rule_r8_permissions",
+      "verifier_assertion": "tests/test_outputs.py:114 asserts UnsafeDeploy has >=1 R8 violation. Detection requires explicit `permissions` at workflow or job level.",
+      "script_refs": ["slice_rule_r8"],
+      "must_include": ["R8", "permissions", "explicitly"]
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+name: SafeProductionDeploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+      - name: Run unit tests
+        run: npm test
+      - name: Run integration tests
+        run: npm run test:integration
+
+  deploy-staging:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    container:
+      image: node:20
+      options: --memory 2g --cpus 1
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+      - name: Deploy to staging
+        run: ./deploy.sh staging
+        env:
+          DEPLOY_TOKEN: ${{ secrets.STAGING_TOKEN }}
+      - name: Health check staging
+        run: curl --retry 5 --retry-delay 10 https://staging.example.com/health
+
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    container:
+      image: node:20
+      options: --memory 2g --cpus 1
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+      - name: Deploy to production
+        run: ./deploy.sh production
+        env:
+          DEPLOY_TOKEN: ${{ secrets.PROD_TOKEN }}
+      - name: Health check production
+        run: curl --retry 5 --retry-delay 10 https://app.example.com/health
+      - name: Notify team via Slack
+        run: ./scripts/notify_slack.sh "Production deploy succeeded"

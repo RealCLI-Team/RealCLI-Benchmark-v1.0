@@ -1,0 +1,250 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": [
+    "instruction.md",
+    "tests/test.sh",
+    "tests/test_outputs.py"
+  ],
+  "requirements": [
+    {
+      "id": "router_mode_entry",
+      "verifier_assertion": "Starting llama-server without -m/-hf/... enters router mode: the main process loads no model itself. tests/test_outputs.py:170-198 starts the router with no model flags and asserts the process stays up serving /v1/models.",
+      "script_refs": ["slice_router_mode_entry"],
+      "must_include": [
+        "without specifying any model",
+        "loads no model itself"
+      ]
+    },
+    {
+      "id": "models_dir_flag",
+      "verifier_assertion": "--models-dir PATH is the mechanism the router uses to discover servable models. tests/test_outputs.py:171 passes --models-dir MODELS_DIR at startup; the router must accept and honour it.",
+      "script_refs": ["slice_models_dir_flag"],
+      "must_include": [
+        "--models-dir PATH",
+        "report an error and exit"
+      ]
+    },
+    {
+      "id": "naming_top_level",
+      "verifier_assertion": "Top-level GGUF files are named by stripping the .gguf suffix. tests/test_outputs.py:222-228 asserts models list contains ids {tiny-a, tiny-b} for /opt/models/tiny-a.gguf and /opt/models/tiny-b.gguf.",
+      "script_refs": ["slice_models_dir_naming", "slice_test_models_paths"],
+      "must_include": [
+        ".gguf suffix stripped"
+      ]
+    },
+    {
+      "id": "naming_subdir",
+      "verifier_assertion": "A GGUF placed inside a subdirectory of --models-dir makes the entire subdirectory count as one model named after the directory. tests/test_outputs.py:222-228 asserts id tiny-c (subdirectory) with path ending in tiny-c/tiny-c.gguf.",
+      "script_refs": ["slice_models_dir_subdir", "slice_test_models_paths"],
+      "must_include": [
+        "entire subdirectory counts as one model",
+        "named after the subdirectory"
+      ]
+    },
+    {
+      "id": "models_max_default_and_zero",
+      "verifier_assertion": "--models-max N controls the maximum simultaneously-loaded models; default 4 and 0 means unlimited. tests/test_outputs.py:389-401 starts the router with --models-max 1 to exercise the limit.",
+      "script_refs": ["slice_models_max_default"],
+      "must_include": [
+        "--models-max N",
+        "Default 4",
+        "0 means unlimited"
+      ]
+    },
+    {
+      "id": "models_max_lru_eviction",
+      "verifier_assertion": "Exceeding --models-max causes automatic unload of the least recently used loaded model. tests/test_outputs.py:389-401 loads MODEL_A, touches it, then loads MODEL_C and asserts MODEL_A transitions to unloaded while MODEL_C is loaded.",
+      "script_refs": ["slice_models_max_eviction"],
+      "must_include": [
+        "least recently used"
+      ]
+    },
+    {
+      "id": "models_extra_args_flag",
+      "verifier_assertion": "--models-allow-extra-args is off by default; when off the extra_args field on the load endpoint must be ignored. tests/test_outputs.py exercises the flag semantics indirectly by requiring the default startup args reported on load to be a non-empty array (line 254).",
+      "script_refs": ["slice_models_extra_args_flag"],
+      "must_include": [
+        "--models-allow-extra-args",
+        "Off by default",
+        "must be ignored"
+      ]
+    },
+    {
+      "id": "router_pass_through_inference_args",
+      "verifier_assertion": "Inference-related parameters given to the router at startup (for example -ctx, -n) must be passed through as defaults to every spawned instance. Reflected in tests/test_outputs.py:253-254 which asserts loaded status carries a non-empty args array.",
+      "script_refs": ["slice_router_pass_through_args"],
+      "must_include": [
+        "-ctx",
+        "-n",
+        "passed through as defaults to every model instance"
+      ]
+    },
+    {
+      "id": "models_list_envelope",
+      "verifier_assertion": "GET /models and GET /v1/models return the OpenAI-compatible {\"object\": \"list\", \"data\": [...]} envelope. tests/test_outputs.py:75-76 asserts status==200 and body.object=='list'; :232-235 asserts alias /models returns same ids.",
+      "script_refs": ["slice_endpoints_list_shape"],
+      "must_include": [
+        "GET /models and GET /v1/models",
+        "\"object\": \"list\", \"data\": [...]"
+      ]
+    },
+    {
+      "id": "model_entry_required_fields",
+      "verifier_assertion": "Each model entry carries id, in_cache (false for --models-dir entries), path, and status. tests/test_outputs.py:222-229 asserts these fields, including in_cache is False and path ends with the expected relative filename.",
+      "script_refs": ["slice_endpoints_list_ids"],
+      "must_include": [
+        "id (the model name)",
+        "in_cache (boolean, false for models coming from --models-dir)",
+        "path (the model file path)"
+      ]
+    },
+    {
+      "id": "status_field_shape",
+      "verifier_assertion": "The status object's value is one of unloaded/loading/loaded; loaded status carries a non-empty args array; a failed load returns to unloaded with failed:true and exit_code. tests/test_outputs.py:84-99 polls status; :229 asserts initial value=='unloaded'; :253-254 asserts loaded carries non-empty args.",
+      "script_refs": ["slice_status_field"],
+      "must_include": [
+        "\"unloaded\"",
+        "\"loading\"",
+        "\"loaded\"",
+        "the array of startup arguments actually used by that model instance",
+        "failed: true and exit_code"
+      ]
+    },
+    {
+      "id": "endpoint_models_load_contract",
+      "verifier_assertion": "POST /models/load with {\"model\": name} returns 200 + {success:true} on success (tests/test_outputs.py:104-106), 404 with error.type==\"not_found_error\" for an unknown model (:263-265), and 400 for an already-loaded model (:273-275).",
+      "script_refs": ["slice_endpoint_models_load"],
+      "must_include": [
+        "POST /models/load with body {\"model\": \"<name>\"}",
+        "HTTP 200 with {\"success\": true}",
+        "\"not_found_error\"",
+        "Already-loaded model → 400"
+      ]
+    },
+    {
+      "id": "endpoint_models_unload_contract",
+      "verifier_assertion": "POST /models/unload with {\"model\": name} returns 200 + {success:true} on success (tests/test_outputs.py:111-113); 400 for unknown model (:285-287); 400 for a not-loaded model (:280-282).",
+      "script_refs": ["slice_endpoint_models_unload"],
+      "must_include": [
+        "POST /models/unload with body {\"model\": \"<name>\"}",
+        "success",
+        "Unknown model name → 400",
+        "Model is not currently in the loaded state → 400"
+      ]
+    },
+    {
+      "id": "routing_post_body_by_model",
+      "verifier_assertion": "POST inference endpoints route by the \"model\" field in the JSON body. tests/test_outputs.py:296-305 posts /v1/completions with model==MODEL_A and asserts 200 + non-empty choices[0].text; :311-323 posts /v1/chat/completions with model==MODEL_B and asserts assistant message. :329-337 asserts missing/unknown model → 400.",
+      "script_refs": ["slice_routing_post_body_model"],
+      "must_include": [
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/infill",
+        "\"model\" field in the JSON request body",
+        "A model name that does not exist → 400"
+      ]
+    },
+    {
+      "id": "routing_get_by_query",
+      "verifier_assertion": "GET endpoints like /props route by URL query ?model=... (URL-encoded). tests/test_outputs.py:340-347 GETs /props?model=<urlquoted> and asserts a routed response.",
+      "script_refs": ["slice_routing_get_query_model"],
+      "must_include": [
+        "/props and /metrics",
+        "URL-encoded"
+      ]
+    },
+    {
+      "id": "autoload_default_on",
+      "verifier_assertion": "Autoload is on by default. tests/test_outputs.py:294-308 POSTs /v1/completions against an unloaded model without any autoload override and asserts 200 + choices; :308 asserts the model ended up loaded.",
+      "script_refs": ["slice_autoload_default_on"],
+      "must_include": [
+        "autoload is ON by default"
+      ]
+    },
+    {
+      "id": "autoload_disable_flag",
+      "verifier_assertion": "--no-models-autoload at startup disables autoload globally. tests/test_outputs.py:355 starts the router with [--no-models-autoload]; :356-360 asserts /v1/completions on an unloaded model returns 400.",
+      "script_refs": ["slice_autoload_disable_flag"],
+      "must_include": [
+        "--no-models-autoload"
+      ]
+    },
+    {
+      "id": "autoload_disable_per_request",
+      "verifier_assertion": "?autoload=false disables autoload for one request. tests/test_outputs.py:372-377 POSTs /v1/completions?autoload=false against an unloaded model and asserts 400 + the model stays unloaded; :380-382 asserts a follow-up without the flag returns 200.",
+      "script_refs": ["slice_autoload_disable_query"],
+      "must_include": [
+        "?autoload=false"
+      ]
+    },
+    {
+      "id": "autoload_disabled_400",
+      "verifier_assertion": "When autoload is disabled, a request for an unloaded model returns 400. tests/test_outputs.py:359 and :375 both assert status==400 in this configuration.",
+      "script_refs": ["slice_autoload_disabled_response"],
+      "must_include": [
+        "must return 400",
+        "not loaded"
+      ]
+    },
+    {
+      "id": "props_router_role",
+      "verifier_assertion": "GET /props without a model parameter returns the router's own info with role==\"router\". tests/test_outputs.py:239-242 asserts status==200 and body.role=='router'.",
+      "script_refs": ["slice_props_router_role"],
+      "must_include": [
+        "GET /props without a model parameter",
+        "role field must be set to \"router\""
+      ]
+    },
+    {
+      "id": "instance_model_alias",
+      "verifier_assertion": "Each spawned model instance exposes its own /props with model_alias equal to the model name. tests/test_outputs.py:340-347 asserts a /props routed to MODEL_A carries model_alias == MODEL_A.",
+      "script_refs": ["slice_instance_model_alias"],
+      "must_include": [
+        "model_alias field in its /props equals the corresponding model name"
+      ]
+    },
+    {
+      "id": "routing_transparent",
+      "verifier_assertion": "Routing is transparent to callers — the response is the instance's own response with the usual choices/message shape. tests/test_outputs.py:300-305 (choices+text+finish_reason=='length') and :318-323 (message.role=='assistant', non-empty content) rely on transparent pass-through.",
+      "script_refs": ["slice_routing_transparent"],
+      "must_include": [
+        "transparent to callers",
+        "the choices array for completions",
+        "the message structure for chat"
+      ]
+    },
+    {
+      "id": "self_test_model_paths",
+      "verifier_assertion": "Three tiny GGUFs at /opt/models/tiny-a.gguf, /opt/models/tiny-b.gguf, /opt/models/tiny-c/tiny-c.gguf; ids tiny-a, tiny-b, tiny-c. tests/test_outputs.py:33-36 pins the ids; :222-228 pins the relative paths.",
+      "script_refs": ["slice_test_models_paths"],
+      "must_include": [
+        "/opt/models/tiny-a.gguf",
+        "/opt/models/tiny-b.gguf",
+        "/opt/models/tiny-c/tiny-c.gguf",
+        "tiny-a",
+        "tiny-b",
+        "tiny-c"
+      ]
+    },
+    {
+      "id": "verify_flow_and_build",
+      "verifier_assertion": "The verifier builds llama-server incrementally and exercises the whole list→load→routing→unload→eviction flow. tests/test_outputs.py:120-142 configures + builds via cmake and asserts the binary; every subsequent test hits the running router with curl-equivalent HTTP.",
+      "script_refs": ["slice_verify_flow"],
+      "must_include": [
+        "cmake",
+        "--models-dir /opt/models",
+        "curl",
+        "list, load, inference routing including autoload, unload, and eviction"
+      ]
+    },
+    {
+      "id": "pkill_safety_note",
+      "verifier_assertion": "During verify the agent must not use pkill -f llama-server because the harness runs the agent CLI with the task text (which contains the substring llama-server) in its command line. tests/test_outputs.py:210-212 uses `pkill -x llama-server` (exact match) in teardown, which is the recommended pattern.",
+      "script_refs": ["slice_pkill_note"],
+      "must_include": [
+        "pkill -f llama-server",
+        "pkill -x llama-server"
+      ]
+    }
+  ]
+}

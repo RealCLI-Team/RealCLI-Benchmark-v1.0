@@ -1,0 +1,2042 @@
+diff --git a/libcloud/reclaim2/__init__.py b/libcloud/reclaim2/__init__.py
+new file mode 100644
+index 000000000..8f2c20d40
+--- /dev/null
++++ b/libcloud/reclaim2/__init__.py
+@@ -0,0 +1,141 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Offline, read-only cloud reclamation planning for Apache Libcloud fleets.
++
++This package layers a *scriptable, offline* reclamation planner on top of
++Libcloud's own resource model. Given a heterogeneous fleet of already-collected
++resources, it distils them into targets, recommends spend-reduction actions (stop
++idle nodes, destroy long-stopped ones, delete unattached volumes, prune old /
++surplus snapshots, delete empty containers, rightsize under-utilised nodes),
++projects the monthly savings, and -- through *injected* action callables -- can
++preview (dry-run) or apply the plan without ever calling a cloud API itself.
++
++Everything a caller needs is re-exported here for ``from libcloud.reclaim2
++import ...``.
++"""
++
++from libcloud.reclaim2.errors import (
++    ReclaimError,
++    ReclaimConfigError,
++    UnknownActionError,
++    PolicyError,
++    ProtectedResourceError,
++    ActionExecutionError,
++)
++from libcloud.reclaim2.money import (
++    HOURS_PER_MONTH,
++    Money,
++    monthly_from_hourly,
++    format_money,
++)
++from libcloud.reclaim2.target import (
++    ResourceKind,
++    ReclaimTarget,
++    build_target,
++    build_targets,
++)
++from libcloud.reclaim2.actions import (
++    Action,
++    ACTION_SAVINGS_FRACTION,
++    action_is_destructive,
++    savings_for,
++    Recommendation,
++)
++from libcloud.reclaim2.rules import (
++    RuleConfig,
++    Rule,
++    IdleNodeRule,
++    StoppedNodeRule,
++    UnattachedVolumeRule,
++    OldSnapshotRule,
++    EmptyContainerRule,
++    RightsizeRule,
++    default_rules,
++)
++from libcloud.reclaim2.plan import ReclaimPlan
++from libcloud.reclaim2.planner import RetentionConfig, ReclaimPlanner
++from libcloud.reclaim2.executor import (
++    Outcome,
++    ActionResult,
++    ExecutionReport,
++    ReclaimExecutor,
++)
++from libcloud.reclaim2.session import ReclaimSession
++from libcloud.reclaim2.loader import (
++    DEFAULT_SETTINGS,
++    RULE_REGISTRY,
++    merge_documents,
++    load_settings,
++    load_rule_config,
++    load_planner,
++    load_session,
++)
++
++__all__ = [
++    # errors
++    "ReclaimError",
++    "ReclaimConfigError",
++    "UnknownActionError",
++    "PolicyError",
++    "ProtectedResourceError",
++    "ActionExecutionError",
++    # money
++    "HOURS_PER_MONTH",
++    "Money",
++    "monthly_from_hourly",
++    "format_money",
++    # target
++    "ResourceKind",
++    "ReclaimTarget",
++    "build_target",
++    "build_targets",
++    # actions
++    "Action",
++    "ACTION_SAVINGS_FRACTION",
++    "action_is_destructive",
++    "savings_for",
++    "Recommendation",
++    # rules
++    "RuleConfig",
++    "Rule",
++    "IdleNodeRule",
++    "StoppedNodeRule",
++    "UnattachedVolumeRule",
++    "OldSnapshotRule",
++    "EmptyContainerRule",
++    "RightsizeRule",
++    "default_rules",
++    # plan
++    "ReclaimPlan",
++    # planner
++    "RetentionConfig",
++    "ReclaimPlanner",
++    # executor
++    "Outcome",
++    "ActionResult",
++    "ExecutionReport",
++    "ReclaimExecutor",
++    # session
++    "ReclaimSession",
++    # loader
++    "DEFAULT_SETTINGS",
++    "RULE_REGISTRY",
++    "merge_documents",
++    "load_settings",
++    "load_rule_config",
++    "load_planner",
++    "load_session",
++]
+diff --git a/libcloud/reclaim2/actions.py b/libcloud/reclaim2/actions.py
+new file mode 100644
+index 000000000..2afc35e90
+--- /dev/null
++++ b/libcloud/reclaim2/actions.py
+@@ -0,0 +1,156 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Reclamation actions and the recommendations that carry them.
++
++An action is *what to do* to a resource to save money: stop an idle node, destroy
++one that's been off for weeks, delete an unattached volume, prune an old snapshot,
++or resize an over-provisioned node to a cheaper shape. Each verb has a
++*reversibility* -- stopping and resizing are reversible, destroying and deleting
++are not -- which the executor and reports treat differently.
++
++A :class:`Recommendation` pairs one action with the target it applies to, why it
++was chosen, and how much it is projected to save per month. Recommendations are
++pure data: building one changes nothing.
++"""
++
++from __future__ import annotations
++
++from libcloud.reclaim2.money import Money, monthly_from_hourly
++
++__all__ = [
++    "Action",
++    "ACTION_SAVINGS_FRACTION",
++    "action_is_destructive",
++    "savings_for",
++    "Recommendation",
++]
++
++
++class Action:
++    """The catalogue of reclamation verbs."""
++
++    STOP_NODE = "stop-node"
++    DESTROY_NODE = "destroy-node"
++    DELETE_VOLUME = "delete-volume"
++    DELETE_SNAPSHOT = "delete-snapshot"
++    DELETE_CONTAINER = "delete-container"
++    RESIZE_NODE = "resize-node"
++
++    _ALL = (
++        STOP_NODE,
++        DESTROY_NODE,
++        DELETE_VOLUME,
++        DELETE_SNAPSHOT,
++        DELETE_CONTAINER,
++        RESIZE_NODE,
++    )
++
++    # Verbs that cannot be undone -- treated with extra care by the executor.
++    _DESTRUCTIVE = frozenset({
++        DESTROY_NODE, DELETE_VOLUME, DELETE_SNAPSHOT, DELETE_CONTAINER,
++    })
++
++    @classmethod
++    def is_valid(cls, action):
++        return action in cls._ALL
++
++    @classmethod
++    def all(cls):
++        return cls._ALL
++
++
++def action_is_destructive(action):
++    return action in Action._DESTRUCTIVE
++
++
++# Fraction of a target's current hourly cost that each action is expected to
++# save. Stopping a node removes its compute charge (but leaves disks), so it is
++# less than a full destroy; a resize saves a caller-supplied delta and defaults
++# to nothing here unless an explicit saved amount is given.
++ACTION_SAVINGS_FRACTION = {
++    Action.STOP_NODE: 1.0,          # compute charge eliminated while stopped
++    Action.DESTROY_NODE: 1.0,       # whole node cost gone
++    Action.DELETE_VOLUME: 1.0,      # whole volume cost gone
++    Action.DELETE_SNAPSHOT: 1.0,    # whole snapshot cost gone
++    Action.DELETE_CONTAINER: 1.0,   # whole container cost gone
++    Action.RESIZE_NODE: 0.0,        # savings must be supplied explicitly
++}
++
++
++def savings_for(action, target, hourly_saved=None, currency="USD"):
++    """Projected *monthly* :class:`Money` saved by applying ``action`` to ``target``.
++
++    By default the saving is ``fraction * target.hourly_cost`` projected to a
++    730-hour month. For a resize (or any action where the caller knows better),
++    pass ``hourly_saved`` to override the hourly delta directly.
++    """
++    if hourly_saved is None:
++        fraction = ACTION_SAVINGS_FRACTION.get(action, 0.0)
++        hourly_saved = fraction * target.hourly_cost
++    hourly_saved = max(0.0, float(hourly_saved))
++    return monthly_from_hourly(hourly_saved, currency)
++
++
++class Recommendation:
++    """One proposed action against one target, with rationale and savings."""
++
++    __slots__ = ("target", "action", "reason", "monthly_savings", "detail")
++
++    def __init__(self, target, action, reason, monthly_savings, detail=None):
++        self.target = target
++        self.action = action
++        self.reason = reason
++        self.monthly_savings = monthly_savings
++        self.detail = dict(detail or {})
++
++    @property
++    def resource_id(self):
++        return self.target.resource_id
++
++    @property
++    def is_destructive(self):
++        return action_is_destructive(self.action)
++
++    @property
++    def sort_key(self):
++        # Biggest savings first; ties broken by the target's own order.
++        return (-self.monthly_savings.amount, self.target.sort_key, self.action)
++
++    def as_dict(self):
++        return {
++            "action": self.action,
++            "resource_id": self.resource_id,
++            "provider": self.target.provider,
++            "kind": self.target.kind,
++            "region": self.target.region,
++            "reason": self.reason,
++            "destructive": self.is_destructive,
++            "monthly_savings": self.monthly_savings.as_dict(),
++            "detail": dict(sorted(self.detail.items())),
++        }
++
++    def __eq__(self, other):
++        return isinstance(other, Recommendation) and (
++            self.target.identity, self.action
++        ) == (other.target.identity, other.action)
++
++    def __hash__(self):
++        return hash((self.target.identity, self.action))
++
++    def __repr__(self):
++        return "<Recommendation %s %s save=%s>" % (
++            self.action, self.resource_id, self.monthly_savings,
++        )
+diff --git a/libcloud/reclaim2/errors.py b/libcloud/reclaim2/errors.py
+new file mode 100644
+index 000000000..24aca5346
+--- /dev/null
++++ b/libcloud/reclaim2/errors.py
+@@ -0,0 +1,74 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Exception hierarchy for the reclamation planner.
++
++The important distinction, made explicit here, is between problems that can be
++caught *before* any plan is built or executed -- bad configuration, an unknown
++action verb, a malformed policy -- and problems that surface only while a plan is
++being carried out (a resource the caller pinned as protected being handed to a
++destructive action, or an injected action callable blowing up). Grouping the
++former under :class:`ReclaimConfigError` lets a caller validate input up front and
++fail fast.
++"""
++
++from __future__ import annotations
++
++__all__ = [
++    "ReclaimError",
++    "ReclaimConfigError",
++    "UnknownActionError",
++    "PolicyError",
++    "ProtectedResourceError",
++    "ActionExecutionError",
++]
++
++
++class ReclaimError(Exception):
++    """Root of every error raised by :mod:`libcloud.reclaim2`."""
++
++
++class ReclaimConfigError(ReclaimError):
++    """Invalid configuration or arguments -- detectable before doing any work."""
++
++
++class UnknownActionError(ReclaimConfigError):
++    """An action verb that the planner/executor does not recognise."""
++
++
++class PolicyError(ReclaimConfigError):
++    """A reclamation policy is malformed (bad threshold, bad selector spec, ...)."""
++
++
++class ProtectedResourceError(ReclaimError):
++    """A protected/pinned resource was routed to a destructive action.
++
++    This is a *runtime* guard: the plan should never contain actions on protected
++    resources, so hitting it means something tried to bypass the plan.
++    """
++
++    def __init__(self, message, resource_id=None):
++        super().__init__(message)
++        self.resource_id = resource_id
++
++
++class ActionExecutionError(ReclaimError):
++    """An injected action callable failed while a plan was being applied."""
++
++    def __init__(self, message, action=None, resource_id=None, cause=None):
++        super().__init__(message)
++        self.action = action
++        self.resource_id = resource_id
++        self.cause = cause
+diff --git a/libcloud/reclaim2/executor.py b/libcloud/reclaim2/executor.py
+new file mode 100644
+index 000000000..2ebcf8a63
+--- /dev/null
++++ b/libcloud/reclaim2/executor.py
+@@ -0,0 +1,239 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Carrying out a plan -- safely, and only through injected callables.
++
++The executor turns a :class:`~libcloud.reclaim2.plan.ReclaimPlan` into
++:class:`ActionResult` outcomes. Crucially it never calls a cloud driver itself:
++the caller injects one Python callable per action verb (``{action: fn}``), and the
++executor invokes those. That keeps the whole package testable offline (inject
++fakes that just record what they were asked to do) and puts the caller in full
++control of what "apply" actually means.
++
++Safety rails:
++
++* **dry-run by default** -- nothing is invoked; every recommendation is reported
++  as ``planned``.
++* **destructive gate** -- destructive actions (destroy/delete) are only invoked
++  when the caller opts in with ``allow_destructive=True``; otherwise they are
++  reported as ``skipped`` with a reason.
++* **protected guard** -- if a recommendation's target is somehow protected, the
++  executor refuses with :class:`ProtectedResourceError` rather than acting.
++* **idempotency** -- a callable may signal "already gone / nothing to do" (by
++  returning a falsey/``"noop"`` sentinel or raising the caller's own
++  already-done marker) and the result is recorded as ``noop`` rather than
++  ``done``; re-running a plan is therefore safe.
++"""
++
++from __future__ import annotations
++
++from libcloud.reclaim2.actions import Action
++from libcloud.reclaim2.errors import (
++    ActionExecutionError,
++    ProtectedResourceError,
++    UnknownActionError,
++)
++from libcloud.reclaim2.money import Money
++
++__all__ = ["Outcome", "ActionResult", "ExecutionReport", "ReclaimExecutor"]
++
++
++class Outcome:
++    PLANNED = "planned"      # dry-run: would have acted
++    DONE = "done"            # action callable ran and changed something
++    NOOP = "noop"            # already in desired state; nothing to do
++    SKIPPED = "skipped"      # deliberately not run (destructive gate, missing fn)
++    FAILED = "failed"        # action callable raised
++
++
++class ActionResult:
++    """The outcome of (attempting) one recommendation."""
++
++    __slots__ = ("recommendation", "outcome", "detail", "error")
++
++    def __init__(self, recommendation, outcome, detail=None, error=None):
++        self.recommendation = recommendation
++        self.outcome = outcome
++        self.detail = detail
++        self.error = error
++
++    @property
++    def action(self):
++        return self.recommendation.action
++
++    @property
++    def resource_id(self):
++        return self.recommendation.resource_id
++
++    @property
++    def realised_savings(self):
++        """Monthly savings actually realised: only DONE outcomes count."""
++        if self.outcome == Outcome.DONE:
++            return self.recommendation.monthly_savings
++        return Money.zero(self.recommendation.monthly_savings.currency)
++
++    def as_dict(self):
++        return {
++            "action": self.action,
++            "resource_id": self.resource_id,
++            "outcome": self.outcome,
++            "detail": self.detail,
++            "error": self.error,
++            "monthly_savings": self.recommendation.monthly_savings.as_dict(),
++        }
++
++    def __repr__(self):
++        return "<ActionResult %s %s -> %s>" % (
++            self.action, self.resource_id, self.outcome,
++        )
++
++
++class ExecutionReport:
++    """The full outcome of executing a plan."""
++
++    def __init__(self, results, dry_run, currency="USD"):
++        self.results = list(results)
++        self.dry_run = dry_run
++        self.currency = currency
++
++    def __len__(self):
++        return len(self.results)
++
++    def __iter__(self):
++        return iter(self.results)
++
++    def by_outcome(self, outcome):
++        return [r for r in self.results if r.outcome == outcome]
++
++    def outcome_counts(self):
++        counts = {}
++        for r in self.results:
++            counts[r.outcome] = counts.get(r.outcome, 0) + 1
++        return counts
++
++    @property
++    def ok(self):
++        return not self.by_outcome(Outcome.FAILED)
++
++    @property
++    def realised_monthly_savings(self):
++        total = Money.zero(self.currency)
++        for r in self.results:
++            total = total + r.realised_savings
++        return total.rounded()
++
++    @property
++    def projected_monthly_savings(self):
++        total = Money.zero(self.currency)
++        for r in self.results:
++            total = total + r.recommendation.monthly_savings
++        return total.rounded()
++
++    def as_dict(self):
++        return {
++            "dry_run": self.dry_run,
++            "ok": self.ok,
++            "count": len(self.results),
++            "outcome_counts": self.outcome_counts(),
++            "realised_monthly_savings": self.realised_monthly_savings.as_dict(),
++            "projected_monthly_savings": self.projected_monthly_savings.as_dict(),
++            "results": [r.as_dict() for r in self.results],
++        }
++
++    def __repr__(self):
++        return "<ExecutionReport dry_run=%s %s>" % (
++            self.dry_run, self.outcome_counts(),
++        )
++
++
++# Sentinels a caller's action callable may return to signal "nothing to do".
++_NOOP_SENTINELS = frozenset({"noop", "already-gone", "not-found", "absent"})
++
++
++class ReclaimExecutor:
++    """Execute a plan through injected per-action callables.
++
++    ``actions`` maps an action verb to ``fn(target, recommendation) -> result``.
++    In dry-run mode the callables are never invoked.
++    """
++
++    def __init__(self, actions=None, allow_destructive=False, dry_run=True):
++        self.actions = dict(actions or {})
++        for verb in self.actions:
++            if not Action.is_valid(verb):
++                raise UnknownActionError("unknown action verb %r" % (verb,))
++        self.allow_destructive = bool(allow_destructive)
++        self.dry_run = bool(dry_run)
++
++    def execute(self, plan, dry_run=None, allow_destructive=None):
++        """Run ``plan`` and return an :class:`ExecutionReport`."""
++        dry = self.dry_run if dry_run is None else bool(dry_run)
++        allow_destr = (
++            self.allow_destructive if allow_destructive is None else bool(allow_destructive)
++        )
++        results = []
++        for rec in plan:
++            results.append(self._execute_one(rec, dry, allow_destr))
++        return ExecutionReport(results, dry_run=dry, currency=plan.currency)
++
++    def _execute_one(self, rec, dry, allow_destr):
++        target = rec.target
++
++        # A protected target must never reach a destructive action.
++        if target.protected and rec.is_destructive:
++            raise ProtectedResourceError(
++                "refusing destructive action %s on protected resource %s" % (
++                    rec.action, target.resource_id),
++                resource_id=target.resource_id,
++            )
++
++        if dry:
++            return ActionResult(rec, Outcome.PLANNED, detail="dry-run")
++
++        if rec.is_destructive and not allow_destr:
++            return ActionResult(
++                rec, Outcome.SKIPPED,
++                detail="destructive action not permitted (allow_destructive=False)",
++            )
++
++        fn = self.actions.get(rec.action)
++        if fn is None:
++            return ActionResult(
++                rec, Outcome.SKIPPED, detail="no callable registered for %s" % rec.action,
++            )
++
++        try:
++            result = fn(target, rec)
++        except Exception as exc:  # noqa: BLE001 - surfaced as a structured result
++            return ActionResult(
++                rec, Outcome.FAILED, detail=str(exc),
++                error=ActionExecutionError(
++                    "action %s failed on %s" % (rec.action, target.resource_id),
++                    action=rec.action, resource_id=target.resource_id, cause=exc,
++                ),
++            )
++
++        # Interpret the callable's return value for idempotency.
++        if isinstance(result, str) and result.lower() in _NOOP_SENTINELS:
++            return ActionResult(rec, Outcome.NOOP, detail=result)
++        if result is False or result is None:
++            # Convention: falsey means "nothing to do" (already reclaimed).
++            return ActionResult(rec, Outcome.NOOP, detail="callable reported no-op")
++        return ActionResult(rec, Outcome.DONE, detail=result if isinstance(result, str) else None)
++
++    def __repr__(self):
++        return "<ReclaimExecutor actions=%s dry_run=%s destructive=%s>" % (
++            sorted(self.actions), self.dry_run, self.allow_destructive,
++        )
+diff --git a/libcloud/reclaim2/loader.py b/libcloud/reclaim2/loader.py
+new file mode 100644
+index 000000000..3ecd8b800
+--- /dev/null
++++ b/libcloud/reclaim2/loader.py
+@@ -0,0 +1,184 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Layered configuration for the reclamation planner.
++
++A reclamation policy is usually assembled from layers: an organisation baseline
++(keep 3 snapshots, destroy nodes stopped > 30 days), refined per environment (prod
++keeps more snapshots and is more conservative about destroying). :func:`merge_documents`
++folds config dicts left-to-right with predictable semantics (nested dicts merge,
++list-typed keys such as ``enabled_rules`` accumulate and de-dupe, ``None`` deletes,
++else replace), and :func:`load_planner` / :func:`load_session` turn the merged
++settings into live objects.
++
++The set of rules is selectable by name so an environment can switch individual
++policies off without touching code.
++"""
++
++from __future__ import annotations
++
++import copy
++
++from libcloud.reclaim2.errors import PolicyError, ReclaimConfigError
++from libcloud.reclaim2.planner import ReclaimPlanner, RetentionConfig
++from libcloud.reclaim2.rules import (
++    EmptyContainerRule,
++    IdleNodeRule,
++    OldSnapshotRule,
++    RightsizeRule,
++    RuleConfig,
++    StoppedNodeRule,
++    UnattachedVolumeRule,
++)
++from libcloud.reclaim2.session import ReclaimSession
++
++__all__ = [
++    "DEFAULT_SETTINGS",
++    "RULE_REGISTRY",
++    "merge_documents",
++    "load_settings",
++    "load_rule_config",
++    "load_planner",
++    "load_session",
++]
++
++# Keys whose list values accumulate across layers rather than replacing.
++_APPEND_LIST_KEYS = frozenset({"enabled_rules"})
++
++# Rule name -> class.
++RULE_REGISTRY = {
++    StoppedNodeRule.name: StoppedNodeRule,
++    IdleNodeRule.name: IdleNodeRule,
++    UnattachedVolumeRule.name: UnattachedVolumeRule,
++    OldSnapshotRule.name: OldSnapshotRule,
++    EmptyContainerRule.name: EmptyContainerRule,
++    RightsizeRule.name: RightsizeRule,
++}
++
++# Order rules are applied in when a subset is selected.
++_RULE_ORDER = [
++    StoppedNodeRule.name,
++    IdleNodeRule.name,
++    UnattachedVolumeRule.name,
++    OldSnapshotRule.name,
++    EmptyContainerRule.name,
++    RightsizeRule.name,
++]
++
++DEFAULT_SETTINGS = {
++    "currency": "USD",
++    # ``enabled_rules`` is deliberately absent here: when no layer specifies it,
++    # every rule is active (see :func:`_build_rules`). Presetting the full list
++    # would make the append-merge semantics unable to *narrow* to a subset.
++    "thresholds": {
++        "idle_stop_days": 3.0,
++        "stopped_destroy_days": 30.0,
++        "unattached_volume_days": 7.0,
++        "snapshot_max_age_days": 90.0,
++        "empty_container_days": 30.0,
++        "rightsize_utilisation_floor": 0.2,
++        "rightsize_savings_fraction": 0.5,
++    },
++    "retention": {"keep_last": 3},
++}
++
++
++def _merge_two(base, override):
++    if not isinstance(base, dict) or not isinstance(override, dict):
++        return copy.deepcopy(override)
++    result = copy.deepcopy(base)
++    for key, value in override.items():
++        if value is None:
++            result.pop(key, None)
++            continue
++        if key in _APPEND_LIST_KEYS and isinstance(value, list):
++            existing = result.get(key)
++            if not isinstance(existing, list):
++                existing = []
++            merged = list(existing)
++            for element in value:
++                if isinstance(element, (str, int, float, bool)) and element in merged:
++                    continue
++                merged.append(copy.deepcopy(element))
++            result[key] = merged
++        elif isinstance(value, dict) and isinstance(result.get(key), dict):
++            result[key] = _merge_two(result[key], value)
++        else:
++            result[key] = copy.deepcopy(value)
++    return result
++
++
++def merge_documents(*documents):
++    """Left-to-right fold of config documents into one settings dict."""
++    merged = {}
++    for document in documents:
++        if document is None:
++            continue
++        if not isinstance(document, dict):
++            raise ReclaimConfigError(
++                "config document must be a dict, got %r" % (type(document).__name__,)
++            )
++        merged = _merge_two(merged, document)
++    return merged
++
++
++def load_settings(*documents):
++    return merge_documents(DEFAULT_SETTINGS, *documents)
++
++
++def load_rule_config(settings):
++    """Build a :class:`RuleConfig` from merged settings."""
++    thresholds = settings.get("thresholds") or {}
++    if not isinstance(thresholds, dict):
++        raise PolicyError("thresholds must be a mapping")
++    try:
++        return RuleConfig(currency=settings.get("currency", "USD"), **thresholds)
++    except TypeError as exc:
++        raise PolicyError("invalid threshold key: %s" % (exc,))
++
++
++def _build_rules(settings, config):
++    names = settings.get("enabled_rules")
++    if names is None:
++        names = list(_RULE_ORDER)
++    if not isinstance(names, list):
++        raise PolicyError("enabled_rules must be a list of rule names")
++    rules = []
++    for name in _RULE_ORDER:
++        if name in names:
++            rules.append(RULE_REGISTRY[name](config))
++    # Any name not in the registry is a configuration mistake worth surfacing.
++    for name in names:
++        if name not in RULE_REGISTRY:
++            raise PolicyError("unknown rule name %r" % (name,))
++    return rules
++
++
++def load_planner(*documents):
++    """Merge config and build a :class:`ReclaimPlanner`."""
++    settings = load_settings(*documents)
++    config = load_rule_config(settings)
++    rules = _build_rules(settings, config)
++    retention_spec = settings.get("retention") or {}
++    if not isinstance(retention_spec, dict):
++        raise PolicyError("retention must be a mapping")
++    retention = RetentionConfig(keep_last=retention_spec.get("keep_last", 3))
++    return ReclaimPlanner(rules=rules, config=config, retention=retention)
++
++
++def load_session(*documents, executor=None, as_of=None):
++    """End-to-end: merge config, build a planner, return a reclamation session."""
++    planner = load_planner(*documents)
++    return ReclaimSession(planner=planner, executor=executor, as_of=as_of)
+diff --git a/libcloud/reclaim2/money.py b/libcloud/reclaim2/money.py
+new file mode 100644
+index 000000000..221d15bac
+--- /dev/null
++++ b/libcloud/reclaim2/money.py
+@@ -0,0 +1,108 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""A small money primitive for expressing projected savings.
++
++Reclamation is all about "how much would we save per month if we did this?", so
++the planner needs to add up per-resource monthly savings, scale hourly rates into
++monthly ones, and render human-readable totals. This is a deliberately tiny,
++currency-safe value type -- adding two amounts in different currencies is refused
++rather than silently mis-summed. The monthly projection uses the industry-standard
++730-hour month (365 x 24 / 12) so an hourly rate maps to a monthly figure that
++matches the way cloud vendors quote their prices.
++"""
++
++from __future__ import annotations
++
++__all__ = ["HOURS_PER_MONTH", "Money", "monthly_from_hourly", "format_money"]
++
++# Industry-standard month length used across cloud pricing pages.
++HOURS_PER_MONTH = 730.0
++
++
++class Money:
++    """An immutable, currency-tagged monetary amount."""
++
++    __slots__ = ("amount", "currency")
++
++    def __init__(self, amount, currency="USD"):
++        self.amount = float(amount)
++        self.currency = currency
++
++    @classmethod
++    def zero(cls, currency="USD"):
++        return cls(0.0, currency)
++
++    def _check(self, other):
++        if not isinstance(other, Money):
++            raise TypeError("can only combine Money with Money, not %r" % (type(other).__name__,))
++        if other.currency != self.currency:
++            raise ValueError(
++                "refusing to combine %s and %s" % (self.currency, other.currency)
++            )
++
++    def __add__(self, other):
++        self._check(other)
++        return Money(self.amount + other.amount, self.currency)
++
++    def __sub__(self, other):
++        self._check(other)
++        return Money(self.amount - other.amount, self.currency)
++
++    def __mul__(self, factor):
++        return Money(self.amount * float(factor), self.currency)
++
++    __rmul__ = __mul__
++
++    def rounded(self, ndigits=2):
++        return Money(round(self.amount, ndigits), self.currency)
++
++    def as_dict(self):
++        return {"amount": round(self.amount, 6), "currency": self.currency}
++
++    def __eq__(self, other):
++        return (
++            isinstance(other, Money)
++            and self.currency == other.currency
++            and abs(self.amount - other.amount) < 1e-9
++        )
++
++    def __lt__(self, other):
++        self._check(other)
++        return self.amount < other.amount
++
++    def __le__(self, other):
++        self._check(other)
++        return self.amount <= other.amount
++
++    def __hash__(self):
++        return hash((round(self.amount, 6), self.currency))
++
++    def __repr__(self):
++        return "<Money %s %.4f>" % (self.currency, self.amount)
++
++
++def monthly_from_hourly(hourly, currency="USD"):
++    """Project an hourly rate into a monthly :class:`Money` amount (730h month)."""
++    return Money(float(hourly) * HOURS_PER_MONTH, currency)
++
++
++def format_money(money):
++    """Render a :class:`Money` as e.g. ``$1,234.56`` (USD) or ``EUR 1,234.56``."""
++    symbol = {"USD": "$", "GBP": "£", "EUR": "€"}.get(money.currency)
++    body = "{:,.2f}".format(money.amount)
++    if symbol:
++        return "%s%s" % (symbol, body)
++    return "%s %s" % (money.currency, body)
+diff --git a/libcloud/reclaim2/plan.py b/libcloud/reclaim2/plan.py
+new file mode 100644
+index 000000000..343a26891
+--- /dev/null
++++ b/libcloud/reclaim2/plan.py
+@@ -0,0 +1,151 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""The reclamation plan: an ordered, deduplicated set of recommendations.
++
++A :class:`ReclaimPlan` is the planner's output and the executor's input. It holds
++recommendations sorted biggest-saving-first, guarantees at most one action per
++resource (the most valuable wins), exposes rollups (total projected monthly
++savings, savings by action / by provider, destructive vs reversible counts), and
++serialises to dict / JSON / human text. It is pure data: nothing in here reaches
++out to a cloud.
++"""
++
++from __future__ import annotations
++
++import json
++
++from libcloud.reclaim2.actions import action_is_destructive
++from libcloud.reclaim2.money import Money, format_money
++
++__all__ = ["ReclaimPlan"]
++
++
++class ReclaimPlan:
++    """An ordered set of recommendations plus savings rollups."""
++
++    def __init__(self, recommendations, currency="USD", skipped_protected=None):
++        self.currency = currency
++        # At most one recommendation per resource identity: keep the one with the
++        # largest projected saving (ties -> deterministic by sort_key).
++        best = {}
++        for rec in recommendations:
++            ident = rec.target.identity
++            cur = best.get(ident)
++            if cur is None or rec.sort_key < cur.sort_key:
++                best[ident] = rec
++        self.recommendations = sorted(best.values(), key=lambda r: r.sort_key)
++        # Targets that were excluded because they were protected/pinned.
++        self.skipped_protected = list(skipped_protected or [])
++
++    # --- Size -----------------------------------------------------------------
++    def __len__(self):
++        return len(self.recommendations)
++
++    def __iter__(self):
++        return iter(self.recommendations)
++
++    @property
++    def is_empty(self):
++        return not self.recommendations
++
++    # --- Savings rollups ------------------------------------------------------
++    @property
++    def total_monthly_savings(self):
++        total = Money.zero(self.currency)
++        for rec in self.recommendations:
++            total = total + rec.monthly_savings
++        return total.rounded()
++
++    def savings_by_action(self):
++        out = {}
++        for rec in self.recommendations:
++            cur = out.get(rec.action, Money.zero(self.currency))
++            out[rec.action] = cur + rec.monthly_savings
++        return {k: v.rounded() for k, v in out.items()}
++
++    def savings_by_provider(self):
++        out = {}
++        for rec in self.recommendations:
++            key = rec.target.provider
++            cur = out.get(key, Money.zero(self.currency))
++            out[key] = cur + rec.monthly_savings
++        return {k: v.rounded() for k, v in out.items()}
++
++    def count_by_action(self):
++        out = {}
++        for rec in self.recommendations:
++            out[rec.action] = out.get(rec.action, 0) + 1
++        return out
++
++    # --- Risk split -----------------------------------------------------------
++    @property
++    def destructive(self):
++        return [r for r in self.recommendations if r.is_destructive]
++
++    @property
++    def reversible(self):
++        return [r for r in self.recommendations if not r.is_destructive]
++
++    def for_action(self, action):
++        return [r for r in self.recommendations if r.action == action]
++
++    def for_provider(self, provider):
++        return [r for r in self.recommendations if r.target.provider == provider]
++
++    def top(self, n=5):
++        return self.recommendations[:n]
++
++    # --- Serialisation --------------------------------------------------------
++    def as_dict(self):
++        return {
++            "currency": self.currency,
++            "count": len(self.recommendations),
++            "total_monthly_savings": self.total_monthly_savings.as_dict(),
++            "count_by_action": self.count_by_action(),
++            "savings_by_action": {
++                k: v.as_dict() for k, v in sorted(self.savings_by_action().items())
++            },
++            "savings_by_provider": {
++                k: v.as_dict() for k, v in sorted(self.savings_by_provider().items())
++            },
++            "destructive_count": len(self.destructive),
++            "reversible_count": len(self.reversible),
++            "skipped_protected": len(self.skipped_protected),
++            "recommendations": [r.as_dict() for r in self.recommendations],
++        }
++
++    def as_json(self, indent=2):
++        return json.dumps(self.as_dict(), indent=indent, sort_keys=True)
++
++    def render_text(self):
++        lines = []
++        lines.append("Reclamation plan: %d action(s), projected savings %s/month" % (
++            len(self.recommendations), format_money(self.total_monthly_savings)))
++        counts = self.count_by_action()
++        for action in sorted(counts):
++            savings = self.savings_by_action().get(action, Money.zero(self.currency))
++            lines.append("  %-16s %d  (%s/mo)" % (
++                action, counts[action], format_money(savings)))
++        if self.destructive:
++            lines.append("  ! %d destructive action(s) require confirmation" % len(self.destructive))
++        if self.skipped_protected:
++            lines.append("  %d protected resource(s) skipped" % len(self.skipped_protected))
++        return "\n".join(lines)
++
++    def __repr__(self):
++        return "<ReclaimPlan actions=%d savings=%s>" % (
++            len(self.recommendations), self.total_monthly_savings,
++        )
+diff --git a/libcloud/reclaim2/planner.py b/libcloud/reclaim2/planner.py
+new file mode 100644
+index 000000000..ca07e96c8
+--- /dev/null
++++ b/libcloud/reclaim2/planner.py
+@@ -0,0 +1,131 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""The planner: run rules over a fleet and assemble a reclamation plan.
++
++The :class:`ReclaimPlanner` is the brain. Given a list of
++:class:`~libcloud.reclaim2.target.ReclaimTarget`, it:
++
++* filters out every **protected** target up front (they are recorded as skipped,
++  never recommended for anything),
++* runs each per-resource :class:`~libcloud.reclaim2.rules.Rule`,
++* applies the one genuinely cross-resource policy -- **snapshot retention**: for
++  each parent volume keep the newest ``keep_last`` snapshots and propose deleting
++  the surplus,
++* and folds everything into a deterministic :class:`~libcloud.reclaim2.plan.ReclaimPlan`.
++
++The planner is pure: it reads targets and returns a plan. It never calls a cloud
++API and never mutates a target.
++"""
++
++from __future__ import annotations
++
++from libcloud.reclaim2.actions import Action, Recommendation, savings_for
++from libcloud.reclaim2.plan import ReclaimPlan
++from libcloud.reclaim2.rules import RuleConfig, default_rules
++from libcloud.reclaim2.target import ResourceKind
++
++__all__ = ["RetentionConfig", "ReclaimPlanner"]
++
++
++class RetentionConfig:
++    """How many snapshots to keep per parent volume."""
++
++    __slots__ = ("keep_last",)
++
++    def __init__(self, keep_last=3):
++        self.keep_last = int(keep_last)
++
++    def as_dict(self):
++        return {"keep_last": self.keep_last}
++
++
++class ReclaimPlanner:
++    """Assemble a :class:`ReclaimPlan` from a fleet of targets."""
++
++    def __init__(self, rules=None, config=None, retention=None, currency=None):
++        self.config = config or RuleConfig()
++        if currency:
++            self.config.currency = currency
++        self.rules = rules if rules is not None else default_rules(self.config)
++        self.retention = retention or RetentionConfig()
++
++    # --- Public API -----------------------------------------------------------
++    def plan(self, targets):
++        """Return a :class:`ReclaimPlan` for ``targets``."""
++        targets = list(targets)
++        protected = [t for t in targets if t.protected]
++        active = [t for t in targets if not t.protected]
++
++        context = {"by_identity": {t.identity: t for t in active}}
++        recommendations = []
++
++        # Per-resource rules.
++        for target in active:
++            for rule in self.rules:
++                rec = rule.propose(target, context=context)
++                if rec is not None:
++                    recommendations.append(rec)
++
++        # Cross-resource: snapshot retention per parent volume.
++        recommendations.extend(self._retention_recommendations(active))
++
++        return ReclaimPlan(
++            recommendations,
++            currency=self.config.currency,
++            skipped_protected=protected,
++        )
++
++    # --- Snapshot retention ---------------------------------------------------
++    def _retention_recommendations(self, targets):
++        keep = self.retention.keep_last
++        if keep < 0:
++            return []
++        # Group snapshots by parent volume (skip those with no parent).
++        groups = {}
++        for t in targets:
++            if t.kind != ResourceKind.SNAPSHOT:
++                continue
++            parent = t.parent_volume
++            if parent is None:
++                continue
++            groups.setdefault(str(parent), []).append(t)
++
++        out = []
++        for parent, snaps in groups.items():
++            if len(snaps) <= keep:
++                continue
++            # Newest first: larger age_days == older, so sort ascending by age
++            # keeps the youngest at the front. Unknown age sorts oldest.
++            def _age(s):
++                return s.age_days if s.age_days is not None else float("inf")
++            ordered = sorted(snaps, key=lambda s: (_age(s), s.sort_key))
++            surplus = ordered[keep:]
++            for snap in surplus:
++                savings = savings_for(
++                    Action.DELETE_SNAPSHOT, snap, currency=self.config.currency
++                )
++                out.append(Recommendation(
++                    snap, Action.DELETE_SNAPSHOT,
++                    "surplus snapshot: keeping newest %d for volume %s" % (keep, parent),
++                    savings,
++                    detail={"parent_volume": parent, "keep_last": keep},
++                ))
++        return out
++
++    def __repr__(self):
++        return "<ReclaimPlanner rules=%d keep_last=%d>" % (
++            len(self.rules), self.retention.keep_last,
++        )
+diff --git a/libcloud/reclaim2/rules.py b/libcloud/reclaim2/rules.py
+new file mode 100644
+index 000000000..18ca65f12
+--- /dev/null
++++ b/libcloud/reclaim2/rules.py
+@@ -0,0 +1,287 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Reclamation rules: the policies that turn a target into a recommendation.
++
++Each rule looks at one :class:`~libcloud.reclaim2.target.ReclaimTarget` and, if it
++applies, proposes one action with a rationale. The rules encode the usual
++cost-hygiene playbook:
++
++* **idle nodes** -- a running node flagged idle for long enough should be stopped;
++  a node already stopped for long enough should be destroyed.
++* **unattached volumes** -- a volume with no attachment, past a grace age, should
++  be deleted.
++* **old / surplus snapshots** -- snapshots older than a max age should be pruned;
++  and, per parent volume, only the newest N are kept.
++* **empty containers** -- a zero-byte bucket past a grace age should be deleted.
++* **rightsizing** -- a node whose utilisation hint sits below a floor should be
++  resized to a cheaper shape, saving a caller-estimated delta.
++
++Rules never mutate anything and never touch a protected target (the planner
++filters those out first, but rules double-check). Thresholds come from a
++:class:`RuleConfig` so the whole policy is data-driven and testable.
++"""
++
++from __future__ import annotations
++
++from libcloud.reclaim2.actions import Action, Recommendation, savings_for
++from libcloud.reclaim2.target import ResourceKind
++
++__all__ = [
++    "RuleConfig",
++    "Rule",
++    "IdleNodeRule",
++    "StoppedNodeRule",
++    "UnattachedVolumeRule",
++    "OldSnapshotRule",
++    "EmptyContainerRule",
++    "RightsizeRule",
++    "default_rules",
++]
++
++
++class RuleConfig:
++    """Tunable thresholds shared by the rules.
++
++    Every field has a conservative default. ``currency`` tags the savings.
++    """
++
++    __slots__ = (
++        "currency",
++        "idle_stop_days",
++        "stopped_destroy_days",
++        "unattached_volume_days",
++        "snapshot_max_age_days",
++        "empty_container_days",
++        "rightsize_utilisation_floor",
++        "rightsize_savings_fraction",
++    )
++
++    def __init__(
++        self,
++        currency="USD",
++        idle_stop_days=3.0,
++        stopped_destroy_days=30.0,
++        unattached_volume_days=7.0,
++        snapshot_max_age_days=90.0,
++        empty_container_days=30.0,
++        rightsize_utilisation_floor=0.2,
++        rightsize_savings_fraction=0.5,
++    ):
++        self.currency = currency
++        self.idle_stop_days = float(idle_stop_days)
++        self.stopped_destroy_days = float(stopped_destroy_days)
++        self.unattached_volume_days = float(unattached_volume_days)
++        self.snapshot_max_age_days = float(snapshot_max_age_days)
++        self.empty_container_days = float(empty_container_days)
++        self.rightsize_utilisation_floor = float(rightsize_utilisation_floor)
++        self.rightsize_savings_fraction = float(rightsize_savings_fraction)
++
++    def as_dict(self):
++        return {
++            "currency": self.currency,
++            "idle_stop_days": self.idle_stop_days,
++            "stopped_destroy_days": self.stopped_destroy_days,
++            "unattached_volume_days": self.unattached_volume_days,
++            "snapshot_max_age_days": self.snapshot_max_age_days,
++            "empty_container_days": self.empty_container_days,
++            "rightsize_utilisation_floor": self.rightsize_utilisation_floor,
++            "rightsize_savings_fraction": self.rightsize_savings_fraction,
++        }
++
++    def __repr__(self):
++        return "<RuleConfig currency=%s>" % (self.currency,)
++
++
++# States that count as "stopped" for the destroy rule.
++_STOPPED_STATES = frozenset({"stopped", "suspended", "paused"})
++_RUNNING_STATES = frozenset({"running", "normal"})
++# Volume states that indicate no attachment.
++_UNATTACHED_STATES = frozenset({"available", "unattached", "detached"})
++
++
++class Rule:
++    """Base class: a named policy that may propose one action for a target.
++
++    ``context`` is a small dict the planner threads through (e.g. the full target
++    list keyed by identity), letting cross-resource rules see their neighbours.
++    """
++
++    name = "rule"
++
++    def __init__(self, config=None):
++        self.config = config or RuleConfig()
++
++    def propose(self, target, context=None):
++        """Return a :class:`Recommendation` or ``None``. Must not mutate anything."""
++        raise NotImplementedError
++
++    def _rec(self, target, action, reason, hourly_saved=None, detail=None):
++        savings = savings_for(
++            action, target, hourly_saved=hourly_saved, currency=self.config.currency
++        )
++        return Recommendation(target, action, reason, savings, detail=detail)
++
++    def __repr__(self):
++        return "<%s>" % (type(self).__name__,)
++
++
++class IdleNodeRule(Rule):
++    """Running-but-idle nodes past ``idle_stop_days`` -> stop them."""
++
++    name = "idle-node"
++
++    def propose(self, target, context=None):
++        if target.kind != ResourceKind.NODE:
++            return None
++        if target.state not in _RUNNING_STATES:
++            return None
++        if not target.idle:
++            return None
++        if not target.older_than(self.config.idle_stop_days):
++            # Age unknown or too young: only act when we can justify it by age.
++            if target.age_days is not None:
++                return None
++        return self._rec(
++            target, Action.STOP_NODE,
++            "node idle for >= %g days" % self.config.idle_stop_days,
++            detail={"idle": True, "age_days": target.age_days},
++        )
++
++
++class StoppedNodeRule(Rule):
++    """Nodes stopped for longer than ``stopped_destroy_days`` -> destroy them."""
++
++    name = "stopped-node"
++
++    def propose(self, target, context=None):
++        if target.kind != ResourceKind.NODE:
++            return None
++        if target.state not in _STOPPED_STATES:
++            return None
++        if not target.older_than(self.config.stopped_destroy_days):
++            return None
++        return self._rec(
++            target, Action.DESTROY_NODE,
++            "node stopped for >= %g days" % self.config.stopped_destroy_days,
++            detail={"age_days": target.age_days},
++        )
++
++
++class UnattachedVolumeRule(Rule):
++    """Unattached volumes past ``unattached_volume_days`` -> delete them."""
++
++    name = "unattached-volume"
++
++    def propose(self, target, context=None):
++        if target.kind != ResourceKind.VOLUME:
++            return None
++        if target.attachment:
++            return None
++        if target.state not in _UNATTACHED_STATES and target.state != "unknown":
++            return None
++        if not target.older_than(self.config.unattached_volume_days):
++            if target.age_days is not None:
++                return None
++        return self._rec(
++            target, Action.DELETE_VOLUME,
++            "volume unattached for >= %g days" % self.config.unattached_volume_days,
++            detail={"size": target.size, "age_days": target.age_days},
++        )
++
++
++class OldSnapshotRule(Rule):
++    """Snapshots older than ``snapshot_max_age_days`` -> prune them."""
++
++    name = "old-snapshot"
++
++    def propose(self, target, context=None):
++        if target.kind != ResourceKind.SNAPSHOT:
++            return None
++        if not target.older_than(self.config.snapshot_max_age_days):
++            return None
++        return self._rec(
++            target, Action.DELETE_SNAPSHOT,
++            "snapshot older than %g days" % self.config.snapshot_max_age_days,
++            detail={"age_days": target.age_days},
++        )
++
++
++class EmptyContainerRule(Rule):
++    """Zero-byte containers past ``empty_container_days`` -> delete them."""
++
++    name = "empty-container"
++
++    def propose(self, target, context=None):
++        if target.kind != ResourceKind.CONTAINER:
++            return None
++        if target.size > 0:
++            return None
++        if target.age_days is not None and not target.older_than(
++            self.config.empty_container_days
++        ):
++            return None
++        return self._rec(
++            target, Action.DELETE_CONTAINER,
++            "container empty for >= %g days" % self.config.empty_container_days,
++            detail={"age_days": target.age_days},
++        )
++
++
++class RightsizeRule(Rule):
++    """Under-utilised nodes -> resize to a cheaper shape.
++
++    Utilisation is read from ``target.extra['utilisation']`` (a 0..1 float). When
++    it sits at or below the floor, we propose a resize projected to save
++    ``rightsize_savings_fraction`` of the current hourly cost.
++    """
++
++    name = "rightsize"
++
++    def propose(self, target, context=None):
++        if target.kind != ResourceKind.NODE:
++            return None
++        if target.state not in _RUNNING_STATES:
++            return None
++        util = target.extra.get("utilisation", target.extra.get("utilization"))
++        if util is None:
++            return None
++        try:
++            util = float(util)
++        except (TypeError, ValueError):
++            return None
++        if util > self.config.rightsize_utilisation_floor:
++            return None
++        hourly_saved = self.config.rightsize_savings_fraction * target.hourly_cost
++        return self._rec(
++            target, Action.RESIZE_NODE,
++            "node utilisation %.2f <= floor %.2f" % (
++                util, self.config.rightsize_utilisation_floor),
++            hourly_saved=hourly_saved,
++            detail={"utilisation": util},
++        )
++
++
++def default_rules(config=None):
++    """The standard rule set, in priority order."""
++    config = config or RuleConfig()
++    return [
++        StoppedNodeRule(config),
++        IdleNodeRule(config),
++        UnattachedVolumeRule(config),
++        OldSnapshotRule(config),
++        EmptyContainerRule(config),
++        RightsizeRule(config),
++    ]
+diff --git a/libcloud/reclaim2/session.py b/libcloud/reclaim2/session.py
+new file mode 100644
+index 000000000..ef1be49fb
+--- /dev/null
++++ b/libcloud/reclaim2/session.py
+@@ -0,0 +1,119 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""The reclamation session: collect a fleet, plan, preview, apply.
++
++A :class:`ReclaimSession` is the one object a caller drives end to end. Add raw
++Libcloud resources (from any provider/region), and it distils them to targets,
++builds a plan on demand, and -- through injected action callables -- previews
++(dry-run) or applies that plan. Adding or clearing resources invalidates the
++cached plan so a session never previews a stale picture.
++
++Nothing here is destructive on its own: ``preview()`` is always a dry-run, and
++``apply()`` only does anything when the caller has both wired up action callables
++and explicitly permitted destructive ones.
++"""
++
++from __future__ import annotations
++
++from libcloud.reclaim2.executor import ReclaimExecutor
++from libcloud.reclaim2.planner import ReclaimPlanner
++from libcloud.reclaim2.target import build_targets
++
++__all__ = ["ReclaimSession"]
++
++
++class ReclaimSession:
++    """Stateful driver over a planner, an optional executor, and a fleet."""
++
++    def __init__(self, planner=None, executor=None, as_of=None,
++                 default_provider=None, default_region=None):
++        self.planner = planner or ReclaimPlanner()
++        self.executor = executor
++        self.as_of = as_of
++        self.default_provider = default_provider
++        self.default_region = default_region
++        self._raw = []       # list of (resource, meta)
++        self._targets = None  # cached target list
++        self._plan = None     # cached plan
++
++    # --- Fleet management -----------------------------------------------------
++    def add(self, resource, **meta):
++        self._raw.append((resource, dict(meta)))
++        self._invalidate()
++        return self
++
++    def add_many(self, resources, **meta):
++        for resource in resources:
++            self.add(resource, **meta)
++        return self
++
++    def add_nodes(self, nodes, **meta):
++        return self.add_many(nodes, **dict(meta, kind="node"))
++
++    def add_volumes(self, volumes, **meta):
++        return self.add_many(volumes, **dict(meta, kind="volume"))
++
++    def add_snapshots(self, snapshots, **meta):
++        return self.add_many(snapshots, **dict(meta, kind="snapshot"))
++
++    def add_containers(self, containers, **meta):
++        return self.add_many(containers, **dict(meta, kind="container"))
++
++    def clear(self):
++        self._raw = []
++        self._invalidate()
++        return self
++
++    def _invalidate(self):
++        self._targets = None
++        self._plan = None
++
++    @property
++    def fleet_size(self):
++        return len(self._raw)
++
++    # --- Analysis -------------------------------------------------------------
++    def targets(self, force=False):
++        if self._targets is None or force:
++            self._targets = build_targets(
++                self._raw,
++                as_of=self.as_of,
++                provider=self.default_provider,
++                region=self.default_region,
++            )
++        return self._targets
++
++    def plan(self, force=False):
++        if self._plan is None or force:
++            self._plan = self.planner.plan(self.targets(force=force))
++        return self._plan
++
++    # --- Execution ------------------------------------------------------------
++    def preview(self):
++        """Always a dry-run: report what would happen, invoke nothing."""
++        executor = self.executor or ReclaimExecutor()
++        return executor.execute(self.plan(), dry_run=True)
++
++    def apply(self, allow_destructive=False):
++        """Apply the plan through the wired executor. Requires an executor."""
++        if self.executor is None:
++            raise ValueError("no executor configured; cannot apply a plan")
++        return self.executor.execute(
++            self.plan(), dry_run=False, allow_destructive=allow_destructive
++        )
++
++    def __repr__(self):
++        return "<ReclaimSession fleet=%d>" % (self.fleet_size,)
+diff --git a/libcloud/reclaim2/target.py b/libcloud/reclaim2/target.py
+new file mode 100644
+index 000000000..81d2112d0
+--- /dev/null
++++ b/libcloud/reclaim2/target.py
+@@ -0,0 +1,386 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""The reclamation target: a resource distilled to what the planner needs.
++
++To decide whether a resource is worth reclaiming, the planner needs a handful of
++facts in a uniform shape regardless of which cloud the resource came from: what
++kind it is, what it costs per hour right now, how old it is, whether it is idle,
++whether the operator pinned it as protected, and enough identity to act on it
++later. A :class:`ReclaimTarget` is that distilled view, built from a Libcloud
++resource plus optional caller-supplied context (an as-of time for age maths, an
++hourly cost, utilisation hints).
++
++Ages are computed against an explicit ``as_of`` reference the caller passes in,
++never against the wall clock -- so a plan built from the same inputs is always
++reproducible.
++"""
++
++from __future__ import annotations
++
++__all__ = ["ResourceKind", "ReclaimTarget", "build_target", "build_targets"]
++
++# Seconds in a day, for age maths.
++_SECONDS_PER_DAY = 86400.0
++
++
++class ResourceKind:
++    NODE = "node"
++    VOLUME = "volume"
++    SNAPSHOT = "snapshot"
++    CONTAINER = "container"
++    IMAGE = "image"
++
++    _ALL = (NODE, VOLUME, SNAPSHOT, CONTAINER, IMAGE)
++
++    @classmethod
++    def is_valid(cls, kind):
++        return kind in cls._ALL
++
++
++# ``extra`` keys that commonly flag a resource as protected / do-not-touch.
++_PROTECT_KEYS = ("protected", "do_not_delete", "keep", "termination_protection")
++# Tag keys that, if truthy, protect a resource.
++_PROTECT_TAGS = ("protected", "do-not-delete", "keep", "pinned")
++# ``extra`` keys that commonly carry an attachment reference for volumes.
++_ATTACH_KEYS = ("attached_to", "instance_id", "attachments")
++# ``extra`` keys that commonly carry a parent-volume reference for snapshots.
++_PARENT_VOLUME_KEYS = ("volume_id", "source_volume", "volume")
++
++
++def _state_to_str(state):
++    if state is None:
++        return "unknown"
++    return str(getattr(state, "value", state)).lower()
++
++
++def _coerce_bool(value):
++    if isinstance(value, str):
++        return value.strip().lower() in ("1", "true", "yes", "on", "protected")
++    return bool(value)
++
++
++def _merge_tags(extra):
++    tags = {}
++    for key in ("metadata", "labels", "tags"):
++        container = extra.get(key)
++        if isinstance(container, dict):
++            for k, v in container.items():
++                tags[str(k)] = "" if v is None else str(v)
++    return tags
++
++
++class ReclaimTarget:
++    """A resource distilled to the facts the planner reasons about."""
++
++    __slots__ = (
++        "kind",
++        "provider",
++        "resource_id",
++        "name",
++        "region",
++        "state",
++        "size",
++        "hourly_cost",
++        "age_days",
++        "idle",
++        "protected",
++        "tags",
++        "extra",
++    )
++
++    def __init__(
++        self,
++        kind,
++        provider,
++        resource_id,
++        name=None,
++        region="unknown",
++        state="unknown",
++        size=0.0,
++        hourly_cost=0.0,
++        age_days=None,
++        idle=False,
++        protected=False,
++        tags=None,
++        extra=None,
++    ):
++        self.kind = kind
++        self.provider = provider
++        self.resource_id = resource_id
++        self.name = name
++        self.region = region
++        self.state = state
++        self.size = float(size or 0.0)
++        self.hourly_cost = float(hourly_cost or 0.0)
++        self.age_days = age_days
++        self.idle = bool(idle)
++        self.protected = bool(protected)
++        self.tags = dict(tags or {})
++        self.extra = dict(extra or {})
++
++    # --- Identity -------------------------------------------------------------
++    @property
++    def identity(self):
++        return (self.provider, self.kind, str(self.resource_id))
++
++    @property
++    def sort_key(self):
++        return (self.kind, self.provider, self.region, str(self.resource_id or ""))
++
++    # --- Convenience ----------------------------------------------------------
++    @property
++    def attachment(self):
++        for key in _ATTACH_KEYS:
++            val = self.extra.get(key)
++            if val:
++                return val
++        return None
++
++    @property
++    def parent_volume(self):
++        for key in _PARENT_VOLUME_KEYS:
++            val = self.extra.get(key)
++            if val is not None:
++                return val
++        return None
++
++    def has_tag(self, key):
++        return key in self.tags
++
++    def tag(self, key, default=None):
++        return self.tags.get(key, default)
++
++    def older_than(self, days):
++        return self.age_days is not None and self.age_days >= days
++
++    def as_dict(self):
++        return {
++            "kind": self.kind,
++            "provider": self.provider,
++            "resource_id": self.resource_id,
++            "name": self.name,
++            "region": self.region,
++            "state": self.state,
++            "size": self.size,
++            "hourly_cost": round(self.hourly_cost, 6),
++            "age_days": self.age_days,
++            "idle": self.idle,
++            "protected": self.protected,
++            "tags": dict(sorted(self.tags.items())),
++        }
++
++    def __eq__(self, other):
++        return isinstance(other, ReclaimTarget) and self.identity == other.identity
++
++    def __hash__(self):
++        return hash(self.identity)
++
++    def __repr__(self):
++        return "<ReclaimTarget %s/%s %s $%.4f/h%s>" % (
++            self.provider, self.kind, self.resource_id, self.hourly_cost,
++            " protected" if self.protected else "",
++        )
++
++
++def _infer_kind(resource):
++    cls = type(resource).__name__.lower()
++    if "snapshot" in cls:
++        return ResourceKind.SNAPSHOT
++    if "volume" in cls:
++        return ResourceKind.VOLUME
++    if "container" in cls:
++        return ResourceKind.CONTAINER
++    if "image" in cls:
++        return ResourceKind.IMAGE
++    if "node" in cls or (hasattr(resource, "state") and hasattr(resource, "public_ips")):
++        return ResourceKind.NODE
++    return None
++
++
++def _created_of(resource, extra):
++    # Libcloud stashes creation time in a few spots depending on the resource.
++    for attr in ("created_at", "created"):
++        val = getattr(resource, attr, None)
++        if val is not None:
++            return val
++    for key in ("created_at", "created", "creation_time", "launch_time"):
++        if key in extra:
++            return extra[key]
++    return None
++
++
++def _age_days(created, as_of):
++    """Compute age in days from ``created`` to ``as_of``.
++
++    Both may be epoch seconds (int/float) or anything exposing ``.timestamp()``.
++    Returns ``None`` when age can't be determined. Never reads the wall clock.
++    """
++    if created is None or as_of is None:
++        return None
++
++    def _epoch(v):
++        if isinstance(v, (int, float)):
++            return float(v)
++        ts = getattr(v, "timestamp", None)
++        if callable(ts):
++            try:
++                return float(ts())
++            except Exception:
++                return None
++        return None
++
++    c = _epoch(created)
++    a = _epoch(as_of)
++    if c is None or a is None:
++        return None
++    return max(0.0, (a - c) / _SECONDS_PER_DAY)
++
++
++def _size_of(resource, kind, extra):
++    if kind == ResourceKind.CONTAINER:
++        total = extra.get("total_bytes")
++        if total is None:
++            total = extra.get("size")
++        try:
++            return float(total or 0.0)
++        except (TypeError, ValueError):
++            return 0.0
++    try:
++        return float(getattr(resource, "size", None) or 0.0)
++    except (TypeError, ValueError):
++        return 0.0
++
++
++def _is_protected(extra, tags):
++    for key in _PROTECT_KEYS:
++        if key in extra and _coerce_bool(extra[key]):
++            return True
++    for key in _PROTECT_TAGS:
++        if key in tags and _coerce_bool(tags[key]):
++            return True
++    return False
++
++
++def build_target(
++    resource,
++    provider=None,
++    region=None,
++    kind=None,
++    as_of=None,
++    hourly_cost=None,
++    idle=None,
++    protected=None,
++):
++    """Distil a Libcloud resource into a :class:`ReclaimTarget`.
++
++    ``as_of`` (epoch seconds or a datetime-like) anchors the age computation.
++    ``hourly_cost`` / ``idle`` / ``protected`` let the caller override or supply
++    facts the resource object itself doesn't carry.
++    """
++    from libcloud.reclaim2.errors import ReclaimConfigError
++
++    if resource is None:
++        raise ReclaimConfigError("cannot build a target from None")
++    kind = kind or _infer_kind(resource)
++    if kind is None:
++        raise ReclaimConfigError(
++            "cannot infer resource kind for %r" % (type(resource).__name__,)
++        )
++    if not ResourceKind.is_valid(kind):
++        raise ReclaimConfigError("unknown resource kind %r" % (kind,))
++
++    extra = dict(getattr(resource, "extra", None) or {})
++    tags = _merge_tags(extra)
++
++    prov = provider or extra.get("provider")
++    if not prov:
++        driver = getattr(resource, "driver", None)
++        prov = getattr(driver, "name", None) or "unknown"
++    prov = str(prov)
++
++    reg = region
++    if not reg:
++        for key in ("region", "availability_zone", "zone", "location"):
++            if extra.get(key):
++                reg = str(extra[key])
++                break
++    reg = reg or "unknown"
++
++    rid = getattr(resource, "id", None)
++    if rid is None:
++        rid = getattr(resource, "name", None)
++
++    hc = hourly_cost
++    if hc is None:
++        hc = extra.get("hourly_cost")
++    if hc is None:
++        size = getattr(resource, "size", None)
++        hc = getattr(size, "price", None) if size is not None else None
++    if hc is None:
++        hc = 0.0
++
++    is_idle = idle
++    if is_idle is None:
++        is_idle = _coerce_bool(extra.get("idle", False))
++
++    prot = protected
++    if prot is None:
++        prot = _is_protected(extra, tags)
++
++    created = _created_of(resource, extra)
++    age = _age_days(created, as_of)
++
++    return ReclaimTarget(
++        kind=kind,
++        provider=prov,
++        resource_id=rid,
++        name=getattr(resource, "name", None),
++        region=reg,
++        state=_state_to_str(getattr(resource, "state", None)),
++        size=_size_of(resource, kind, extra),
++        hourly_cost=float(hc),
++        age_days=age,
++        idle=is_idle,
++        protected=prot,
++        tags=tags,
++        extra=extra,
++    )
++
++
++def build_targets(elements, as_of=None, provider=None, region=None):
++    """Build targets from an iterable of resources or ``(resource, meta)`` pairs.
++
++    ``meta`` may carry ``provider`` / ``region`` / ``kind`` / ``hourly_cost`` /
++    ``idle`` / ``protected`` overrides. Output is sorted deterministically.
++    """
++    out = []
++    for element in elements:
++        if isinstance(element, tuple) and len(element) == 2 and isinstance(element[1], dict):
++            resource, meta = element
++        else:
++            resource, meta = element, {}
++        out.append(build_target(
++            resource,
++            provider=meta.get("provider", provider),
++            region=meta.get("region", region),
++            kind=meta.get("kind"),
++            as_of=meta.get("as_of", as_of),
++            hourly_cost=meta.get("hourly_cost"),
++            idle=meta.get("idle"),
++            protected=meta.get("protected"),
++        ))
++    out.sort(key=lambda t: t.sort_key)
++    return out

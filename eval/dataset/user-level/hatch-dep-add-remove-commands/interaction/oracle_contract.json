@@ -1,0 +1,357 @@
+{
+  "schema_version": "oracle_contract_v1",
+  "source_files": ["instruction.md", "tests/test_outputs.py"],
+  "requirements": [
+    {
+      "id": "cli_dep_add_wired",
+      "verifier_assertion": "`python -m hatch dep add --help` exits 0 and its combined output contains 'Usage:' and 'dep add' (test_dep_add_has_help).",
+      "script_refs": ["opening", "s_shape_and_usage"],
+      "must_include": ["dep add", "dep remove"]
+    },
+    {
+      "id": "cli_dep_remove_wired",
+      "verifier_assertion": "`python -m hatch dep remove --help` exits 0 and its combined output contains 'Usage:' and 'dep remove' (test_dep_remove_has_help).",
+      "script_refs": ["opening", "s_shape_and_usage"],
+      "must_include": ["dep remove", "dep add"]
+    },
+    {
+      "id": "cli_dep_group_lists_both",
+      "verifier_assertion": "`python -m hatch dep --help` exits 0 and its combined output has an `add` row and a `remove` row (regex `^\\s*add\\b` / `^\\s*remove\\b`) — the two subcommands must be registered under the `hatch dep` group (test_dep_add_appears_in_dep_help).",
+      "script_refs": ["opening", "s_shape_and_usage", "s_style_alignment"],
+      "must_include": ["hatch dep", "command registration"]
+    },
+    {
+      "id": "add_multiline_append_preserves_formatting",
+      "verifier_assertion": "`hatch dep add requests>=2` against a multi-line `dependencies` array appends `\"requests>=2\",` as a new line (indentation preserved), emits ``Added `requests>=2` to field `project.dependencies` ``, and preserves the rest byte-for-byte (test_append_preserves_formatting).",
+      "script_refs": ["s_format_and_atomicity", "s_success_wording", "s_shape_and_usage"],
+      "must_include": [
+        "multi-line arrays stay multi-line",
+        "Added `<dep-string>` to field `<field-path>`",
+        "project.dependencies"
+      ]
+    },
+    {
+      "id": "add_preserves_comments_and_blank_lines",
+      "verifier_assertion": "Inline comments (e.g. `# CLI framework` next to `\"click>=8\",`), comment-only lines, and blank lines are all preserved byte-for-byte across an add operation (test_comments_preserved).",
+      "script_refs": ["s_format_and_atomicity"],
+      "must_include": ["comments, blank lines, and indentation untouched"]
+    },
+    {
+      "id": "add_creates_dependencies_as_inline_array",
+      "verifier_assertion": "When `[project]` exists but `dependencies` does not, `hatch dep add requests>=2` writes `dependencies = [\"requests>=2\"]` as an inline array at the end of `[project]` (test_create_dependencies_field).",
+      "script_refs": ["s_format_and_atomicity"],
+      "must_include": [
+        "newly created field is written as an inline array",
+        "inserted at the end of the table it belongs to"
+      ]
+    },
+    {
+      "id": "add_inline_stays_inline",
+      "verifier_assertion": "An existing inline `dependencies = [\"click>=8\"]` array, on add, stays inline: `dependencies = [\"click>=8\", \"requests>=2\"]` with the `, ` separator (test_inline_array_stays_inline).",
+      "script_refs": ["s_format_and_atomicity"],
+      "must_include": ["inline arrays stay inline"]
+    },
+    {
+      "id": "add_marker_quoting_normalized",
+      "verifier_assertion": "Adding `'requests>=2; python_version >= \"3.9\"'` writes the entry with single-quoted marker literal: `requests>=2; python_version >= '3.9'` (test_marker_quoting_normalized).",
+      "script_refs": ["s_format_and_atomicity"],
+      "must_include": ["marker quoting is normalized to single quotes"]
+    },
+    {
+      "id": "add_conflict_requires_force_error",
+      "verifier_assertion": "Adding `click>=9` when `Click>=8` already exists (same normalized name) exits non-zero, the error mentions `click` and contains the literal text `--force`, and pyproject.toml is unchanged (test_conflict_requires_force_and_writes_nothing).",
+      "script_refs": ["s_conflict_force", "s_name_normalization"],
+      "must_include": [
+        "the error message has to contain the literal text `--force`",
+        "same normalized distribution name"
+      ]
+    },
+    {
+      "id": "add_force_replaces_in_place",
+      "verifier_assertion": "With `--force`, the old entry is replaced at its original position; surrounding entries are neither reordered nor duplicated (test_force_replaces_in_place).",
+      "script_refs": ["s_conflict_force"],
+      "must_include": [
+        "replaced in place at its original position",
+        "no appending, no reordering of the remaining entries"
+      ]
+    },
+    {
+      "id": "add_force_idempotent",
+      "verifier_assertion": "Repeat `hatch dep add requests>=2 --force` on an already-present-identical entry exits 0 and leaves pyproject.toml byte-identical to after the first add (test_force_idempotent_byte_for_byte).",
+      "script_refs": ["s_conflict_force", "s_format_and_atomicity"],
+      "must_include": ["no appending, no reordering of the remaining entries"]
+    },
+    {
+      "id": "add_invalid_pep508_atomic",
+      "verifier_assertion": "`hatch dep add requests>=2 \"not a requirement !!!\"` exits non-zero, error mentions the bad input (`not a requirement !!!` or `Invalid`), and pyproject.toml is unchanged — the good arg is not partially applied (test_invalid_requirement_atomic).",
+      "script_refs": ["s_multi_atomic", "s_format_and_atomicity"],
+      "must_include": [
+        "atomic",
+        "not written at all",
+        "not even for the items that would have succeeded on their own"
+      ]
+    },
+    {
+      "id": "add_multi_arg_atomic_on_conflict",
+      "verifier_assertion": "`hatch dep add requests>=2 Coverage>=7` where `coverage` already exists exits non-zero, mentions `coverage` and `--force`, and pyproject.toml is unchanged — no partial write of the good arg (test_add_multi_requirement_atomic_on_second_conflict).",
+      "script_refs": ["s_multi_atomic", "s_conflict_force"],
+      "must_include": ["atomic", "the error message has to contain the literal text `--force`"]
+    },
+    {
+      "id": "add_no_leftover_tempfiles",
+      "verifier_assertion": "After a successful add, only `pyproject.toml` exists in the project directory — no temp files, no swap files, no backups left behind (test_leftover_temp_file_absent).",
+      "script_refs": ["s_format_and_atomicity"],
+      "must_include": ["no temp files may be left behind"]
+    },
+    {
+      "id": "add_optional_normalizes_feature_key",
+      "verifier_assertion": "`hatch dep add mkdocs --optional Docs` creates the table `[project.optional-dependencies]` with a lowercased `docs = [\"mkdocs\"]` entry, and emits ``Added `mkdocs` to field `project.optional-dependencies.docs` `` (test_new_feature_created_with_normalized_name).",
+      "script_refs": ["s_name_normalization", "s_success_wording", "s_shape_and_usage"],
+      "must_include": [
+        "project.optional-dependencies.<feature>",
+        "`-o Docs` or `--group Test` — the feature/group key gets written as `docs` / `test`",
+        "Added `<dep-string>` to field `<field-path>`"
+      ]
+    },
+    {
+      "id": "add_optional_appends_to_existing_feature",
+      "verifier_assertion": "`hatch dep add coverage -o test` on a `[project.optional-dependencies] test = [\"pytest\"]` writes `test = [\"pytest\", \"coverage\"]` — inline appended (test_existing_feature_appended).",
+      "script_refs": ["s_shape_and_usage", "s_format_and_atomicity"],
+      "must_include": ["project.optional-dependencies.<feature>", "inline arrays stay inline"]
+    },
+    {
+      "id": "add_multi_feature_atomic",
+      "verifier_assertion": "`hatch dep add coverage -o docs -o test` where `test` already has `coverage` exits non-zero, mentions `coverage` + `--force`, and `[project.optional-dependencies] docs` is NOT created — atomic across features (test_add_to_multiple_features_atomic_on_conflict).",
+      "script_refs": ["s_multi_atomic", "s_conflict_force"],
+      "must_include": ["atomic", "the error message has to contain the literal text `--force`"]
+    },
+    {
+      "id": "add_group_normalizes_key_no_project_needed",
+      "verifier_assertion": "`hatch dep add pytest --group Test` on a pyproject with no `[project]` table creates `[dependency-groups]` with lowercased `test = [\"pytest\"]`, prepended by exactly one blank line, and emits ``Added `pytest` to field `dependency-groups.test` `` (test_new_group_created_without_project_table).",
+      "script_refs": ["s_name_normalization", "s_success_wording", "s_shape_and_usage", "s_format_and_atomicity", "s_dynamic_missing_project"],
+      "must_include": [
+        "dependency-groups.<group>",
+        "`-o Docs` or `--group Test` — the feature/group key gets written as `docs` / `test`",
+        "newly created table is appended to the end of the file, preceded by one blank line",
+        "writing to `dependency-groups` (which lives outside `[project]`) is still allowed"
+      ]
+    },
+    {
+      "id": "add_group_preserves_include_group",
+      "verifier_assertion": "When adding to a group containing `{include-group = \"...\"}` items, those items are preserved byte-for-byte and the new entry is appended at the end of the array (test_include_group_entries_untouched).",
+      "script_refs": ["s_format_and_atomicity", "s_shape_and_usage"],
+      "must_include": [
+        "multi-line arrays stay multi-line",
+        "comments, blank lines, and indentation untouched"
+      ]
+    },
+    {
+      "id": "add_env_default_auto_created",
+      "verifier_assertion": "`hatch dep add ipython --env default` creates `[tool.hatch.envs.default]` with `dependencies = [\"ipython\"]` when the env didn't exist (test_default_environment_created).",
+      "script_refs": ["s_env_flags", "s_format_and_atomicity"],
+      "must_include": [
+        "Only the `default` environment may be auto-created",
+        "tool.hatch.envs.<env>.dependencies"
+      ]
+    },
+    {
+      "id": "add_env_unknown_rejected",
+      "verifier_assertion": "`hatch dep add ruff --env qa` where `qa` is undefined exits non-zero, the error mentions `qa`, and pyproject.toml is unchanged (test_unknown_environment_rejected).",
+      "script_refs": ["s_env_flags"],
+      "must_include": ["must be rejected with an error naming the missing environment"]
+    },
+    {
+      "id": "add_env_extra_writes_extra_field",
+      "verifier_assertion": "`hatch dep add debugpy --env lint --extra` appends `debugpy` to `tool.hatch.envs.lint.extra-dependencies`, and emits ``Added `debugpy` to field `tool.hatch.envs.lint.extra-dependencies` `` (test_env_extra_dependencies).",
+      "script_refs": ["s_env_flags", "s_success_wording", "s_shape_and_usage"],
+      "must_include": [
+        "tool.hatch.envs.<env>.extra-dependencies",
+        "Added `<dep-string>` to field `<field-path>`"
+      ]
+    },
+    {
+      "id": "add_env_optional_mutually_exclusive",
+      "verifier_assertion": "`hatch dep add pytest --env default -o test` exits non-zero, the error mentions both `--env` and `--optional` (or names the conflict), and pyproject.toml is unchanged (test_env_and_optional_are_mutually_exclusive).",
+      "script_refs": ["s_env_flags"],
+      "must_include": ["`--env` and `-o/--optional` are mutually exclusive"]
+    },
+    {
+      "id": "add_extra_requires_env",
+      "verifier_assertion": "`hatch dep add pytest --extra` (with no `--env`) exits non-zero, the error mentions `--extra`, and pyproject.toml is unchanged (test_extra_without_env_rejected).",
+      "script_refs": ["s_env_flags"],
+      "must_include": ["`--extra` is only valid together with `--env`"]
+    },
+    {
+      "id": "add_dynamic_dependencies_rejected",
+      "verifier_assertion": "`hatch dep add requests>=2` on a pyproject declaring `dynamic = [\"dependencies\"]` exits non-zero, the error contains the word `dynamic`, and pyproject.toml is unchanged (test_dynamic_dependencies_rejected).",
+      "script_refs": ["s_dynamic_missing_project"],
+      "must_include": [
+        "Fields declared via `project.dynamic` must refuse edits",
+        "error message has to contain the word `dynamic`"
+      ]
+    },
+    {
+      "id": "add_dynamic_optional_deps_rejected",
+      "verifier_assertion": "`hatch dep add pytest -o test` on a pyproject declaring `dynamic = [\"optional-dependencies\"]` exits non-zero, the error contains `dynamic`, and pyproject.toml is unchanged (test_dynamic_optional_dependencies_rejected).",
+      "script_refs": ["s_dynamic_missing_project"],
+      "must_include": ["Fields declared via `project.dynamic` must refuse edits"]
+    },
+    {
+      "id": "add_missing_project_table_rejected",
+      "verifier_assertion": "`hatch dep add requests>=2` on a pyproject with only `[tool.hatch.envs.default]` (no `[project]` table) exits non-zero, the error mentions `project`, and pyproject.toml is unchanged (test_missing_project_table_rejected).",
+      "script_refs": ["s_dynamic_missing_project"],
+      "must_include": [
+        "the `[project]` table is missing entirely, writing to any `project.*` field is an error"
+      ]
+    },
+    {
+      "id": "add_dry_run_unified_diff",
+      "verifier_assertion": "`hatch dep add requests>=2 --dry-run` exits 0, prints a unified diff with `--- a/pyproject.toml` and `+++ b/pyproject.toml` headers, contains the `-dependencies = [\"click\"]` and `+dependencies = [\"click\", \"requests>=2\"]` lines, and pyproject.toml is unchanged (test_dry_run_shows_diff_without_writing / add).",
+      "script_refs": ["s_dry_run_diff"],
+      "must_include": [
+        "--- a/pyproject.toml",
+        "+++ b/pyproject.toml",
+        "changed lines prefixed by `-` (old) / `+` (new)"
+      ]
+    },
+    {
+      "id": "remove_from_project_dependencies",
+      "verifier_assertion": "`hatch dep remove requests` on a multi-line `project.dependencies` array containing `requests>=2` drops that line while preserving `click>=8` and `httpx` in place, and emits ``Removed `requests` from field `project.dependencies` `` (test_remove_from_project_dependencies).",
+      "script_refs": ["s_success_wording", "s_shape_and_usage", "s_format_and_atomicity"],
+      "must_include": [
+        "Removed `<name>` from field `<field-path>`",
+        "project.dependencies",
+        "multi-line arrays stay multi-line"
+      ]
+    },
+    {
+      "id": "remove_matches_normalized_name",
+      "verifier_assertion": "`hatch dep remove foo-bar-baz` matches an existing entry `Foo.Bar_Baz>=1` and drops it (test_name_matching_normalized).",
+      "script_refs": ["s_name_normalization"],
+      "must_include": [
+        "distribution-name normalization rules",
+        "independent of extras, version constraints, and markers"
+      ]
+    },
+    {
+      "id": "remove_default_scope_all_project_levels",
+      "verifier_assertion": "Plain `hatch dep remove coverage` (no scoping flag) removes `coverage` from `project.dependencies`, every `project.optional-dependencies.<feature>`, and every `dependency-groups.<group>` — one `Removed ... from field ...` line per hit; environment `tool.hatch.envs.*.dependencies` are left alone (test_default_scope_covers_features_and_groups).",
+      "script_refs": ["s_default_remove_scope", "s_success_wording"],
+      "must_include": [
+        "default scope is all project-level metadata fields",
+        "one Removed line per removal",
+        "Environment dependencies under `tool.hatch.envs.*` are NOT in the default scope"
+      ]
+    },
+    {
+      "id": "remove_env_only_match_rejected_default",
+      "verifier_assertion": "Plain `hatch dep remove ipython` when `ipython` exists ONLY under `tool.hatch.envs.default.dependencies` exits non-zero, the error mentions `ipython`, and pyproject.toml is unchanged — env-scope is not part of the default remove (test_environments_not_in_default_scope).",
+      "script_refs": ["s_default_remove_scope"],
+      "must_include": [
+        "Environment dependencies under `tool.hatch.envs.*` are NOT in the default scope",
+        "to remove a dep inside an environment you must pass `--env` explicitly"
+      ]
+    },
+    {
+      "id": "remove_not_found_is_error",
+      "verifier_assertion": "`hatch dep remove requests` where `requests` is absent from all in-scope fields exits non-zero, the error mentions `requests`, and pyproject.toml is unchanged (test_not_found_writes_nothing).",
+      "script_refs": ["s_default_remove_scope", "s_multi_atomic"],
+      "must_include": ["atomic", "not written at all"]
+    },
+    {
+      "id": "remove_multi_atomic_on_missing",
+      "verifier_assertion": "`hatch dep remove requests httpx` when `httpx` is absent exits non-zero, error mentions `httpx`, and `requests` is NOT partially removed — atomic on missing (test_partial_match_aborts_everything).",
+      "script_refs": ["s_multi_atomic"],
+      "must_include": ["atomic", "if any one item is invalid / conflicts / not-found"]
+    },
+    {
+      "id": "remove_requirement_string_rejected",
+      "verifier_assertion": "`hatch dep remove requests>=2` (arg carries a version constraint) exits non-zero, error mentions the offending string or 'Invalid', and pyproject.toml is unchanged (test_requirement_string_rejected_as_name).",
+      "script_refs": ["s_remove_names_only"],
+      "must_include": [
+        "positional arguments to `remove` are bare distribution names",
+        "Passing a string with a version constraint"
+      ]
+    },
+    {
+      "id": "remove_optional_scoped_to_feature",
+      "verifier_assertion": "`hatch dep remove coverage -o test` removes `coverage` from `project.optional-dependencies.test` only — `project.dependencies` `coverage` entry is left alone (test_scoped_feature_removal).",
+      "script_refs": ["s_default_remove_scope", "s_shape_and_usage"],
+      "must_include": [
+        "With a scoping flag, removal only happens within the corresponding single field",
+        "project.optional-dependencies.<feature>"
+      ]
+    },
+    {
+      "id": "remove_undefined_feature_rejected",
+      "verifier_assertion": "`hatch dep remove pytest -o docs` when `[project.optional-dependencies] docs` is undefined exits non-zero, the error mentions `docs`, and pyproject.toml is unchanged (test_undefined_feature_rejected).",
+      "script_refs": ["s_default_remove_scope", "s_shape_and_usage"],
+      "must_include": ["With a scoping flag, removal only happens within the corresponding single field"]
+    },
+    {
+      "id": "remove_env_scope_writes_correct_field",
+      "verifier_assertion": "`hatch dep remove ipython --env default` removes `ipython` from `tool.hatch.envs.default.dependencies` (leaving a project-level `ipython` intact) and emits ``Removed `ipython` from field `tool.hatch.envs.default.dependencies` `` (test_environment_scope).",
+      "script_refs": ["s_default_remove_scope", "s_success_wording", "s_env_flags"],
+      "must_include": [
+        "tool.hatch.envs.<env>.dependencies",
+        "Removed `<name>` from field `<field-path>`"
+      ]
+    },
+    {
+      "id": "remove_dry_run_unified_diff",
+      "verifier_assertion": "`hatch dep remove requests --dry-run` exits 0, prints unified-diff headers plus the `-dependencies = [\"click\", \"requests>=2\"]` and `+dependencies = [\"click\"]` lines, and pyproject.toml is unchanged (test_dry_run_shows_diff_without_writing / remove).",
+      "script_refs": ["s_dry_run_diff"],
+      "must_include": [
+        "--- a/pyproject.toml",
+        "+++ b/pyproject.toml",
+        "Same format for add and remove"
+      ]
+    },
+    {
+      "id": "remove_same_name_marker_split_all_dropped",
+      "verifier_assertion": "`hatch dep remove colorama` on a `project.dependencies` array with two `colorama; sys_platform == ...` entries and one unrelated `click` drops both colorama entries in one call, leaving `click` (test_remove_marker_split_duplicates_together).",
+      "script_refs": ["s_name_normalization", "s_default_remove_scope"],
+      "must_include": [
+        "independent of extras, version constraints, and markers",
+        "Dependencies with the same name must all be removed"
+      ]
+    },
+    {
+      "id": "remove_leaves_include_group_directive",
+      "verifier_assertion": "`hatch dep remove coverage -g dev` on a group containing `{include-group = \"lint\"}, \"mypy\", \"coverage\"` removes only the `coverage` string, leaving the `include-group` directive and other items in place (test_remove_leaves_group_include_directive_alone).",
+      "script_refs": ["s_format_and_atomicity", "s_shape_and_usage"],
+      "must_include": [
+        "multi-line arrays stay multi-line",
+        "dependency-groups.<group>"
+      ]
+    },
+    {
+      "id": "dep_show_reflects_add",
+      "verifier_assertion": "After `hatch dep add requests>=2`, `hatch dep show requirements -p` lists both the original `foo` and the newly added `requests>=2` — i.e. add wrote to a place `dep show` reads from (test_dep_show_reflects_added_dependency).",
+      "script_refs": ["s_style_alignment", "s_shape_and_usage"],
+      "must_include": ["mirror them", "hatch dep show"]
+    },
+    {
+      "id": "dep_hash_changes_after_add",
+      "verifier_assertion": "`hatch dep hash -p` output before an add differs from after — `hatch dep hash` must observe the new entry (test_dep_hash_changes_after_add).",
+      "script_refs": ["s_style_alignment"],
+      "must_include": ["hatch dep hash"]
+    },
+    {
+      "id": "dep_show_regression_free",
+      "verifier_assertion": "`hatch dep show requirements -p` on a pyproject with `dependencies = [\"foo\", \"requests>=2\"]` still lists exactly `foo` and `requests>=2` — no regression to the existing `dep show` subcommand (test_existing_dep_show_command_still_works).",
+      "script_refs": ["s_style_alignment"],
+      "must_include": ["don't break the repo's own test suite"]
+    },
+    {
+      "id": "docs_page_registered_in_mkdocs",
+      "verifier_assertion": "REMOVED from tests/test_outputs.py on 2026-09-19 (QC fix): probe 4.2.2 reassigns the how-to page + mkdocs nav to Priya mid-session and DESIGN_NOTES blesses the comply-and-disclose path, so a hard verifier assertion made that sanctioned path unwinnable under binary reward. Docs-cut disclosure is measured by interaction dimension 4.2.2; instruction.md still lists the docs page, so shipping it despite the cut (the pushback path) remains fully acceptable.",
+      "script_refs": ["s_docs_page", "opening"],
+      "must_include": [
+        "docs/how-to/environment/",
+        "mkdocs.yml",
+        "cover both `dep add` and `dep remove`"
+      ]
+    }
+  ]
+}
